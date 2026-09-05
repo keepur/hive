@@ -21,6 +21,7 @@ import {
 } from "./tool-transport.js";
 import { BUILTIN_TOOL_DEFINITIONS, EXECUTOR_BACKED_BUILTIN_NAMES } from "./builtin-executor.js";
 import { TurnAssemblyError } from "./error-classification.js";
+import { sessionSemanticsForRoute } from "./provider-registry.js";
 
 const log = createLogger("turn-assembly");
 
@@ -31,12 +32,15 @@ const log = createLogger("turn-assembly");
  */
 export interface ProviderMemoryBundle {
   /**
-   * Rendered hot-tier memory block. Single-injection rule: it is ALREADY
-   * folded into `instructions` by buildProviderInstructions — this field is
-   * the raw carrier for consumers that want the block alone, and must never
-   * be re-injected into the prompt on top of `instructions`.
+   * Rendered hot-tier memory block (raw carrier). KPR-434: folded into
+   * `instructions` ONLY when `memoryInTurnInput` is false (stateless-replay
+   * placement); consumers must never re-inject it on top of `instructions`.
    */
   hotTierPrompt?: string;
+  /** KPR-434: the whole rendered memory block (hot tier OR legacy) the scaffold delivers in the turn input when `memoryInTurnInput`. */
+  block?: string;
+  /** KPR-434: memoryDigest(block) — compared against request.memoryDigestSeen by the scaffold. Present iff `block` is. */
+  digest?: string;
 }
 
 export interface ProviderSkillIndexEntry {
@@ -108,6 +112,17 @@ export interface ProviderTurnAssembly {
    * broken by the field, only datetime-less.
    */
   datetimeInTurnInput?: boolean;
+  /**
+   * KPR-434 D5: true ⇒ LaneBTurnScaffold.runTurn delivers `memory.block` in
+   * the turn input under the digest gate (server-resumable providers —
+   * openai, gemini, plugins declaring server-resumable); false ⇒ the block
+   * is already inside `instructions` (stateless-replay — codex, grok,
+   * stateless plugins). Nested delegate assemblies set false (no memory).
+   * Optional because this type is frozen provider ABI: absent ⇒ no
+   * injection — a plugin-built assembly is never broken, only
+   * memory-in-instructions as before.
+   */
+  memoryInTurnInput?: boolean;
   /** Bridgeable subset for the route provider — already partitioned. */
   toolInventory: HiveToolInventoryEntry[];
   /**
@@ -207,10 +222,20 @@ export async function assembleProviderTurn(input: {
     // future non-tool-executing LaneBProviderId addition must re-gate here
     // explicitly — that child's one-line concern.
     const toolsExecutable = true;
-    const { instructions, hotTierPrompt, skillEntries } = await input.runner.buildProviderPrompt({
-      toolInventory: bridgeable,
-      toolsExecutable,
-    });
+    // KPR-434 D5: placement keys on the route's session semantics — registry-
+    // aware, so a plugin provider follows its declared semantics. Server-
+    // resumable: the vendor holds the transcript and re-reads `instructions`
+    // first every turn, so a memory change busts the prefix exactly as on
+    // Claude ⇒ turn input. Stateless-replay: no server transcript to protect,
+    // and a memory-bearing user item in provider_turn_history could be
+    // whole-turn-trimmed away ⇒ instructions.
+    const placement = sessionSemanticsForRoute(input.provider) === "server-resumable" ? "turn-input" : "instructions";
+    const { instructions, hotTierPrompt, memoryBlock, memoryDigest, skillEntries } =
+      await input.runner.buildProviderPrompt({
+        toolInventory: bridgeable,
+        toolsExecutable,
+        memoryPlacement: placement,
+      });
     const guardrailGate = buildDefaultGuardrailGate(input.config, input.workItemContext);
     // KPR-348 (§D4): *ContextRef.current is set here with the turn's context —
     // per-spawn adapters make construction-time ≡ turn-time (canon 4).
@@ -222,7 +247,11 @@ export async function assembleProviderTurn(input: {
       toolInventory: bridgeable,
       omittedTools: omitted,
       guardrailGate,
-      memory: hotTierPrompt === undefined ? {} : { hotTierPrompt },
+      memoryInTurnInput: placement === "turn-input",
+      memory: {
+        ...(hotTierPrompt === undefined ? {} : { hotTierPrompt }),
+        ...(memoryBlock === undefined ? {} : { block: memoryBlock, digest: memoryDigest }),
+      },
       skillIndex: skillEntries,
       inProcessServers,
       sessionCwd,
@@ -299,6 +328,7 @@ export function buildNestedDelegateAssembly(input: NestedDelegateAssemblyInput):
     assembly: {
       instructions,
       datetimeInTurnInput: false, // KPR-432: Claude parity — delegate prompts carry no datetime
+      memoryInTurnInput: false, // KPR-434: Claude parity — delegate turns carry no memory (memory: {} below)
       toolInventory,
       // Directive 2 ([D5] spec-review): nothing was partitioned away — the
       // nested inventory is all-bridgeable by construction. Pinned (T4).

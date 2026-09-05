@@ -240,7 +240,13 @@ vi.mock("../search/conversation-index.js", () => ({
   }),
 }));
 
-import { AgentManager, conferenceRoundOf, isStaleServerHandleError, type TurnContext } from "./agent-manager.js";
+import {
+  AgentManager,
+  conferenceRoundOf,
+  isStaleServerHandleError,
+  resolveMemoryMark,
+  type TurnContext,
+} from "./agent-manager.js";
 import { config as appConfig } from "../config.js";
 import { AgentRunner, type RunResult } from "./agent-runner.js";
 import type { AgentConfig } from "../types/agent-config.js";
@@ -399,16 +405,35 @@ function makeMockRegistry() {
 function makeMockSessionStore() {
   // KPR-313: records mirror the real store's rows; get() applies the same
   // ""-⇒-undefined normalization the real choke point does.
-  const sessions = new Map<string, { sessionId: string; provider: string }>();
+  // KPR-434: rows also carry the memoryDigest mark; set() applies the real
+  // tri-state (string ⇒ set, null ⇒ clear, undefined ⇒ untouched).
+  type Row = { sessionId: string; provider: string; memoryDigest?: string };
+  const sessions = new Map<string, Row>();
   return {
     get: vi.fn().mockImplementation(async (agentId: string, threadId: string) => {
       const rec = sessions.get(`${agentId}:${threadId}`);
       if (!rec) return undefined;
-      return { sessionId: rec.sessionId || undefined, provider: rec.provider };
+      return {
+        sessionId: rec.sessionId || undefined,
+        provider: rec.provider,
+        ...(rec.memoryDigest !== undefined ? { memoryDigest: rec.memoryDigest } : {}),
+      };
     }),
     set: vi.fn().mockImplementation(
-      async (agentId: string, threadId: string, sessionId: string, provider: string, _tokenData?: any) => {
-        sessions.set(`${agentId}:${threadId}`, { sessionId, provider });
+      async (
+        agentId: string,
+        threadId: string,
+        sessionId: string,
+        provider: string,
+        _tokenData?: any,
+        memoryDigest?: string | null,
+      ) => {
+        const key = `${agentId}:${threadId}`;
+        const prev = sessions.get(key);
+        const next: Row = { sessionId, provider };
+        const mark = memoryDigest === undefined ? prev?.memoryDigest : memoryDigest === null ? undefined : memoryDigest;
+        if (mark !== undefined) next.memoryDigest = mark;
+        sessions.set(key, next);
       },
     ),
     delete: vi.fn(),
@@ -900,6 +925,7 @@ describe("AgentManager", () => {
         undefined,
         undefined,
         undefined,
+        undefined,
       );
     });
   });
@@ -1104,6 +1130,7 @@ describe("AgentManager", () => {
         "session-sms-1",
         "claude",
         expect.objectContaining({ inputTokens: 100, outputTokens: 50 }),
+        null,
       );
 
       // Underlying runner.send called with the resume id (undefined on first turn) and
@@ -2605,7 +2632,7 @@ describe("AgentManager", () => {
         expect(prompt).toContain("conversation_search"); // claude-target variant
         expect(prompt).toContain("hello over sms"); // original text intact
         expect(recordSpawnSpy).toHaveBeenCalledTimes(1); // counted as a new session
-        expect(sessionStore.get).toHaveBeenCalledTimes(1); // the authoritative re-read — trip path only
+        expect(sessionStore.get).toHaveBeenCalledTimes(2); // the every-turn post-lock read (KPR-434) + the authoritative trip re-read
         expect(mockLogWarn).toHaveBeenCalledWith(
           expect.stringContaining("provider mismatch"),
           expect.objectContaining({ stored: "openai", turn: "claude", hadSessionId: true }),
@@ -2620,7 +2647,7 @@ describe("AgentManager", () => {
         const [prompt, sessionArg] = mockRunnerSend.mock.calls[0]!;
         expect(sessionArg).toBe("s-1");
         expect(prompt).not.toContain("session continuity was reset");
-        expect(sessionStore.get).not.toHaveBeenCalled(); // zero-I/O hot path
+        expect(sessionStore.get).toHaveBeenCalledTimes(1); // hot path pays exactly one post-lock read for the memory mark (KPR-434 D4.3) — no trip read
       });
 
       it("codex-tagged empty row + claude turn: nothing to resume AND the annotation still fires (round-trip return leg)", async () => {
@@ -2671,7 +2698,7 @@ describe("AgentManager", () => {
         expect(req.sessionId).toBeUndefined(); // guard stripped the claude id
         expect(req.prompt).toContain("session continuity was reset"); // §3.4 annotation
         expect(sessionStore.set).toHaveBeenCalledWith(
-          "openai-pilot", threadId, "openai-session", "openai", expect.anything(),
+          "openai-pilot", threadId, "openai-session", "openai", expect.anything(), null,
         ); // first openai turn persists the first lastResponseId
       });
 
@@ -2699,7 +2726,7 @@ describe("AgentManager", () => {
           expect(req.sessionId).toBeUndefined(); // guard stripped the claude id
           expect(req.prompt).toContain("session continuity was reset");
           expect(req.prompt).not.toContain("conversation_search"); // gemini gets the pilot variant
-          expect(sessionStore.set).toHaveBeenCalledWith(id, threadId, "interactions/new", "gemini", expect.anything());
+          expect(sessionStore.set).toHaveBeenCalledWith(id, threadId, "interactions/new", "gemini", expect.anything(), null);
         });
 
         it("gemini→claude: guard trips, fresh claude turn, CLAUDE notice variant (conversation_search)", async () => {
@@ -2725,7 +2752,7 @@ describe("AgentManager", () => {
             smsCtx({ agentId: id, threadId, sessionId: "resp_openai", sessionProvider: "openai" }),
           );
           expect(mockGeminiRunTurn.mock.calls[0]![0].sessionId).toBeUndefined();
-          expect(sessionStore.set).toHaveBeenCalledWith(id, threadId, "interactions/new", "gemini", expect.anything());
+          expect(sessionStore.set).toHaveBeenCalledWith(id, threadId, "interactions/new", "gemini", expect.anything(), null);
         });
 
         it("gemini→openai: the interaction handle never crosses into an openai turn", async () => {
@@ -2739,7 +2766,7 @@ describe("AgentManager", () => {
             smsCtx({ agentId: "oai", threadId, sessionId: "interactions/old", sessionProvider: "gemini" }),
           );
           expect(mockOpenAIRunTurn.mock.calls[0]![0].sessionId).toBeUndefined();
-          expect(sessionStore.set).toHaveBeenCalledWith("oai", threadId, "openai-session", "openai", expect.anything());
+          expect(sessionStore.set).toHaveBeenCalledWith("oai", threadId, "openai-session", "openai", expect.anything(), null);
         });
 
         it("adopt: a seeded gemini row matching a gemini turn resumes the handle with NO handoff notice", async () => {
@@ -2790,7 +2817,7 @@ describe("AgentManager", () => {
         mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-c" }));
         await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr313-p-claude" }));
         expect(sessionStore.set).toHaveBeenCalledWith(
-          "agent-a", "sms:line-1:kpr313-p-claude", "s-c", "claude", expect.anything(),
+          "agent-a", "sms:line-1:kpr313-p-claude", "s-c", "claude", expect.anything(), null,
         );
 
         // Codex — adapter returns a fabricated id ("codex-session" fixture); store must get "".
@@ -2800,7 +2827,7 @@ describe("AgentManager", () => {
         );
         await manager.spawnTurn(smsCtx({ agentId: "codex-pilot", threadId: "sms:line-1:kpr313-p-codex" }));
         expect(sessionStore.set).toHaveBeenLastCalledWith(
-          "codex-pilot", "sms:line-1:kpr313-p-codex", "", "codex", expect.anything(),
+          "codex-pilot", "sms:line-1:kpr313-p-codex", "", "codex", expect.anything(), null,
         );
         // The ROW survives — thread→agent mapping intact (the ticket's rule, literally).
         await expect(sessionStore.findAgentByThread("sms:line-1:kpr313-p-codex")).resolves.toBe("codex-pilot");
@@ -2814,7 +2841,7 @@ describe("AgentManager", () => {
         mockGeminiRunTurn.mockResolvedValueOnce(makeRunResult({ text: "g", sessionId: "interactions/xyz" }));
         await manager.spawnTurn(smsCtx({ agentId: "gemini-pilot", threadId: "sms:line-1:kpr313-p-gem" }));
         expect(sessionStore.set).toHaveBeenLastCalledWith(
-          "gemini-pilot", "sms:line-1:kpr313-p-gem", "interactions/xyz", "gemini", expect.anything(),
+          "gemini-pilot", "sms:line-1:kpr313-p-gem", "interactions/xyz", "gemini", expect.anything(), null,
         );
       });
 
@@ -2858,7 +2885,7 @@ describe("AgentManager", () => {
         );
         await manager.spawnTurn(smsCtx({ agentId: "openai-pilot", threadId: "sms:line-1:kpr313-p-oai" }));
         expect(sessionStore.set).toHaveBeenLastCalledWith(
-          "openai-pilot", "sms:line-1:kpr313-p-oai", "openai-session", "openai", expect.anything(),
+          "openai-pilot", "sms:line-1:kpr313-p-oai", "openai-session", "openai", expect.anything(), null,
         );
       });
 
@@ -2893,7 +2920,7 @@ describe("AgentManager", () => {
           smsCtx({ threadId: "sms:line-1:kpr313-same", sessionId: "s-same", sessionProvider: "claude" }),
         );
         expect(sessionStore.set).toHaveBeenCalledWith(
-          "agent-a", "sms:line-1:kpr313-same", "s-same", "claude", expect.anything(),
+          "agent-a", "sms:line-1:kpr313-same", "s-same", "claude", expect.anything(), undefined,
         );
       });
 
@@ -2901,7 +2928,7 @@ describe("AgentManager", () => {
         mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "tool blew up", sessionId: "s-first" }));
         await manager.spawnTurn(smsCtx({ threadId: "sms:line-1:kpr313-first" }));
         expect(sessionStore.set).toHaveBeenCalledWith(
-          "agent-a", "sms:line-1:kpr313-first", "s-first", "claude", expect.anything(),
+          "agent-a", "sms:line-1:kpr313-first", "s-first", "claude", expect.anything(), null,
         );
       });
 
@@ -3068,7 +3095,7 @@ describe("AgentManager", () => {
           const req = mockGeminiRunTurn.mock.calls[0]![0];
           expect(req.sessionId).toBeUndefined(); // fresh gemini chain
           expect(req.prompt).toContain("session continuity was reset");
-          expect(sessionStore.set).toHaveBeenCalledWith("gem", threadId, "interactions/fresh", "gemini", expect.anything());
+          expect(sessionStore.set).toHaveBeenCalledWith("gem", threadId, "interactions/fresh", "gemini", expect.anything(), null);
         });
 
         it("ORDERING pin: the clear is AWAITED — the codex adapter (and its load) is unreachable until clear resolves", async () => {
@@ -3182,7 +3209,7 @@ describe("AgentManager", () => {
         expect(result.finalMessage).toBe("healed");
         expect(result.newSessionId).toBe("resp-fresh");
         expect(sessionStore.set).toHaveBeenCalledWith(
-          "openai-pilot", ctx.threadId, "resp-fresh", "openai", expect.anything(),
+          "openai-pilot", ctx.threadId, "resp-fresh", "openai", expect.anything(), null,
         ); // write path self-corrects — no explicit scrub
         expect(mockLogWarn).toHaveBeenCalledWith(
           expect.stringContaining("stale-server-handle"),
@@ -3263,7 +3290,7 @@ describe("AgentManager", () => {
           expect(mockOpenAIRunTurn.mock.calls[1]![0].sessionId).toBe("resp-contender"); // adopt, NOT fresh
           expect(result.finalMessage).toBe("adopted");
           expect(sessionStore.set).toHaveBeenCalledWith(
-            "openai-pilot", ctx.threadId, "resp-contender-2", "openai", expect.anything(),
+            "openai-pilot", ctx.threadId, "resp-contender-2", "openai", expect.anything(), undefined,
           );
           // Redaction: adoption is a boolean; no handle value in any warn meta.
           expect(mockLogWarn).toHaveBeenCalledWith(
@@ -3467,7 +3494,7 @@ describe("AgentManager", () => {
         expect(result.finalMessage).toBe("healed");
         expect(result.newSessionId).toBe("interactions/new");
         expect(sessionStore.set).toHaveBeenCalledWith(
-          ctx.agentId, ctx.threadId, "interactions/new", "gemini", expect.anything(),
+          ctx.agentId, ctx.threadId, "interactions/new", "gemini", expect.anything(), null,
         ); // write path self-corrects — the row is overwritten
         // Redaction pin: the self-heal warn carries {agentId, threadId, provider}
         // only — the provider message (which embeds the handle) is never logged.
@@ -3557,10 +3584,12 @@ describe("AgentManager", () => {
         const ctx = smsCtx({ threadId: "sms:line-1:kpr399-p1" });
         await manager.spawnTurn(ctx);
         expect(sessionStore.set).toHaveBeenCalledTimes(1);
-        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s1", "claude");
-        // No 5th arg: tokenData omitted — aborted turns carry all-zero usage;
-        // set() without tokenData preserves the prior turn's stats.
-        expect(sessionStore.set.mock.calls[0]!.length).toBe(4);
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s1", "claude", undefined, null);
+        // tokenData slot is undefined (aborted turns carry all-zero usage;
+        // set() without tokenData preserves the prior turn's stats); the 6th
+        // arg is the KPR-434 mark.
+        expect(sessionStore.set.mock.calls[0]!.length).toBe(6);
+        expect(sessionStore.set.mock.calls[0]![4]).toBeUndefined();
       });
 
       it.each([
@@ -3573,7 +3602,7 @@ describe("AgentManager", () => {
         );
         const ctx = smsCtx({ threadId: "sms:line-1:kpr399-sig" });
         await manager.spawnTurn(ctx);
-        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s1", "claude");
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s1", "claude", undefined, null);
       });
 
       it("fail-closed: aborted with ZERO progress persists nothing (also synthesizeAbortedResult's shape)", async () => {
@@ -3598,7 +3627,7 @@ describe("AgentManager", () => {
         );
         const ctx = smsCtx({ threadId: "sms:line-1:kpr399-stop" });
         await manager.spawnTurn(ctx);
-        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-stop", "claude");
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-stop", "claude", undefined, null);
       });
 
       it("mint-safety belt: aborted + errored + resumed + DIFFERENT id never overwrites the row", async () => {
@@ -3617,7 +3646,7 @@ describe("AgentManager", () => {
         );
         const ctx = smsCtx({ threadId: "sms:line-1:kpr399-same", sessionId: "s-same", sessionProvider: "claude" });
         await manager.spawnTurn(ctx);
-        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-same", "claude");
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-same", "claude", undefined, undefined);
       });
 
       it("C3 pins: aborted-with-progress on openai / gemini / codex routes persists NOTHING (Lane B byte-for-byte)", async () => {
@@ -3663,7 +3692,7 @@ describe("AgentManager", () => {
             );
             const ctx = smsCtx({ agentId, threadId: `sms:line-1:kpr399-${provider}` });
             await manager.spawnTurn(ctx);
-            expect(sessionStore.set).toHaveBeenCalledWith(agentId, ctx.threadId, sessionId, provider);
+            expect(sessionStore.set).toHaveBeenCalledWith(agentId, ctx.threadId, sessionId, provider, undefined, null);
           } finally {
             delete process.env[envKey];
           }
@@ -3722,7 +3751,7 @@ describe("AgentManager", () => {
         expect(result.finalMessage).toBe("healed");
         expect(result.newSessionId).toBe("s-fresh");
         // Write path self-corrects: fresh handle persisted normally (no scrub).
-        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-fresh", "claude", expect.anything());
+        expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-fresh", "claude", expect.anything(), null);
         // Redaction posture: the warn carries no error string / handle value.
         expect(mockLogWarn).toHaveBeenCalledWith(
           expect.stringContaining("resume rejected"),
@@ -3986,7 +4015,7 @@ describe("AgentManager", () => {
         mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-kimi-new" }));
         await manager.spawnTurn(smsCtx({ agentId: "agent-kimi", threadId }));
         expect(sessionStore.set).toHaveBeenCalledWith(
-          "agent-kimi", threadId, "s-kimi-new", "kimi", expect.anything(),
+          "agent-kimi", threadId, "s-kimi-new", "kimi", expect.anything(), null,
         );
       });
 
@@ -4276,7 +4305,7 @@ describe("AgentManager", () => {
         mockGrokRunTurn.mockResolvedValueOnce(makeRunResult({ text: "ok", sessionId: "chatcmpl-abc123" }));
         await manager.spawnTurn(smsCtx({ agentId: "agent-grok", threadId }));
         expect(sessionStore.set).toHaveBeenCalledWith(
-          "agent-grok", threadId, "", "grok", expect.anything(),
+          "agent-grok", threadId, "", "grok", expect.anything(), null,
         );
       });
 
@@ -4307,7 +4336,7 @@ describe("AgentManager", () => {
           smsCtx({ agentId: "agent-grok", threadId, sessionId: "chatcmpl-old", sessionProvider: "grok" }),
         );
 
-        expect(sessionStore.get).not.toHaveBeenCalled(); // same-provider tag: zero-I/O hot path
+        expect(sessionStore.get).toHaveBeenCalledTimes(1); // same-provider tag: one post-lock read for the memory mark (KPR-434), no trip read
         const req = mockGrokRunTurn.mock.calls[0]![0];
         expect(req.prompt).not.toContain("session continuity was reset");
       });
@@ -5291,8 +5320,10 @@ describe("AgentManager", () => {
         expect(mockCodexConstructor).not.toHaveBeenCalled();
         expect(mockGeminiConstructor).not.toHaveBeenCalled();
         // KPR-338: send carries no per-turn model — arity pin proves no extra
-        // positional survives (the type system enforces the rest).
-        expect(mockRunnerSend.mock.calls[0]!.length).toBe(7);
+        // positional survives (the type system enforces the rest). KPR-434:
+        // 8, not 7 — the adapter forwards request.memoryDigestSeen as the last
+        // positional on every call (undefined here: fresh SMS thread, no mark).
+        expect(mockRunnerSend.mock.calls[0]!.length).toBe(8);
         // Telemetry + audit both read the agent's STATIC model, not the route junk.
         expect(turnTelemetryStore.record).toHaveBeenCalledWith(
           expect.objectContaining({ model: "claude-sonnet-4-6" }),
@@ -6492,6 +6523,288 @@ describe("AgentManager", () => {
     });
   });
 
+  describe("memory telemetry (KPR-434 D6)", () => {
+    beforeEach(() => {
+      // Redundant with the outer beforeEach prime (:467) — kept deliberately, matching the
+      // sibling KPR-389/KPR-399 describes' own re-prime so a future outer-prime removal
+      // cannot silently break this block.
+      mockConversationIndex.mockResolvedValue(undefined);
+    });
+
+    it("memoryInjected: true iff RunResult.memoryDigestInjected is set — sparse", async () => {
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ memoryDigestInjected: "0123456789abcdef" }));
+      await manager.spawnTurn(makeSmsCtx({ threadId: "sms:line-1:kpr434-tel-inj" }));
+      const doc = turnTelemetryStore.record.mock.calls[0]![0];
+      expect(doc.memoryInjected).toBe(true);
+      expect(doc).not.toHaveProperty("memoryRenderFailed");
+    });
+
+    it("memoryRenderFailed: true iff RunResult.memoryRenderFailed — sparse; a plain turn carries neither key", async () => {
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ memoryRenderFailed: true }));
+      await manager.spawnTurn(makeSmsCtx({ threadId: "sms:line-1:kpr434-tel-fail" }));
+      expect(turnTelemetryStore.record.mock.calls[0]![0].memoryRenderFailed).toBe(true);
+      expect(turnTelemetryStore.record.mock.calls[0]![0]).not.toHaveProperty("memoryInjected");
+
+      await manager.spawnTurn(makeSmsCtx({ threadId: "sms:line-1:kpr434-tel-plain" }));
+      const plain = turnTelemetryStore.record.mock.calls[1]![0];
+      expect(plain).not.toHaveProperty("memoryInjected");
+      expect(plain).not.toHaveProperty("memoryRenderFailed");
+    });
+
+    it("T1 (manager half): a memoryRenderFailed result is a SUCCESS to the breaker — never a claude fault", async () => {
+      const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ memoryRenderFailed: true }));
+      await manager.spawnTurn(makeSmsCtx({ threadId: "sms:line-1:kpr434-brk-soft" }));
+      expect(recordSpy).toHaveBeenCalledTimes(1);
+      expect(recordSpy.mock.calls[0]![1]).toEqual({ outcome: "success" });
+      expect(manager.circuitBreakers.stateFor("claude")!.consecutiveHardFaults).toBe(0);
+    });
+
+    it("T1 hazard pin (why send() must catch): a THROWN Mongo-shaped error out of the adapter classifies connect-fail on the claude breaker", async () => {
+      // This is the exact shape the fail-soft catch prevents (spec D2). It is
+      // pinned here — not fixed — so a future refactor that lets the render
+      // throw again shows up as a breaker fault in this row's twin above.
+      const recordSpy = vi.spyOn(manager.circuitBreakers, "record");
+      mockRunnerSend.mockRejectedValueOnce(new Error("connect ECONNREFUSED 127.0.0.1:27017"));
+      await expect(manager.spawnTurn(makeSmsCtx({ threadId: "sms:line-1:kpr434-brk-hazard" }))).rejects.toThrow(/ECONNREFUSED/);
+      expect(recordSpy.mock.calls[0]![1]).toMatchObject({ outcome: "fault", kind: "connect-fail" });
+    });
+  });
+
+  describe("memory digest mark — post-lock read, pairing, adopt/drop sites, persist (KPR-434 D4)", () => {
+    const STALE = "Previous response with id 'resp_stale' not found.";
+    const UNKNOWN_SESSION = "No conversation found with session ID: 0198c3f2-abcd-7890-b1c2-d3e4f5a6b7c8";
+    const AUTH_REBUILD = "Failed to resolve authentication for resume";
+    const ctxOf = (threadId: string, sessionId?: string, provider = "claude"): TurnContext => ({
+      ...makeSmsCtx({ threadId, sessionId }),
+      ...(sessionId ? { sessionProvider: provider } : {}),
+    });
+    const smsItem = (threadId: string, text: string) =>
+      makeWorkItem({ text, threadId, source: { kind: "sms" as const, id: "line-1", label: "May" }, sender: "+1" });
+    /** positional slot 7 of runner.send = memoryDigestSeen (prompt, sessionId, onStream, ctx, limits, override, effort, seen). */
+    const seenArg = (call = 0) => mockRunnerSend.mock.calls[call]![7];
+
+    beforeEach(() => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      // Hermetic once-queues (the KPR-399 describe's idiom).
+      mockRunnerSend.mockReset();
+      mockRunnerSend.mockResolvedValue(makeRunResult());
+    });
+
+    // ── (ii) post-lock read on every turn kind ─────────────────────────
+    it("non-reflection hot path: pre-lock + exactly ONE post-lock get; memoryDigestSeen comes from the post-lock row, never the pre-lock ref", async () => {
+      const threadId = "sms:line-1:kpr434-postlock";
+      sessionStore.get
+        .mockResolvedValueOnce({ sessionId: "s-1", provider: "claude", memoryDigest: "old" }) // pre-lock (runWorkItemTurn)
+        .mockResolvedValueOnce({ sessionId: "s-1", provider: "claude", memoryDigest: "new" }); // post-lock (spawnTurn)
+      await manager.runWorkItemTurn("agent-a", smsItem(threadId, "hello"));
+      expect(sessionStore.get).toHaveBeenCalledTimes(2); // same provider ⇒ no trip read
+      expect(mockRunnerSend.mock.calls[0]![1]).toBe("s-1");
+      expect(seenArg()).toBe("new");
+    });
+
+    it("reflection turn: the widened read is ONE read (never two) and pairs after the KPR-220 re-resolve", async () => {
+      const ctx = { ...ctxOf("sms:line-1:kpr434-reflect", "s-stale"), kind: "reflection" as const };
+      sessionStore._sessions.set(`agent-a:${ctx.threadId}`, { sessionId: "s-live", provider: "claude", memoryDigest: "dL" });
+      await manager.spawnTurn(ctx);
+      expect(sessionStore.get).toHaveBeenCalledTimes(1);
+      expect(mockRunnerSend.mock.calls[0]![1]).toBe("s-live"); // KPR-220 re-resolve, unchanged
+      expect(seenArg()).toBe("dL"); // paired against the re-resolved id
+    });
+
+    // ── (iii) pairing ──────────────────────────────────────────────────
+    it("paired: the post-lock row names the resumed session ⇒ its mark reaches runner.send", async () => {
+      const ctx = ctxOf("sms:line-1:kpr434-paired", "s-1");
+      sessionStore._sessions.set(`agent-a:${ctx.threadId}`, { sessionId: "s-1", provider: "claude", memoryDigest: "d1" });
+      await manager.spawnTurn(ctx);
+      expect(seenArg()).toBe("d1");
+    });
+
+    it("unpaired: a post-lock row naming a DIFFERENT session yields no mark; the turn still resumes the pre-lock id (edge 23, ⚠A9)", async () => {
+      const ctx = ctxOf("sms:line-1:kpr434-rotated", "s-old");
+      sessionStore._sessions.set(`agent-a:${ctx.threadId}`, { sessionId: "s-rotated", provider: "claude", memoryDigest: "dR" });
+      await manager.spawnTurn(ctx);
+      expect(mockRunnerSend.mock.calls[0]![1]).toBe("s-old"); // KPR-220 "microseconds, tolerated" — not widened
+      expect(seenArg()).toBeUndefined(); // dR belongs to s-rotated ⇒ inject on s-old (duplicate at worst)
+    });
+
+    it("unpaired: a session-less ctx never pairs, even with a session-less row carrying a mark (stateless-replay row shape)", async () => {
+      const ctx = ctxOf("sms:line-1:kpr434-nopair");
+      // A ""-sessionId row is a stateless-replay producer's shape (KPR-313) — tag it codex for
+      // fidelity; the fake store normalizes "" ⇒ undefined regardless of tag.
+      sessionStore._sessions.set(`agent-a:${ctx.threadId}`, { sessionId: "", provider: "codex", memoryDigest: "dX" });
+      await manager.spawnTurn(ctx);
+      expect(mockRunnerSend.mock.calls[0]![1]).toBeUndefined();
+      expect(seenArg()).toBeUndefined();
+    });
+
+    // ── (iv) adopt sites re-pair, drop sites drop ──────────────────────
+    it("KPR-313 adopt branch re-pairs the mark from its trip re-read (queued turn adopts the predecessor's switched session AND mark)", async () => {
+      const threadId = "sms:line-1:kpr434-adopt313";
+      sessionStore._sessions.set(`agent-a:${threadId}`, { sessionId: "resp_stale", provider: "openai" });
+      mockRunnerSend
+        .mockResolvedValueOnce(makeRunResult({ text: "A", sessionId: "s-A", memoryDigestInjected: "dA" }))
+        .mockResolvedValueOnce(makeRunResult({ text: "B", sessionId: "s-A" }));
+      await Promise.all([
+        manager.runWorkItemTurn("agent-a", smsItem(threadId, "turn A")),
+        manager.runWorkItemTurn("agent-a", smsItem(threadId, "turn B")),
+      ]);
+      expect(mockRunnerSend.mock.calls[0]![1]).toBeUndefined(); // A: handoff, fresh
+      expect(seenArg(0)).toBeUndefined();
+      expect(mockRunnerSend.mock.calls[1]![1]).toBe("s-A"); // B adopted A's switched session…
+      expect(seenArg(1)).toBe("dA"); // …and A's mark (R3 landed through the fake store's tri-state)
+    });
+
+    it("KPR-351 R2 contender adopt re-pairs the mark from the contender row", async () => {
+      registry._agents.set(
+        "openai-pilot",
+        makeAgentConfig({ id: "openai-pilot", name: "OpenAI Pilot", model: "openai/gpt-5.4-mini", coreServers: [] }),
+      );
+      const ctx: TurnContext = {
+        ...makeSmsCtx({ agentId: "openai-pilot", threadId: "sms:line-1:kpr434-adopt351", sessionId: "resp_stale" }),
+        sessionProvider: "openai",
+      };
+      sessionStore._sessions.set(`openai-pilot:${ctx.threadId}`, {
+        sessionId: "resp-contender",
+        provider: "openai",
+        memoryDigest: "dC",
+      });
+      mockOpenAIRunTurn
+        .mockResolvedValueOnce(makeRunResult({ error: STALE, sessionId: "resp_stale" }))
+        .mockResolvedValueOnce(makeRunResult({ text: "adopted", sessionId: "resp-contender-2" }));
+      await manager.spawnTurn(ctx);
+      expect(mockOpenAIRunTurn.mock.calls[0]![0]).toMatchObject({ sessionId: "resp_stale" });
+      expect(mockOpenAIRunTurn.mock.calls[0]![0].memoryDigestSeen).toBeUndefined(); // unpaired at the every-turn read
+      expect(mockOpenAIRunTurn.mock.calls[1]![0]).toMatchObject({ sessionId: "resp-contender", memoryDigestSeen: "dC" });
+    });
+
+    // Spec T5(iv) "the retried request injects" is pinned through its INPUTS only: runner.send is mocked
+    // here, so the observable is sessionId === undefined && memoryDigestSeen === undefined on the retry —
+    // which shouldInjectMemory maps to true whenever a block rendered (T2's predicate pin, prefix-builder.test.ts).
+    it("KPR-399 fresh retry drops handle AND mark (the retried request is fresh ⇒ the predicate injects)", async () => {
+      const ctx = ctxOf("sms:line-1:kpr434-drop399", "s-dead");
+      sessionStore._sessions.set(`agent-a:${ctx.threadId}`, { sessionId: "s-dead", provider: "claude", memoryDigest: "d0" });
+      mockRunnerSend
+        .mockResolvedValueOnce(makeRunResult({ error: UNKNOWN_SESSION, sessionId: "" }))
+        .mockResolvedValueOnce(makeRunResult({ text: "healed", sessionId: "s-fresh" }));
+      await manager.spawnTurn(ctx);
+      expect(mockRunnerSend.mock.calls[0]![1]).toBe("s-dead");
+      expect(seenArg(0)).toBe("d0");
+      expect(mockRunnerSend.mock.calls[1]![1]).toBeUndefined();
+      expect(seenArg(1)).toBeUndefined();
+    });
+
+    it("auth-rebuild retry drops handle AND mark", async () => {
+      const ctx = ctxOf("sms:line-1:kpr434-dropauth", "s-1");
+      sessionStore._sessions.set(`agent-a:${ctx.threadId}`, { sessionId: "s-1", provider: "claude", memoryDigest: "dA" });
+      mockRunnerSend
+        .mockResolvedValueOnce(makeRunResult({ error: AUTH_REBUILD, sessionId: "s-1" }))
+        .mockResolvedValueOnce(makeRunResult({ text: "ok", sessionId: "s-2" }));
+      await manager.spawnTurn(ctx);
+      expect(seenArg(0)).toBe("dA");
+      expect(mockRunnerSend.mock.calls[1]![1]).toBeUndefined();
+      expect(seenArg(1)).toBeUndefined();
+    });
+
+    it("KPR-313 handoff drops the mark with the handle", async () => {
+      const ctx: TurnContext = { ...makeSmsCtx({ threadId: "sms:line-1:kpr434-handoff", sessionId: "resp_x" }), sessionProvider: "openai" };
+      sessionStore._sessions.set(`agent-a:${ctx.threadId}`, { sessionId: "resp_x", provider: "openai", memoryDigest: "dH" });
+      await manager.spawnTurn(ctx);
+      expect(mockRunnerSend.mock.calls[0]![1]).toBeUndefined();
+      expect(seenArg(0)).toBeUndefined();
+      expect(mockRunnerSend.mock.calls[0]![0]).toContain("session continuity was reset");
+    });
+
+    // ── (v) persist — both arms pass the helper's value as set()'s trailing arg ──
+    it("resumable arm: an injected digest is $set (R3) and the fake row carries it", async () => {
+      const ctx = ctxOf("sms:line-1:kpr434-persist");
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-1", memoryDigestInjected: "dI" }));
+      await manager.spawnTurn(ctx);
+      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-1", "claude", expect.anything(), "dI");
+      expect(sessionStore._sessions.get(`agent-a:${ctx.threadId}`)?.memoryDigest).toBe("dI");
+    });
+
+    it("abort-persist arm (progress-gated): an injected digest is $set, tokenData stays omitted (R2/R3)", async () => {
+      const ctx = ctxOf("sms:line-1:kpr434-abort");
+      mockRunnerSend.mockResolvedValueOnce(
+        makeRunResult({ aborted: true, timedOut: true, sessionId: "s1", toolCalls: 3, streamed: true, text: "", memoryDigestInjected: "dI" }),
+      );
+      await manager.spawnTurn(ctx);
+      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s1", "claude", undefined, "dI");
+    });
+
+    it("fresh turn that injected nothing writes null (R4) — the new session never inherits the row's old mark", async () => {
+      const ctx = ctxOf("sms:line-1:kpr434-fresh-null");
+      sessionStore._sessions.set(`agent-a:${ctx.threadId}`, { sessionId: "", provider: "claude", memoryDigest: "dOld" });
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-new" }));
+      await manager.spawnTurn(ctx);
+      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-new", "claude", expect.anything(), null);
+      expect(sessionStore._sessions.get(`agent-a:${ctx.threadId}`)?.memoryDigest).toBeUndefined();
+    });
+
+    it("resumed turn that injected nothing leaves the mark alone (R5 — undefined)", async () => {
+      const ctx = ctxOf("sms:line-1:kpr434-keep", "s-1");
+      sessionStore._sessions.set(`agent-a:${ctx.threadId}`, { sessionId: "s-1", provider: "claude", memoryDigest: "dKeep" });
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-1" }));
+      await manager.spawnTurn(ctx);
+      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-1", "claude", expect.anything(), undefined);
+      expect(sessionStore._sessions.get(`agent-a:${ctx.threadId}`)?.memoryDigest).toBe("dKeep");
+    });
+
+    it("compaction clears even when this turn injected (R1)", async () => {
+      const ctx = ctxOf("sms:line-1:kpr434-compact", "s-1");
+      sessionStore._sessions.set(`agent-a:${ctx.threadId}`, { sessionId: "s-1", provider: "claude", memoryDigest: "dOld" });
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ sessionId: "s-1b", compactions: 1, memoryDigestInjected: "dNew" }));
+      await manager.spawnTurn(ctx);
+      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-1b", "claude", expect.anything(), null);
+    });
+
+    it("errored turn WITH progress that injected advances the mark (R2 via hasObservedProgress — SDK cap subtypes)", async () => {
+      const ctx = ctxOf("sms:line-1:kpr434-cap", "s-1");
+      mockRunnerSend.mockResolvedValueOnce(
+        makeRunResult({ sessionId: "s-1", error: "error_max_turns", toolCalls: 12, memoryDigestInjected: "dCap" }),
+      );
+      await manager.spawnTurn(ctx);
+      expect(sessionStore.set).toHaveBeenCalledWith("agent-a", ctx.threadId, "s-1", "claude", expect.anything(), "dCap");
+    });
+
+    it("churn-mint persists nothing at all (existing rule, unchanged)", async () => {
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ error: "error_during_execution", sessionId: "s-minted", memoryDigestInjected: "dM" }));
+      await manager.spawnTurn(ctxOf("sms:line-1:kpr434-mint", "s-old"));
+      expect(sessionStore.set).not.toHaveBeenCalled();
+    });
+
+    // Review fix (post-implementation, fable round 2): on a server-resumable
+    // Lane B route, an errored turn that made progress must NOT advance the
+    // mark — the vendor never committed a new resumable point (sessionId
+    // reverts to the same id this attempt resumed), so the next resume never
+    // actually saw the injected block. R2's client-transcript-only gate keeps
+    // the mark untouched (R5) here instead of falsely advancing it.
+    it("openai, resumed, errored WITH progress, unchanged id: the mark is left untouched, not advanced (R2 gated off Lane B)", async () => {
+      registry._agents.set(
+        "openai-pilot",
+        makeAgentConfig({ id: "openai-pilot", name: "OpenAI Pilot", model: "openai/gpt-5.4-mini", coreServers: [] }),
+      );
+      const ctx: TurnContext = {
+        ...makeSmsCtx({ agentId: "openai-pilot", threadId: "sms:line-1:kpr434-openai-noadvance", sessionId: "resp_1" }),
+        sessionProvider: "openai",
+      };
+      sessionStore._sessions.set(`openai-pilot:${ctx.threadId}`, {
+        sessionId: "resp_1",
+        provider: "openai",
+        memoryDigest: "dOld",
+      });
+      // Mid-loop failure after a tool call: sessionId reverts to the fallback
+      // (the pre-turn head, "resp_1" — unchanged), error set, real progress.
+      mockOpenAIRunTurn.mockResolvedValueOnce(
+        makeRunResult({ error: "error_max_turns", sessionId: "resp_1", toolCalls: 3, memoryDigestInjected: "dNew" }),
+      );
+      await manager.spawnTurn(ctx);
+      expect(sessionStore.set).toHaveBeenCalledWith("openai-pilot", ctx.threadId, "resp_1", "openai", expect.anything(), undefined);
+      expect(sessionStore._sessions.get(`openai-pilot:${ctx.threadId}`)?.memoryDigest).toBe("dOld"); // never overwritten to "dNew"
+    });
+  });
+
   describe("conferenceRoundOf (KPR-389 D1)", () => {
     it.each([
       ["round 0", { conferenceRound: 0 }, 0],
@@ -6700,5 +7013,68 @@ describe("AgentManager — KPR-390 worker pool handshake", () => {
     manager.setWorkerPool(pool as any);
     manager.stopAgent("agent-a");
     expect(pool.abortForBoss).toHaveBeenCalledWith("agent-a");
+  });
+});
+
+describe("resolveMemoryMark (KPR-434 D4.2) — truth table, one row per rule", () => {
+  // clientTranscript: true ⇒ claude/Lane-A shape — R2's hasObservedProgress
+  // relaxation applies (the original rows below, unchanged). A dedicated
+  // block further down pins clientTranscript: false (server-resumable Lane B).
+  const base = { compactions: 0, toolCalls: 0, streamed: false, text: "", resumedSession: true, clientTranscript: true };
+
+  it("R1: compaction wins — null even when this turn injected", () => {
+    expect(resolveMemoryMark({ ...base, injected: "d", compactions: 1 })).toBeNull();
+  });
+  it("R3: injected, no error ⇒ that digest", () => {
+    expect(resolveMemoryMark({ ...base, injected: "d" })).toBe("d");
+  });
+  it("R2 via hasObservedProgress: injected + error_max_turns + toolCalls > 0 ⇒ that digest", () => {
+    expect(resolveMemoryMark({ ...base, injected: "d", error: "error_max_turns", toolCalls: 3 })).toBe("d");
+  });
+  it("R2 each progress signal suffices: streamed alone / text alone", () => {
+    expect(resolveMemoryMark({ ...base, injected: "d", error: "boom", streamed: true })).toBe("d");
+    expect(resolveMemoryMark({ ...base, injected: "d", error: "boom", text: "partial" })).toBe("d");
+  });
+  it("R5: injected, error, ZERO progress, resumed ⇒ undefined (duplicate next turn, never gap — ⚠A10)", () => {
+    expect(resolveMemoryMark({ ...base, injected: "d", error: "boom" })).toBeUndefined();
+  });
+  it("R4: not injected, fresh ⇒ null", () => {
+    expect(resolveMemoryMark({ ...base, resumedSession: false })).toBeNull();
+  });
+  it("R4 over the R5 residual: injected, error, zero progress, FRESH ⇒ null (never inherit)", () => {
+    expect(resolveMemoryMark({ ...base, injected: "d", error: "boom", resumedSession: false })).toBeNull();
+  });
+  it("R5: not injected, resumed ⇒ undefined", () => {
+    expect(resolveMemoryMark(base)).toBeUndefined();
+  });
+  it("`aborted` is read by no rule", () => {
+    expect(resolveMemoryMark({ ...base, injected: "d", aborted: true })).toBe("d");
+    expect(resolveMemoryMark({ ...base, aborted: true, resumedSession: false })).toBeNull();
+  });
+
+  // Review fix (post-implementation, fable round 2): R2's progress relaxation
+  // is a client-transcript-only fact. On a server-resumable Lane B route
+  // (openai/gemini) an errored/interrupted turn's persisted sessionId reverts
+  // to the PRE-turn head (fallbackSessionId) — the vendor commits no new
+  // resumable point at all — so a tool call before the failure proves nothing
+  // about what the NEXT resume will see. Without this gate the mark would
+  // advance while the actual chain the next turn resumes from never received
+  // the block: a gap, not a duplicate.
+  describe("clientTranscript: false (server-resumable Lane B — openai/gemini)", () => {
+    const nonCT = { ...base, clientTranscript: false };
+
+    it("R2 does NOT relax on error even with full progress — mark is left untouched (R5), never advanced", () => {
+      expect(resolveMemoryMark({ ...nonCT, injected: "d", error: "error_max_turns", toolCalls: 12, streamed: true, text: "partial" })).toBeUndefined();
+    });
+    it("a FRESH turn with progress+error still nulls (R4 over the relaxed-R2 residual) — never inherits the old mark", () => {
+      expect(resolveMemoryMark({ ...nonCT, injected: "d", error: "boom", toolCalls: 3, resumedSession: false })).toBeNull();
+    });
+    it("a clean (error-less) turn still advances the mark normally — the gate only narrows the error path", () => {
+      expect(resolveMemoryMark({ ...nonCT, injected: "d" })).toBe("d");
+    });
+    it("compaction (R1) and resumed-nothing-new (R5) are unaffected by the gate", () => {
+      expect(resolveMemoryMark({ ...nonCT, injected: "d", compactions: 1 })).toBeNull();
+      expect(resolveMemoryMark(nonCT)).toBeUndefined();
+    });
   });
 });

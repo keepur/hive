@@ -31,6 +31,7 @@ describe("ClaudeAgentAdapter", () => {
         resourceLimits,
         systemPromptOverride: "voice prompt",
         effort: "low",
+        memoryDigestSeen: "0123456789abcdef",
       }),
     ).resolves.toBe(result);
 
@@ -42,7 +43,15 @@ describe("ClaudeAgentAdapter", () => {
       resourceLimits,
       "voice prompt",
       "low",
+      "0123456789abcdef",
     );
+  });
+
+  it("KPR-434: an ABSENT memoryDigestSeen is forwarded as the 8th positional (undefined) — the runner's predicate then injects", async () => {
+    const runner = { send: vi.fn().mockResolvedValue({ text: "ok", sessionId: "s1" }), abort: vi.fn(), wasAborted: false };
+    const adapter = new ClaudeAgentAdapter(runner as any);
+    await adapter.runTurn({ prompt: "hello" });
+    expect(runner.send).toHaveBeenCalledWith("hello", undefined, undefined, undefined, undefined, undefined, undefined, undefined);
   });
 
   it("delegates abort and exposes aborted state", () => {

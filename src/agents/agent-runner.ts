@@ -17,7 +17,14 @@ import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
-import { buildPrefix, buildProviderInstructions, appendDateTimeTrailer } from "./prefix-builder.js";
+import {
+  buildPrefix,
+  buildProviderInstructions,
+  composeTurnInput,
+  renderMemoryBlock,
+  shouldInjectMemory,
+  type RenderedMemoryBlock,
+} from "./prefix-builder.js";
 import { deriveProviderSkillIndex } from "./provider-adapters/skill-index.js";
 import {
   buildGenericDelegatePrompt,
@@ -172,6 +179,15 @@ export interface RunResult {
   timedOut?: boolean; // KPR-306: deadline fired; distinguishes timeout-abort from operator abort
   /** KPR-388: populated ONLY by the dispatcher's convertTurnResult mapping (TurnResult passthrough); runner/adapters never set it. */
   resumedSession?: boolean;
+  /** KPR-434: digest of the memory block this turn's input carried; absent ⇒ no block was injected. */
+  memoryDigestInjected?: string;
+  /**
+   * KPR-434 D2: the Claude-lane memory render threw (Mongo) and the turn ran
+   * memory-less — sparse, never false. The fail-soft observability half of
+   * "proceed without memory"; a burst across agents is the Mongo-outage
+   * signature. Lane B never sets it (its render fault fails the turn, D5).
+   */
+  memoryRenderFailed?: true;
 }
 
 /**
@@ -428,11 +444,12 @@ export class AgentRunner {
       ? await this.prefixCache.getOrBuild(this.agentConfig.id, () => buildPrefix(this.agentConfig, buildContext))
       : await buildPrefix(this.agentConfig, buildContext);
 
-    // KPR-432: no datetime here. The trailer is appended to the TURN INPUT in
-    // send() (appendDateTimeTrailer), so this string is byte-stable across
-    // minutes and the API prompt cache (tools → system → messages, strict
-    // prefix) holds the transcript. Single definition shared with Lane B
-    // (KPR-349 §D1: the two lanes cannot drift).
+    // KPR-432: no datetime here; KPR-434: no agent memory here either. Both
+    // ride the TURN INPUT (send() → composeTurnInput), so this string is
+    // byte-stable across minutes AND across memory writes, and the API prompt
+    // cache (tools → system → messages, strict prefix) holds the transcript.
+    // Single definition shared with Lane B (KPR-349 §D1: the two lanes cannot
+    // drift).
     return prefix;
   }
 
@@ -1471,8 +1488,9 @@ export class AgentRunner {
           agentId: this.agentConfig.id,
           memoryScopes: this.resolveMemoryScopes(),
           // KPR-213: write-through prefix cache invalidation. Path-aware:
-          // agents/<id>/... invalidates that agent; shared/* invalidates
-          // everyone; status/* is operational telemetry and does not affect prompts.
+          // shared/* invalidates everyone; status/* is operational telemetry
+          // and does not affect prompts; agents/<id>/* is scope `none` since
+          // KPR-434 (agent memory rides the turn input under the digest gate).
           onWrite: this.prefixCache
             ? (path, reason) => invalidatePrefixCacheByMemoryPath(this.prefixCache!, path, reason)
             : undefined,
@@ -1627,14 +1645,10 @@ export class AgentRunner {
           context: this.structuredMemoryContextRef,
           qdrantUrl: process.env.QDRANT_URL,
           ollamaUrl: process.env.OLLAMA_URL,
-          // KPR-213: structured-memory mutations affect the agent's hot-tier
-          // and therefore its prefix. Bulk paths pass null → invalidateAll.
-          onMutate: this.prefixCache
-            ? (mutAgentId, reason) => {
-                if (mutAgentId === null) this.prefixCache!.invalidateAll(reason);
-                else this.prefixCache!.invalidateAgent(mutAgentId, reason);
-              }
-            : undefined,
+          // KPR-434: no onMutate — structured-memory writes no longer touch
+          // the prefix (the hot tier left the system prompt; the digest gate
+          // in send() sees the change on the next turn). prefixCache stays
+          // for buildSystemPrompt.
         });
       }
       servers["structured-memory"] = this.structuredMemoryMcpServer;
@@ -1691,17 +1705,39 @@ export class AgentRunner {
   async buildProviderPrompt(opts: {
     toolInventory: HiveToolInventoryEntry[];
     toolsExecutable: boolean;
-  }): Promise<{ instructions: string; hotTierPrompt?: string; skillEntries: ProviderSkillIndexEntry[] }> {
+    /**
+     * KPR-434 D5: decided by assembleProviderTurn from the route's session
+     * semantics. Inlined union (≡ prefix-builder's ProviderMemoryPlacement) on
+     * purpose: this method is on agent-runner.d.ts, which ships in the
+     * provider-ABI d.ts closure via provider-abi.ts's RunResult re-export —
+     * naming the prefix-builder alias here would pull prefix-builder.d.ts into
+     * pkg/types/ (KPR-407 "resist growth").
+     */
+    memoryPlacement: "instructions" | "turn-input";
+  }): Promise<{
+    instructions: string;
+    hotTierPrompt?: string;
+    memoryBlock?: string;
+    memoryDigest?: string;
+    skillEntries: ProviderSkillIndexEntry[];
+  }> {
     const skillEntries = deriveProviderSkillIndex(this.buildNativeSkills());
     const result = await buildProviderInstructions(this.agentConfig, {
       toolInventory: opts.toolInventory,
       skillIndex: skillEntries,
       toolsExecutable: opts.toolsExecutable,
+      memoryPlacement: opts.memoryPlacement,
       memoryManager: this.memoryManager,
       teamRoster: this.teamRoster,
       plugins: this.plugins,
     });
-    return { instructions: result.instructions, hotTierPrompt: result.hotTierPrompt, skillEntries };
+    return {
+      instructions: result.instructions,
+      hotTierPrompt: result.hotTierPrompt,
+      memoryBlock: result.memoryBlock,
+      memoryDigest: result.memoryDigest,
+      skillEntries,
+    };
   }
 
   /**
@@ -1952,7 +1988,7 @@ export class AgentRunner {
       }];
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: TurnEffort): Promise<RunResult> {
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: TurnEffort, memoryDigestSeen?: string): Promise<RunResult> {
     // KPR-346 (§D5): Lane A passthrough — the CLI model is the FOREIGN id;
     // agentConfig.model keeps the prefixed string (kimi/…) so telemetry and
     // the activity log attribute the provider via the model string untouched.
@@ -2046,12 +2082,38 @@ export class AgentRunner {
       toolSearchEnvValue = toolSearch.mode === "on" ? "true" : toolSearch.mode === "off" ? "false" : "auto";
     }
 
-    // KPR-432: the datetime rides the turn input, not the system prompt.
-    // Computed here — after every upstream re-wrap (outage replay, deadline
-    // continuation, meeting ack) — so a replayed turn carries the time it
-    // actually ran. Same pre-try surface as buildSystemPrompt above: nothing
-    // (ticket, timer, abort controller) is armed yet.
-    const turnPrompt = appendDateTimeTrailer(prompt);
+    // KPR-434: memory rides the turn input under the digest gate; overrides
+    // (voice, worker, scribe) are total replacements and never get it — a
+    // contained worker must never see the boss's hot tier. FAIL-SOFT: a render
+    // fault (Mongo) must not fail the turn and must never reach the breaker.
+    // Why: ClaudeAgentAdapter.runTurn is a bare forward, so a throw out of
+    // here lands in spawnTurn's recorded catch → classifyThrown, which
+    // pattern-matches the message — a Mongo ECONNREFUSED/ETIMEDOUT hits the
+    // connect-fail row and three such turns open the CLAUDE breaker for a
+    // healthy provider. Not wrapped in TurnAssemblyError (that is Lane B's
+    // honest-failure contract); the ruling here is to PROCEED memory-less,
+    // leave the mark alone, and re-deliver on the next successful render.
+    // Same pre-try surface as buildSystemPrompt above: nothing (ticket, timer,
+    // abort controller) is armed yet.
+    let rendered: RenderedMemoryBlock | undefined;
+    let memoryRenderFailed = false;
+    if (systemPromptOverride === undefined) {
+      try {
+        rendered = await renderMemoryBlock(this.memoryManager, this.agentConfig.id, { toolsExecutable: true });
+      } catch (err) {
+        memoryRenderFailed = true;
+        log.warn("Memory render failed — turn proceeds without memory this turn (KPR-434)", {
+          agent: this.agentConfig.id,
+          resumeSession: sessionId ?? "new",
+          error: String(err),
+        });
+      }
+    }
+    const injectMemory = shouldInjectMemory({ sessionId, digest: rendered?.digest, memoryDigestSeen });
+    // KPR-432/KPR-434: composed here — after every upstream re-wrap (outage
+    // replay, deadline continuation, meeting ack) — so a replayed turn carries
+    // the time it actually ran and the memory the session has not yet seen.
+    const turnPrompt = composeTurnInput({ prompt, memoryBlock: injectMemory ? rendered!.block : undefined });
 
     const q = query({
       prompt: turnPrompt,
@@ -2423,6 +2485,8 @@ export class AgentRunner {
       // "Did this run actually ship anything?" — previously only inferable by
       // reading outputTokens off the final record.
       producedOutput: resultText.length > 0,
+      // KPR-434: did this turn's input carry the memory block?
+      memoryInjected: injectMemory,
     };
 
     // Only `error` level reaches stderr (and therefore hive.err). A timeout is
@@ -2446,6 +2510,8 @@ export class AgentRunner {
       contextWindow, compactions, preCompactTokens,
       error, aborted: this._aborted,
       ...(timedOut ? { timedOut: true } : {}),
+      ...(injectMemory ? { memoryDigestInjected: rendered!.digest } : {}),
+      ...(memoryRenderFailed ? { memoryRenderFailed: true as const } : {}),
     };
   }
 

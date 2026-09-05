@@ -28,7 +28,7 @@ import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import type { AgentProviderAdapter, AgentProviderTurnRequest } from "./types.js";
 import { ToolBridge } from "./tool-bridge.js";
 import { TURN_DEADLINE_SUBTYPE } from "./error-classification.js";
-import { appendDateTimeTrailer } from "../prefix-builder.js";
+import { composeTurnInput, shouldInjectMemory } from "../prefix-builder.js";
 
 /** Scaffold-owned turn accumulator (§4.1). */
 export interface LaneBTurnTotals {
@@ -130,14 +130,37 @@ export abstract class LaneBTurnScaffold implements AgentProviderAdapter {
   }
 
   async runTurn(incoming: AgentProviderTurnRequest): Promise<RunResult> {
-    // KPR-432: FIRST statement — before the ToolBridge is constructed (closed
-    // only in the finally below), so nothing is armed if this ever threw.
-    // Primary assemblies carry the datetime as the last line of the turn
-    // input; nested delegate assemblies (Claude parity) and flag-less
+    // KPR-432/KPR-434: FIRST statement — before the ToolBridge is constructed
+    // (closed only in the finally below), so nothing is armed if this ever
+    // threw. Primary assemblies carry the datetime as the last line of the
+    // turn input and, on server-resumable routes, the memory block under the
+    // digest gate; nested delegate assemblies (Claude parity) and flag-less
     // plugin-built assemblies pass the prompt through byte-identical.
-    const request: AgentProviderTurnRequest = this.scaffoldInit.assembly.datetimeInTurnInput
-      ? { ...incoming, prompt: appendDateTimeTrailer(incoming.prompt) }
-      : incoming;
+    const a = this.scaffoldInit.assembly;
+    // Operand order is load-bearing: `memoryInTurnInput` is tested FIRST so an
+    // assembly that carries no `memory` bundle (every engine-built one does —
+    // agent-manager.ts is the only builder — but the scaffold is frozen kit
+    // ABI) never dereferences `a.memory.digest`; `?.` is belt-and-braces — a
+    // throw here would be a bare pre-request throw (KPR-432 D3 audit).
+    const injectMemory =
+      !!a.memoryInTurnInput &&
+      incoming.systemPromptOverride === undefined &&
+      shouldInjectMemory({
+        sessionId: incoming.sessionId,
+        digest: a.memory?.digest,
+        memoryDigestSeen: incoming.memoryDigestSeen,
+      });
+    const request: AgentProviderTurnRequest =
+      a.datetimeInTurnInput || injectMemory
+        ? {
+            ...incoming,
+            prompt: composeTurnInput({
+              prompt: incoming.prompt,
+              memoryBlock: injectMemory ? a.memory?.block : undefined,
+              datetime: !!a.datetimeInTurnInput,
+            }),
+          }
+        : incoming;
     const startedAt = Date.now();
     const abortController = new AbortController();
     this.currentAbortController = abortController;
@@ -192,6 +215,11 @@ export abstract class LaneBTurnScaffold implements AgentProviderAdapter {
         outputTokens: totals.outputTokens,
         cacheReadTokens: totals.cacheReadTokens,
         toolStats: bridge.stats,
+        // Hardening (review): key on `block`, not just `digest` — an engine-built
+        // assembly always pairs the two (turn-assembly.ts), but a plugin-built one
+        // carrying `digest` without `block` would otherwise deliver nothing to the
+        // model while still stamping the mark as advanced.
+        memoryDigestInjected: injectMemory && !!a.memory?.block ? a.memory.digest : undefined,
       });
 
     const abortedResult = (): RunResult =>
@@ -297,6 +325,7 @@ export abstract class LaneBTurnScaffold implements AgentProviderAdapter {
     cacheReadTokens,
     error,
     toolStats,
+    memoryDigestInjected,
   }: {
     text: string;
     sessionId: string;
@@ -309,6 +338,8 @@ export abstract class LaneBTurnScaffold implements AgentProviderAdapter {
     cacheReadTokens: number;
     error?: string;
     toolStats?: Readonly<{ toolCalls: number; toolMs: number; perTool: Map<string, number> }>;
+    /** KPR-434: the digest of the block this turn's input actually carried (server-resumable placement only). */
+    memoryDigestInjected?: string;
   }): RunResult {
     const toolMs = toolStats?.toolMs ?? 0;
     const toolCalls = toolStats?.toolCalls ?? 0;
@@ -338,6 +369,7 @@ export abstract class LaneBTurnScaffold implements AgentProviderAdapter {
       aborted,
       ...(timedOut ? { timedOut: true } : {}),
       ...(error ? { error } : {}),
+      ...(memoryDigestInjected !== undefined ? { memoryDigestInjected } : {}),
     };
   }
 }

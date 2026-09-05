@@ -5,11 +5,10 @@ import {
 } from "./prefix-invalidation.js";
 
 describe("prefixInvalidationScopeForMemoryPath", () => {
-  it("invalidates only the owning agent for agent memory paths", () => {
-    expect(prefixInvalidationScopeForMemoryPath("agents/river/memory.md")).toEqual({
-      kind: "agent",
-      agentId: "river",
-    });
+  it("KPR-434: agent memory paths never invalidate the prefix (memory rides the turn input)", () => {
+    expect(prefixInvalidationScopeForMemoryPath("agents/river/memory.md")).toEqual({ kind: "none" });
+    expect(prefixInvalidationScopeForMemoryPath("agents/river/projects.md")).toEqual({ kind: "none" });
+    expect(prefixInvalidationScopeForMemoryPath("agents/chief-of-staff/notes/2026.md")).toEqual({ kind: "none" });
   });
 
   it("invalidates all agents for shared prompt memory", () => {
@@ -36,5 +35,14 @@ describe("invalidatePrefixCacheByMemoryPath", () => {
 
     expect(cache.invalidateAgent).not.toHaveBeenCalled();
     expect(cache.invalidateAll).not.toHaveBeenCalled();
+  });
+
+  it("KPR-434: skips PrefixCache calls for agent memory paths; constitution still invalidates all", () => {
+    const cache = { invalidateAgent: vi.fn(), invalidateAll: vi.fn() };
+    invalidatePrefixCacheByMemoryPath(cache as any, "agents/river/memory.md", "memory-manager-write");
+    expect(cache.invalidateAgent).not.toHaveBeenCalled();
+    expect(cache.invalidateAll).not.toHaveBeenCalled();
+    invalidatePrefixCacheByMemoryPath(cache as any, "shared/constitution.md", "memory-manager-write");
+    expect(cache.invalidateAll).toHaveBeenCalledTimes(1);
   });
 });

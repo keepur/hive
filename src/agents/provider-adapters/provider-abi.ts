@@ -56,7 +56,15 @@ export interface LaneBProviderKit {
    *    must not append their own. Additive optional field — no ABI version bump.
    *    A plugin that implements AgentProviderAdapter directly (bypassing this
    *    scaffold) receives no datetime at all — it no longer rides `instructions`;
-   *    extend the scaffold to get it. */
+   *    extend the scaffold to get it.
+   *  - KPR-434: `harness.request.prompt` may ALSO already carry the engine's
+   *    memory block (server-resumable assemblies, `memoryInTurnInput`, under
+   *    the per-session digest gate); plugin adapters must not inject
+   *    `assembly.memory` themselves. A plugin adapter bypassing this scaffold on
+   *    a server-resumable route gets no memory at all (fail-dark — extend the
+   *    scaffold); on a stateless route the block still rides `instructions`.
+   *    Additive optional fields — no ABI version bump.
+   */
   LaneBTurnScaffold: typeof LaneBTurnScaffold;
   /** The shared bounded tool-dispatch loop (codex/gemini/grok template). */
   runBoundedDispatchLoop: typeof runBoundedDispatchLoop;

@@ -10,6 +10,7 @@ import { ToolBridge } from "./tool-bridge.js";
 import { TURN_DEADLINE_SUBTYPE } from "./error-classification.js";
 import type { ProviderTurnAssembly } from "./turn-assembly.js";
 import type { AgentProviderTurnRequest } from "./types.js";
+import { MEMORY_TURN_HEADER, memoryDigest, appendDateTimeTrailer } from "../prefix-builder.js";
 
 // The real ToolBridge the scaffold constructs logs; keep the suite quiet.
 const logMock = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }));
@@ -501,6 +502,110 @@ describe("KPR-432: datetime trailer on the turn input", () => {
         throw new Error("pre-request");
       },
       makeAssembly({ datetimeInTurnInput: true }),
+    );
+    const result = await adapter.runTurn(req());
+    expect(result.error).toBe("pre-request");
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("KPR-434: memory block on the turn input (server-resumable assemblies)", () => {
+  const NOW = new Date("2026-09-05T17:17:01Z"); // 10:17 AM PDT
+  const BLOCK = "## Your Memory\n\n### Key Facts\n- [2026-09-05] scaffold fact (high)";
+  const memAssembly = (overrides: Partial<ProviderTurnAssembly> = {}) =>
+    makeAssembly({
+      datetimeInTurnInput: true,
+      memoryInTurnInput: true,
+      memory: { hotTierPrompt: BLOCK, block: BLOCK, digest: memoryDigest(BLOCK) },
+      ...overrides,
+    });
+  const capture = (assembly: ProviderTurnAssembly) => {
+    let seen: string | undefined;
+    const adapter = new TestScaffoldAdapter(async (harness) => {
+      seen = harness.request.prompt;
+      return { kind: "success", text: "ok", sessionId: "s-1" };
+    }, assembly);
+    return { adapter, seen: () => seen };
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("fresh request ⇒ header + block + prompt + datetime, and RunResult.memoryDigestInjected", async () => {
+    const { adapter, seen } = capture(memAssembly());
+    const result = await adapter.runTurn(req({ prompt: "hello" }));
+    expect(seen()).toBe(`${MEMORY_TURN_HEADER}\n\n${BLOCK}\n\nhello\n\n**Current date/time**: Saturday, September 5, 2026 at 10:17 AM (Pacific Time)`);
+    expect(result.memoryDigestInjected).toBe(memoryDigest(BLOCK));
+  });
+
+  it("resumed with an equal mark ⇒ datetime only; a differing mark ⇒ block again", async () => {
+    const equal = capture(memAssembly());
+    const r1 = await equal.adapter.runTurn(req({ prompt: "hello", sessionId: "s-1", memoryDigestSeen: memoryDigest(BLOCK) }));
+    expect(equal.seen()).toBe(appendDateTimeTrailer("hello", NOW));
+    expect(r1).not.toHaveProperty("memoryDigestInjected");
+
+    const differing = capture(memAssembly());
+    const r2 = await differing.adapter.runTurn(req({ prompt: "hello", sessionId: "s-1", memoryDigestSeen: "0000000000000000" }));
+    expect(differing.seen()!.startsWith(MEMORY_TURN_HEADER)).toBe(true);
+    expect(r2.memoryDigestInjected).toBe(memoryDigest(BLOCK));
+  });
+
+  it("systemPromptOverride ⇒ never injects (voice/worker shape), datetime still rides", async () => {
+    const { adapter, seen } = capture(memAssembly());
+    const result = await adapter.runTurn(req({ prompt: "hello", systemPromptOverride: "OVERRIDE" }));
+    expect(seen()).toBe(appendDateTimeTrailer("hello", NOW));
+    expect(result).not.toHaveProperty("memoryDigestInjected");
+  });
+
+  it("stateless assembly (memoryInTurnInput false, block still present) ⇒ datetime only; nested (both flags false) ⇒ byte-identical", async () => {
+    const stateless = capture(memAssembly({ memoryInTurnInput: false }));
+    await stateless.adapter.runTurn(req({ prompt: "hello" }));
+    expect(stateless.seen()).toBe(appendDateTimeTrailer("hello", NOW));
+
+    const nested = capture(memAssembly({ datetimeInTurnInput: false, memoryInTurnInput: false }));
+    await nested.adapter.runTurn(req({ prompt: "hello" }));
+    expect(nested.seen()).toBe("hello");
+  });
+
+  it("operand-order pin (D5): an assembly with memoryInTurnInput absent AND memory undefined (JS-plugin shape) passes through without throwing", async () => {
+    const jsPlugin = { ...makeAssembly({ datetimeInTurnInput: true }), memory: undefined } as unknown as ProviderTurnAssembly;
+    const { adapter, seen } = capture(jsPlugin);
+    const result = await adapter.runTurn(req({ prompt: "hello" }));
+    expect(result.error).toBeUndefined();
+    expect(seen()).toBe(appendDateTimeTrailer("hello", NOW));
+    // And with the flag SET but no bundle: `?.` keeps it a no-inject, never a throw.
+    const flagged = capture({ ...jsPlugin, memoryInTurnInput: true } as ProviderTurnAssembly);
+    const r2 = await flagged.adapter.runTurn(req({ prompt: "hello" }));
+    expect(r2.error).toBeUndefined();
+    expect(flagged.seen()).toBe(appendDateTimeTrailer("hello", NOW));
+  });
+
+  it.each([
+    ["absent block", undefined],
+    ["empty-string block (falsy, matches composeTurnInput's own gate)", ""],
+  ])("hardening (review): digest with a %s delivers nothing and never claims memoryDigestInjected", async (_label, block) => {
+    // Engine-built assemblies always pair block+digest (turn-assembly.ts); a
+    // hand-built or malformed plugin assembly might not — this must not stamp
+    // the mark as advanced for a block the model never actually received.
+    // The gate here (`!!a.memory?.block`) deliberately matches
+    // composeTurnInput's own truthiness check on memoryBlock, so the two
+    // never disagree about whether a block was actually delivered.
+    const mismatched = memAssembly({ memory: { block, digest: "digest-only" } });
+    const { adapter, seen } = capture(mismatched);
+    const result = await adapter.runTurn(req({ prompt: "hello" }));
+    expect(seen()).toBe(appendDateTimeTrailer("hello", NOW));
+    expect(result).not.toHaveProperty("memoryDigestInjected");
+  });
+
+  it("the compose still precedes ToolBridge construction: a pre-request throw still closes the bridge exactly once", async () => {
+    const adapter = new TestScaffoldAdapter(
+      () => {
+        throw new Error("pre-request");
+      },
+      memAssembly(),
     );
     const result = await adapter.runTurn(req());
     expect(result.error).toBe("pre-request");

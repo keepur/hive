@@ -15,6 +15,7 @@ import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import { BUILTIN_TOOL_DEFINITIONS } from "./builtin-executor.js";
 import { classifyTurnResult } from "./error-classification.js";
 import { ProviderCircuitBreaker, DEFAULT_CIRCUIT_BREAKER_CONFIG } from "../provider-circuit-breaker.js";
+import { MEMORY_TURN_HEADER, memoryDigest } from "../prefix-builder.js";
 
 interface McpBehavior {
   connect?: () => Promise<void>;
@@ -291,6 +292,23 @@ describe("OpenAIAgentsAdapter", () => {
       model: "gpt-5.4-mini",
       modelSettings: { store: true, truncation: "auto" },
     });
+  });
+
+  it("KPR-434: a server-resumable assembly's FIRST turn sends the memory block ahead of the prompt in the run input", async () => {
+    runMock.mockResolvedValueOnce(makeSdkResult() as never);
+    const BLOCK = "## Your Memory\n\n### Key Facts\n- [2026-09-05] openai fact (high)";
+    const adapter = makeAdapter({
+      assembly: makeAssembly({
+        datetimeInTurnInput: true,
+        memoryInTurnInput: true,
+        memory: { hotTierPrompt: BLOCK, block: BLOCK, digest: memoryDigest(BLOCK) },
+      }),
+    });
+    const result = await adapter.runTurn({ prompt: "hello" });
+    const input = runMock.mock.calls[0]![1] as string;
+    expect(input.startsWith(`${MEMORY_TURN_HEADER}\n\n${BLOCK}\n\nhello\n\n**Current date/time**: `)).toBe(true);
+    expect(AgentMock).toHaveBeenCalledWith(expect.objectContaining({ instructions: "Be useful." })); // instructions untouched
+    expect(result.memoryDigestInjected).toBe(memoryDigest(BLOCK));
   });
 
   it("streams text chunks to onStream and returns accumulated text", async () => {

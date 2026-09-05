@@ -152,6 +152,15 @@ export interface TurnContext {
    * reschedule reflection. Other channel turns leave this undefined.
    */
   kind?: "reflection";
+  /**
+   * KPR-434 D4.3: the session's memory-digest mark, PAIRED to `sessionId`.
+   * Set in exactly ONE place — spawnTurn's post-lock store read — and
+   * re-paired at the two adopt sites (KPR-313 trip re-read, KPR-351 R2
+   * contender). Never set by callers (a pre-lock value is never a digest
+   * source: under same-thread queueing it is a whole predecessor turn stale).
+   * undefined ⇒ the adapter injects (duplicate, never gap).
+   */
+  memoryDigestSeen?: string;
 }
 
 export interface TurnUsage {
@@ -218,6 +227,71 @@ export type SpawnTurnStreamCallback = StreamCallback;
 export function conferenceRoundOf(item: WorkItem): 0 | 1 | undefined {
   const v = item.meta?.conferenceRound;
   return v === 0 || v === 1 ? v : undefined;
+}
+
+/** KPR-434 D4.2 input — RunResult field names, verbatim, plus the manager's resumedSession. */
+export interface MemoryMarkInput {
+  /** RunResult.memoryDigestInjected */
+  injected?: string;
+  error?: string;
+  /** Read by NO rule — present only so a full RunResult passes structurally. Do not invent a rule for it. */
+  aborted?: boolean;
+  compactions: number;
+  // hasObservedProgress inputs (KPR-398)
+  toolCalls: number;
+  streamed: boolean;
+  text: string;
+  /** !!finalAttemptSessionId — the finalized attempt launched with a handle. */
+  resumedSession: boolean;
+  /**
+   * KPR-434 review fix: `sessionSemanticsForRoute(route.provider) === "client-transcript"`
+   * (claude + Lane A kimi/deepseek — the SAME gate `finalizeSpawnResult`'s own `abortPersist`
+   * already applies to its own `hasObservedProgress` use, in this file). R2's "the request was sent
+   * ⇒ the transcript carries the block" reasoning is a CLIENT-TRANSCRIPT fact: those
+   * providers flush a locally/CLI-held transcript incrementally, so a partial turn's
+   * injected memory really is retained across the error. On server-resumable Lane B
+   * (openai/gemini), an errored/interrupted turn's `sessionId` reverts to
+   * `fallbackSessionId` — the PRE-turn head, unchanged — because the vendor only
+   * commits a new resumable point on a clean completion; nothing was durably chained
+   * forward, so a tool call before the failure proves nothing about what the NEXT
+   * resume will see. Without this gate, R2 would advance the mark on such a turn,
+   * the next resume would skip re-injecting (digest unchanged), and the agent would
+   * run memory-less against a chain that never received the block — the ticket's
+   * covering invariant turned inside out into a gap. `false` here forces R2 down to
+   * a bare `!error`, matching pre-434 "on this provider only a clean turn counts."
+   */
+  clientTranscript: boolean;
+}
+
+/**
+ * KPR-434 D4.2: what this turn's persist should do to sessions.memoryDigest.
+ * string ⇒ $set, null ⇒ $unset, undefined ⇒ untouched (SessionStore.set is a
+ * dumb applier). Pinned row by row in agent-manager.test.ts (T5 i).
+ *  R1 compaction wins — the block may sit on either side of the boundary; one
+ *     duplicate beats a gap (⚠A6).
+ *  R2 "request was sent" proof = hasObservedProgress (KPR-398, the SAME
+ *     predicate the abort-persist gate uses), but ONLY on `clientTranscript`
+ *     routes — error_max_turns / error_max_budget_usd set `error` on a
+ *     delivered turn whose transcript certainly carries the block; a bare
+ *     `!error` would re-inject every turn. On a non-client-transcript route
+ *     (server-resumable Lane B) an error means no new resumable point was
+ *     committed at all, so progress proves nothing there — see
+ *     `MemoryMarkInput.clientTranscript`'s doc comment.
+ *  R3 advance only to the digest this turn actually injected — never a
+ *     post-turn re-render (that would swallow a sibling's concurrent write, ⚠A5).
+ *  R4 a fresh session whose first turn delivered nothing (empty hot tier,
+ *     failed render, zero-progress error) must NOT inherit the row's old mark.
+ *  R5 resumed, nothing new ⇒ leave the last delivered digest in place.
+ * Deliberately absent: an id-inequality "rotation" rule — on openai/gemini the
+ * chain head rotates every turn (KPR-350/352); it would unset the mark every
+ * turn and reproduce the naive per-turn cost.
+ */
+export function resolveMemoryMark(a: MemoryMarkInput): string | null | undefined {
+  if (a.compactions > 0) return null; // R1
+  const delivered = !a.error || (a.clientTranscript && hasObservedProgress(a)); // R2
+  if (a.injected !== undefined && delivered) return a.injected; // R3
+  if (!a.resumedSession) return null; // R4
+  return undefined; // R5
 }
 
 /** KPR-389: typed read of the KPR-388 injection mode stamped beside the round. */
@@ -1203,25 +1277,47 @@ export class AgentManager {
         deadlineMs: this.acquireDeadlineMs(route.provider, acquireAgentConfig),
       });
 
-      // KPR-220 Phase 15: re-resolve sessionId post-lock for reflection
-      // turns. The reflection timer may have fired while a user turn was
-      // in flight on the same thread; that turn could have rotated the
-      // session post-compaction, so the sessionId captured at timer-fire
-      // time is potentially stale. Reading sessionStore HERE (after the
-      // per-thread lock is held) closes the race because no other turn
-      // can be writing to it. Non-reflection callers keep their original
-      // ctx.sessionId — they always resolve immediately before calling
-      // spawnTurn, so the window is microseconds and tolerated.
+      // KPR-434 D4.3: ONE post-lock store read for EVERY turn kind — KPR-220
+      // Phase 15's reflection-only re-read, widened. The read is withRetry
+      // fail-soft (never throws — no new throw surface inside the R7 window);
+      // a failed read ⇒ no mark ⇒ inject (duplicate, never gap).
+      //
+      // The sessionId/provider replacement keeps its REFLECTION-ONLY condition
+      // (⚠A9): which session a queued non-reflection turn resumes is KPR-220's
+      // "microseconds, tolerated" ruling (the reflection timer may have fired
+      // while a user turn was in flight on the same thread and rotated the
+      // session post-compaction; non-reflection callers resolve immediately
+      // before spawnTurn) — this ticket does not widen it.
+      //
+      // The DIGEST, by contrast, is adopted from the post-lock read on every
+      // turn: a pre-lock capture is a whole predecessor turn stale under
+      // same-thread queueing (a sibling write + exact-revert delete during the
+      // predecessor would make B skip a block its session never saw — gap).
+      const fresh = await this.sessionStore.get(ctx.agentId, ctx.threadId);
       let effectiveCtx = ctx;
       if (ctx.kind === "reflection") {
-        const fresh = await this.sessionStore.get(ctx.agentId, ctx.threadId);
-        // KPR-313: FIELD-wise staleness compare. get() now returns a ref — a
+        // KPR-313: FIELD-wise staleness compare. get() returns a ref — a
         // naive `fresh !== ctx.sessionId` would compare ref-vs-string, always
         // mismatch, and (worse) assign a ref where a string id belongs.
         if (fresh?.sessionId !== ctx.sessionId || fresh?.provider !== ctx.sessionProvider) {
           effectiveCtx = { ...ctx, sessionId: fresh?.sessionId, sessionProvider: fresh?.provider };
         }
       }
+      // Pairing rule: the mark is usable only if there IS a session to resume
+      // AND the row still names it. `undefined === undefined` is not a pair:
+      // stateless-replay rows normalise sessionId to undefined, a scrubbed row
+      // has none, and a session-less ctx never injects by mark anyway. If the
+      // predecessor rotated the row (fresh.sessionId ≠ ctx.sessionId), the
+      // digest belongs to a session this turn is not resuming ⇒ undefined ⇒
+      // inject on the stale session (duplicate at worst, never a cross-session
+      // skip — spec §8 edge 23).
+      effectiveCtx = {
+        ...effectiveCtx,
+        memoryDigestSeen:
+          effectiveCtx.sessionId !== undefined && fresh?.sessionId === effectiveCtx.sessionId
+            ? fresh?.memoryDigest
+            : undefined,
+      };
 
       // KPR-313: session-identity guard. Resume only a same-provider handle;
       // on any provider transition with prior thread state, hand off (fresh +
@@ -1242,14 +1338,24 @@ export class AgentManager {
       // withRetry fail-soft (never throws) and dereferences no registry —
       // no new throw surface inside the R7 window.
       if (effectiveCtx.sessionProvider && effectiveCtx.sessionProvider !== route.provider) {
-        const fresh = await this.sessionStore.get(ctx.agentId, ctx.threadId); // post-lock ⇒ authoritative
-        if (fresh?.provider === route.provider) {
+        const tripRow = await this.sessionStore.get(ctx.agentId, ctx.threadId); // post-lock ⇒ authoritative (KPR-434: distinct from the every-turn read above — see adopt branch)
+        if (tripRow?.provider === route.provider) {
           // A queued predecessor already performed the switch — adopt its
-          // state, no handoff. fresh.sessionId may itself be undefined
+          // state, no handoff. tripRow.sessionId may itself be undefined
           // (predecessor was a stateless pilot turn): the turn then runs
           // fresh WITHOUT an annotation, which is exactly the same-provider
           // stateless case where no transition annotation is owed.
-          effectiveCtx = { ...effectiveCtx, sessionId: fresh.sessionId, sessionProvider: fresh.provider };
+          //
+          // KPR-434: re-pair the mark from THIS re-read (tripRow.sessionId can be
+          // undefined here — undefined === undefined is not a pair). Kept as a
+          // separate read from the every-turn read above, deliberately: same
+          // row, but folding them would move the :2608 pin back to 1 (D4.3).
+          effectiveCtx = {
+            ...effectiveCtx,
+            sessionId: tripRow.sessionId,
+            sessionProvider: tripRow.provider,
+            memoryDigestSeen: tripRow.sessionId !== undefined ? tripRow.memoryDigest : undefined,
+          };
         } else {
           log.warn("Session provider mismatch — fresh session with memory handoff (KPR-313)", {
             agentId: ctx.agentId,
@@ -1274,7 +1380,7 @@ export class AgentManager {
           if (this.turnHistoryStore) {
             await this.turnHistoryStore.clear(ctx.agentId, ctx.threadId).catch(() => {});
           }
-          effectiveCtx = { ...effectiveCtx, sessionId: undefined, sessionHandoff: true };
+          effectiveCtx = { ...effectiveCtx, sessionId: undefined, sessionHandoff: true, memoryDigestSeen: undefined }; // KPR-434: the mark drops with the handle (pairing invariant)
         }
       }
 
@@ -1317,7 +1423,7 @@ export class AgentManager {
           });
           finalAttemptSessionId = undefined;
           finalResult = await this.runOneSpawnAttempt(
-            { ...effectiveCtx, sessionId: undefined },
+            { ...effectiveCtx, sessionId: undefined, memoryDigestSeen: undefined }, // KPR-434: fresh ⇒ no mark
             shaping,
             ticket,
             onStream,
@@ -1374,7 +1480,12 @@ export class AgentManager {
           });
           finalAttemptSessionId = adoptedSessionId;
           finalResult = await this.runOneSpawnAttempt(
-            { ...effectiveCtx, sessionId: adoptedSessionId },
+            {
+              ...effectiveCtx,
+              sessionId: adoptedSessionId,
+              // KPR-434: re-pair from the same contender read (the one retry that KEEPS a handle).
+              memoryDigestSeen: adoptedSessionId !== undefined ? contender?.memoryDigest : undefined,
+            },
             shaping,
             ticket,
             onStream,
@@ -1417,7 +1528,7 @@ export class AgentManager {
           // into a mark ADVANCE instead of a clear (C9 gap).
           finalAttemptSessionId = undefined;
           finalResult = await this.runOneSpawnAttempt(
-            { ...effectiveCtx, sessionId: undefined },
+            { ...effectiveCtx, sessionId: undefined, memoryDigestSeen: undefined }, // KPR-434: fresh ⇒ no mark
             shaping,
             ticket,
             onStream,
@@ -1876,6 +1987,7 @@ export class AgentManager {
       resourceLimits: shaping.resourceLimits,
       systemPromptOverride: ctx.systemPromptOverride,
       effort: shaping.effortOverride,
+      memoryDigestSeen: ctx.memoryDigestSeen,
     });
     // KPR-224: model router cost lives outside RunResult; add it here so
     // finalizeSpawnResult and recordSpawnObservability see the full cost.
@@ -2131,8 +2243,9 @@ export class AgentManager {
 
     // KPR-313 §3.4: hive-owned handoff annotation — sessionHandoff is set
     // ONLY by spawnTurn's session-identity guard. Prepended ahead of the
-    // sender prefix; memory carryover needs nothing here (every fresh spawn
-    // already assembles the full system prompt incl. agent memory). Variant
+    // sender prefix; memory carryover needs nothing here (KPR-434: a fresh
+    // spawn carries no memoryDigestSeen, so send()/the scaffold inject the
+    // full memory block in the turn input by construction). Variant
     // keyed on the static provider (≡ effective under the W3 clamp): Lane B
     // targets keep the conservative pilot-era default (no conversation_search
     // clause) pending a dedicated follow-up, not because they lack tools —
@@ -2413,6 +2526,10 @@ export class AgentManager {
           ...(injectionMode ? { injectionMode } : {}),
           // KPR-401: sparse — only aborted:true is ever written.
           ...(result.aborted ? { aborted: true as const } : {}),
+          // KPR-434 D6: sparse memory flags (the KPR-401 `aborted` shape —
+          // only ever written true; absent keys stay absent).
+          ...(result.memoryDigestInjected !== undefined ? { memoryInjected: true as const } : {}),
+          ...(result.memoryRenderFailed ? { memoryRenderFailed: true as const } : {}),
         })
         .catch(() => {
           // Already logged inside the store via withRetry. Swallow here.
@@ -2517,6 +2634,21 @@ export class AgentManager {
       // mint-safe.
       !(result.error && ctx.sessionId && result.sessionId !== ctx.sessionId);
 
+    // KPR-434 D4.2: one tri-state mark value for BOTH persist arms, decided by
+    // the pure helper (pinned as a truth table) and applied inside the turn's
+    // own set() — never a separate mark-only write (fire-and-forget ordering).
+    const memoryMark = resolveMemoryMark({
+      injected: result.memoryDigestInjected,
+      error: result.error,
+      aborted: result.aborted,
+      compactions: result.compactions,
+      toolCalls: result.toolCalls,
+      streamed: result.streamed,
+      text: result.text,
+      resumedSession,
+      clientTranscript: sessionSemanticsForRoute(route.provider) === "client-transcript",
+    });
+
     if (result.sessionId && !result.aborted) {
       // KPR-313 §3.2: persist a resumable handle ONLY for providers whose
       // adapters actually resume. Stateless pilots keep the ROW (the session
@@ -2541,15 +2673,22 @@ export class AgentManager {
       } else {
         // Persist post-spawn — captures session-id rotation post-compaction
         // (KPR-211 verified this fires on resume).
-        this.sessionStore.set(ctx.agentId, ctx.threadId, resumable ? result.sessionId : "", route.provider, {
-          inputTokens: result.inputTokens,
-          outputTokens: result.outputTokens,
-          cacheReadTokens: result.cacheReadTokens,
-          cacheCreationTokens: result.cacheCreationTokens,
-          contextWindow: result.contextWindow,
-          compactions: result.compactions,
-          preCompactTokens: result.preCompactTokens,
-        });
+        this.sessionStore.set(
+          ctx.agentId,
+          ctx.threadId,
+          resumable ? result.sessionId : "",
+          route.provider,
+          {
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            cacheReadTokens: result.cacheReadTokens,
+            cacheCreationTokens: result.cacheCreationTokens,
+            contextWindow: result.contextWindow,
+            compactions: result.compactions,
+            preCompactTokens: result.preCompactTokens,
+          },
+          memoryMark,
+        );
       }
     } else if (abortPersist) {
       log.info("Persisting session from aborted turn — replay/follow-up will resume (KPR-399)", {
@@ -2564,7 +2703,10 @@ export class AgentManager {
       // tokenData updates only sessionId/provider/updatedAt, preserving the
       // prior turn's stats (session-store.ts set(): defaults land
       // $setOnInsert-only).
-      this.sessionStore.set(ctx.agentId, ctx.threadId, result.sessionId, route.provider);
+      // KPR-434: reached only with observed progress ⇒ R2 holds ⇒ an aborted
+      // turn that injected advances the mark (the transcript was flushed
+      // incrementally and carries the input). tokenData stays omitted.
+      this.sessionStore.set(ctx.agentId, ctx.threadId, result.sessionId, route.provider, undefined, memoryMark);
     }
 
     const state = this.states.get(ctx.agentId)!;

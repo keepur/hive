@@ -32,6 +32,10 @@ export interface TurnTelemetryDoc {
    * aborted-turn spend; the aggregation pipelines are deliberately unchanged
    * (aborted turns' completed API calls are real cache traffic). */
   aborted?: true;
+  /** KPR-434 D6: sparse — true iff this turn's input carried the memory block (RunResult.memoryDigestInjected). */
+  memoryInjected?: true;
+  /** KPR-434 D2/D6: sparse — true iff the Claude-lane memory render threw and the turn ran memory-less. */
+  memoryRenderFailed?: true;
   createdAt: Date;
 }
 
@@ -60,6 +64,10 @@ export interface TurnTelemetryInput {
   effortSource?: EffortSource;
   /** KPR-401: sparse — set only when true (see TurnTelemetryDoc.aborted). */
   aborted?: true;
+  /** KPR-434: sparse — see TurnTelemetryDoc. */
+  memoryInjected?: true;
+  /** KPR-434: sparse — see TurnTelemetryDoc. */
+  memoryRenderFailed?: true;
 }
 
 export interface CacheHitRateRow {
