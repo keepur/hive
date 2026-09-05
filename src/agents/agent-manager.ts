@@ -245,8 +245,8 @@ export interface MemoryMarkInput {
   resumedSession: boolean;
   /**
    * KPR-434 review fix: `sessionSemanticsForRoute(route.provider) === "client-transcript"`
-   * (claude + Lane A kimi/deepseek — the SAME gate `abortPersist` already applies to its
-   * own `hasObservedProgress` use, `agent-manager.ts` ~:2606). R2's "the request was sent
+   * (claude + Lane A kimi/deepseek — the SAME gate `finalizeSpawnResult`'s own `abortPersist`
+   * already applies to its own `hasObservedProgress` use, in this file). R2's "the request was sent
    * ⇒ the transcript carries the block" reasoning is a CLIENT-TRANSCRIPT fact: those
    * providers flush a locally/CLI-held transcript incrementally, so a partial turn's
    * injected memory really is retained across the error. On server-resumable Lane B

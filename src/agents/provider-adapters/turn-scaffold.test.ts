@@ -583,11 +583,17 @@ describe("KPR-434: memory block on the turn input (server-resumable assemblies)"
     expect(flagged.seen()).toBe(appendDateTimeTrailer("hello", NOW));
   });
 
-  it("hardening (review): digest without a paired block delivers nothing and never claims memoryDigestInjected", async () => {
+  it.each([
+    ["absent block", undefined],
+    ["empty-string block (falsy, matches composeTurnInput's own gate)", ""],
+  ])("hardening (review): digest with a %s delivers nothing and never claims memoryDigestInjected", async (_label, block) => {
     // Engine-built assemblies always pair block+digest (turn-assembly.ts); a
     // hand-built or malformed plugin assembly might not — this must not stamp
     // the mark as advanced for a block the model never actually received.
-    const mismatched = memAssembly({ memory: { digest: "digest-only-no-block" } });
+    // The gate here (`!!a.memory?.block`) deliberately matches
+    // composeTurnInput's own truthiness check on memoryBlock, so the two
+    // never disagree about whether a block was actually delivered.
+    const mismatched = memAssembly({ memory: { block, digest: "digest-only" } });
     const { adapter, seen } = capture(mismatched);
     const result = await adapter.runTurn(req({ prompt: "hello" }));
     expect(seen()).toBe(appendDateTimeTrailer("hello", NOW));

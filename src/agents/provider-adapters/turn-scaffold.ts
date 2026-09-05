@@ -219,7 +219,7 @@ export abstract class LaneBTurnScaffold implements AgentProviderAdapter {
         // assembly always pairs the two (turn-assembly.ts), but a plugin-built one
         // carrying `digest` without `block` would otherwise deliver nothing to the
         // model while still stamping the mark as advanced.
-        memoryDigestInjected: injectMemory && a.memory?.block !== undefined ? a.memory.digest : undefined,
+        memoryDigestInjected: injectMemory && !!a.memory?.block ? a.memory.digest : undefined,
       });
 
     const abortedResult = (): RunResult =>
