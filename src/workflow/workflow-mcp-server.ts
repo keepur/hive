@@ -10,6 +10,7 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { Db } from "mongodb";
 import { randomUUID } from "node:crypto";
+import type { WorkItemContextRef } from "../agents/agent-runner.js";
 import {
   TaskState,
   isTerminal,
@@ -25,6 +26,8 @@ import { computePlanStatus } from "./types.js";
 import type { WorkflowTaskComment } from "./types.js";
 
 export interface WorkflowToolDeps {
+  /** Optional live runtime context; never copy it into a stored document. */
+  workItemContext?: WorkItemContextRef;
   db: Db;
   agentId: string;
   /**

@@ -68,8 +68,10 @@ export const WORKER_SERVER_DENYLIST = new Set<string>([
   "code-task",
 ]);
 
-/** The WorkItemContext seven — per-turn metadata from the boss's dispatching turn. */
+/** Transport/thread metadata plus optional runtime identity from the boss's dispatching turn. */
 export interface WorkerPoolTurnContext {
+  /** Identity of this runtime invocation, when it represents a WorkItem. */
+  workItemId?: string;
   adapterId?: string;
   channelId?: string;
   channelKind?: string;
@@ -572,10 +574,12 @@ export class MeetingWorkerPool {
     base: AgentConfig;
     role: WorkerRoleParams;
     prompt: string;
-    /** The seven-required shape `workItemContextFromClaim` already returns —
-     *  deliberately NOT the all-optional WorkerPoolTurnContext, so no cast and
-     *  no agent-runner import are needed to satisfy adapter.runTurn. */
+    /** Required transport/thread metadata plus optional runtime identity,
+     *  compatible with `workItemContextFromClaim` and adapter.runTurn without
+     *  a cast or agent-runner import. */
     workItemContext: {
+      /** Identity of this runtime invocation, when it represents a WorkItem. */
+      workItemId?: string;
       adapterId: string;
       channelId: string;
       channelKind: string;

@@ -8,6 +8,7 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { ObjectId, type Collection, type Db } from "mongodb";
 import { z } from "zod";
+import type { WorkItemContextRef } from "../agents/agent-runner.js";
 
 interface PhoneEntry {
   number: string; // E.164 (+1XXXXXXXXXX)
@@ -37,6 +38,8 @@ interface ContactDoc {
 }
 
 export interface ContactsToolDeps {
+  /** Optional live runtime context; never copy it into a stored document. */
+  workItemContext?: WorkItemContextRef;
   db: Db;
 }
 

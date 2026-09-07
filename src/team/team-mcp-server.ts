@@ -10,10 +10,13 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { ObjectId, type Db } from "mongodb";
+import type { WorkItemContextRef } from "../agents/agent-runner.js";
 import type { TeamMessage } from "./types.js";
 import { internalChannelId } from "./types.js";
 
 export interface TeamToolDeps {
+  /** Optional live runtime context; never copy it into a stored document. */
+  workItemContext?: WorkItemContextRef;
   db: Db;
   agentId: string;
   /** Live agent-id lookup — invoked on every tool call so hot reloads apply. */

@@ -13,6 +13,8 @@ import { z } from "zod";
 import { ObjectId, type Db } from "mongodb";
 
 export interface CallbackTurnContext {
+  /** Identity of this runtime invocation, when it represents a WorkItem. */
+  workItemId?: string;
   adapterId?: string;
   channelId?: string;
   channelKind?: string;
@@ -194,6 +196,8 @@ export function createCallbackMcpServer(deps: CallbackToolDeps) {
 export interface CallbackTurnDeps {
   db: Db;
   agentId: string;
+  /** Identity of this runtime invocation, when it represents a WorkItem. */
+  workItemId?: string;
   adapterId?: string;
   channelId?: string;
   channelKind?: string;
@@ -206,6 +210,7 @@ export interface CallbackTurnDeps {
 export function buildCallbackMcpForTurn(deps: CallbackTurnDeps) {
   const contextRef: { current: CallbackTurnContext } = {
     current: {
+      workItemId: deps.workItemId,
       adapterId: deps.adapterId,
       channelId: deps.channelId,
       channelKind: deps.channelKind,

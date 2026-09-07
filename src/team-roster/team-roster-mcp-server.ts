@@ -1,5 +1,6 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import type { WorkItemContextRef } from "../agents/agent-runner.js";
 import type { TeamRoster } from "./team-roster.js";
 
 /**
@@ -8,7 +9,7 @@ import type { TeamRoster } from "./team-roster.js";
  * Exported separately so unit tests can drive the handlers directly without
  * going through the SDK's MCP transport.
  */
-export function buildTeamRosterTools(roster: TeamRoster) {
+export function buildTeamRosterTools(roster: TeamRoster, _workItemContext?: WorkItemContextRef) {
   return [
     tool(
       "team_list",
@@ -78,10 +79,10 @@ export function buildTeamRosterTools(roster: TeamRoster) {
  * because the cache singleton must be shared between engine internals and the
  * agent-facing tools.
  */
-export function createTeamRosterMcpServer(roster: TeamRoster) {
+export function createTeamRosterMcpServer(roster: TeamRoster, workItemContext?: WorkItemContextRef) {
   return createSdkMcpServer({
     name: "team-roster",
     version: "0.1.0",
-    tools: buildTeamRosterTools(roster),
+    tools: buildTeamRosterTools(roster, workItemContext),
   });
 }
