@@ -176,6 +176,35 @@ describe("delivery obligation assembly", () => {
     expect(h.submitted).toHaveLength(0);
     expect(h.fake.collection(COLLECTION).rows.size).toBe(0);
   });
+  it.each([
+    { boundary: "registration", dueAt: "2026-09-07T08:00:00.000Z", lower: "2026-09-07T06:00:00.000Z" },
+    { boundary: "previous deadline", dueAt: "2026-09-08T08:00:00.000Z", lower: "2026-09-07T08:00:00.000Z" },
+  ])("rejects a send exactly at the $boundary windowStart, then admits it at +1ms", async ({ dueAt, lower }) => {
+    const h = await harness(), e = h.engine(), deadline = new Date(dueAt), windowStart = new Date(lower);
+    h.at(windowStart);
+    const snapshot = h.snapshot(), writes = h.fake.writes();
+    await expect(h.send(e.delivery, deadline)).rejects.toThrow("window_not_open");
+    expect(h.submitted).toHaveLength(0); expect(h.receiptInserts()).toBe(0);
+    expect(h.fake.collection(COLLECTION).rows.size).toBe(0);
+    expect((await h.store.get("demo"))!.deliveryAdmission).toBeUndefined();
+    expect(h.snapshot()).toEqual(snapshot); expect(h.fake.writes()).toBe(writes);
+    h.at(new Date(windowStart.getTime() + 1));
+    expect(await h.send(e.delivery, deadline)).toMatchObject({ state: "confirmed_delivery", history: "present" });
+    expect(h.submitted).toHaveLength(1); expect(h.receiptInserts()).toBe(1);
+    expect(await h.store.occurrence("demo/" + dueAt)).toMatchObject({
+      dueAt: deadline, windowStart, delivery: { state: "acknowledged" },
+      acknowledgement: { acknowledgedAt: h.clock(), receiptWriteState: "persisted" },
+    });
+  });
+  it("accepts exactly 3900 attributed characters as one complete post", async () => {
+    const h = await harness(), e = h.engine();
+    h.at("2026-09-07T07:00:00.000Z");
+    const attribution = "[demo-producer]\n", text = "x".repeat(3900 - attribution.length);
+    expect(await h.send(e.delivery, DUE, text)).toMatchObject({ state: "confirmed_delivery", history: "present" });
+    expect(h.submitted).toEqual([{ channel: definition.destination.channelId, text: attribution + text }]);
+    expect(h.submitted[0]!.text).toHaveLength(3900);
+    expect(h.receiptInserts()).toBe(1);
+  });
   it("a late receipt cannot suppress the missed deadline or satisfy tomorrow", async () => {
     const h = await harness(), e = h.engine();
     h.at("2026-09-07T08:00:00.001Z");
@@ -612,7 +641,8 @@ import { harness, definition, KEY } from "../obligations/testing/harness.js";
 vi.mock("../keychain/from-keychain.js", () => ({ fromKeychain: () => null }));
 const roots: string[] = [];
 beforeEach(() => {
-  for (const key of ["MONGODB_URI", "MONGODB_DB", "HIVE_HOME", "HIVE_CONFIG"]) vi.stubEnv(key, "");
+  for (const key of ["MONGODB_URI", "MONGODB_DB", "HIVE_HOME"]) vi.stubEnv(key, "");
+  vi.stubEnv("HIVE_CONFIG", undefined); // Absent selects hive.yaml; unstubAllEnvs restores any inherited value.
 });
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -881,7 +911,7 @@ For manager forwarding, extend its existing new-AgentRunner spy fixture: a norma
 | Schedule independence | Execute actual my_schedule_remove handler and Scheduler.reloadSchedules with the registered producer; upcoming obligation still materializes and notices; scheduler regression suite remains unchanged |
 | Clock rollback | Complete one scan, move clock backwards, sweep and inspect → scanThrough never regresses or duplicates an occurrence |
 | Notice content boundary | Malicious description containing Slack mentions/markup stays escaped; explicit notice destination used; no user mention, urgency, audit/home destination fallback |
-| Acknowledgement equality | At dueAt counts on time; at dueAt+1ms is late; at windowStart is not admitted; first registration due instant is not retroactively monitored |
+| Acknowledgement equality | At dueAt counts on time; at dueAt+1ms is late; Task 18 sends exactly at registration-clamped and previous-deadline windowStart → window_not_open, zero posts/receipts/writes and unchanged occurrence/admission state, then +1ms is admitted; first registration due instant is not retroactively monitored |
 
 The table is a coverage index. Apply the complete tests in [chunk 7](kpr-456-plan-7-fault-tests.md) for these cases; boundary/content assertions already present above and in chunk 5 are not duplicated. No test may be replaced with a call-shape-only mock, TODO, skip, or snapshot of fabricated results.
 
