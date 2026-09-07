@@ -54,6 +54,7 @@ Existing files to modify:
 Tests to create:
 
 - src/obligations/testing/fake-db.ts
+- src/obligations/testing/refusals.ts
 - src/obligations/testing/harness.ts
 - src/obligations/deadlines.test.ts
 - src/obligations/slack-post.test.ts
@@ -69,7 +70,7 @@ Tests to create:
 - Unit: required
   - Scope: strict schemas, recurrence/windows/DST, bounded scanning, Slack acknowledgement/refusal classification, reader cursor validation, exact receipt match and retention decisions.
   - Reason: correctness depends on boundaries and conservative interpretation, not happy-path CRUD.
-  - Minimum assertions: invalid/extra fields rejected; channel/thread canonicality; UTC host independence; DST gap absent/fold double; (previousDueAt,dueAt] window; <=3,900 attributed characters; every allow-listed refusal retryable; every other submitted result unknown; no raw bodies/errors persisted.
+  - Minimum assertions: invalid/extra fields rejected; channel/thread canonicality and length bounds; UTC host independence; DST gap absent/fold double; (previousDueAt,dueAt] window; <=3,900 attributed characters; the design's independent exact 13-code refusal fixture matches the production set and each refusal is retryable; every other submitted result unknown; wrong response URL, absent provenance and redirects remain unknown with redirect:error asserted on real fetch options; no raw bodies/errors persisted.
 
 - Integration: required
   - Scope: real guarded Mongo stores, receipt reconciler, sender, sweeper, CLI handler and schedule service/tool assembly over an atomic fake Mongo driver and fake Slack HTTP responses.
@@ -92,6 +93,10 @@ Tests to create:
 - Receipt insert failure/restart → original-timestamp repair only while pending/eligible; terminal history expiry never recreates rows.
 - Old overdue keys, including deactivated past expectations, remain discoverable by bounded pagination; a late send stays assigned to its original deadline.
 - Store failure/write guard → unknown/pending evaluation and visible stale heartbeat/backlog; no false success.
+- Local-only commit followed by write timeout → majority recovery cannot authorize submission or publish receipt persistence; majority-confirmed commit-then-throw may recover the exact token/row.
+- Same-boot invocation ends before handoff → token-fenced recovery records unknown, clears only its admission and permits a later occurrence; active delayed invocations remain untouched.
+- Concurrent receipt repair/expiry → one shared per-occurrence queue, fresh clock at insert admission, no insertion behind a terminal checkpoint; queued repairs after persisted+TTL remain read-only for history.
+- Future/cancelled pending receipts and admissions beyond one recovery page → nonzero heartbeat recovery backlog until drained; missing retained admission projection → explicit read-only integrity failure.
 
 ### Regression Surface
 
@@ -108,7 +113,7 @@ Execute from the child implementation worktree on Node 24. A missing install is 
 - Adjacent regression: npx vitest run src/scheduler/scheduler.test.ts src/activity/activity-logger.test.ts src/slack/slack-gateway.test.ts src/slack/outbound-ts-cache.test.ts src/db/db-identity.integration.test.ts src/cli/doctor.test.ts
 - E2E: not required; no live account/service command.
 - Broader regression: npm run check
-- Artifact/code hygiene: git diff --check; rg -n 'activity_log' src scripts setup plugins
+- Artifact/code hygiene: git diff --check; rg -n 'activity_log' src scripts setup
 - Expected results: exit 0, all selected Vitest tests pass, no skipped new contract cases, no TypeScript/ESLint/Prettier errors. Record actual totals, do not invent expected test counts.
 
 ### Harness Requirements
@@ -116,11 +121,14 @@ Execute from the child implementation worktree on Node 24. A missing install is 
 - Node 24; dependency installation from the existing lockfile.
 - Fake clock controls both acknowledgement time and sweep time. No date assertions using the real wall clock.
 - Atomic in-memory driver must enforce matching filters, unique _id/receipt indexes, CAS revisions, $setOnInsert/$set/$unset/$inc/$max and sorted limited cursor reads; all mutation decisions occur synchronously before returning their promise.
-- Barrier hooks at registry admission, occurrence claim, HTTP submission, acknowledgement checkpoint, receipt insert and persisted-marker publication. Failure modes must include commit-then-throw, throw-before-commit, and delayed successful writes.
+- Record read/write options and model majority-confirmed visibility separately from local-only commit-then-timeout; majority reads must never return the local-only row/token. Permit explicit majority commit or rollback of that staged state for recovery assertions.
+- Barrier hooks at registry admission, occurrence claim, HTTP submission, acknowledgement checkpoint, receipt insert and persisted-marker publication. Failure modes must include commit-then-throw, throw-before-commit, and delayed successful writes. Serialize receipt repair through the real shared queue: never make a test barrier wait for two operations that the queue intentionally serializes.
 - Fake Slack HTTP fetch runs through the real dedicated WebClient; accepted-message count is independent of returned acknowledgements. Test redirects/proxy/malformed acknowledgements and absent provenance.
 - A fresh service reuses the same fake DB and new boot ID after the old service is stopped. Simultaneous senders/sweepers in the same live engine share a boot ID. No production credentials.
+- All runtime stores share the engine's guarded Db object, so their receipt queues and active invocation tokens are shared even across distinct store/service wrappers. Test same-boot abandonment separately from a paused live invocation.
 - Real SDK in-process MCP transport/ToolBridge tests for both provider paths; contained worker creation retains the existing denylist and suppressAutoInjectedServers gates.
 - CLI fake connection verifies sentinel, read/write separation, selected instance, cleanup and idempotence without loading real secrets.
+- CLI read-only cases include pending and expired initial receipt writes; instance tests capture exact CliSelection and route to distinct fake databases. Runtime initialization tests begin with no receipt indexes and cover independent receipt setup, createIndex failure and incompatible existing TTL without enabling readiness.
 
 ### Non-Required Rationale
 
@@ -149,6 +157,7 @@ Each chunk gives exact commands and touched-file commit lists. Worker scheduling
 ## Engineering decisions and limits
 
 - One engine owns a database at a time, as the existing launchd/instance model assumes. A boot ID denotes that live engine, not a lease that expires. Concurrent callers/ticks share it. Do not introduce multi-engine leader election or declare a slow live owner orphaned.
+- Recovery reads use primary majority concern with bounded execution time. A per-Db in-memory queue serializes receipt insert admission and terminal retention decisions; retained CAS state supplies durable fencing after restart. Same-boot delivery and notice liveness use invocation-owned tokens registered before claims and removed in finally, never elapsed-time reclamation.
 - Technical bounds: 20 registry documents and 1,440 UTC minutes per document per tick; 100 recovery/evaluation records per page; stable keyset pagination and monotonic cursors prevent dropped work. Repeated infrastructure failures rotate eligible work by next-check time while remaining pending.
 - Retention is the existing timestamp TTL. Initialization fails on an incompatible existing TTL, and the reader reports the observed effective value. Runtime modification of the TTL while this engine is running is outside this feature's administration surface.
 - Slack acknowledgement is accepted transport evidence, not human reading or semantic completeness. Unknown means uncertainty; there is no exactly-once visible delivery promise.
@@ -162,3 +171,5 @@ The dedicated client sets retryConfig.retries to zero and rejectRateLimitedCalls
 Slack success contains the destination channel and ts; some server errors permit partial success, so the classifier defaults to unknown. [chat.postMessage](https://docs.slack.dev/reference/methods/chat.postMessage/).
 
 Receipt-only partial unique indexes preserve legacy turn rows with absent receipt keys. [MongoDB partial indexes](https://www.mongodb.com/docs/manual/core/index-partial/).
+
+Majority reads return majority-acknowledged data; write-concern timeouts do not undo local modifications. This plan therefore uses explicit primary majority reads wherever observation substitutes for acknowledged persistence. [MongoDB majority read concern](https://www.mongodb.com/docs/manual/reference/read-concern-majority/), [MongoDB write concern](https://www.mongodb.com/docs/manual/reference/write-concern/).

@@ -31,11 +31,12 @@ export const definition: Registration = {
   noticeDestination: { kind: "slack", channelId: "C00000002" }, createdBy: "operator",
 };
 export type ResponseScript = {
-  body?: unknown; status?: number; provenance?: boolean; accepted?: boolean; throws?: boolean; retryAfter?: string;
+  body?: unknown; rawBody?: string; status?: number; provenance?: boolean; accepted?: boolean; throws?: boolean; retryAfter?: string;
 };
-export async function harness() {
+export async function harness(options: { instanceId?: string; dbName?: string; initialize?: boolean } = {}) {
+  const instanceId = options.instanceId ?? "demo", dbName = options.dbName ?? "hive_" + instanceId;
   const fake = new FakeDb();
-  const guard = new WriteGuard({ instanceId: "demo", dbName: "hive_demo" });
+  const guard = new WriteGuard({ instanceId, dbName });
   const db = guardDb(fake.db, guard);
   let now = new Date("2026-09-07T06:00:00.000Z");
   const clock = () => new Date(now);
@@ -54,20 +55,20 @@ export async function harness() {
       if (!script || script.accepted) accepted.push(sent);
       if (beforeResponse) await beforeResponse();
       if (script?.throws) throw new Error("simulated_timeout");
-      const headers = new Headers({ "content-type": "application/json" });
+      const headers = new Headers({ "content-type": script?.rawBody === undefined ? "application/json" : "text/plain" });
       if (script?.provenance !== false) headers.set("x-slack-req-id", "fixture");
       if (script?.retryAfter) headers.set("retry-after", script.retryAfter);
-      const response = new Response(JSON.stringify(body), { status: script?.status ?? 200, headers });
+      const response = new Response(script?.rawBody ?? JSON.stringify(body), { status: script?.status ?? 200, headers });
       Object.defineProperty(response, "url", { value: "https://slack.com/api/chat.postMessage" });
       return response;
     });
   await fake.collection("agent_definitions").insertOne({ _id: definition.producerAgentId, schedule: [] });
   await fake.collection("instance_identity").insertOne({
-    _id: "identity_sentinel", schemaVersion: 1, instanceId: "demo", dbName: "hive_demo",
+    _id: "identity_sentinel", schemaVersion: 1, instanceId, dbName,
     sentinelId: randomUUID(), stampedAt: clock(), stampedBy: { engineVersion: "test", hostname: "test", pid: 1 },
   });
   const store = new ObligationStore(db), receipts = new ReceiptStore(db, 1);
-  await store.init(); await receipts.init();
+  if (options.initialize !== false) { await store.init(); await receipts.init(); }
   await store.register(definition, clock());
   function engine(bootId = randomUUID()) {
     const delivery = new DeliveryService(store, receipts, poster, bootId, clock, () => !guard.engaged);
@@ -81,6 +82,8 @@ export async function harness() {
     beforeResponse: (hook?: () => Promise<void>) => { beforeResponse = hook; },
     send: (service: DeliveryService, dueAt = DUE, text = "Complete deliverable") =>
       service.deliver(definition.producerAgentId, { obligationId: "demo", dueAt: dueAt.toISOString(), text }),
+    snapshot: () => structuredClone([...fake.collections].map(([name, collection]) =>
+      ({ name, rows: [...collection.rows], indexes: collection.indexes }))),
     receiptInserts: () => fake.operations.filter((v) => v.collection === "activity_log" && v.operation === "insertOne").length,
   };
 }
@@ -98,7 +101,10 @@ The pinned Slack SDK 8.1.1 serializes this text request as application/x-www-for
 import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { ActivityLogger } from "../activity/activity-logger.js";
-import { reconcileReceipt } from "./receipts.js";
+import { ReceiptStore, reconcileReceipt } from "./receipts.js";
+import { ObligationStore } from "./store.js";
+import { DeliveryService } from "./delivery.js";
+import { SPEC_REFUSALS } from "./testing/refusals.js";
 import { definition, DUE, KEY, COLLECTION, REGISTRY, harness } from "./testing/harness.js";
 
 describe("delivery obligation assembly", () => {
@@ -278,6 +284,27 @@ describe("delivery obligation assembly", () => {
     await expect(h.send(e.delivery)).rejects.toThrow("expectation_cancelled");
     expect(h.submitted).toHaveLength(1);
   });
+  it.each(SPEC_REFUSALS)("retries the approved %s refusal on delivery and notice paths", async (error) => {
+    for (const side of ["delivery", "notice"] as const) {
+      const h = await harness(), e = h.engine();
+      h.at(side === "delivery" ? "2026-09-07T07:00:00Z" : DUE);
+      h.scripts.push({ body: { ok: false, error } });
+      const run = () => side === "delivery" ? h.send(e.delivery) : e.sweeper.sweepOnce();
+      await run();
+      const first = await h.store.occurrence(KEY);
+      const intent = side === "delivery" ? first.delivery : first.notice!;
+      expect(intent.state).toBe("rejected"); expect(h.accepted).toHaveLength(0);
+      expect(h.receiptInserts()).toBe(0);
+      await run(); expect(h.submitted).toHaveLength(1);
+      h.at(intent.retryAt!); await run();
+      const last = await h.store.occurrence(KEY);
+      expect(side === "delivery" ? last.delivery : last.notice).toMatchObject({
+        state: "acknowledged", intentId: intent.intentId,
+      });
+      expect(h.submitted).toHaveLength(2); expect(h.accepted).toHaveLength(1);
+      expect(h.receiptInserts()).toBe(side === "delivery" ? 1 : 0);
+    }
+  });
   it.each(["delivery", "notice"] as const)("only authoritative %s refusal retries; same logical notice identity survives", async (side) => {
     const h = await harness(), e = h.engine();
     h.at(side === "delivery" ? "2026-09-07T07:00:00Z" : DUE);
@@ -290,6 +317,26 @@ describe("delivery obligation assembly", () => {
     if (side === "delivery") await h.send(e.delivery); else await e.sweeper.sweepOnce();
     expect(h.submitted).toHaveLength(2); expect(h.accepted).toHaveLength(1);
     if (side === "notice") expect((await h.store.occurrence(KEY)).notice?.intentId).toBe(original.notice?.intentId);
+  });
+  it.each(["invalid_auth", "not_in_channel"])("never retries a non-JSON %s body synthesized by the SDK", async (rawBody) => {
+    for (const side of ["delivery", "notice"] as const) {
+      const h = await harness(), e = h.engine();
+      h.at(side === "delivery" ? "2026-09-07T07:00:00Z" : DUE);
+      h.scripts.push({ rawBody, accepted: true });
+      if (side === "delivery") await h.send(e.delivery); else await e.sweeper.sweepOnce();
+      const original = await h.store.occurrence(KEY);
+      expect(side === "delivery" ? original.delivery : original.notice).toMatchObject({ state: "unknown" });
+      h.at(new Date(h.clock().getTime() + 120_000));
+      for (let i = 0; i < 2; i++) {
+        if (side === "delivery") await h.send(e.delivery); else await e.sweeper.sweepOnce();
+      }
+      await e.sweeper.stop(); const next = h.engine();
+      for (let i = 0; i < 2; i++) {
+        if (side === "delivery") await h.send(next.delivery); else await next.sweeper.sweepOnce();
+      }
+      expect(h.submitted).toHaveLength(1); expect(h.accepted).toHaveLength(1);
+      expect(h.receiptInserts()).toBe(0);
+    }
   });
   it.each(["internal_error", "fatal_error", "unrecognized_code", "timeout", "proxy"])("never reposts ambiguous %s on either side across restart", async (error) => {
     for (const side of ["delivery", "notice"]) {
@@ -321,23 +368,32 @@ describe("delivery obligation assembly", () => {
     expect((await h.store.get("demo"))!.deliveryAdmission).toBeUndefined();
     expect(h.submitted).toHaveLength(0);
   });
-  it("does not steal a live owner admission or mark its slow request orphaned", async () => {
-    const h = await harness(), e = h.engine();
+  it("protects a real live invocation before and after transfer across same-Db wrappers", async () => {
+    const h = await harness(), boot = randomUUID(), e = h.engine(boot);
+    const otherStore = new ObligationStore(h.db), otherReceipts = new ReceiptStore(h.db, 1);
+    const otherDelivery = new DeliveryService(otherStore, otherReceipts, h.poster, boot, h.clock, () => true);
     h.at("2026-09-07T07:00:00Z");
-    const o = await h.store.materialize((await h.store.get("demo"))!, DUE);
-    const admission = (await h.store.admit(o, e.bootId))!;
-    await e.sweeper.sweepOnce();
-    expect((await h.store.get("demo"))!.deliveryAdmission?.claimToken).toBe(admission.claimToken);
-    await e.delivery.transfer(admission, "demo");
-    await e.sweeper.sweepOnce();
-    expect((await h.store.occurrence(KEY)).delivery.state).toBe("sending");
+    const gate = h.fake.pause(COLLECTION, "replaceOne", (ctx) => ctx.document?.delivery?.state === "sending");
+    const request = h.fake.pause(REGISTRY, "updateOne", (ctx) => ctx.update?.$unset?.deliveryAdmission !== undefined);
+    const sending = h.send(e.delivery); await gate.reached;
+    const admission = (await h.store.get("demo"))!.deliveryAdmission!;
+    expect(otherStore.activeDeliveries.has(admission.claimToken)).toBe(true);
+    await otherDelivery.recoverAdmission("demo", admission); await e.sweeper.sweepOnce();
+    expect((await h.store.get("demo"))!.deliveryAdmission).toEqual(admission);
+    expect((await h.store.occurrence(KEY)).delivery.state).toBe("pending");
+    gate.release(); await request.reached;
+    await otherDelivery.recoverAdmission("demo", admission); await e.sweeper.sweepOnce();
+    expect((await h.store.occurrence(KEY)).delivery).toMatchObject({ state: "sending", claimToken: admission.claimToken });
+    request.release(); expect(await sending).toMatchObject({ state: "confirmed_delivery" });
+    expect(otherStore.activeDeliveries.size).toBe(0); expect(h.submitted).toHaveLength(1);
   });
-  it("commit-then-throw admission/claim writes resolve only by the exact durable token", async () => {
-    for (const stage of ["admission", "claim"] as const) {
+  it("commit-then-throw admission/claim/acknowledgement writes resolve only by durable evidence", async () => {
+    for (const stage of ["admission", "claim", "acknowledgement"] as const) {
       const h = await harness(), e = h.engine();
       h.at("2026-09-07T07:00:00Z");
       h.fake.failNext(stage === "admission" ? REGISTRY : COLLECTION, stage === "admission" ? "updateOne" : "replaceOne",
-        true, (ctx) => stage === "admission" ? Boolean(ctx.update?.$set?.deliveryAdmission) : ctx.document?.delivery?.state === "sending");
+        true, (ctx) => stage === "admission" ? Boolean(ctx.update?.$set?.deliveryAdmission)
+          : ctx.document?.delivery?.state === (stage === "claim" ? "sending" : "acknowledged"));
       expect(await h.send(e.delivery)).toMatchObject({ state: "confirmed_delivery" });
       expect(h.submitted).toHaveLength(1);
     }
@@ -351,10 +407,10 @@ describe("delivery obligation assembly", () => {
     const next = h.engine(); await next.sweeper.sweepOnce(); await h.send(next.delivery);
     expect(h.submitted).toHaveLength(1); expect(h.receiptInserts()).toBe(0);
   });
-  it.each(["insert", "marker", "insert_committed"] as const)("repairs pending receipt %s once with its original timestamp", async (stage) => {
+  it.each(["insert", "marker", "insert_committed", "marker_committed"] as const)("recovers receipt %s evidence with its original timestamp", async (stage) => {
     const h = await harness(), e = h.engine();
     h.at("2026-09-07T07:00:00Z");
-    if (stage === "marker") h.fake.failNext(COLLECTION, "replaceOne", false,
+    if (stage === "marker" || stage === "marker_committed") h.fake.failNext(COLLECTION, "replaceOne", stage === "marker_committed",
       (ctx) => ctx.document?.acknowledgement?.receiptWriteState === "persisted");
     else h.fake.failNext("activity_log", "insertOne", stage === "insert_committed");
     await h.send(e.delivery);
@@ -403,7 +459,7 @@ describe("delivery obligation assembly", () => {
     const h = await harness(), e = h.engine();
     h.at("2026-09-07T07:00:00Z"); await h.send(e.delivery);
     h.fake.collection("activity_log").rows.clear();
-    await expect(reconcileReceipt(h.store, h.receipts, KEY, h.clock(), true)).rejects.toThrow("evidence_integrity");
+    await expect(reconcileReceipt(h.store, h.receipts, KEY, h.clock, true)).rejects.toThrow("evidence_integrity");
     expect(h.receiptInserts()).toBe(1);
   });
   it("receipt checkpoint publication defeats a stale notice CAS and retains corrections after submission", async () => {
@@ -458,13 +514,15 @@ describe("delivery obligation assembly", () => {
 
 ## Task 19: Read-only, CLI and provider boundary assertions
 
-The remaining tests below use the same production stores and SDK transport; they are not waived because chunk 18 is comprehensive.
+The remaining tests below use the same production stores and SDK transport; they are not waived because Task 18 is comprehensive.
 
 **Create:** src/obligations/reader.test.ts
 
+- [ ] Add this complete reader test file.
+
 ~~~typescript
 import { describe, expect, it } from "vitest";
-import { harness, DUE } from "./testing/harness.js";
+import { harness, DUE, KEY, COLLECTION, REGISTRY } from "./testing/harness.js";
 import { decodeCursor } from "./reader.js";
 describe("read-only obligation views", () => {
   it("does not materialize, repair, index or send while showing current/backlog/history", async () => {
@@ -477,6 +535,59 @@ describe("read-only obligation views", () => {
     expect(await e.reader.discover("other", {})).toMatchObject({ definitions: [] });
     await expect(e.reader.show("unknown", { limit: 20 })).rejects.toThrow("unknown_obligation");
   });
+  it("inspects pending initial history before and after retention without publishing or inserting", async () => {
+    const h = await harness(), e = h.engine();
+    h.at("2026-09-07T07:00:00Z"); h.fake.failNext("activity_log", "insertOne");
+    await h.send(e.delivery);
+    expect((await h.store.occurrence(KEY)).acknowledgement?.receiptWriteState).toBe("pending");
+    for (const expired of [false, true]) {
+      if (expired) h.at("2026-09-09T07:00:00Z");
+      const snapshot = h.snapshot(), writes = h.fake.writes(), inserts = h.receiptInserts(), posts = h.submitted.length;
+      const definitions = await e.reader.discover("demo-producer", { section: "definitions" });
+      const overdue = await e.reader.discover("demo-producer", { section: "overdue" });
+      const shown = await e.reader.show("demo", { limit: 20 });
+      for (const view of [definitions, overdue, shown]) expect(view).toMatchObject({ receiptRetentionMs: 86400_000 });
+      expect(shown).toMatchObject({ occurrences: [{
+        history: expired ? "expired_unresolved" : "initial_write_pending",
+        acknowledgement: { receiptWriteState: "pending" }, sendable: false,
+      }] });
+      expect(h.snapshot()).toEqual(snapshot); expect(h.fake.writes()).toBe(writes);
+      expect(h.receiptInserts()).toBe(inserts); expect(h.submitted).toHaveLength(posts);
+    }
+  });
+  it("reports observed retention even when it differs from the writer's configured value", async () => {
+    const h = await harness(), e = h.engine();
+    h.fake.collection("activity_log").indexes.find((index) => index.key.timestamp === 1)!.expireAfterSeconds = 172800;
+    const before = h.snapshot();
+    expect(await e.reader.discover("demo-producer", {})).toMatchObject({ receiptRetentionMs: 172800_000 });
+    expect(await e.reader.show("demo", { limit: 20 })).toMatchObject({ receiptRetentionMs: 172800_000 });
+    expect(h.snapshot()).toEqual(before);
+  });
+  it("renders the newly reconciled occurrence rather than the caller's stale snapshot", async () => {
+    const h = await harness(), e = h.engine(); h.at("2026-09-07T07:00:00Z");
+    const stale = await h.store.materialize((await h.store.get("demo"))!, DUE);
+    await h.send(e.delivery);
+    expect(stale.delivery.state).toBe("pending");
+    const before = h.snapshot();
+    expect(await e.reader.occurrenceView(stale)).toMatchObject({
+      delivery: { state: "acknowledged" }, acknowledgement: { receiptWriteState: "persisted" },
+      history: "present", sendable: false,
+    });
+    expect(h.snapshot()).toEqual(before); expect(h.submitted).toHaveLength(1);
+  });
+  it.each(["admission", "scanned_current"] as const)("rejects missing required %s projection without fixing it", async (kind) => {
+    const h = await harness(), e = h.engine(); h.at(DUE);
+    const d = (await h.store.get("demo"))!, o = await h.store.materialize(d, DUE);
+    if (kind === "admission") await h.store.admit(o, e.bootId);
+    else await h.store.advance(d, DUE);
+    h.fake.collection(COLLECTION).rows.delete(KEY);
+    const before = h.snapshot(), writes = h.fake.writes();
+    await expect(e.reader.discover("demo-producer", { section: "definitions" })).rejects.toThrow("evidence_integrity");
+    await expect(e.reader.show("demo", { limit: 20 })).rejects.toThrow("evidence_integrity");
+    expect(h.snapshot()).toEqual(before); expect(h.fake.writes()).toBe(writes);
+    expect(h.submitted).toHaveLength(0);
+    if (kind === "admission") expect(h.fake.collection(REGISTRY).rows.get("demo")!.deliveryAdmission).toBeDefined();
+  });
   it("rejects invalid and cross-owner pagination cursors", () => {
     expect(() => decodeCursor("!!!", "overdue", "demo-producer")).toThrow("invalid_cursor");
     const cursor = Buffer.from(JSON.stringify({
@@ -487,59 +598,89 @@ describe("read-only obligation views", () => {
 });
 ~~~
 
-**Create:** src/cli/obligations.test.ts. Mock fromKeychain to return null; create a temp hive.yaml containing instance.id: demo and .env with only fake MONGODB_URI/MONGODB_DB values. Use afterEach to remove the temp directory and restore HIVE_HOME/MONGODB_* environment values. The complete core test block is:
+**Create:** src/cli/obligations.test.ts. Mock fromKeychain to return null, isolate environment selection and temporary config/.env fixtures, and route exact CliSelection values to distinct fake databases. The complete test file is:
+
+- [ ] Add this complete CLI test file.
 
 ~~~typescript
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runObligations } from "./obligations.js";
-import { harness, definition } from "../obligations/testing/harness.js";
+import { runObligations, type CliSelection } from "./obligations.js";
+import { harness, definition, KEY } from "../obligations/testing/harness.js";
 vi.mock("../keychain/from-keychain.js", () => ({ fromKeychain: () => null }));
 const roots: string[] = [];
 beforeEach(() => {
-  vi.stubEnv("MONGODB_URI", "mongodb://fake.invalid");
-  vi.stubEnv("MONGODB_DB", "hive_demo");
+  for (const key of ["MONGODB_URI", "MONGODB_DB", "HIVE_HOME", "HIVE_CONFIG"]) vi.stubEnv(key, "");
 });
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   vi.unstubAllEnvs();
 });
-function fixture() {
-  const root = mkdtempSync(join(tmpdir(), "hive-obligations-test-")); roots.push(root);
-  const path = join(root, "hive.yaml");
-  writeFileSync(path, "instance:\n  id: demo\n");
-  writeFileSync(join(root, ".env"), "MONGODB_URI=mongodb://fake.invalid\nMONGODB_DB=hive_demo\n");
-  return { root, path };
+function temporaryRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), "hive-obligations-test-")); roots.push(root); return root;
+}
+function fixture(instanceId = "demo", filename = "hive.yaml", root = temporaryRoot()) {
+  mkdirSync(root, { recursive: true });
+  const path = join(root, filename), uri = "mongodb://" + instanceId + ".invalid", dbName = "hive_" + instanceId;
+  writeFileSync(path, "instance:\n  id: " + instanceId + "\n");
+  const suffix = filename.match(/^hive-(.+)\.yaml$/)?.[1];
+  writeFileSync(join(root, suffix ? ".env-" + suffix : ".env"),
+    "MONGODB_URI=" + uri + "\nMONGODB_DB=" + dbName + "\n");
+  return { root, path, selection: { configPath: path, instanceId, uri, dbName } satisfies CliSelection };
+}
+function connection(h: Awaited<ReturnType<typeof harness>>, f: ReturnType<typeof fixture>) {
+  const close = vi.fn(async () => {});
+  const connect = vi.fn(async (selection: CliSelection) => {
+    expect(selection).toEqual(f.selection);
+    return { db: h.fake.db, close };
+  });
+  return { connect, close };
 }
 describe("instance-bound obligations CLI", () => {
-  it("reads without mutations and always closes its client", async () => {
-    const h = await harness(), f = fixture(), close = vi.fn(async () => {}), emit = vi.fn();
-    const writes = h.fake.writes();
-    await runObligations(["obligations", "list", "--config", f.path, "--json"], {
-      connect: async () => ({ db: h.fake.db, close }), clock: h.clock, emit,
-    });
-    expect(close).toHaveBeenCalledTimes(1); expect(h.fake.writes()).toBe(writes);
-    expect(JSON.parse(emit.mock.calls[0]![0])).toHaveProperty("definitions");
+  it("reads pending and expired initial history without any mutations and closes every client", async () => {
+    const h = await harness(), f = fixture(), c = connection(h, f), emit = vi.fn();
+    const e = h.engine(); h.at("2026-09-07T07:00:00Z");
+    h.fake.failNext("activity_log", "insertOne"); await h.send(e.delivery);
+    for (const expired of [false, true]) {
+      if (expired) h.at("2026-09-09T07:00:00Z");
+      const snapshot = h.snapshot(), writes = h.fake.writes(), inserts = h.receiptInserts(), posts = h.submitted.length;
+      for (const command of [["list"], ["show", "demo"]]) {
+        await runObligations(["obligations", ...command, "--config", f.path, "--json"], {
+          connect: c.connect, clock: h.clock, emit,
+        });
+        const view = JSON.parse(emit.mock.calls.at(-1)![0]);
+        expect(view.receiptRetentionMs).toBe(86400_000);
+        if (command[0] === "show") expect(view.occurrences[0]).toMatchObject({
+          history: expired ? "expired_unresolved" : "initial_write_pending",
+          acknowledgement: { receiptWriteState: "pending" }, sendable: false,
+        });
+        else expect(view).toHaveProperty("definitions");
+      }
+      expect(h.snapshot()).toEqual(snapshot); expect(h.fake.writes()).toBe(writes);
+      expect(h.receiptInserts()).toBe(inserts); expect(h.submitted).toHaveLength(posts);
+      expect((await h.store.occurrence(KEY)).acknowledgement?.receiptWriteState).toBe("pending");
+    }
+    expect(c.connect).toHaveBeenCalledTimes(4); expect(c.close).toHaveBeenCalledTimes(4);
   });
   it("refuses absent/mismatched sentinels without restamping", async () => {
     for (const absent of [true, false]) {
-      const h = await harness(), f = fixture(), close = vi.fn(async () => {});
+      const h = await harness(), f = fixture(), c = connection(h, f);
       const sentinel = h.fake.collection("instance_identity");
       if (absent) sentinel.rows.clear();
       else sentinel.rows.get("identity_sentinel")!.instanceId = "other";
       const writes = h.fake.writes();
       await expect(runObligations(["obligations", "deactivate", "demo", "--reason", "stop", "--config", f.path], {
-        connect: async () => ({ db: h.fake.db, close }), clock: h.clock, emit: () => {},
+        connect: c.connect, clock: h.clock, emit: () => {},
       })).rejects.toThrow("identity_unverified");
-      expect(h.fake.writes()).toBe(writes); expect(close).toHaveBeenCalledTimes(1);
+      expect(h.fake.writes()).toBe(writes); expect(c.close).toHaveBeenCalledTimes(1);
     }
   });
   it("registers identically, rejects conflicts, and deactivates only once without changing schedules", async () => {
-    const h = await harness(), f = fixture(), json = join(f.root, "definition.json");
+    const h = await harness(), f = fixture(), c = connection(h, f), json = join(f.root, "definition.json");
     writeFileSync(json, JSON.stringify(definition));
-    const deps = { connect: async () => ({ db: h.fake.db, close: async () => {} }), clock: h.clock, emit: () => {} };
+    const deps = { connect: c.connect, clock: h.clock, emit: () => {} };
     const args = ["obligations", "register", "--file", json, "--config", f.path];
     await runObligations(args, deps); await runObligations(args, deps);
     writeFileSync(json, JSON.stringify({ ...definition, deliverable: "Different" }));
@@ -550,14 +691,126 @@ describe("instance-bound obligations CLI", () => {
     await runObligations(["obligations", "deactivate", "demo", "--reason", "second", "--config", f.path], deps);
     expect((await h.store.get("demo"))!.deactivatedAt).toEqual(cutoff);
     expect((await h.fake.collection("agent_definitions").findOne({ _id: "demo-producer" }))!.schedule).toEqual([]);
+    expect(c.close).toHaveBeenCalledTimes(5);
+  });
+  it.each(["config_file", "config_directory", "config_suffix", "home", "home_config", "instance"] as const)(
+    "routes %s to the selected instance and leaves the other database intact", async (mode) => {
+      const original = await harness(), selected = await harness({ instanceId: "other" });
+      const f1 = fixture(), homeRoot = temporaryRoot();
+      const f2 = fixture("other", ["config_suffix", "home_config"].includes(mode) ? "hive-selected.yaml" : "hive.yaml",
+        mode === "instance" ? join(homeRoot, "services", "hive", "other") : undefined);
+      let args: string[];
+      if (mode === "instance") { vi.stubEnv("HOME", homeRoot); args = ["--instance", "other"]; }
+      else if (mode === "home" || mode === "home_config") {
+        vi.stubEnv("HIVE_HOME", f2.root);
+        if (mode === "home_config") vi.stubEnv("HIVE_CONFIG", "hive-selected.yaml");
+        args = [];
+      } else args = ["--config", mode === "config_directory" ? f2.root : f2.path];
+      const c1 = connection(original, f1), c2 = connection(selected, f2);
+      const connect = vi.fn(async (selection: CliSelection) => {
+        if (selection.dbName === f1.selection.dbName) return c1.connect(selection);
+        if (selection.dbName === f2.selection.dbName) return c2.connect(selection);
+        throw new Error("unexpected_target");
+      });
+      const untouched = original.snapshot(), writes = selected.fake.writes();
+      selected.at("2026-09-07T07:00:00Z");
+      await runObligations(["obligations", "deactivate", "demo", "--reason", "selected", ...args], {
+        connect, clock: selected.clock, emit: () => {},
+      });
+      expect(connect).toHaveBeenCalledWith(f2.selection);
+      expect(c1.connect).not.toHaveBeenCalled(); expect(c2.close).toHaveBeenCalledTimes(1);
+      expect(original.snapshot()).toEqual(untouched);
+      expect(selected.fake.writes()).toBeGreaterThan(writes);
+      expect((await selected.store.get("demo"))!.deactivatedAt).toEqual(selected.clock());
+    },
+  );
+  it("captures environment overrides in the selected target before sentinel verification", async () => {
+    const h = await harness({ instanceId: "other", dbName: "hive_override" }), f = fixture("other");
+    vi.stubEnv("MONGODB_URI", "mongodb://override.invalid"); vi.stubEnv("MONGODB_DB", "hive_override");
+    const selected = { ...f, selection: { ...f.selection, uri: "mongodb://override.invalid", dbName: "hive_override" } };
+    const c = connection(h, selected);
+    await runObligations(["obligations", "list", "--config", f.path], { connect: c.connect, clock: h.clock, emit: () => {} });
+    expect(c.connect).toHaveBeenCalledWith(selected.selection); expect(c.close).toHaveBeenCalledTimes(1);
+  });
+  it("rejects missing/conflicting selection before connecting", async () => {
+    const f = fixture(), connect = vi.fn(async () => { throw new Error("must_not_connect"); });
+    const deps = { connect, clock: () => new Date(0), emit: vi.fn() };
+    await expect(runObligations(["obligations", "list"], deps)).rejects.toThrow("explicit_instance_required");
+    await expect(runObligations(["obligations", "list", "--config", f.path, "--instance", "demo"], deps))
+      .rejects.toThrow("choose_config_or_instance");
+    expect(connect).not.toHaveBeenCalled(); expect(deps.emit).not.toHaveBeenCalled();
   });
 });
 ~~~
 
-**Modify:** src/agents/provider-adapters/tool-bridge.test.ts. Append to its existing real AgentRunner/InMemoryTransport test harness (makeMemoryAgentConfig and makeMemMgr already exist). Import harness, DUE from ../../obligations/testing/harness.js, Client from @modelcontextprotocol/sdk/client/index.js, and InMemoryTransport from @modelcontextprotocol/sdk/inMemory.js.
+**Modify:** src/agents/provider-adapters/tool-bridge.test.ts. Append to its existing real AgentRunner/InMemoryTransport test harness (makeMemoryAgentConfig and makeMemMgr already exist). Import harness, definition, DUE from ../../obligations/testing/harness.js, Client from @modelcontextprotocol/sdk/client/index.js, and InMemoryTransport from @modelcontextprotocol/sdk/inMemory.js.
+
+- [ ] Add the imports and append the provider cases below.
 
 ~~~typescript
+import { harness, definition, DUE } from "../../obligations/testing/harness.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+
 describe("KPR-456 provider schedule capability", () => {
+  it.each(["claude", "lane-b"] as const)("keeps two overlapping %s runners bound to their own producer", async (lane) => {
+    const h = await harness(), e = h.engine();
+    await h.fake.collection("agent_definitions").insertOne({ _id: "other-producer", schedule: [] });
+    await h.store.register({ ...definition, _id: "other", producerAgentId: "other-producer",
+      destination: { kind: "slack", channelId: "C00000003" } }, h.clock());
+    h.at("2026-09-07T07:00:00Z");
+    const calls: Array<{ producer: string; input: unknown }> = [];
+    const capability = {
+      discover: (id: string, input: unknown) => e.reader.discover(id, input),
+      deliver: (id: string, input: unknown) => { calls.push({ producer: id, input }); return e.delivery.deliver(id, input); },
+    };
+    const closers: Array<() => Promise<void>> = [];
+    async function open(id: string) {
+      const runner = new AgentRunner(makeMemoryAgentConfig({ id, coreServers: ["schedule"] }),
+        makeMemMgr() as never, [], new Map(), "{}", undefined, undefined, h.db, undefined, undefined,
+        { obligations: capability });
+      const servers = runner.buildInProcessServers();
+      if (lane === "claude") {
+        const client = new Client({ name: id, version: "1" });
+        const [ct, st] = InMemoryTransport.createLinkedPair();
+        await servers.schedule!.instance.connect(st); await client.connect(ct);
+        closers.push(async () => { await client.close(); await servers.schedule!.instance.close(); });
+        return async (input: Record<string, unknown>) => JSON.stringify(await client.callTool({ name: "deliver_obligation", arguments: input }));
+      }
+      const bridge = new ToolBridge({
+        inventory: runner.buildToolTransportInventory().filter((entry) => entry.name === "schedule"),
+        inProcessServers: servers, gate: async () => ({ behavior: "allow" }),
+        signal: new AbortController().signal, agentId: id, sessionCwd: tmpdir(), skillIndex: [],
+      });
+      const tools = await bridge.connect(); closers.push(() => bridge.close());
+      return async (input: Record<string, unknown>) => tools.find((tool) => tool.name === "mcp__schedule__deliver_obligation")!.execute(input);
+    }
+    let release!: () => void, reached!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    const bothEntered = new Promise<void>((resolve) => { reached = resolve; }); let entered = 0;
+    try {
+      const a = await open("demo-producer"), b = await open("other-producer");
+      const inputA = { obligationId: "demo", dueAt: DUE.toISOString(), text: "A" };
+      const inputB = { obligationId: "other", dueAt: DUE.toISOString(), text: "B" };
+      expect(await a(inputB)).not.toContain("confirmed_delivery");
+      expect(await b(inputA)).not.toContain("confirmed_delivery"); expect(h.submitted).toHaveLength(0);
+      calls.length = 0;
+      h.beforeResponse(async () => { if (++entered === 2) reached(); await waiting; });
+      const sendingA = a(inputA), sendingB = b(inputB); await bothEntered;
+      expect(h.submitted.map((post) => post.channel).sort()).toEqual(["C00000001", "C00000003"]);
+      expect(calls).toEqual(expect.arrayContaining([
+        { producer: "demo-producer", input: inputA }, { producer: "other-producer", input: inputB },
+      ]));
+      release();
+      for (const result of await Promise.all([sendingA, sendingB])) expect(result).toContain("confirmed_delivery");
+      const rows = [...h.fake.collection("activity_log").rows.values()];
+      expect(rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({ obligationId: "demo", producerAgentId: "demo-producer", destination: definition.destination }),
+        expect.objectContaining({ obligationId: "other", producerAgentId: "other-producer", destination: { kind: "slack", channelId: "C00000003" } }),
+      ]));
+      expect(rows).toHaveLength(2); expect(h.submitted).toHaveLength(2);
+    } finally { release(); h.beforeResponse(); for (const close of closers) await close(); }
+  });
   it.each(["claude", "lane-b"] as const)("round-trips the strict delivery tool through %s", async (lane) => {
     const h = await harness(), e = h.engine();
     h.at("2026-09-07T07:00:00Z");
@@ -620,7 +873,7 @@ For manager forwarding, extend its existing new-AgentRunner spy fixture: a norma
 | Live notice request overlaps another sweep | Block h.beforeResponse; run a second same-boot sweeper and force a Mongo read failure there; first claim remains sending under the same exact token, then may acknowledge once |
 | Receipt read failure at deadline | Deliver/ack checkpoint pending, fail activity_log.findOne, sweep → no notice and no evaluatedAt success; next tick repairs and evaluates |
 | Receipt/checkpoint exact mismatch | Mutate retained destination/message timestamp or row fields; reader shows integrity error and never reports confirmed delivery |
-| Shutdown drain | Delay a real runtime's poster/receipt insertion; call runtime.stop, assert it has not resolved, new deliver returns unavailable, release barrier, assert stop completes before Slack/Mongo close spies |
+| Shutdown drain | Delay a real runtime's poster/receipt insertion; call runtime.stop, assert it has not resolved, new deliver returns unavailable, release barrier, assert stop completes only after the receipt write; source-anchor tests verify the production dependency-close order |
 | Scan fairness | Seed 25 definitions, fail the first definition's occurrence persistence repeatedly; bounded page rotation still advances later definitions, failed cursor does not skip its due instant |
 | Malformed projections | Remove/malformed window/definition/ack fields; show returns an explicit bounded integrity error, never manufactures missing state |
 | Registration validation | Unknown producer, extra engine fields, invalid thread/channel, conflicting identical ID, missing noticeDestination; zero registration side effects |
@@ -637,6 +890,6 @@ The table is a coverage index. Apply the complete tests in [chunk 7](kpr-456-pla
 - [ ] Commit remaining verified tests with:
 
 ~~~bash
-git add src/obligations/testing/harness.ts src/obligations/testing/fake-db.ts src/obligations/obligations.integration.test.ts src/obligations/reader.test.ts src/cli/obligations.test.ts src/agents/provider-adapters/tool-bridge.test.ts src/agents/agent-runner.test.ts src/agents/agent-manager.test.ts src/boot-order.test.ts
+git add src/obligations/testing/harness.ts src/obligations/testing/fake-db.ts src/obligations/testing/refusals.ts src/obligations/obligations.integration.test.ts src/obligations/reader.test.ts src/cli/obligations.test.ts src/agents/provider-adapters/tool-bridge.test.ts src/agents/agent-runner.test.ts src/agents/agent-manager.test.ts src/boot-order.test.ts
 git commit -m "test: cover delivery obligation races retention recovery and provider boundaries"
 ~~~

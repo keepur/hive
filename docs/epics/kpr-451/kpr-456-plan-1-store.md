@@ -18,7 +18,7 @@ const label = (max: number) => z.string().trim().min(1).max(max);
 export const destinationSchema = z.object({
   kind: z.literal("slack"),
   channelId: z.string().regex(/^[CDG][A-Z0-9]{8,31}$/),
-  threadTs: z.string().regex(/^\d{10,}\.\d{6}$/).optional(),
+  threadTs: z.string().max(100).regex(/^\d{10,}\.\d{6}$/).optional(),
 }).strict();
 export const deadlineSchema = z.object({
   localTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/),
@@ -288,6 +288,17 @@ import {
 import { windowStart } from "./deadlines.js";
 
 const WRITE = { writeConcern: { w: "majority" as const, wtimeoutMS: 5000 } };
+export const DURABLE_READ = {
+  readConcern: { level: "majority" as const },
+  readPreference: "primary" as const, maxTimeMS: 5000,
+};
+// All wrappers over the engine's one guarded Db share coordination. This
+// never grants send authority; retained tokens and acknowledged CAS do that.
+const coordination = new WeakMap<Db, {
+  receiptTails: Map<string, Promise<void>>;
+  activeDeliveries: Set<string>;
+  activeNotices: Set<string>;
+}>();
 export function duplicate(err: unknown): boolean {
   return typeof err === "object" && err !== null && "code" in err && err.code === 11000;
 }
@@ -298,10 +309,33 @@ export class ObligationStore {
   readonly definitions: Collection<Obligation>;
   readonly occurrences: Collection<Occurrence>;
   readonly telemetry: Collection;
+  readonly activeDeliveries: Set<string>;
+  readonly activeNotices: Set<string>;
+  private readonly receiptTails: Map<string, Promise<void>>;
   constructor(readonly db: Db) {
+    let shared = coordination.get(db);
+    if (!shared) {
+      shared = { receiptTails: new Map(), activeDeliveries: new Set(), activeNotices: new Set() };
+      coordination.set(db, shared);
+    }
+    this.receiptTails = shared.receiptTails;
+    this.activeDeliveries = shared.activeDeliveries;
+    this.activeNotices = shared.activeNotices;
     this.definitions = db.collection<Obligation>("delivery_obligations");
     this.occurrences = db.collection<Occurrence>("delivery_obligation_occurrences");
     this.telemetry = db.collection("telemetry");
+  }
+  async withReceiptLock<T>(id: string, run: () => Promise<T>): Promise<T> {
+    const previous = this.receiptTails.get(id) ?? Promise.resolve();
+    let release!: () => void;
+    const tail = new Promise<void>((resolve) => { release = resolve; });
+    this.receiptTails.set(id, tail);
+    await previous;
+    try { return await run(); }
+    finally {
+      release();
+      if (this.receiptTails.get(id) === tail) this.receiptTails.delete(id);
+    }
   }
   async init(): Promise<void> {
     await this.definitions.createIndex({ producerAgentId: 1, _id: 1 });
@@ -313,11 +347,11 @@ export class ObligationStore {
     await this.occurrences.createIndex({ producerAgentId: 1, dueAt: 1, _id: 1 });
   }
   async get(id: string): Promise<Obligation | null> {
-    const raw = await this.definitions.findOne({ _id: id });
+    const raw = await this.definitions.findOne({ _id: id }, DURABLE_READ);
     return raw ? parseStored(obligationSchema, raw) : null;
   }
   async occurrence(id: string): Promise<Occurrence> {
-    const raw = await this.occurrences.findOne({ _id: id });
+    const raw = await this.occurrences.findOne({ _id: id }, DURABLE_READ);
     if (!raw) return fail("occurrence_missing");
     return parseStored(occurrenceSchema, raw);
   }
@@ -388,10 +422,10 @@ export class ObligationStore {
     assertWrite(result);
     return result.matchedCount === 1;
   }
-  async admit(o: Occurrence, bootId: string): Promise<Admission | null> {
+  async admit(o: Occurrence, bootId: string, claimToken = randomUUID()): Promise<Admission | null> {
     const a: Admission = {
       occurrenceId: o._id, dueAt: o.dueAt, intentId: o.delivery.intentId,
-      claimToken: randomUUID(), ownerBootId: bootId,
+      claimToken, ownerBootId: bootId,
     };
     try {
       const result = await this.definitions.updateOne({
@@ -417,13 +451,13 @@ export class ObligationStore {
   async definitionsPage(filter: Filter<Obligation>, after: string | undefined, limit: number): Promise<Obligation[]> {
     const rows = await this.definitions.find({
       $and: [filter, ...(after ? [{ _id: { $gt: after } }] : [])],
-    }).sort({ _id: 1 }).limit(limit).toArray();
+    }, DURABLE_READ).sort({ _id: 1 }).limit(limit).toArray();
     return rows.map((v) => parseStored(obligationSchema, v));
   }
   async occurrencesPage(filter: Filter<Occurrence>, after: string | undefined, limit: number): Promise<Occurrence[]> {
     const rows = await this.occurrences.find({
       $and: [filter, ...(after ? [{ _id: { $gt: after } }] : [])],
-    }).sort({ _id: 1 }).limit(limit).toArray();
+    }, DURABLE_READ).sort({ _id: 1 }).limit(limit).toArray();
     return rows.map((v) => parseStored(occurrenceSchema, v));
   }
   async definitionFor(o: Occurrence): Promise<Obligation> {
@@ -437,11 +471,26 @@ export class ObligationStore {
     }
     return d;
   }
+  async admittedOccurrence(d: Obligation): Promise<Occurrence | null> {
+    const a = d.deliveryAdmission;
+    if (!a) return null;
+    const raw = await this.occurrences.findOne({ _id: a.occurrenceId }, DURABLE_READ);
+    if (!raw) return fail("evidence_integrity");
+    const o = parseStored(occurrenceSchema, raw);
+    await this.definitionFor(o);
+    if (o.obligationId !== d._id || !same(o.dueAt, a.dueAt)
+      || o._id !== occurrenceId(d._id, a.dueAt) || o.delivery.intentId !== a.intentId) {
+      return fail("evidence_integrity");
+    }
+    return o;
+  }
 }
 export type { Registration };
 ~~~
 
 A CAS uncertain-result exception propagates; sender and reconciler explicitly re-read token/state before further action. Do not add a generic retry around a Slack call. The release operation matches the exact admission token; deactivation never unsets it.
+
+Every observation that substitutes for an acknowledged write uses DURABLE_READ, including admission/transfer/settlement, registry idempotence and receipt/marker recovery. Local-only visibility after a write-concern timeout is insufficient: a missing majority-confirmed token leaves the outcome unresolved, and read failure propagates without permission to send. The bounded primary majority read applies to projected evidence pages as well. The per-Db queue serializes receipt insertion and terminal retention decisions across all sender/sweeper wrappers; all runtime wrappers must receive the same guarded Db object. Active delivery and notice tokens describe currently executing invocations only, are registered before their claim writes, and are removed in finally; they are never leases or durable proof.
 
 - [ ] Verify the strict date/nesting schema and actual unique-index behavior using chunk 5's atomic fake. In tests, permit Mongo-generated _id on receipt/telemetry rows only; registry and occurrences always have string _id.
 

@@ -18,7 +18,7 @@ import {
   cancelledAt, fail, ObligationError,
 } from "./types.js";
 import { scan, localDeadline } from "./deadlines.js";
-import { ObligationStore, assertWrite } from "./store.js";
+import { ObligationStore, assertWrite, DURABLE_READ } from "./store.js";
 import { ReceiptStore, reconcileReceipt, type Evidence } from "./receipts.js";
 import { DeliveryService, claimable } from "./delivery.js";
 import { escapeSlack, type ObligationPoster } from "./slack-post.js";
@@ -33,6 +33,17 @@ export function laggingFilter(now: Date): Filter<Obligation> {
       { $expr: { $lt: ["$scanThrough", "$deactivatedAt"] } },
     ],
   };
+}
+export function recoveryFilter(now?: Date): Filter<Occurrence> {
+  return { $or: [
+    // Inspect all delivery/notice intents; invocation tokens distinguish active
+    // same-boot work from abandoned work. Counting active work is conservative.
+    { "delivery.state": "sending" },
+    { "notice.state": "sending" },
+    { repairAt: now ? { $type: "date", $lte: now } : { $type: "date" } },
+    { "acknowledgement.receiptWriteState": "pending",
+      ...(now ? { $or: [{ repairAt: null }, { repairAt: { $lte: now } }] } : {}) },
+  ] };
 }
 export function deliveryEvaluation(e: Evidence): Occurrence["evaluation"] {
   const o = e.occurrence;
@@ -75,6 +86,7 @@ export class ObligationSweeper {
     if (this.timer) return;
     this.stopped = false;
     await this.sweepOnce();
+    if (this.stopped || this.timer) return;
     this.timer = setInterval(() => { void this.sweepOnce(); }, INTERVAL);
     this.timer.unref?.();
   }
@@ -123,29 +135,25 @@ export class ObligationSweeper {
       this.admissionCursor = d._id;
     }
     if (defs.length < 100) this.admissionCursor = undefined;
-    const filter: Filter<Occurrence> = { $or: [
-      { "delivery.state": "sending", "delivery.ownerBootId": { $ne: this.bootId } },
-      { "notice.state": "sending", "notice.ownerBootId": { $ne: this.bootId } },
-      { repairAt: { $type: "date", $lte: now } },
-    ] };
+    const filter = recoveryFilter(now);
     const rows = await this.store.occurrencesPage(filter, this.recoveryCursor, 100);
     for (const before of rows) {
       try {
         const o = await this.store.occurrence(before._id);
         const patch: Partial<Occurrence> = {};
-        if (o.delivery.state === "sending" && o.delivery.ownerBootId !== this.bootId) {
+        if (this.delivery.interrupted(o)) {
           patch.delivery = { ...o.delivery, state: "unknown", reason: "interrupted_attempt" };
           patch.checkAt = now;
         }
-        if (o.notice?.state === "sending" && o.notice.ownerBootId !== this.bootId) {
+        if (o.notice?.state === "sending" && !this.noticeIsActive(o.notice)) {
           patch.notice = { ...o.notice, state: "unknown", reason: "interrupted_attempt" };
           patch.checkAt = now;
         }
         if (Object.keys(patch).length) await this.store.cas(o, patch);
         const latest = await this.store.occurrence(o._id);
-        if (latest.acknowledgement?.receiptWriteState === "pending") {
-          await reconcileReceipt(this.store, this.receipts, o._id, now, true);
-        }
+        // Terminal receipt states may still have an obsolete repairAt after
+        // a lost CAS acknowledgement. The same queue clears it without repair.
+        await reconcileReceipt(this.store, this.receipts, latest._id, this.clock, true);
       } catch {
         ok = false;
         try {
@@ -157,6 +165,10 @@ export class ObligationSweeper {
     }
     if (rows.length < 100) this.recoveryCursor = undefined;
     return ok;
+  }
+  private noticeIsActive(notice: Attempt): boolean {
+    return notice.ownerBootId === this.bootId && notice.claimToken !== undefined
+      && this.store.activeNotices.has(notice.claimToken);
   }
   async evaluate(id: string, now: Date): Promise<void> {
     let ownedNoticeToken: string | undefined;
@@ -170,7 +182,7 @@ export class ObligationSweeper {
       }
       if (o.dueAt > now) return;
       // This may repair a pending receipt and returns its NEW revision.
-      const e = await reconcileReceipt(this.store, this.receipts, id, now, true);
+      const e = await reconcileReceipt(this.store, this.receipts, id, this.clock, true);
       o = e.occurrence;
       const evaluation = deliveryEvaluation(e);
       if (evaluation === "on_time" || evaluation === "evidence_incomplete" || evaluation === "integrity_error") {
@@ -196,17 +208,25 @@ export class ObligationSweeper {
       // Re-read cutoff and exact receipt/checkpoint immediately before CAS.
       const cutoff = await this.store.definitionFor(o);
       if (cancelledAt(cutoff, o.dueAt)) continue;
-      const finalEvidence = await reconcileReceipt(this.store, this.receipts, id, now, true);
+      const finalEvidence = await reconcileReceipt(this.store, this.receipts, id, this.clock, true);
       if (finalEvidence.occurrence.revision !== o.revision
         || deliveryEvaluation(finalEvidence) !== evaluation) continue;
+      const token = randomUUID();
       const notice: Attempt = {
         intentId: o.notice?.intentId ?? o._id + "/notice",
-        state: "sending", claimToken: randomUUID(), ownerBootId: this.bootId, startedAt: now,
+        state: "sending", claimToken: token, ownerBootId: this.bootId, startedAt: now,
       };
       if (!this.canWrite()) return fail("identity_unverified");
+      // Register before the CAS can commit or pause; the token remains live
+      // through posting, outcome publication and local exception cleanup.
+      ownedNoticeToken = token;
+      this.store.activeNotices.add(token);
       // Unknown claim result never proceeds to post. Recovery retains it.
-      if (!(await this.store.cas(o, { notice, evaluation, evaluatedAt: now, checkAt: now }))) continue;
-      ownedNoticeToken = notice.claimToken;
+      if (!(await this.store.cas(o, { notice, evaluation, evaluatedAt: now, checkAt: now }))) {
+        this.store.activeNotices.delete(token);
+        ownedNoticeToken = undefined;
+        continue;
+      }
       if (!this.canWrite()) return fail("identity_unverified");
       const outcome = await this.poster.post(o.definition.noticeDestination, noticeText(o));
       for (let publish = 0; publish < 8; publish++) {
@@ -242,6 +262,8 @@ export class ObligationSweeper {
         } catch { /* retain the non-retryable durable intent */ }
       }
       throw err;
+    } finally {
+      if (ownedNoticeToken) this.store.activeNotices.delete(ownedNoticeToken);
     }
   }
   private async evaluations(now: Date): Promise<boolean> {
@@ -275,27 +297,40 @@ export class ObligationSweeper {
     const recovered = await this.recover(now);
     const materialized = await this.materialize(now);
     const evaluated = await this.evaluations(now);
-    const backlogObligations = await this.store.definitions.countDocuments(laggingFilter(now));
+    const backlogObligations = await this.store.definitions.countDocuments(laggingFilter(now), DURABLE_READ);
     const pendingOccurrences = await this.store.occurrences.countDocuments({
       dueAt: { $lte: now }, checkAt: { $type: "date" },
-    });
+    }, DURABLE_READ);
+    const pendingAdmissions = await this.store.definitions.countDocuments(
+      { deliveryAdmission: { $exists: true } }, DURABLE_READ,
+    );
+    // No dueAt/cancellation/retry-time filter: throttled or future evidence
+    // repair and retained admissions are unfinished work between pages too.
+    const pendingRecoveryOccurrences = await this.store.occurrences.countDocuments(
+      recoveryFilter(), DURABLE_READ,
+    );
+    const backlogCount = backlogObligations + pendingOccurrences
+      + pendingAdmissions + pendingRecoveryOccurrences;
     if (recovered && materialized && evaluated) this.lastSuccessfulSweep = now;
     assertWrite(await this.store.telemetry.updateOne(
       { kind: "delivery_obligations_stats" },
       { $set: {
         kind: "delivery_obligations_stats", timestamp: now,
         lastSuccessfulSweep: this.lastSuccessfulSweep,
-        backlogObligations, pendingOccurrences,
-        backlogCount: backlogObligations + pendingOccurrences,
-        state: recovered && materialized && evaluated ? "ok" : "degraded",
-      } }, { upsert: true },
+        backlogObligations, pendingOccurrences, pendingAdmissions, pendingRecoveryOccurrences,
+        backlogCount,
+        state: recovered && materialized && evaluated
+          ? (backlogCount === 0 ? "ok" : "backlog") : "degraded",
+      } }, { upsert: true, writeConcern: { w: "majority", wtimeoutMS: 5000 } },
     ));
   }
 }
 export { obligationSchema, occurrenceSchema };
 ~~~
 
-A local exception fences its unknown publication by the exact notice claim token held by that evaluate invocation. Two live sweepers share a boot ID, so ownerBootId alone must never be used to interrupt another sweeper's request.
+A local exception fences its unknown publication by the exact notice claim token held by that evaluate invocation. Register the shared active notice token before claiming, including majority-committed claims whose acknowledgement throws. A definitely losing CAS removes only that token before retrying; finally removes it on every other exit. If both outcome publication and exception cleanup fail, the retained sending intent is recovered to unknown on a later same-boot sweep once its token is inactive, without another post. Recovery scans sending notices regardless of boot, deadline or cancellation; it preserves active same-boot tokens and token-fences any abandoned intent through the observed occurrence revision. Two live sweepers share a boot ID and the same guarded Db coordination, so ownerBootId alone must never be used to interrupt another sweeper's request. No timeout or age threshold makes a live notice token abandoned.
+
+Heartbeat backlogCount counts unfinished work units across the materialization, due-evaluation, registry-admission and occurrence-recovery lanes. An occurrence can have both evaluation and recovery work, so the sum is not a distinct-occurrence count. Recovery counts include future/cancelled checkpoints and delayed repairAt work; bounded pages and technical retry delays cannot hide them. A successful bounded tick with remaining work reports state=backlog; failed lanes report degraded.
 
 ## Task 8: Bounded, read-only inspection and producer discovery
 
@@ -308,10 +343,10 @@ import { z } from "zod";
 import type { Filter } from "mongodb";
 import {
   type Obligation, type Occurrence, type DiscoveryInput,
-  discoveryInputSchema, cancelledAt, fail, occurrenceSchema, parseStored,
+  discoveryInputSchema, cancelledAt, fail, occurrenceSchema, parseStored, occurrenceId,
 } from "./types.js";
 import { adjacent, currentDue, localDeadline } from "./deadlines.js";
-import { ObligationStore } from "./store.js";
+import { ObligationStore, DURABLE_READ } from "./store.js";
 import { ReceiptStore, reconcileReceipt } from "./receipts.js";
 import { claimable, safeError } from "./delivery.js";
 
@@ -334,7 +369,7 @@ export function decodeCursor(value: string | undefined, section: string, owner: 
 export class ObligationReader {
   constructor(readonly store: ObligationStore, readonly receipts: ReceiptStore, readonly clock: () => Date) {}
   async heartbeat(): Promise<unknown> {
-    const row = await this.store.telemetry.findOne({ kind: "delivery_obligations_stats" });
+    const row = await this.store.telemetry.findOne({ kind: "delivery_obligations_stats" }, DURABLE_READ);
     if (!row) return { state: "unknown", reason: "no_heartbeat" };
     const now = this.clock().getTime();
     const last = row.lastSuccessfulSweep instanceof Date ? row.lastSuccessfulSweep.getTime() : null;
@@ -344,12 +379,15 @@ export class ObligationReader {
       stale: !last || now - last > 120_000,
       backlogCount: row.backlogCount, backlogObligations: row.backlogObligations,
       pendingOccurrences: row.pendingOccurrences,
+      pendingAdmissions: row.pendingAdmissions,
+      pendingRecoveryOccurrences: row.pendingRecoveryOccurrences,
     };
   }
   async occurrenceView(o: Occurrence): Promise<unknown> {
     try {
+      const evidence = await reconcileReceipt(this.store, this.receipts, o._id, this.clock, false);
+      o = evidence.occurrence;
       const d = await this.store.definitionFor(o);
-      const evidence = await reconcileReceipt(this.store, this.receipts, o._id, this.clock(), false);
       const effectiveCancelled = cancelledAt(d, o.dueAt);
       return {
         occurrenceId: o._id, obligationId: o.obligationId, dueAt: o.dueAt,
@@ -369,18 +407,23 @@ export class ObligationReader {
     }
   }
   private async definitionView(d: Obligation): Promise<unknown> {
+    // A retained admission requires its exact projection even when its dueAt
+    // is old, future or cancelled. This validation performs only reads.
+    await this.store.admittedOccurrence(d);
     const now = this.clock();
     const due = currentDue(d, now);
     const next = adjacent(d.deadline, now, 1);
     const nextEligible = d.deactivatedAt && next > d.deactivatedAt ? null : next;
     let current: unknown = null;
     if (due) {
-      const id = d._id + "/" + due.toISOString();
-      const found = await this.store.occurrences.findOne({ _id: id });
+      const id = occurrenceId(d._id, due);
+      const found = await this.store.occurrences.findOne({ _id: id }, DURABLE_READ);
+      if (!found && due <= d.scanThrough) return fail("evidence_integrity");
       current = found ? await this.occurrenceView(await this.store.occurrence(id))
-        : { occurrenceId: id, obligationId: d._id, dueAt: due, sendable: true, delivery: "pending" };
+        : { occurrenceId: id, obligationId: d._id, dueAt: due,
+          sendable: d.deliveryAdmission === undefined, delivery: "pending", materialized: false };
     }
-    const recent = await this.store.occurrences.find({ obligationId: d._id })
+    const recent = await this.store.occurrences.find({ obligationId: d._id }, DURABLE_READ)
       .sort({ dueAt: -1 }).limit(5).toArray();
     return {
       definition: d, nextDeadline: nextEligible,
@@ -400,6 +443,7 @@ export class ObligationReader {
       definitions: await Promise.all(page.map((d) => this.definitionView(d))),
       nextCursor: rows.length > input.limit ? cursor("definitions", owner, page.at(-1)!._id) : null,
       heartbeat: await this.heartbeat(),
+      receiptRetentionMs: await this.receipts.retentionMs(),
       overdueQuery: { section: "overdue", limit: input.limit },
     };
   }
@@ -416,13 +460,14 @@ export class ObligationReader {
     };
     const rows = await this.store.occurrencesPage(filter, after, input.limit + 1);
     const page = rows.slice(0, input.limit);
-    const backlog = await this.store.definitions.find({ producerAgentId: agentId })
+    const backlog = await this.store.definitions.find({ producerAgentId: agentId }, DURABLE_READ)
       .sort({ scanThrough: 1 }).limit(1).toArray();
     return {
       occurrences: await Promise.all(page.map((o) => this.occurrenceView(o))),
       nextCursor: rows.length > input.limit ? cursor("overdue", agentId, page.at(-1)!._id) : null,
       earliestScanThrough: backlog[0]?.scanThrough ?? null,
       heartbeat: await this.heartbeat(),
+      receiptRetentionMs: await this.receipts.retentionMs(),
       note: "Current keys and per-definition scan/backlog are in section definitions. Acknowledged history is in recent occurrences and the operator show command.",
     };
   }
@@ -437,6 +482,7 @@ export class ObligationReader {
       occurrences: await Promise.all(page.map((o) => this.occurrenceView(o))),
       nextCursor: rows.length > input.limit ? cursor("history", id, page.at(-1)!._id) : null,
       heartbeat: await this.heartbeat(),
+      receiptRetentionMs: await this.receipts.retentionMs(),
     };
   }
 }

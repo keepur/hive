@@ -167,7 +167,7 @@ import type { DeliveryCapability } from "../obligations/types.js";
 obligations?: DeliveryCapability;
 ~~~
 
-In AgentRunner fields add and initialize in its constructor:
+- [ ] In AgentRunner fields add and initialize in its constructor:
 
 ~~~typescript
 private readonly obligations?: DeliveryCapability;
@@ -177,7 +177,7 @@ private readonly obligations?: DeliveryCapability;
 this.obligations = runnerOptions?.obligations;
 ~~~
 
-Replace only the existing createScheduleMcpServer argument at the already gated construction site:
+- [ ] Replace only the existing createScheduleMcpServer argument at the already gated construction site:
 
 ~~~typescript
 this.scheduleMcpServer = createScheduleMcpServer({
@@ -199,7 +199,7 @@ setDeliveryObligations(capability: DeliveryCapability): void {
 }
 ~~~
 
-Replace normal-runner options construction in createProviderAdapter with:
+- [ ] Replace normal-runner options construction in createProviderAdapter with:
 
 ~~~typescript
 const runnerOptions: AgentRunnerOptions | undefined =
@@ -504,7 +504,7 @@ The checker runs independently every 30 seconds and never invokes an agent. A mi
 
 Deactivation is prospective: deadlines at/before its cutoff remain due. Later expectations are cancelled. An attempt admitted before the atomic deactivation update may finish and preserve its evidence; a fresh admission after the cutoff is refused. The command reports outstanding attempts. Schedules are unaffected.
 
-Producer discovery uses section=definitions for current keys and section=overdue plus nextCursor for older unresolved keys, including past deadlines of deactivated definitions. Acknowledged/cancelled history and sending/unknown states are non-sendable. list/show are read-only and never materialize a deadline, repair a receipt, or send a notice. JSON dates are UTC. The heartbeat reports unfinished work units and becomes unknown when its last successful sweep is older than 120 seconds.
+Producer discovery uses section=definitions for current keys and section=overdue plus nextCursor for older unresolved keys, including past deadlines of deactivated definitions. Acknowledged/cancelled history and sending/unknown states are non-sendable. list/show are read-only and never materialize a deadline, repair a receipt, or send a notice. JSON dates are UTC. receiptRetentionMs reports the observed timestamp TTL in milliseconds. The heartbeat reports unfinished materialization, evaluation, admission and receipt-recovery work units, including future/cancelled evidence repair. It reports backlog while work remains and becomes unknown when its last successful sweep is older than 120 seconds.
 ~~~
 
 - [ ] Run the CLI/provider/containment/boot commands from the main Testing Contract, then npm run typecheck and git diff --check. Commit verified wiring and docs:

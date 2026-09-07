@@ -54,6 +54,7 @@ export class SlackObligationPoster implements ObligationPoster {
     let slackOrigin = false;
     let status = 0;
     let retryAfter = 0;
+    let rawRefusalCode: string | undefined;
     const client = new WebClient(this.token, {
       slackApiUrl: "https://slack.com/api/",
       allowAbsoluteUrls: false,
@@ -69,7 +70,25 @@ export class SlackObligationPoster implements ObligationPoster {
           && Boolean(response.headers.get("x-slack-req-id")?.trim());
         const seconds = Number(response.headers.get("retry-after"));
         retryAfter = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
-        return response;
+        // The SDK synthesizes { ok: false, error: rawText } for malformed
+        // JSON. Capture only an allow-listed code from the actual body as
+        // the SDK consumes it; never retain raw text as refusal evidence.
+        return {
+          ok: response.ok, status: response.status, statusText: response.statusText,
+          url: response.url, headers: response.headers,
+          arrayBuffer: () => response.arrayBuffer(),
+          json: () => response.json(),
+          text: async () => {
+            const body = await response.text();
+            rawRefusalCode = undefined;
+            try {
+              const parsed = object(JSON.parse(body));
+              if (parsed.ok === false && typeof parsed.error === "string"
+                && NONACCEPTANCE.has(parsed.error)) rawRefusalCode = parsed.error;
+            } catch { /* malformed JSON supplies no nonacceptance evidence */ }
+            return body;
+          },
+        };
       },
     });
     try {
@@ -93,7 +112,7 @@ export class SlackObligationPoster implements ObligationPoster {
       const data = object(error.data);
       const is429 = slackOrigin && status === 429 && error.code === ErrorCode.RateLimitedError;
       const refusal = slackOrigin && status === 200 && error.code === ErrorCode.PlatformError
-        && data.ok === false && typeof data.error === "string" && NONACCEPTANCE.has(data.error);
+        && rawRefusalCode !== undefined && data.ok === false && data.error === rawRefusalCode;
       if (is429 || refusal) {
         const reported = Number(error.retryAfter);
         const delaySeconds = Math.max(30, retryAfter, Number.isFinite(reported) && reported > 0 ? reported : 0);
@@ -110,7 +129,7 @@ export class SlackObligationPoster implements ObligationPoster {
 }
 ~~~
 
-No receipt/notice body is logged. Only returned acknowledgement fields cross into the persistence layer. No RetryQueue or normal gateway client is used. A refusal with missing provenance stays unknown even if its string matches the allowlist.
+No receipt/notice body is logged. Only returned acknowledgement fields cross into the persistence layer. No RetryQueue or normal gateway client is used. A refusal with missing provenance stays unknown even if its string matches the allowlist. HTTP 200 refusal also requires actual JSON containing ok:false and an allow-listed error; plain text such as invalid_auth/not_in_channel stays unknown even when the SDK converts it into a PlatformError. The request-local evidence retains only the allow-listed code, never the raw response body or parser error.
 
 ## Task 5: Append-only receipts and retained retention checkpoints
 
@@ -124,9 +143,9 @@ No receipt/notice body is logged. Only returned acknowledgement fields cross int
 import type { Collection, Db } from "mongodb";
 import {
   type DeliveryReceiptRecord, type Occurrence, type Acknowledgement,
-  receiptSchema, same, fail,
+  receiptSchema, same, fail, parseStored,
 } from "./types.js";
-import { ObligationStore, assertWrite, duplicate } from "./store.js";
+import { ObligationStore, assertWrite, duplicate, DURABLE_READ } from "./store.js";
 
 export type HistoryAvailability =
   | "none" | "present" | "expired" | "initial_write_pending" | "expired_unresolved";
@@ -173,11 +192,11 @@ export class ReceiptStore {
     });
   }
   async exact(o: Occurrence, a: Acknowledgement): Promise<boolean> {
-    const raw = await this.collection.findOne({ recordKind: "delivery_receipt", receiptId: a.receiptId });
+    const raw = await this.collection.findOne({ recordKind: "delivery_receipt", receiptId: a.receiptId }, DURABLE_READ);
     if (!raw) return false;
     const { _id: ignored, ...body } = raw;
     void ignored;
-    if (!same(receiptSchema.parse(body), this.record(o, a))) return fail("evidence_integrity");
+    if (!same(parseStored(receiptSchema, body), this.record(o, a))) return fail("evidence_integrity");
     return true;
   }
   async insert(o: Occurrence, a: Acknowledgement): Promise<void> {
@@ -193,11 +212,13 @@ export class ReceiptStore {
     }
   }
 }
-/** Both the sender and checker use this one initial-write repair path. */
+/** Both the sender and checker use this one serialized initial-write path. */
 export async function reconcileReceipt(
-  store: ObligationStore, receipts: ReceiptStore, id: string, now: Date, repair: boolean,
+  store: ObligationStore, receipts: ReceiptStore, id: string, clock: () => Date, repair: boolean,
 ): Promise<Evidence> {
+  return store.withReceiptLock(id, async () => {
   const retentionMs = await receipts.retentionMs();
+  let initialPersistence: DeliveryReceiptRecord | undefined;
   for (let attempt = 0; attempt < 8; attempt++) {
     const o = await store.occurrence(id), a = o.acknowledgement;
     if (!a) {
@@ -205,20 +226,36 @@ export async function reconcileReceipt(
       const unexpected = await receipts.collection.findOne({
         recordKind: "delivery_receipt", obligationId: o.obligationId, dueAt: o.dueAt,
         producerAgentId: o.producerAgentId, destination: o.definition.destination,
-      });
+      }, DURABLE_READ);
       if (unexpected) return fail("evidence_integrity");
+      if (repair && o.repairAt !== null) {
+        await store.cas(o, { repairAt: null });
+        continue;
+      }
       return { occurrence: o, history: "none", confirmed: false };
     }
     if (o.delivery.state !== "acknowledged" || a.receiptId !== o._id + "/receipt"
       || a.providerMessageTs !== o.delivery.providerMessageTs
       || !same(a.acknowledgedAt, o.delivery.acknowledgedAt)) return fail("evidence_integrity");
     const exists = await receipts.exact(o, a);
+    if (exists) initialPersistence = receipts.record(o, a);
+    // Sample after acquiring the queue and finishing all eligibility reads.
+    // No await separates this decision from submission of an initial insert.
+    const now = clock();
     const expired = now.getTime() - a.timestamp.getTime() >= retentionMs;
     if (a.receiptWriteState === "persisted") {
       if (!exists && !expired) return fail("evidence_integrity");
+      if (repair && o.repairAt !== null) {
+        await store.cas(o, { repairAt: null });
+        continue;
+      }
       return { occurrence: o, history: exists ? "present" : "expired", confirmed: true };
     }
     if (a.receiptWriteState === "expired_unresolved") {
+      if (repair && o.repairAt !== null) {
+        await store.cas(o, { repairAt: null });
+        continue;
+      }
       return { occurrence: o, history: "expired_unresolved",
         confirmed: o.evaluation === "on_time" || o.evaluation === "late" };
     }
@@ -226,24 +263,32 @@ export async function reconcileReceipt(
       return { occurrence: o, history: expired && !exists ? "expired_unresolved" : "initial_write_pending",
         confirmed: false };
     }
-    if (!exists && !expired) await receipts.insert(o, a);
-    const nextState = exists || !expired ? "persisted" : "expired_unresolved";
+    if (!initialPersistence && !expired) {
+      await receipts.insert(o, a);
+      initialPersistence = receipts.record(o, a);
+    }
+    // Preserve acknowledged insertion proof across CAS contention, even if
+    // TTL removes history while an unrelated occurrence revision is updated.
+    const nextState = same(initialPersistence, receipts.record(o, a)) ? "persisted" : "expired_unresolved";
     try {
       if (await store.cas(o, {
         acknowledgement: { ...a, receiptWriteState: nextState },
-        repairAt: null, checkAt: now,
+        repairAt: null, checkAt: clock(),
       })) continue;
     } catch {
       const latest = await store.occurrence(id);
-      if (latest.acknowledgement?.receiptWriteState === nextState) continue;
+      if (same(latest.acknowledgement, { ...a, receiptWriteState: nextState })) continue;
       return fail("storage_unavailable");
     }
   }
   return fail("state_contention");
+  });
 }
 ~~~
 
 The original timestamp never changes. A persisted checkpoint is terminal even when activity history is absent; absence before TTL is an integrity error. A pending row that exists after its retention age still proves initial insertion and may publish persisted. An absent pending row after TTL becomes expired_unresolved; no insert occurs. Read-only inspection never publishes a marker or repairs data.
+
+Hold the shared per-occurrence queue from the fresh checkpoint read through insert completion and terminal-marker publication. ReceiptStore.insert is the internal primitive called only here in production; neither callers nor sweep lanes may bypass this queue to insert or close receipt state. A delayed waiter acquires the queue before reading state/time, so it cannot insert behind persisted/expired_unresolved even after TTL removes history. If an insert was submitted while eligible and is still in flight as retention passes, another reconciler waits for its outcome before deciding expiry; acknowledged insertion remains proof for publishing persisted. A fresh retry after an unsuccessful insert must re-read the checkpoint, exact majority-confirmed row and current clock. Terminal cleanup clears obsolete repairAt only and never reopens state.
 
 - [ ] In src/activity/activity-logger.ts import TURN_ACTIVITY_FILTER from ./types.js and replace only the startup diagnostic count:
 
@@ -251,7 +296,7 @@ The original timestamp never changes. A persisted checkpoint is terminal even wh
 const count = await this.collection.countDocuments(TURN_ACTIVITY_FILTER);
 ~~~
 
-Update the existing logger fake from estimatedDocumentCount to countDocuments and assert this filter. There are no other activity_log aggregators in the inspected source/scripts/setup/plugins baseline. Re-run the repository search during implementation; any newly merged turn aggregate must apply the same discriminator filter at its initial match. Do not alter TurnTelemetryStore, fabricate turn fields, or gate ReceiptStore.init on activity.enabled.
+Update the existing logger fake from estimatedDocumentCount to countDocuments and assert this filter. There are no other activity_log aggregators in the inspected src/scripts/setup baseline. Re-run the repository search during implementation; any newly merged turn aggregate must apply the same discriminator filter at its initial match. Do not alter TurnTelemetryStore, fabricate turn fields, or gate ReceiptStore.init on activity.enabled.
 
 ## Task 6: Atomic admission and token-fenced outcomes
 
@@ -260,12 +305,13 @@ Update the existing logger fake from estimatedDocumentCount to countDocuments an
 - [ ] Add this complete implementation.
 
 ~~~typescript
+import { randomUUID } from "node:crypto";
 import type { Admission, Attempt, Occurrence } from "./types.js";
 import {
   deliveryInputSchema, fail, cancelledAt, same, occurrenceId, ObligationError,
 } from "./types.js";
 import { windowStart } from "./deadlines.js";
-import { ObligationStore } from "./store.js";
+import { ObligationStore, DURABLE_READ } from "./store.js";
 import { ReceiptStore, reconcileReceipt } from "./receipts.js";
 import { attributedText, type ObligationPoster, type PostOutcome } from "./slack-post.js";
 
@@ -287,7 +333,7 @@ export class DeliveryService {
   async historical(o: Occurrence): Promise<unknown> {
     if (!this.canWrite()) return { state: "delivery_outcome_unknown", reason: "identity_unverified", retryAllowed: false };
     try {
-      const evidence = await reconcileReceipt(this.store, this.receipts, o._id, this.clock(), true);
+      const evidence = await reconcileReceipt(this.store, this.receipts, o._id, this.clock, true);
       return {
         state: evidence.confirmed ? "confirmed_delivery" : "delivery_evidence_incomplete",
         dueAt: evidence.occurrence.dueAt, acknowledgement: evidence.occurrence.acknowledgement,
@@ -302,6 +348,7 @@ export class DeliveryService {
     // Admission is authority even if deactivation has since committed.
     const d = await this.store.get(obligationId);
     if (!same(d?.deliveryAdmission, a)) return false;
+    await this.store.admittedOccurrence(d!);
     for (let n = 0; n < 8; n++) {
       const o = await this.store.occurrence(a.occurrenceId);
       if (o.delivery.claimToken === a.claimToken) {
@@ -373,7 +420,7 @@ export class DeliveryService {
     // All identity/input/recurrence/window checks precede materialization.
     // Historical acknowledged responses remain available after cancellation.
     const id = occurrenceId(obligationId, dueAt);
-    const existing = await this.store.occurrences.findOne({ _id: id });
+    const existing = await this.store.occurrences.findOne({ _id: id }, DURABLE_READ);
     if (existing) {
       const o = await this.store.occurrence(id);
       await this.store.definitionFor(o);
@@ -386,7 +433,12 @@ export class DeliveryService {
     if (!claimable(o.delivery, now)) {
       return { state: o.delivery.state, retryAt: o.delivery.retryAt, retryAllowed: false };
     }
-    const a = await this.store.admit(o, this.bootId);
+    // Register liveness before admission can be observed by a concurrent
+    // sweep, including commit-then-throw. Only this invocation removes it.
+    const token = randomUUID();
+    this.store.activeDeliveries.add(token);
+    try {
+    const a = await this.store.admit(o, this.bootId, token);
     if (!a) {
       const latest = (await this.store.get(obligationId)) ?? fail("definition_missing");
       return { state: cancelledAt(latest, dueAt) ? "expectation_cancelled" : "admission_unavailable",
@@ -412,17 +464,38 @@ export class DeliveryService {
     } catch {
       return { state: "delivery_outcome_unknown", reason: "storage_unavailable", retryAllowed: false };
     }
+    } finally {
+      this.store.activeDeliveries.delete(token);
+    }
+  }
+  isActive(token: string | undefined, ownerBootId: string | undefined): boolean {
+    return ownerBootId === this.bootId && token !== undefined
+      && this.store.activeDeliveries.has(token);
+  }
+  interrupted(o: Occurrence): boolean {
+    return o.delivery.state === "sending"
+      && !this.isActive(o.delivery.claimToken, o.delivery.ownerBootId);
   }
   /** Reconcile a persisted handoff, never submit it to Slack. */
   async recoverAdmission(obligationId: string, a: Admission): Promise<void> {
-    const o = await this.store.occurrence(a.occurrenceId);
+    const d = await this.store.get(obligationId);
+    if (!same(d?.deliveryAdmission, a)) return;
+    const o = (await this.store.admittedOccurrence(d!))!;
+    // A shared same-boot token denotes a still-executing invocation. It
+    // cannot be reclaimed because it is slow, paused, or awaiting Mongo.
+    if (this.isActive(a.claimToken, a.ownerBootId)) return;
     if (o.delivery.claimToken === a.claimToken) {
-      // Matching occurrence proves the transfer. Clearing this exact slot
-      // does not reclaim a live owner's attempt or confer another authority.
+      if (o.delivery.state === "sending") {
+        if (!(await this.store.cas(o, {
+          delivery: { ...o.delivery, state: "unknown", reason: "interrupted_attempt" },
+          checkAt: this.clock(),
+        }))) return;
+      }
+      // Majority-observed transfer/outcome plus no active invocation permits
+      // clearing this exact slot, including an abandoned same-boot handoff.
       await this.store.release(obligationId, a);
       return;
     }
-    if (a.ownerBootId === this.bootId) return;
     if (claimable(o.delivery, this.clock())) {
       const unknown: Attempt = {
         intentId: a.intentId, claimToken: a.claimToken, ownerBootId: a.ownerBootId,
@@ -443,6 +516,8 @@ PostOutcome is a trusted internal transport result, never a tool parameter. If a
 
 Recovering an orphan admission whose occurrence is missing is an integrity fault. The reader must expose it; do not clear the slot or manufacture successful delivery. Such partial restores are outside automatic recovery.
 
+A token is active from before the registry admission call through completion of its delivery invocation. finally removes it on success, refusal, read/transfer/settlement failure and thrown poster errors. Recovery leaves a truly active same-boot invocation untouched. An ended invocation with a retained slot is reconciled conservatively to unknown and released by exact token; a same-boot sending occurrence whose slot was already released is likewise recovered without submission. No timeout or age threshold makes a live token abandoned.
+
 - [ ] Execute:
 
 ~~~bash
@@ -454,6 +529,6 @@ git diff --check
 Expected: exit 0 and one physical HTTP submission for every ambiguous transport test. Run receipt/admission integration cases after chunk 3 supplies the checker/reader needed by the shared harness. Commit only after verification:
 
 ~~~bash
-git add src/obligations/slack-post.ts src/obligations/receipts.ts src/obligations/delivery.ts src/activity/activity-logger.ts src/activity/activity-logger.test.ts src/obligations/slack-post.test.ts
+git add src/obligations/testing/refusals.ts src/obligations/slack-post.ts src/obligations/receipts.ts src/obligations/delivery.ts src/activity/activity-logger.ts src/activity/activity-logger.test.ts src/obligations/slack-post.test.ts
 git commit -m "feat: persist admitted obligation sends and delivery receipt checkpoints"
 ~~~
