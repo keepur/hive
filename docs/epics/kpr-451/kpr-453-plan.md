@@ -105,6 +105,8 @@ Expected for each Vitest command: exit 0, all selected tests pass, no skipped KP
 
 No changes are planned to `WorkItem`, event schemas, persistence types/collections, provider ABI exports/version, `tool-bridge.ts`, `turn-assembly.ts`, `turn-scaffold.ts`, or `claude-agent-adapter.ts`: their existing full-context forwarding is verified through tests. Keep the work one child implementation: it is one propagation contract, not independent features.
 
+Before beginning Task 1 or editing any implementation files, run `git rev-parse HEAD` in the child implementation worktree and record the full returned commit SHA in the child delivery handoff as `implementation-base`. In Task 6, substitute this saved SHA for `<implementation-base>`; retain it across sessions and intermediate commits, and do not recompute it from the later HEAD.
+
 ## Task 1: Add the compatible identity type and compiled ABI contract
 
 **Files:** Modify `src/agents/agent-runner.ts:148`; create `test-fixtures/provider-abi/work-item-context.ts` and `scripts/provider-work-item-context.test.ts`. Read `src/agents/provider-adapters/provider-abi.ts:127`; leave its ABI version unchanged.
@@ -308,6 +310,18 @@ function identityContext(workItemId?: string): WorkItemContext {
   };
 }
 ```
+
+Add this module-level client mock alongside the existing mocks in `agent-runner.test.ts`:
+
+```typescript
+vi.mock("@qdrant/js-client-rest", () => ({
+  QdrantClient: vi.fn().mockImplementation(function () {
+    return { query: vi.fn().mockResolvedValue({ points: [] }) };
+  }),
+}));
+```
+
+Keep the real `createCodeSearchMcpServer` and `buildCodeSearchTools` implementations. Mocking only the Qdrant client prevents its constructor's compatibility request from reaching the ambient `QDRANT_URL` or localhost while preserving the factory/dependency boundary under test. This lifecycle test constructs tools without executing search handlers.
 
 Add this complete lifecycle test as a new top-level test. It spies on real factory exports called by the runner, so it tests the dependency boundary without production-only observer hooks or diagnostic tools. Existing memory/structured-memory wrapping mocks remain valid; all spies call through and are restored.
 
@@ -671,7 +685,7 @@ it("KPR-453: role callers can supply identity without changing detached defaults
 
 - [ ] **Step 4:** In the scribe “D2a: pins role params, containment, workItemContext” test, keep its exact old-shape expectation and additionally assert `expect(call.workItemContext).not.toHaveProperty("workItemId")`. Replace the nearby “All seven workItemContext fields” comment with “Detached role transport metadata; no represented WorkItem.” Do not change `meeting-scribe.ts`.
 - [ ] **Step 5:** Format the four changed tests; run the Unit, Integration, and focused producer/containment commands from the Testing Contract. Expect all selected tests to pass. The unchanged outage replay/deadline tests establish producer semantics remain intact; no new ID producers are needed.
-- [ ] **Step 6:** Inspect the complete diff with `git diff --check` and `git diff`. Verify only the file map/test additions changed; no event/logging code, persistence schema, tool input/output schema, external MCP environment, prompt text, routing policy, or ABI version changed. Verify all type imports from MCP modules are `import type` and `WorkItemContextRef` is instance-owned.
+- [ ] **Step 6:** Inspect the complete implementation diff with `git diff --check <implementation-base>` and `git diff <implementation-base>`, substituting the exact SHA recorded before Task 1. These comparisons include the already committed Tasks 1–5 and all pending tracked changes, including staged Task 6 test changes. Verify only the file map/test additions changed; no event/logging code, persistence schema, tool input/output schema, external MCP environment, prompt text, routing policy, or ABI version changed. Verify all type imports from MCP modules are `import type` and `WorkItemContextRef` is instance-owned.
 - [ ] **Step 7:** Run `npm run check` and record exact exit status/results in the child delivery handoff. Do not broaden tests again unless a change/failure warrants it. Commit the verified tests with `git commit -m "test: preserve runtime-only identity and detached worker boundaries"`.
 
 ## Handoff and assumptions
