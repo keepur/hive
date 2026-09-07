@@ -28,6 +28,13 @@ interface SessionDoc {
    *  thread message this agent's session has been shown via conference
    *  injection. Absent ⇒ no delta basis ⇒ full-transcript injection. */
   meetingLastSeenTs?: string;
+  /** KPR-434: digest (memoryDigest(), 16 hex) of the memory block this row's
+   *  `sessionId` last provably received in its turn input. Meaningful ONLY for
+   *  the sessionId on the same row (pairing rule — the manager reads it only
+   *  when the row still names the session being resumed). Written inside the
+   *  turn's own set() (tri-state), cleared on compaction / fresh-and-nothing-
+   *  delivered. Absent ⇒ inject on the next turn (duplicate, never gap). */
+  memoryDigest?: string;
 }
 
 /**
@@ -41,6 +48,8 @@ export interface StoredSessionRef {
   provider: string | undefined;
   /** KPR-388: meeting-continuity mark; absent ⇒ full injection. */
   meetingLastSeenTs?: string;
+  /** KPR-434: memory-digest mark; absent ⇒ the next turn injects. Pair it with `sessionId` before use. */
+  memoryDigest?: string;
 }
 
 /** KPR-313: legacy fabricated pilot ids (and unprovenanced resp_ chain ids) — scrub on read. */
@@ -128,6 +137,7 @@ export class SessionStore {
           : undefined,
         provider: doc.provider,
         meetingLastSeenTs: doc.meetingLastSeenTs,
+        memoryDigest: doc.memoryDigest,
       };
     }
 
@@ -159,9 +169,24 @@ export class SessionStore {
     }
 
     // Legacy untagged plain id: grandfathered as claude (pre-313 fleet rows).
-    return { sessionId: doc.sessionId || undefined, provider: "claude", meetingLastSeenTs: doc.meetingLastSeenTs };
+    return {
+      sessionId: doc.sessionId || undefined,
+      provider: "claude",
+      meetingLastSeenTs: doc.meetingLastSeenTs,
+      memoryDigest: doc.memoryDigest,
+    };
   }
 
+  /**
+   * KPR-434 D4.2: `memoryDigest` is a TRI-STATE applied inside the SAME upsert
+   * as the session id — a string ⇒ $set, null ⇒ $unset, undefined ⇒ untouched.
+   * set() is a dumb applier: it never decides (the rule is
+   * agent-manager.ts resolveMemoryMark). Folded into this write on purpose:
+   * finalizeSpawnResult fires set() without awaiting, so a separate mark-only
+   * updateOne (the KPR-388 shape) could race ahead of a fresh row's upsert and
+   * lose every session's first mark. $set and $unset on the same path are
+   * mutually exclusive by the tri-state.
+   */
   async set(agentId: string, threadId: string, sessionId: string, provider: string, tokenData?: {
     inputTokens: number;
     outputTokens: number;
@@ -170,7 +195,7 @@ export class SessionStore {
     contextWindow: number;
     compactions: number;
     preCompactTokens?: number;
-  }): Promise<void> {
+  }, memoryDigest?: string | null): Promise<void> {
     await this.withRetry(async () => {
       const now = new Date();
       const update: Record<string, any> = {
@@ -207,6 +232,13 @@ export class SessionStore {
           inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
           cacheCreationTokens: 0, contextWindow: 0,
         });
+      }
+
+      // KPR-434: the mark, tri-state (see doc comment).
+      if (typeof memoryDigest === "string") {
+        update.$set.memoryDigest = memoryDigest;
+      } else if (memoryDigest === null) {
+        update.$unset = { memoryDigest: "" };
       }
 
       await this.collection.updateOne(

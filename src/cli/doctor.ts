@@ -12,6 +12,7 @@ import {
   type OutageQueueStats,
   type MemoryLifecycleRow,
   type DatastoreIdentityReport,
+  type ResourceEnvelopeRow,
   brewServiceRunning,
   cacheHitRatesForDoctor,
   circuitBreakerStatsForDoctor,
@@ -33,12 +34,14 @@ import {
   slackAuthOk,
   spawnCoordinatorStatsForDoctor,
   voiceWorkerStatsForDoctor,
+  resourceEnvelopesForDoctor,
   memoryLifecycleStatsForDoctor,
   modelRouterModeLine,
   llmSidecarLine,
   providerPluginsForDoctor,
   renderProviderPluginsSection,
 } from "./doctor-checks.js";
+import { describeLimitSource } from "../agents/resource-tiers.js";
 import { engineDir, hiveHome } from "../paths.js";
 
 type HiveConfig = typeof import("../config.js").config;
@@ -192,6 +195,48 @@ export function renderVoiceWorkerSection(
   if (row.staleSeconds !== null && row.staleSeconds > 90) {
     emit(
       `  ⚠ heartbeat stale — worker down or wedged (launchctl kickstart -k gui/$(id -u)/com.hive.${instanceId}.voice-worker)`,
+    );
+  }
+}
+
+/**
+ * KPR-433 D5: render the "Resource envelopes (Claude lane)" section — per
+ * bare-model agent, the effective router-on envelope with per-field sources,
+ * flagging top-level budgetUsd/maxTurns/timeoutMs the path does not deliver.
+ * INFORMATIONAL by construction — returns void, so it has no failure channel
+ * to fold into `allPassed` (KPR-296 canon: only Datastore identity flips the
+ * exit code). Materialized defaults (budgetUsd 10 / maxTurns 200) flag as
+ * inert too — accepted noise (KPR-422: indistinguishable from intent). Under
+ * router-off the tier envelope is not applied, so one line and no flags.
+ */
+export function renderResourceEnvelopesSection(
+  rows: ResourceEnvelopeRow[] | null,
+  routerEnabled: boolean,
+  emit: (line: string) => void = console.log,
+): void {
+  emit("\nResource envelopes (Claude lane, router-on — KPR-433)");
+  if (!routerEnabled) {
+    emit("  ○ model router off — top-level maxTurns/timeoutMs/budgetUsd are live; tier envelope not applied");
+    return;
+  }
+  if (rows === null) {
+    emit("  ○ unavailable — MongoDB unreachable");
+    return;
+  }
+  if (rows.length === 0) {
+    emit("  ○ no Claude-lane agents");
+    return;
+  }
+  for (const r of rows) {
+    const src = (k: keyof ResourceEnvelopeRow["sources"]) => describeLimitSource(r.sources[k], r.tier);
+    const inert = r.inert.length > 0 ? `  ⚠ inert: ${r.inert.join(", ")}` : "";
+    emit(
+      `  ${r.agentId}: tier=${r.tier} (${r.model}) timeoutMs=${r.timeoutMs} (${src("timeoutMs")}) maxTurns=${r.maxTurns} (${src("maxTurns")}) budgetUsd=$${r.budgetUsd} (${src("budgetUsd")})${inert}`,
+    );
+  }
+  if (rows.some((r) => r.inert.length > 0)) {
+    emit(
+      "  note: inert top-level values are live on Lane A/B and router-off; on this path override via resourceTiers.<tier>.{budgetUsd,maxTurns,timeoutMs}",
     );
   }
 }
@@ -758,6 +803,16 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
       const voiceWorkerStats = await voiceWorkerStatsForDoctor(config.mongo.uri, config.mongo.dbName);
       renderVoiceWorkerSection(voiceWorkerStats, console.log, config.instance.id, config.voice.livekit.sipTrunkId);
     }
+    // KPR-433 D5 (N1 review fix): effective Claude-lane envelopes —
+    // informational only, NEVER contributes to allPassed (KPR-296 canon).
+    // Only fetch when the router is on: under router-off the renderer prints
+    // its single router-off line without consulting rows at all, so the
+    // fetch (a Mongo round-trip that can also warn-once via modelToTier) is
+    // wasted work on a path where no tier envelope applies.
+    const envelopeRows = config.modelRouter.enabled
+      ? await resourceEnvelopesForDoctor(config.mongo.uri, config.mongo.dbName)
+      : [];
+    renderResourceEnvelopesSection(envelopeRows, config.modelRouter.enabled);
     // KPR-306: provider circuit-breaker per-provider stats. Informational —
     // NEVER contributes to allPassed (D4).
     const breakerRows = await circuitBreakerStatsForDoctor(config.mongo.uri, config.mongo.dbName);
@@ -796,6 +851,8 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     console.log("\nPrefix cache (live engine)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nSpawn coordinator (live engine, per agent)");
+    console.log("  ○ skipped: config not loaded");
+    console.log("\nResource envelopes (Claude lane, router-on — KPR-433)");
     console.log("  ○ skipped: config not loaded");
     console.log("\nProvider circuit breakers (live engine, per provider)");
     console.log("  ○ skipped: config not loaded");

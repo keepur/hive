@@ -49,8 +49,11 @@ export interface StructuredMemoryToolDeps {
    * KPR-213: optional invalidation hook plumbed into MemoryStore.setOnMutate.
    * Fired after any structured-memory mutation that may affect this agent's
    * hot-tier composition (save, update, delete, pin, unpin, set-tier, purge,
-   * supersede, summarize, flag-for-review). Bulk-id paths fire `null` agent
-   * → caller invalidates all.
+   * supersede, summarize, flag-for-review). Bulk-id paths fire `null` agent.
+   * KPR-434: NO prefix consumer exists any more — the hot tier left the
+   * cached system prompt (it rides the turn input under a digest gate), so
+   * the runner no longer passes one. Kept on the deps type as the natural
+   * seam for a future memory-generation signal (spec ⚠A1).
    */
   onMutate?: (agentId: string | null, reason: string) => void;
   /** KPR-241: optional write-guard config; defaults to GUARD_DEFAULTS. */
@@ -63,10 +66,7 @@ const VALID_IMPORTANCE = ["critical", "high", "medium", "low"] as const;
 export function buildStructuredMemoryTools(deps: StructuredMemoryToolDeps) {
   const { db, agentId, context } = deps;
   const store = new MemoryStore(db);
-  // KPR-213: wire the prefix-cache invalidation hook into the MCP-owned store.
-  // The store is per-MCP (one per AgentRunner), so the agentId parameter
-  // forwarded by MemoryStore.setOnMutate is always this agent or `null`
-  // (bulk path) — both mapped at the listener.
+  // KPR-213/KPR-434: optional mutation hook on the MCP-owned store (no engine consumer since KPR-434 — see deps.onMutate).
   if (deps.onMutate) store.setOnMutate(deps.onMutate);
   // Lazy init — schema/index creation happens on first use, not at module load,
   // so test harnesses without a real Mongo can still import the module.

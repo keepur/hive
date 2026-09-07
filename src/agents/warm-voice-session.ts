@@ -6,6 +6,7 @@ import type { TurnContext, TurnResult } from "./agent-manager.js";
 import { createLogger } from "../logging/logger.js";
 // KPR-324 C3: voice tool-start acknowledgment (warm spawn loop). `config` is
 // read per-turn at the boundary — same as the cold path (spec §4.3).
+import { composeTurnInput } from "./prefix-builder.js";
 import { config } from "../config.js";
 import { shouldInjectToolAck, nextAckPhrase, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
 
@@ -475,7 +476,7 @@ export class WarmVoiceSession {
     try {
       this.input.push({
         type: "user",
-        message: { role: "user", content: req.text },
+        message: { role: "user", content: composeTurnInput({ prompt: req.text }) },
         parent_tool_use_id: null,
       });
 

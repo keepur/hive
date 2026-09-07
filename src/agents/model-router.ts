@@ -1,78 +1,26 @@
 import { createLogger } from "../logging/logger.js";
 import { config } from "../config.js";
 import { getLLMRegistry } from "../llm/registry.js";
-import { AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 import type { ReasoningEffort } from "./provider-adapters/types.js";
 
 const log = createLogger("model-router");
 
-export type ModelTier = "haiku" | "sonnet" | "opus";
-
-export interface ResourceLimits {
-  timeoutMs: number;
-  maxTurns: number;
-  budgetUsd: number;
-}
-
-/** Per-agent override map — only specified fields override the tier default */
-export type ResourceTierOverrides = Partial<Record<ModelTier, Partial<ResourceLimits>>>;
-
-/** Global defaults per tier — these fire when no per-agent override exists */
-export const RESOURCE_TIER_DEFAULTS: Record<ModelTier, ResourceLimits> = {
-  haiku:  { timeoutMs: 120_000,  maxTurns: 20,  budgetUsd: 1  },
-  sonnet: { timeoutMs: 300_000,  maxTurns: 50,  budgetUsd: 5  },
-  opus:   { timeoutMs: 600_000,  maxTurns: 200, budgetUsd: 50 },
-};
-
-/**
- * Resolve resource limits for a tier, applying per-agent overrides on top of global defaults.
- *
- * KPR-422: `agentTimeoutMs` is the agent definition's top-level `timeoutMs`.
- * Before this fix it was silently dead config on the claude/router-on path —
- * the tier default always won, so a custom-tier model (modelToTier → "sonnet")
- * with `timeoutMs: 1_800_000` still got killed at 300s. Precedence now:
- * explicit `resourceTiers.<tier>.timeoutMs` > top-level `timeoutMs` > tier
- * default.
- *
- * The top-level value participates only when it differs from the materialized
- * default (300_000): `agent_create` and `toAgentConfig` both write
- * `timeoutMs: 300_000` into docs/configs that never set one, so the raw value
- * cannot distinguish operator intent — and folding the materialized default in
- * unconditionally would drop every opus agent from 600s to 300s and loosen
- * every haiku agent from 120s to 300s. Residual corner (accepted): explicitly
- * setting exactly 300_000 on a non-sonnet tier is indistinguishable from the
- * materialized default and keeps the tier default. `maxTurns`/`budgetUsd`
- * deliberately stay tier-defaulted — their materialized defaults (200/10) are
- * likewise indistinguishable from operator intent, and folding them in would
- * flip real bounds (e.g. every sonnet agent's maxTurns 50 → 200; note the
- * maxTurns default coincides with the opus tier value, so no sentinel trick
- * exists for it).
- *
- * Non-finite / non-positive values (a `timeoutMs: 0`, a string cast, NaN) are
- * ignored here rather than armed as a millisecond deadline — the admin write
- * path doesn't validate the field, and pre-KPR-422 such garbage was inert on
- * this path. (Other lanes read the raw field directly and always did.)
- */
-export function resolveResourceLimits(
-  tier: ModelTier,
-  agentOverrides?: ResourceTierOverrides,
-  agentTimeoutMs?: number,
-): ResourceLimits {
-  const defaults = RESOURCE_TIER_DEFAULTS[tier];
-  const overrides = agentOverrides?.[tier];
-  const explicitTimeoutMs =
-    typeof agentTimeoutMs === "number" &&
-    Number.isFinite(agentTimeoutMs) &&
-    agentTimeoutMs > 0 &&
-    agentTimeoutMs !== AGENT_DEFINITION_DEFAULTS.timeoutMs
-      ? agentTimeoutMs
-      : undefined;
-  return {
-    timeoutMs: overrides?.timeoutMs ?? explicitTimeoutMs ?? defaults.timeoutMs,
-    maxTurns: overrides?.maxTurns ?? defaults.maxTurns,
-    budgetUsd: overrides?.budgetUsd ?? defaults.budgetUsd,
-  };
-}
+// KPR-433 D0: the tier envelope math (types, RESOURCE_TIER_DEFAULTS,
+// modelToTier, resolveResourceLimits, explainResourceLimits) lives in
+// resource-tiers.ts — dependency-free so admin + doctor can import it without
+// this module's config.ts / llm-registry side effects. Re-exported here so
+// every pre-KPR-433 import path (agent-manager, tests) keeps working.
+export {
+  RESOURCE_TIER_DEFAULTS,
+  resolveResourceLimits,
+  explainResourceLimits,
+  modelToTier,
+  type ModelTier,
+  type ResourceLimits,
+  type ResourceTierOverrides,
+  type ResourceLimitSource,
+  type ExplainedResourceLimits,
+} from "./resource-tiers.js";
 
 /** KPR-312 §3.3: classifier input bound — bounds worst-case cost/latency. */
 const MAX_CLASSIFIER_INPUT = 4000;
@@ -90,19 +38,6 @@ const ACK_ALLOWLIST: ReadonlySet<string> = new Set([
   "got it", "sounds good", "sure", "will do",
   "👍",
 ]);
-
-/**
- * Infer tier from a model ID string. KPR-338: exported — prepareSpawn derives
- * the agent's STATIC tier for resource limits and audit (tier is a per-agent
- * fact now, never a per-turn decision). Claude-id substring heuristic —
- * meaningless on provider-prefixed pilot ids; callers gate on the
- * claude-static route.
- */
-export function modelToTier(model: string): ModelTier {
-  if (model.includes("opus")) return "opus";
-  if (model.includes("haiku")) return "haiku";
-  return "sonnet";
-}
 
 /**
  * KPR-338: effort-only result. The router no longer names tiers, models,

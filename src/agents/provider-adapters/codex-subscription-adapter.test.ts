@@ -542,6 +542,40 @@ describe("CodexSubscriptionAdapter", () => {
       cleanup();
     }
   });
+
+  it("KPR-432: with datetimeInTurnInput the sent user item ends with the datetime trailer", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-04T17:17:01Z")); // 10:17 AM PDT
+    const fetchMock = sseScript([
+      { event: "response.created", data: { type: "response.created", response: { id: "resp-created" } } },
+      { event: "response.output_text.delta", data: { type: "response.output_text.delta", delta: "ok" } },
+      {
+        event: "response.completed",
+        data: { type: "response.completed", response: { id: "resp-complete", usage: { input_tokens: 1, output_tokens: 1 } } },
+      },
+    ]);
+    const { adapter, cleanup } = makeAdapter({ assembly: makeAssembly({ datetimeInTurnInput: true }) }, fetchMock);
+    try {
+      await adapter.runTurn({ prompt: "say hello" });
+      expect(bodyOf(fetchMock, 0)).toMatchObject({
+        instructions: "Be useful.",
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: "say hello\n\n**Current date/time**: Friday, September 4, 2026 at 10:17 AM (Pacific Time)",
+              },
+            ],
+          },
+        ],
+      });
+    } finally {
+      vi.useRealTimers();
+      cleanup();
+    }
+  });
 });
 
 describe("CodexSubscriptionAdapter — KPR-353 T2 (hive-owned dispatch loop)", () => {

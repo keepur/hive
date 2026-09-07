@@ -295,3 +295,83 @@ describe("SessionStore — meeting-continuity mark (KPR-388)", () => {
     expect(ref).toEqual({ sessionId: undefined, provider: undefined });
   });
 });
+
+describe("SessionStore — memoryDigest mark (KPR-434 D4.1/D4.2 — set() is a dumb applier)", () => {
+  let store: SessionStore;
+  let mocks: ReturnType<typeof makeMockDb>["mocks"];
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const m = makeMockDb();
+    store = new SessionStore(m.db);
+    mocks = m.mocks;
+    await store.init();
+  });
+
+  const TOKENS = { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, contextWindow: 1, compactions: 0 };
+
+  it("string ⇒ $set.memoryDigest in the SAME upsert as sessionId — one updateOne, never a second write", async () => {
+    await store.set("agent-a", "sms:line-1:t1", "s-1", "claude", TOKENS, "abcdef0123456789");
+    expect(mocks.updateOne).toHaveBeenCalledTimes(1);
+    const [filter, update, options] = mocks.updateOne.mock.calls[0]!;
+    expect(filter).toEqual({ _id: KEY });
+    expect(update.$set).toMatchObject({ sessionId: "s-1", provider: "claude", memoryDigest: "abcdef0123456789" });
+    expect(update.$unset).toBeUndefined();
+    expect(options).toEqual({ upsert: true });
+  });
+
+  it('null ⇒ $unset: { memoryDigest: "" } and no $set.memoryDigest', async () => {
+    await store.set("agent-a", "sms:line-1:t1", "s-1", "claude", TOKENS, null);
+    const [, update] = mocks.updateOne.mock.calls[0]!;
+    expect(update.$unset).toEqual({ memoryDigest: "" });
+    expect(update.$set).not.toHaveProperty("memoryDigest");
+  });
+
+  it("undefined ⇒ neither key (untouched) — 5-arg and 4-arg calls are unchanged", async () => {
+    await store.set("agent-a", "sms:line-1:t1", "s-1", "claude", TOKENS);
+    await store.set("agent-a", "sms:line-1:t1", "s-1", "claude");
+    for (const call of mocks.updateOne.mock.calls) {
+      const update = call[1];
+      expect(update.$set).not.toHaveProperty("memoryDigest");
+      expect(update.$unset).toBeUndefined();
+    }
+  });
+
+  it("set() never decides: compactions > 0 WITH a string digest still $sets it (the compaction rule lives in resolveMemoryMark)", async () => {
+    await store.set("agent-a", "sms:line-1:t1", "s-1", "claude", { ...TOKENS, compactions: 1 }, "deadbeefdeadbeef");
+    const [, update] = mocks.updateOne.mock.calls[0]!;
+    expect(update.$inc).toEqual({ compactions: 1 });
+    expect(update.$set.memoryDigest).toBe("deadbeefdeadbeef");
+    expect(update.$unset).toBeUndefined();
+  });
+
+  it("get() surfaces the mark on tagged rows", async () => {
+    mocks.findOne.mockResolvedValueOnce({ ...doc("s-1", "claude"), memoryDigest: "d1d1d1d1d1d1d1d1" });
+    await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
+      sessionId: "s-1",
+      provider: "claude",
+      memoryDigest: "d1d1d1d1d1d1d1d1",
+    });
+  });
+
+  it("get() surfaces the mark on grandfathered legacy rows; absent field ⇒ undefined", async () => {
+    mocks.findOne.mockResolvedValueOnce({ ...doc("3f2a77aa-1111-4222-8333-444455556666"), memoryDigest: "d2d2d2d2d2d2d2d2" });
+    expect((await store.get("agent-a", "sms:line-1:t1"))?.memoryDigest).toBe("d2d2d2d2d2d2d2d2");
+    mocks.findOne.mockResolvedValueOnce(doc("s-2", "claude"));
+    expect((await store.get("agent-a", "sms:line-1:t1"))?.memoryDigest).toBeUndefined();
+  });
+
+  it("scrub branch returns NO mark even when the poisoned row carries one", async () => {
+    mocks.findOne.mockResolvedValue({ ...doc("codex-pilot-9d0e"), memoryDigest: "d3d3d3d3d3d3d3d3" });
+    expect(await store.get("agent-a", "sms:line-1:t1")).toEqual({ sessionId: undefined, provider: undefined });
+  });
+
+  it('a stateless-replay row (sessionId "") surfaces its mark but no session — the manager\'s pairing rule discards it', async () => {
+    mocks.findOne.mockResolvedValueOnce({ ...doc("", "codex"), memoryDigest: "d4d4d4d4d4d4d4d4" });
+    await expect(store.get("agent-a", "sms:line-1:t1")).resolves.toEqual({
+      sessionId: undefined,
+      provider: "codex",
+      memoryDigest: "d4d4d4d4d4d4d4d4",
+    });
+  });
+});

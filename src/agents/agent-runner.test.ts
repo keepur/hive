@@ -103,6 +103,20 @@ vi.mock("../memory/memory-mcp-server.js", async (importOriginal) => {
   };
 });
 
+// KPR-434: the runner passes NO onMutate to the structured-memory server any
+// more (the hot tier left the prefix). Wrapping mock: capture deps, delegate.
+const structuredMemoryDepsCapture = vi.hoisted(() => ({ deps: [] as any[] }));
+vi.mock("../memory/structured-memory-mcp-server.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../memory/structured-memory-mcp-server.js")>();
+  return {
+    ...actual,
+    createStructuredMemoryMcpServer: vi.fn((deps: any) => {
+      structuredMemoryDepsCapture.deps.push(deps);
+      return actual.createStructuredMemoryMcpServer(deps);
+    }),
+  };
+});
+
 // ── Logger mock ─────────────────────────────────────────────────────
 // Hoisted so every createLogger() call shares ONE set of spies. agent-runner.ts
 // binds its logger at module load, so a factory returning a fresh object per
@@ -241,8 +255,21 @@ function getCapturedOptions(): Record<string, any> {
   return call[0].options ?? {};
 }
 
+function getCapturedPrompt(): string {
+  const call = mockQuery.mock.calls[mockQuery.mock.calls.length - 1];
+  return call[0].prompt;
+}
+
 // ── Import after mocks ──────────────────────────────────────────────
 import { AgentRunner, resolveToolSearchEnv, resolveToolSearchMode } from "./agent-runner.js";
+import {
+  buildPrefix,
+  appendDateTimeTrailer,
+  composeTurnInput,
+  formatDateTimeTrailer,
+  memoryDigest,
+  MEMORY_TURN_HEADER,
+} from "./prefix-builder.js";
 import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
 import { config } from "../config.js";
@@ -2182,11 +2209,12 @@ describe("AgentRunner toolkit section prompt (via send)", () => {
     expect(options.systemPrompt).toContain("- custom-tool — A custom tool for testing");
   });
 
-  it("places toolkit section between constitution and date/time (assembly order)", async () => {
+  it("places toolkit section after constitution; no date/time in the system prompt (KPR-432)", async () => {
     memoryManager.read.mockImplementation((path: string) => {
       if (path === "shared/constitution.md") return Promise.resolve("CONSTITUTION_MARKER");
       return Promise.resolve(null);
     });
+    memoryManager.getHotTierPrompt.mockResolvedValue("## Your Memory\nORDER-PIN-HOT");
 
     const runner = new AgentRunner(
       makeAgentConfig({
@@ -2200,10 +2228,12 @@ describe("AgentRunner toolkit section prompt (via send)", () => {
 
     const constIdx = options.systemPrompt.indexOf("CONSTITUTION_MARKER");
     const toolkitIdx = options.systemPrompt.indexOf("## Your toolkit");
-    const dateIdx = options.systemPrompt.indexOf("**Current date/time**");
     expect(constIdx).toBeGreaterThan(-1);
     expect(toolkitIdx).toBeGreaterThan(constIdx);
-    expect(dateIdx).toBeGreaterThan(toolkitIdx);
+    expect(options.systemPrompt).not.toContain("**Current date/time**");
+    expect(options.systemPrompt).not.toContain("## Your Memory"); // KPR-434: memory never in the system prompt
+    expect(getCapturedPrompt()).toContain("ORDER-PIN-HOT"); // …it rides the turn input
+    expect(getCapturedPrompt()).toMatch(/\n\n\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
   });
 });
 
@@ -2463,10 +2493,30 @@ describe("AgentRunner effort option (KPR-312, via send)", () => {
     expect("thinking" in opts).toBe(false);
   });
 
-  it("drops values outside the SDK-deliverable subset (defensive)", async () => {
-    const runner = makeRunner();
-    await runner.send("hi", undefined, undefined, undefined, undefined, undefined, "xhigh" as never);
-    expect("effort" in getCapturedOptions()).toBe(false);
+  it("KPR-430: delivers the SDK-only levels xhigh and max (static field path)", async () => {
+    for (const level of ["xhigh", "max"] as const) {
+      const runner = makeRunner();
+      await runner.send("hi", undefined, undefined, undefined, undefined, undefined, level);
+      const opts = getCapturedOptions();
+      expect(opts.effort).toBe(level);
+      expect("thinking" in opts).toBe(false);
+    }
+  });
+
+  it("KPR-430: delivers every AgentEffort level", async () => {
+    for (const level of ["low", "medium", "high", "xhigh", "max"] as const) {
+      const runner = makeRunner();
+      await runner.send("hi", undefined, undefined, undefined, undefined, undefined, level);
+      expect(getCapturedOptions().effort).toBe(level);
+    }
+  });
+
+  it("drops the Lane B suffix-only levels minimal/none (no SDK counterpart)", async () => {
+    for (const level of ["minimal", "none"] as const) {
+      const runner = makeRunner();
+      await runner.send("hi", undefined, undefined, undefined, undefined, undefined, level);
+      expect("effort" in getCapturedOptions()).toBe(false);
+    }
   });
 });
 
@@ -2925,6 +2975,72 @@ describe("AgentRunner ENABLE_TOOL_SEARCH env pinning (via send) (KPR-329)", () =
     } finally {
       delete process.env.ENABLE_TOOL_SEARCH;
     }
+  });
+});
+
+describe("AgentRunner CLAUDE_CODE_DISABLE_BACKGROUND_TASKS env pinning (via send) (KPR-438)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+  let origDisable: string | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+    // Ambient-pollution guard: the `...process.env` spread would otherwise let
+    // an operator's own value satisfy the assertions without the engine pin.
+    origDisable = process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+    delete process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+  });
+
+  afterEach(() => {
+    if (origDisable === undefined) delete process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+    else process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = origDisable;
+  });
+
+  // Negative-verify: the value must be the literal string "1" in the spawn env
+  // map — NOT merely absent/undefined. Absent lets SDK 0.3.26x run `Agent`
+  // subagents in the background, whose completion notification kills every
+  // subsequent in-process SDK MCP tool call for the rest of the session.
+  it("pins CLAUDE_CODE_DISABLE_BACKGROUND_TASKS to the literal '1', not undefined", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    const env = getCapturedOptions().env;
+    expect(env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS).not.toBeUndefined();
+    expect(env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS).toBe("1");
+  });
+
+  it("engine value overrides an ambient process.env opt-out", async () => {
+    process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "0";
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    expect(getCapturedOptions().env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS).toBe("1");
+  });
+
+  // The Lane A passthrough spread is the LAST env spread; it must not drop the
+  // pin (kimi/deepseek spawns run the same in-process MCP servers).
+  it("survives the Lane A passthrough env spread", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ model: "kimi/kimi-k3" }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        laneAPassthrough: {
+          provider: "kimi" as const,
+          model: "kimi-k3",
+          baseUrl: "https://api.moonshot.ai/anthropic",
+          authToken: "tok-test",
+        },
+      },
+    );
+    await runner.send("hello");
+    expect(getCapturedOptions().env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS).toBe("1");
   });
 });
 
@@ -3476,6 +3592,40 @@ describe("AgentRunner — KPR-122 in-process MCP wiring", () => {
     }
   });
 
+  it("KPR-434 (T6, structural proxy): structured-memory gets NO onMutate even with a prefix cache — the runner has no listener left that could re-run the prefix builder on a mutation", async () => {
+    // Spec T6 asks "a structured-memory mutation no longer re-runs the
+    // getOrBuild builder; a constitution write still does". This suite drives
+    // no real MemoryStore mutation (the MCP-owned store is lazy-init against a
+    // fake db), so the pin is STRUCTURAL: the only wire that could re-run the
+    // builder on a mutation was `deps.onMutate → prefixCache.invalidate*`, and
+    // it is now absent. The constitution half ("shared/* still invalidates
+    // all") is pinned at the scope table in prefix-invalidation.test.ts, which
+    // is exactly the path memoryManager.setOnWrite (index.ts) still feeds.
+    structuredMemoryDepsCapture.deps.length = 0;
+    const cache = {
+      getOrBuild: vi.fn(<T>(_id: string, build: () => T) => build()),
+      invalidateAgent: vi.fn(),
+      invalidateAll: vi.fn(),
+    };
+    const runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["memory"] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeDb(),
+      cache as never,
+    );
+    await runner.send("hello");
+    expect(structuredMemoryDepsCapture.deps).toHaveLength(1);
+    expect(structuredMemoryDepsCapture.deps[0]).not.toHaveProperty("onMutate");
+    expect(cache.getOrBuild).toHaveBeenCalledTimes(1); // the prefix cache is still read through
+    expect(cache.invalidateAgent).not.toHaveBeenCalled();
+    expect(cache.invalidateAll).not.toHaveBeenCalled();
+  });
+
   it("code-search becomes an in-process SDK server when codeAccess is on", async () => {
     const runner = new AgentRunner(
       makeAgentConfig({
@@ -3915,24 +4065,29 @@ describe("AgentRunner is_error result guard (KPR-312, via send)", () => {
   });
 });
 
-describe("buildSystemPrompt datetime composition (KPR-349 §D2 pin)", () => {
-  it("output is <prefix> + joiner + Pacific datetime trailer, datetime last", async () => {
+describe("buildSystemPrompt is the bare prefix (KPR-432 supersedes the KPR-349 §D2 datetime pin)", () => {
+  it("output equals buildPrefix output byte-for-byte — no joiner, no datetime trailer", async () => {
     const memoryManager = makeMockMemoryManager();
-    const runner = new AgentRunner(
-      makeAgentConfig({ systemPrompt: "PIN-SYSTEM-PROMPT" }),
-      memoryManager as never,
+    const cfg = makeAgentConfig({ systemPrompt: "PIN-SYSTEM-PROMPT" });
+    const runner = new AgentRunner(cfg, memoryManager as never, [], new Map(), "{}");
+    const r = runner as unknown as {
+      buildSystemPrompt(c: string[], d?: string[]): Promise<string>;
+      autoInjectedServerNames(): ReadonlySet<string>;
+    };
+    const out = await r.buildSystemPrompt([]);
+    expect(out).toBe(
+      await buildPrefix(cfg, {
+        coreServerNames: [],
+        activeDelegateNames: [],
+        memoryManager: memoryManager as never,
+        plugins: [],
+        skillIndex: new Map(),
+        eventSubscribersJson: "{}",
+        autoInjectedServers: r.autoInjectedServerNames(),
+      }),
     );
-    const out = await (
-      runner as unknown as { buildSystemPrompt(c: string[], d?: string[]): Promise<string> }
-    ).buildSystemPrompt([]);
-    // Full-output shape: prefix, then the exact joiner, then the trailer — nothing after.
-    expect(out).toMatch(/^[\s\S]+\n\n---\n\n\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
     expect(out).toContain("PIN-SYSTEM-PROMPT");
-    // Trailer text renders an en-US Pacific timestamp (weekday, month day, year, h:mm AM/PM).
-    const trailer = out.slice(out.lastIndexOf("**Current date/time**"));
-    expect(trailer).toMatch(
-      /^\*\*Current date\/time\*\*: (Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday), [A-Z][a-z]+ \d{1,2}, \d{4} at \d{1,2}:\d{2} (AM|PM) \(Pacific Time\)$/,
-    );
+    expect(out).not.toContain("**Current date/time**");
   });
 });
 
@@ -3968,7 +4123,7 @@ describe("buildProviderPrompt cache neutrality (KPR-349 §D2, T1)", () => {
   it("Lane B: buildProviderPrompt never touches the prefix cache (uncached by ruling)", async () => {
     const cache = makeSpyPrefixCache();
     const runner = makeRunnerWithCache(cache);
-    await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false });
+    await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false, memoryPlacement: "instructions" });
     expect(cache.getOrBuild).not.toHaveBeenCalled();
     expect(cache.invalidateAgent).not.toHaveBeenCalled();
     expect(cache.invalidateAll).not.toHaveBeenCalled();
@@ -3983,25 +4138,39 @@ describe("buildProviderPrompt cache neutrality (KPR-349 §D2, T1)", () => {
     expect(cache.getOrBuild).toHaveBeenCalledTimes(1);
   });
 
-  it("Lane B: instructions end with the Pacific datetime trailer", async () => {
+  it("Lane B: instructions carry no datetime trailer (KPR-432)", async () => {
     const cache = makeSpyPrefixCache();
     const runner = makeRunnerWithCache(cache);
-    const { instructions } = await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false });
-    expect(instructions).toMatch(/\*\*Current date\/time\*\*: .+ \(Pacific Time\)$/);
+    const { instructions } = await runner.buildProviderPrompt({
+      toolInventory: [],
+      toolsExecutable: false,
+      memoryPlacement: "instructions",
+    });
+    expect(instructions).not.toContain("**Current date/time**");
   });
 
-  it("Lane B: a rendered hot-tier block is returned AND folded into instructions exactly once (single-injection)", async () => {
+  it("Lane B, instructions placement: a rendered hot-tier block is returned AND folded into instructions exactly once (single-injection)", async () => {
+    const HOT = "HOT-TIER-UNIQUE-MARKER-XYZ";
+    const memoryManager = makeMockMemoryManager();
+    memoryManager.getHotTierPrompt.mockResolvedValue(HOT);
+    const runner = makeRunnerWithCache(makeSpyPrefixCache(), memoryManager);
+    const r = await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false, memoryPlacement: "instructions" });
+    expect(r.hotTierPrompt).toBe(HOT);
+    expect(r.memoryBlock).toBe(HOT);
+    expect(r.memoryDigest).toBe(memoryDigest(HOT));
+    expect(r.instructions.split(HOT).length - 1).toBe(1);
+  });
+
+  it("Lane B, turn-input placement (KPR-434): the block is returned and NOT folded into instructions", async () => {
     const HOT = "HOT-TIER-UNIQUE-MARKER-XYZ";
     const memoryManager = makeMockMemoryManager();
     memoryManager.getHotTierPrompt.mockResolvedValue(HOT);
     const cache = makeSpyPrefixCache();
     const runner = makeRunnerWithCache(cache, memoryManager);
-    const { instructions, hotTierPrompt } = await runner.buildProviderPrompt({
-      toolInventory: [],
-      toolsExecutable: false,
-    });
-    expect(hotTierPrompt).toBe(HOT);
-    expect(instructions.split(HOT).length - 1).toBe(1);
+    const r = await runner.buildProviderPrompt({ toolInventory: [], toolsExecutable: false, memoryPlacement: "turn-input" });
+    expect(r.memoryBlock).toBe(HOT);
+    expect(r.instructions).not.toContain(HOT);
+    expect(cache.getOrBuild).not.toHaveBeenCalled(); // still uncached by ruling
   });
 });
 
@@ -4934,5 +5103,202 @@ describe("KPR-324 C2: cold-path tool-start ack injection (AgentRunner.send)", ()
 
     expect(result.toolAckInjected).toBe(0);
     expect(result.text).toBe("all set");
+  });
+});
+
+describe("KPR-432: datetime rides the turn input, system prompt is byte-stable across minutes", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    mockQueryOverride = null;
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("two sends a minute apart: identical systemPrompt, prompts end in their own minute's trailer", async () => {
+    vi.useFakeTimers();
+    const runner = makeRunner({ systemPrompt: "STABLE-PIN" });
+
+    vi.setSystemTime(new Date("2026-09-04T17:16:59Z")); // 10:16:59 AM PDT
+    await runner.send("first");
+    const sys1 = getCapturedOptions().systemPrompt as string;
+    const prompt1 = getCapturedPrompt();
+
+    vi.setSystemTime(new Date("2026-09-04T17:17:01Z")); // 10:17:01 AM PDT
+    await runner.send("second");
+    const sys2 = getCapturedOptions().systemPrompt as string;
+    const prompt2 = getCapturedPrompt();
+
+    expect(sys1).toBe(sys2); // the headline invariant — negative-verified in the plan
+    expect(sys1).not.toContain("**Current date/time**");
+    expect(prompt1).toBe("first\n\n**Current date/time**: Friday, September 4, 2026 at 10:16 AM (Pacific Time)");
+    expect(prompt2).toBe("second\n\n**Current date/time**: Friday, September 4, 2026 at 10:17 AM (Pacific Time)");
+  });
+
+  it("systemPromptOverride turns keep the override bytes and still get the trailer on the prompt", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-04T17:17:01Z"));
+    const runner = makeRunner();
+    await runner.send("hello", undefined, undefined, undefined, undefined, "VOICE-OVERRIDE");
+    expect(getCapturedOptions().systemPrompt).toBe("VOICE-OVERRIDE");
+    expect(getCapturedPrompt()).toBe("hello\n\n**Current date/time**: Friday, September 4, 2026 at 10:17 AM (Pacific Time)");
+  });
+
+  it("the promptLength log reports the caller's length, pre-trailer", async () => {
+    const runner = makeRunner();
+    await runner.send("hello");
+    expect(mockLog.info).toHaveBeenCalledWith("Sending prompt to agent", expect.objectContaining({ promptLength: 5 }));
+  });
+});
+
+describe("KPR-434: memory rides the turn input under the digest gate; system prompt is byte-stable across memory writes", () => {
+  const BLOCK_A = "## Your Memory\n\n### Key Facts\n- [2026-09-04] fact A (high)";
+  const BLOCK_B = "## Your Memory\n\n### Key Facts\n- [2026-09-04] fact A (high)\n- [2026-09-05] fact B (high)";
+  const NOW = new Date("2026-09-05T17:17:01Z"); // 10:17 AM PDT
+  // Hand-mirrored copy of the warn string in send() — deliberately NOT export-pinned: it is
+  // operator log text, never agent-visible bytes (MEMORY_TURN_HEADER is the one that must be exported).
+  const RENDER_WARN = "Memory render failed — turn proceeds without memory this turn (KPR-434)";
+
+  function makeMemoryRunner(memoryManager: ReturnType<typeof makeMockMemoryManager>): AgentRunner {
+    return new AgentRunner(
+      makeAgentConfig({ systemPrompt: "MEM-PIN", coreServers: ["memory"] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      // KPR-327: the memory server (and therefore the File-Tier guidance gate,
+      // keyed on the built server set) only appears via the in-process branch.
+      makeFakeInProcessDb(),
+    );
+  }
+  /** send() with only the positional slots this suite cares about: (prompt, sessionId, …, systemPromptOverride, effort, memoryDigestSeen). */
+  const sendWithSeen = (runner: AgentRunner, prompt: string, sessionId: string | undefined, seen: string | undefined) =>
+    runner.send(prompt, sessionId, undefined, undefined, undefined, undefined, undefined, seen);
+  /** completionRecord() returns the FIRST matching call across the three spies — clear them before a send whose record is under test. */
+  const clearLogSpies = () => {
+    mockLog.info.mockClear();
+    mockLog.warn.mockClear();
+    mockLog.error.mockClear();
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    mockQueryOverride = null;
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => vi.useRealTimers());
+
+  // Title is load-bearing: Task 9 Step 1 selects this test with `-t "byte-identical systemPrompt"`.
+  it("T1: fresh injects A; resumed after a write injects B under a byte-identical systemPrompt; resumed unchanged injects nothing", async () => {
+    const memoryManager = makeMockMemoryManager();
+    memoryManager.getHotTierPrompt.mockResolvedValue(BLOCK_A);
+    const runner = makeMemoryRunner(memoryManager);
+
+    const r1 = await runner.send("hi");
+    const sys1 = getCapturedOptions().systemPrompt as string;
+    expect(getCapturedPrompt()).toBe(composeTurnInput({ prompt: "hi", memoryBlock: BLOCK_A, now: NOW }));
+    expect(getCapturedPrompt()).toBe(`${MEMORY_TURN_HEADER}\n\n${BLOCK_A}\n\nhi\n\n${formatDateTimeTrailer(NOW)}`);
+    expect(r1.memoryDigestInjected).toBe(memoryDigest(BLOCK_A));
+    // NO getHotTierPrompt call-count pin before the byte-equality line below: under Task 9 Step 1's
+    // revert (memory restored in buildPrefix) send #1 renders TWICE (buildPrefix + renderMemoryBlock —
+    // this runner has no PrefixCache), and a (1) pin here would fail first. The cumulative ⚠A2 pins
+    // after the equality line carry the one-render-per-send() property.
+
+    memoryManager.getHotTierPrompt.mockResolvedValue(BLOCK_B); // a hot-tier write landed between turns
+    const r2 = await sendWithSeen(runner, "again", "sess-1", memoryDigest(BLOCK_A));
+    // The headline invariant FIRST (negative-verified in Task 9 Step 1 — with memory restored in
+    // buildPrefix this is the FIRST assertion in this test that fails: everything above it reads the
+    // PROMPT or RunResult, which the revert does not change; the content pins below run only after it).
+    expect(getCapturedOptions().systemPrompt).toBe(sys1);
+    expect(getCapturedPrompt()).toBe(composeTurnInput({ prompt: "again", memoryBlock: BLOCK_B, now: NOW }));
+    expect(r2.memoryDigestInjected).toBe(memoryDigest(BLOCK_B));
+    expect(memoryManager.getHotTierPrompt).toHaveBeenCalledTimes(2);
+    expect(sys1).not.toContain("## Your Memory");
+    expect(sys1).toContain("delivered in the conversation");
+
+    clearLogSpies(); // completionRecord() returns the FIRST "Agent response complete" — isolate the third send
+    const r3 = await sendWithSeen(runner, "third", "sess-1", memoryDigest(BLOCK_B));
+    expect(getCapturedOptions().systemPrompt).toBe(sys1);
+    expect(getCapturedPrompt()).toBe(`third\n\n${formatDateTimeTrailer(NOW)}`);
+    expect(getCapturedPrompt()).not.toContain(MEMORY_TURN_HEADER);
+    expect(getCapturedPrompt()).not.toContain("## Your Memory");
+    expect(r3.memoryDigestInjected).toBeUndefined();
+    expect(memoryManager.getHotTierPrompt).toHaveBeenCalledTimes(3);
+    expect(completionRecord()!.memoryInjected).toBe(false);
+  });
+
+  it("T1: resumed session with NO mark (pre-434 row, unpaired row, failed read) injects — duplicate, never gap", async () => {
+    const memoryManager = makeMockMemoryManager();
+    memoryManager.getHotTierPrompt.mockResolvedValue(BLOCK_A);
+    const runner = makeMemoryRunner(memoryManager);
+    const r = await sendWithSeen(runner, "hi", "sess-1", undefined);
+    expect(getCapturedPrompt().startsWith(MEMORY_TURN_HEADER)).toBe(true);
+    expect(r.memoryDigestInjected).toBe(memoryDigest(BLOCK_A));
+  });
+
+  it("T1 fail-soft (D2): a render throw never rejects — memory-less turn, one warn, memoryRenderFailed, systemPrompt unchanged", async () => {
+    const memoryManager = makeMockMemoryManager();
+    memoryManager.getHotTierPrompt.mockResolvedValueOnce(BLOCK_A);
+    const runner = makeMemoryRunner(memoryManager);
+    await runner.send("warm");
+    const P = getCapturedOptions().systemPrompt as string;
+    expect(memoryManager.getHotTierPrompt).toHaveBeenCalledTimes(1);
+
+    clearLogSpies(); // isolate the failing send's completion record + warn count
+    memoryManager.getHotTierPrompt.mockRejectedValueOnce(new Error("connect ECONNREFUSED 127.0.0.1:27017"));
+    const result = await sendWithSeen(runner, "hi", "sess-1", memoryDigest(BLOCK_A)); // resolves — never rejects
+    expect(getCapturedOptions().systemPrompt).toBe(P);
+    expect(getCapturedPrompt()).toBe(appendDateTimeTrailer("hi", NOW)); // no header, no block
+    expect(result.memoryRenderFailed).toBe(true);
+    expect(result.memoryDigestInjected).toBeUndefined();
+    expect(result.error).toBeUndefined();
+    expect(memoryManager.getHotTierPrompt).toHaveBeenCalledTimes(2); // ⚠A2: one render attempt per send(), even when it throws
+    const warns = mockLog.warn.mock.calls.filter((c) => c[0] === RENDER_WARN);
+    expect(warns).toHaveLength(1);
+    expect(warns[0]![1]).toEqual(
+      expect.objectContaining({ agent: "test-agent", resumeSession: "sess-1", error: expect.stringContaining("ECONNREFUSED") }),
+    );
+    expect(completionRecord()!.memoryInjected).toBe(false);
+  });
+
+  it("T1 fail-soft: a successful turn never carries memoryRenderFailed (sparse)", async () => {
+    const memoryManager = makeMockMemoryManager();
+    memoryManager.getHotTierPrompt.mockResolvedValue(BLOCK_A);
+    const result = await makeMemoryRunner(memoryManager).send("hi");
+    expect(result).not.toHaveProperty("memoryRenderFailed");
+  });
+
+  it("T3: a systemPromptOverride turn (worker / scribe / voice shape) never renders memory", async () => {
+    const memoryManager = makeMockMemoryManager();
+    memoryManager.getHotTierPrompt.mockResolvedValue(BLOCK_A);
+    const runner = makeMemoryRunner(memoryManager);
+    const charter = "You are a meeting fetch-worker. Answer only the task below; you have no memory of the meeting.";
+    const result = await runner.send("fetch the deck", undefined, undefined, undefined, undefined, charter);
+    expect(getCapturedOptions().systemPrompt).toBe(charter);
+    expect(getCapturedPrompt()).toBe(appendDateTimeTrailer("fetch the deck", NOW)); // datetime still rides (KPR-432)
+    expect(getCapturedPrompt()).not.toContain(MEMORY_TURN_HEADER);
+    expect(memoryManager.getHotTierPrompt).not.toHaveBeenCalled(); // renderMemoryBlock never ran (its only I/O)
+    expect(result.memoryDigestInjected).toBeUndefined();
+    expect(result).not.toHaveProperty("memoryRenderFailed");
+  });
+
+  it("T3: an override turn cannot fail-soft either — a rejecting hot tier is never touched", async () => {
+    const memoryManager = makeMockMemoryManager();
+    memoryManager.getHotTierPrompt.mockRejectedValue(new Error("connect ECONNREFUSED 127.0.0.1:27017"));
+    const result = await makeMemoryRunner(memoryManager).send("x", "sess-1", undefined, undefined, undefined, "OVERRIDE");
+    expect(result.error).toBeUndefined();
+    expect(result).not.toHaveProperty("memoryRenderFailed");
+  });
+
+  it("the promptLength log reports the caller's length, pre-composition (KPR-432 convention)", async () => {
+    const memoryManager = makeMockMemoryManager();
+    memoryManager.getHotTierPrompt.mockResolvedValue(BLOCK_A);
+    await makeMemoryRunner(memoryManager).send("hello");
+    expect(mockLog.info).toHaveBeenCalledWith("Sending prompt to agent", expect.objectContaining({ promptLength: 5 }));
   });
 });

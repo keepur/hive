@@ -174,21 +174,7 @@ You have access to the following tools this session. Try them; don't guess at av
 ---
 
 ## File-Tier Memory
-You have a file-tier memory at \`/memories\` (tools: view, create, str_replace, insert, delete, rename). Your hot-tier memory is already injected in this prompt — do **not** re-\`view\` files to rediscover what's already here. \`view\` file-tier paths when a task needs detail beyond the hot tier, and record durable file-worthy material there.
-
----
-
-## Your Memory
-
-### Key Facts
-- [2026-07-01] Golden fact one (high)
-- [2026-07-02] Golden fact two (medium)
-
-### Pinned
-- Golden pinned entry (high, pinned)
-
----
-You have 7 additional memories available via \`memory_recall\`. Use it to search for context before starting tasks."
+You have a file-tier memory at \`/memories\` (tools: view, create, str_replace, insert, delete, rename). Your memory, when present, is delivered in the conversation — at the start of a session and again whenever it changes — do **not** re-\`view\` files to rediscover what's already there. \`view\` file-tier paths when a task needs detail beyond the hot tier, and record durable file-worthy material there."
 `;
 
 exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G9: legacy memory.md + extra files fallback (hot tier null) 1`] = `
@@ -207,21 +193,7 @@ You have access to the following tools this session. Try them; don't guess at av
 - WebFetch / WebSearch — web access
 - NotebookEdit — Jupyter notebook editing
 - Task — delegate to a subagent (see Delegated capability MCPs below)
-- TodoWrite — track multi-step tasks within this session
-
----
-
-## Your Memory
-GOLDEN-LEGACY-MEMORY body.
-
----
-
-## Available Memory Files
-You have 2 reference file(s) in your memory directory:
-- /memories/agents/golden-agent/projects.md
-- /memories/agents/golden-agent/contacts.md
-
-Read relevant files via the memory MCP server (\`view\`) before starting tasks that may relate to them."
+- TodoWrite — track multi-step tasks within this session"
 `;
 
 exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G10: toolkit subsections — core + plugins + delegates + auto-injected 1`] = `
@@ -321,19 +293,5 @@ You have access to the following tools this session. Try them; don't guess at av
 ---
 
 ## File-Tier Memory
-You have a file-tier memory at \`/memories\` (tools: view, create, str_replace, insert, delete, rename). Your hot-tier memory is already injected in this prompt — do **not** re-\`view\` files to rediscover what's already here. \`view\` file-tier paths when a task needs detail beyond the hot tier, and record durable file-worthy material there.
-
----
-
-## Your Memory
-
-### Key Facts
-- [2026-07-01] Golden fact one (high)
-- [2026-07-02] Golden fact two (medium)
-
-### Pinned
-- Golden pinned entry (high, pinned)
-
----
-You have 7 additional memories available via \`memory_recall\`. Use it to search for context before starting tasks."
+You have a file-tier memory at \`/memories\` (tools: view, create, str_replace, insert, delete, rename). Your memory, when present, is delivered in the conversation — at the start of a session and again whenever it changes — do **not** re-\`view\` files to rediscover what's already there. \`view\` file-tier paths when a task needs detail beyond the hot tier, and record durable file-worthy material there."
 `;

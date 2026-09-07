@@ -218,12 +218,12 @@ describe("WarmVoiceSession", () => {
 
     const p1 = lease.runTurn({ text: "u1", timeoutMs: 5000 });
     await microFlush();
-    expect(pushed).toEqual(["u1"]);
+    expect(pushed).toEqual([expect.stringMatching(/^u1\n\n\*\*Current date\/time\*\*: /)]);
 
     const p2 = lease.runTurn({ text: "u2", timeoutMs: 5000 });
     await microFlush();
     // Gate holds: turn 2's utterance is NOT in the stream yet.
-    expect(pushed).toEqual(["u1"]);
+    expect(pushed).toEqual([expect.stringMatching(/^u1\n\n\*\*Current date\/time\*\*: /)]);
     expect(lease.turns).toBe(1);
     expect(lease.hasTurnInFlight).toBe(true);
 
@@ -232,7 +232,7 @@ describe("WarmVoiceSession", () => {
     expect(r1.text).toBe("one");
 
     await microFlush();
-    expect(pushed).toEqual(["u1", "u2"]); // released only after turn 1's result
+    expect(pushed).toEqual([expect.stringMatching(/^u1\n\n\*\*Current date\/time\*\*: /), expect.stringMatching(/^u2\n\n\*\*Current date\/time\*\*: /)]); // released only after turn 1's result
     expect(lease.turns).toBe(2);
 
     emit(resultMsg({ result: "two", session_id: "s2" }));

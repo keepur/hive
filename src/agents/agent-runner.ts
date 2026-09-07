@@ -1,4 +1,4 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUserMessage, type McpServerConfig, type McpSdkServerConfigWithInstance, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUserMessage, type EffortLevel, type McpServerConfig, type McpSdkServerConfigWithInstance, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
 import { existsSync, mkdirSync, symlinkSync, lstatSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -17,7 +17,14 @@ import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { type SkillIndex, getSkillsForAgent } from "./skill-loader.js";
 import { SERVER_CATALOG, type ServerCatalogEntry } from "../tools/server-catalog.js";
 import { buildInstanceCapabilities } from "../tools/instance-capabilities.js";
-import { buildPrefix, buildProviderInstructions, SECTION_JOINER, formatDateTimeTrailer } from "./prefix-builder.js";
+import {
+  buildPrefix,
+  buildProviderInstructions,
+  composeTurnInput,
+  renderMemoryBlock,
+  shouldInjectMemory,
+  type RenderedMemoryBlock,
+} from "./prefix-builder.js";
 import { deriveProviderSkillIndex } from "./provider-adapters/skill-index.js";
 import {
   buildGenericDelegatePrompt,
@@ -50,7 +57,7 @@ import {
   VOICE_FIXTURE_ALLOWED_AGENT_ID,
 } from "./in-process-servers.js";
 
-import type { ResourceLimits } from "./model-router.js";
+import type { ResourceLimits } from "./resource-tiers.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
 import type { TeamRoster } from "../team-roster/team-roster.js";
 import { createTeamRosterMcpServer } from "../team-roster/team-roster-mcp-server.js";
@@ -75,11 +82,24 @@ import { createVoiceFixtureMcpServer } from "../voice/voice-fixture-mcp-server.j
 import type { MeetingWorkerPool, WorkerPoolTurnContext } from "../workers/meeting-worker-pool.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
-import type { ReasoningEffort } from "./provider-adapters/types.js";
+import type { TurnEffort } from "./provider-adapters/types.js";
+import { isAgentEffort, type AgentEffort } from "./agent-effort.js";
 // KPR-394 (§4.11): plugin provider ids widen the admin model-catalog tools.
 import { listPluginProviderIds } from "./provider-adapters/provider-registry.js";
 // KPR-324 C2: voice tool-start acknowledgment (cold spawn loop).
 import { shouldInjectToolAck, nextAckPhrase, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
+
+// KPR-430: compile-time pin — AgentEffort ≡ SDK EffortLevel in BOTH
+// directions. If the SDK adds or removes a level, this fails typecheck
+// rather than the runner silently narrowing (dropping a level) or
+// over-delivering (a param the API 400s on). `void` keeps the warn-level
+// @typescript-eslint/no-unused-vars rule quiet.
+const _agentEffortIsSdkEffort: [AgentEffort] extends [EffortLevel]
+  ? [EffortLevel] extends [AgentEffort]
+    ? true
+    : never
+  : never = true;
+void _agentEffortIsSdkEffort;
 
 /**
  * AgentRunner — assembles SDK `query()` options and runs one inference cycle.
@@ -201,6 +221,15 @@ export interface RunResult {
   initToFirstTokenMs?: number;
   /** KPR-388: populated ONLY by the dispatcher's convertTurnResult mapping (TurnResult passthrough); runner/adapters never set it. */
   resumedSession?: boolean;
+  /** KPR-434: digest of the memory block this turn's input carried; absent ⇒ no block was injected. */
+  memoryDigestInjected?: string;
+  /**
+   * KPR-434 D2: the Claude-lane memory render threw (Mongo) and the turn ran
+   * memory-less — sparse, never false. The fail-soft observability half of
+   * "proceed without memory"; a burst across agents is the Mongo-outage
+   * signature. Lane B never sets it (its render fault fails the turn, D5).
+   */
+  memoryRenderFailed?: true;
 }
 
 /**
@@ -460,10 +489,13 @@ export class AgentRunner {
       ? await this.prefixCache.getOrBuild(this.agentConfig.id, () => buildPrefix(this.agentConfig, buildContext))
       : await buildPrefix(this.agentConfig, buildContext);
 
-    // Date/time last — changes every minute, so placing it at the end
-    // preserves the static prefix for prompt caching. Single definition
-    // shared with Lane B (KPR-349 §D1: the two lanes cannot drift).
-    return `${prefix}${SECTION_JOINER}${formatDateTimeTrailer()}`;
+    // KPR-432: no datetime here; KPR-434: no agent memory here either. Both
+    // ride the TURN INPUT (send() → composeTurnInput), so this string is
+    // byte-stable across minutes AND across memory writes, and the API prompt
+    // cache (tools → system → messages, strict prefix) holds the transcript.
+    // Single definition shared with Lane B (KPR-349 §D1: the two lanes cannot
+    // drift).
+    return prefix;
   }
 
 
@@ -1548,8 +1580,9 @@ export class AgentRunner {
           agentId: this.agentConfig.id,
           memoryScopes: this.resolveMemoryScopes(),
           // KPR-213: write-through prefix cache invalidation. Path-aware:
-          // agents/<id>/... invalidates that agent; shared/* invalidates
-          // everyone; status/* is operational telemetry and does not affect prompts.
+          // shared/* invalidates everyone; status/* is operational telemetry
+          // and does not affect prompts; agents/<id>/* is scope `none` since
+          // KPR-434 (agent memory rides the turn input under the digest gate).
           onWrite: this.prefixCache
             ? (path, reason) => invalidatePrefixCacheByMemoryPath(this.prefixCache!, path, reason)
             : undefined,
@@ -1719,14 +1752,10 @@ export class AgentRunner {
           context: this.structuredMemoryContextRef,
           qdrantUrl: process.env.QDRANT_URL,
           ollamaUrl: process.env.OLLAMA_URL,
-          // KPR-213: structured-memory mutations affect the agent's hot-tier
-          // and therefore its prefix. Bulk paths pass null → invalidateAll.
-          onMutate: this.prefixCache
-            ? (mutAgentId, reason) => {
-                if (mutAgentId === null) this.prefixCache!.invalidateAll(reason);
-                else this.prefixCache!.invalidateAgent(mutAgentId, reason);
-              }
-            : undefined,
+          // KPR-434: no onMutate — structured-memory writes no longer touch
+          // the prefix (the hot tier left the system prompt; the digest gate
+          // in send() sees the change on the next turn). prefixCache stays
+          // for buildSystemPrompt.
         });
       }
       servers["structured-memory"] = this.structuredMemoryMcpServer;
@@ -1783,17 +1812,39 @@ export class AgentRunner {
   async buildProviderPrompt(opts: {
     toolInventory: HiveToolInventoryEntry[];
     toolsExecutable: boolean;
-  }): Promise<{ instructions: string; hotTierPrompt?: string; skillEntries: ProviderSkillIndexEntry[] }> {
+    /**
+     * KPR-434 D5: decided by assembleProviderTurn from the route's session
+     * semantics. Inlined union (≡ prefix-builder's ProviderMemoryPlacement) on
+     * purpose: this method is on agent-runner.d.ts, which ships in the
+     * provider-ABI d.ts closure via provider-abi.ts's RunResult re-export —
+     * naming the prefix-builder alias here would pull prefix-builder.d.ts into
+     * pkg/types/ (KPR-407 "resist growth").
+     */
+    memoryPlacement: "instructions" | "turn-input";
+  }): Promise<{
+    instructions: string;
+    hotTierPrompt?: string;
+    memoryBlock?: string;
+    memoryDigest?: string;
+    skillEntries: ProviderSkillIndexEntry[];
+  }> {
     const skillEntries = deriveProviderSkillIndex(this.buildNativeSkills());
     const result = await buildProviderInstructions(this.agentConfig, {
       toolInventory: opts.toolInventory,
       skillIndex: skillEntries,
       toolsExecutable: opts.toolsExecutable,
+      memoryPlacement: opts.memoryPlacement,
       memoryManager: this.memoryManager,
       teamRoster: this.teamRoster,
       plugins: this.plugins,
     });
-    return { instructions: result.instructions, hotTierPrompt: result.hotTierPrompt, skillEntries };
+    return {
+      instructions: result.instructions,
+      hotTierPrompt: result.hotTierPrompt,
+      memoryBlock: result.memoryBlock,
+      memoryDigest: result.memoryDigest,
+      skillEntries,
+    };
   }
 
   /**
@@ -2057,7 +2108,7 @@ export class AgentRunner {
     context?: WorkItemContext;
     resourceLimits?: ResourceLimits;
     systemPromptOverride?: string;
-    effort?: ReasoningEffort;
+    effort?: TurnEffort;
     streaming: boolean;
   }): Promise<SdkQueryOptions> {
     // KPR-346 (§D5): Lane A passthrough — the CLI model is the FOREIGN id;
@@ -2153,15 +2204,9 @@ export class AgentRunner {
 
       maxTurns: resourceLimits?.maxTurns ?? this.agentConfig.maxTurns,
       maxBudgetUsd: resourceLimits?.budgetUsd ?? this.agentConfig.budgetUsd,
-      // KPR-312: per-turn reasoning effort from the complexity classifier.
-      // ReasoningEffort and the SDK's EffortLevel overlap but neither is a
-      // superset (ReasoningEffort has minimal/none/xhigh; EffortLevel has
-      // max) — only the shared {low, medium, high} subset is deliverable
-      // (routeModel emits nothing else; the narrowing also satisfies the
-      // SDK's EffortLevel type). Deliberately NO `thinking` key: toggling
-      // thinking config turn-to-turn invalidates the messages-tier prompt
-      // cache — the exact cost class KPR-312 avoids.
-      ...(effort === "low" || effort === "medium" || effort === "high" ? { effort } : {}),
+      // KPR-430: deliver SDK-supported effort, including xhigh/max.
+      // Keep thinking configuration stable to preserve the prompt cache.
+      ...(isAgentEffort(effort) ? { effort } : {}),
       // Only allowlisted archetype keys are merged. The archetype's sessionOptions()
       // may return arbitrary SDK options, but we explicitly pick only the safe ones
       // so a rogue archetype can't override security invariants (permissionMode,
@@ -2185,6 +2230,33 @@ export class AgentRunner {
         CLAUDECODE: undefined,
         // KPR-329: always pinned — overrides any ambient ENABLE_TOOL_SEARCH.
         ENABLE_TOOL_SEARCH: toolSearchEnvValue,
+          // KPR-438: always pinned — SDK 0.3.26x (Claude Code 2.1.26x) runs the
+          // `Agent` tool's subagents in the BACKGROUND by default and completes
+          // them with a `<task-notification>` user message that wakes the
+          // session. After that wake-up every in-process SDK MCP tool call
+          // (createSdkMcpServer servers: memory, structured-memory, team,
+          // team-roster, callback, schedule, admin, contacts, event-bus,
+          // conversation-search, code-search, workflow, worker-pool) fails
+          // instantly with "The tool call was interrupted before a result was
+          // received"; stdio servers and builtins are unaffected. Hive's
+          // `delegateServers` subagents ARE `Agent` calls, so any turn that
+          // delegates loses memory/team tools for the rest of the session.
+          // Disabling background tasks runs subagents inline and the failure
+          // disappears (the CLI reads `backgroundTasksDisabled ||
+          // CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`). Hive already awaits every
+          // delegate result, so inline execution costs no throughput here.
+          // KEEP THIS PIN. The removal gate is NOT a repro: a minimal harness
+          // does not reproduce the failure (three variants pass unpinned on
+          // both 0.3.258 and the fleet-resolved 0.3.261 — `^0.3.258` floats,
+          // so deployed instances run higher than this repo's lockfile). The
+          // gate is `npx tsx scripts/repro-bg-subagent-mcp.ts --audit
+          // --since=<deploy date>`, which measures the real before/after-
+          // notification interruption rate out of the CLI transcripts; drop
+          // the pin only after a hive has run a day of delegating traffic
+          // WITHOUT it and that rate stays at the ~0.06% baseline. Unfixed as
+          // of SDK 0.3.263.
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
+
         // KPR-346 (§D5): Lane A pins — base URL, vendor token, foreign-model
         // pins (incl. subagents), ANTHROPIC_API_KEY scrub, tool search off.
         ...(passthrough ? buildPassthroughEnv(passthrough) : {}),
@@ -2201,7 +2273,7 @@ export class AgentRunner {
     return options;
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: ReasoningEffort): Promise<RunResult> {
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: TurnEffort, memoryDigestSeen?: string): Promise<RunResult> {
     // KPR-346 (§D5): Lane A passthrough — the CLI model is the FOREIGN id;
     // agentConfig.model keeps the prefixed string (kimi/…) so telemetry and
     // the activity log attribute the provider via the model string untouched.
@@ -2244,7 +2316,40 @@ export class AgentRunner {
     let bootToInitMs: number | undefined;
     let initToFirstTokenMs: number | undefined;
 
-    const q = query({ prompt, options });
+    // KPR-434: memory rides the turn input under the digest gate; overrides
+    // (voice, worker, scribe) are total replacements and never get it — a
+    // contained worker must never see the boss's hot tier. FAIL-SOFT: a render
+    // fault (Mongo) must not fail the turn and must never reach the breaker.
+    // Why: ClaudeAgentAdapter.runTurn is a bare forward, so a throw out of
+    // here lands in spawnTurn's recorded catch → classifyThrown, which
+    // pattern-matches the message — a Mongo ECONNREFUSED/ETIMEDOUT hits the
+    // connect-fail row and three such turns open the CLAUDE breaker for a
+    // healthy provider. Not wrapped in TurnAssemblyError (that is Lane B's
+    // honest-failure contract); the ruling here is to PROCEED memory-less,
+    // leave the mark alone, and re-deliver on the next successful render.
+    // Same pre-try surface as buildSystemPrompt above: nothing (ticket, timer,
+    // abort controller) is armed yet.
+    let rendered: RenderedMemoryBlock | undefined;
+    let memoryRenderFailed = false;
+    if (systemPromptOverride === undefined) {
+      try {
+        rendered = await renderMemoryBlock(this.memoryManager, this.agentConfig.id, { toolsExecutable: true });
+      } catch (err) {
+        memoryRenderFailed = true;
+        log.warn("Memory render failed — turn proceeds without memory this turn (KPR-434)", {
+          agent: this.agentConfig.id,
+          resumeSession: sessionId ?? "new",
+          error: String(err),
+        });
+      }
+    }
+    const injectMemory = shouldInjectMemory({ sessionId, digest: rendered?.digest, memoryDigestSeen });
+    // KPR-432/KPR-434: composed here — after every upstream re-wrap (outage
+    // replay, deadline continuation, meeting ack) — so a replayed turn carries
+    // the time it actually ran and the memory the session has not yet seen.
+    const turnPrompt = composeTurnInput({ prompt, memoryBlock: injectMemory ? rendered!.block : undefined });
+
+    const q = query({ prompt: turnPrompt, options });
 
     this.activeQuery = q;
 
@@ -2630,6 +2735,8 @@ export class AgentRunner {
       // "Did this run actually ship anything?" — previously only inferable by
       // reading outputTokens off the final record.
       producedOutput: resultText.length > 0,
+      // KPR-434: did this turn's input carry the memory block?
+      memoryInjected: injectMemory,
     };
 
     // Only `error` level reaches stderr (and therefore hive.err). A timeout is
@@ -2654,6 +2761,8 @@ export class AgentRunner {
       error, aborted: this._aborted,
       ...(timedOut ? { timedOut: true } : {}),
       bootToInitMs, initToFirstTokenMs,
+      ...(injectMemory ? { memoryDigestInjected: rendered!.digest } : {}),
+      ...(memoryRenderFailed ? { memoryRenderFailed: true as const } : {}),
     };
   }
 

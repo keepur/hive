@@ -1,5 +1,6 @@
 import { type Collection, type Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
+import type { EffortSource } from "./agent-effort.js";
 
 const log = createLogger("turn-telemetry");
 
@@ -22,12 +23,19 @@ export interface TurnTelemetryDoc {
   llmMs?: number;
   toolMs?: number;
   toolCalls?: number;
-  effort?: string; // delivered effortOverride ("low" pin visible)
+  effort?: string; // delivered effortOverride ("low" pin visible; static field since KPR-430)
+  /** KPR-430 D6: provenance of `effort` — present iff `effort` is present.
+   *  static | suffix | router | pin. Sparse, never null. */
+  effortSource?: EffortSource;
   /** KPR-401: present (true) only on aborted turns with real usage — sparse,
    * matching the ephemeral-counter optional style. Lets dashboards segment
    * aborted-turn spend; the aggregation pipelines are deliberately unchanged
    * (aborted turns' completed API calls are real cache traffic). */
   aborted?: true;
+  /** KPR-434 D6: sparse — true iff this turn's input carried the memory block (RunResult.memoryDigestInjected). */
+  memoryInjected?: true;
+  /** KPR-434 D2/D6: sparse — true iff the Claude-lane memory render threw and the turn ran memory-less. */
+  memoryRenderFailed?: true;
   createdAt: Date;
 }
 
@@ -50,9 +58,16 @@ export interface TurnTelemetryInput {
   llmMs?: number;
   toolMs?: number;
   toolCalls?: number;
-  effort?: string; // delivered effortOverride ("low" pin visible)
+  effort?: string; // delivered effortOverride ("low" pin visible; static field since KPR-430)
+  /** KPR-430 D6: provenance of `effort` — present iff `effort` is present.
+   *  static | suffix | router | pin. Sparse, never null. */
+  effortSource?: EffortSource;
   /** KPR-401: sparse — set only when true (see TurnTelemetryDoc.aborted). */
   aborted?: true;
+  /** KPR-434: sparse — see TurnTelemetryDoc. */
+  memoryInjected?: true;
+  /** KPR-434: sparse — see TurnTelemetryDoc. */
+  memoryRenderFailed?: true;
 }
 
 export interface CacheHitRateRow {

@@ -116,14 +116,14 @@ Synchronous, ephemeral, returns into the caller's turn. Driven by the SDK's `age
 
 ## System prompt assembly
 
-When an agent is invoked, the runner assembles its system prompt in this order, then calls the SDK:
+When an agent is invoked, the runner assembles its system prompt from items 1–4 (plus the KPR-87 file-tier guidance) and composes items 5–6 into each turn's input, then calls the SDK:
 
 1. **Soul** — agent personality / voice / values.
 2. **systemPrompt** — agent's role + guardrails.
 3. **Constitution** — shared `constitution.md` for the instance.
 4. **Toolkit** — runtime-injected catalog of available MCP tools.
-5. **Agent memory** — hot-tier records (always loaded).
-6. **Date / time** — last so the static prefix stays prompt-cache-friendly.
+5. **Agent memory** — hot-tier records, or the legacy `memory.md` + file listing. **Not** in the system prompt: it rides the turn input, digest-gated per session (KPR-434) — delivered on a session's first turn and again whenever the rendered block changes.
+6. **Date / time** — also in the turn input, as its last line (KPR-432), so the system prompt stays byte-stable and prompt-cache-friendly.
 
 ## Hot reload
 

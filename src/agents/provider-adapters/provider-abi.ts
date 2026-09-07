@@ -50,7 +50,21 @@ export interface LaneBProviderKit {
   /** === LANE_B_PROVIDER_ABI_VERSION — belt-and-braces runtime assertion. */
   abiVersion: number;
   /** Abstract per-turn lifecycle base (KPR-391) — EXTEND IT: deadline,
-   *  containment, ToolBridge lifecycle, usage accounting come free. */
+   *  containment, ToolBridge lifecycle, usage accounting come free.
+   *  - KPR-432: `harness.request.prompt` already ends with the engine's datetime
+   *    trailer for primary assemblies (`datetimeInTurnInput`); plugin adapters
+   *    must not append their own. Additive optional field — no ABI version bump.
+   *    A plugin that implements AgentProviderAdapter directly (bypassing this
+   *    scaffold) receives no datetime at all — it no longer rides `instructions`;
+   *    extend the scaffold to get it.
+   *  - KPR-434: `harness.request.prompt` may ALSO already carry the engine's
+   *    memory block (server-resumable assemblies, `memoryInTurnInput`, under
+   *    the per-session digest gate); plugin adapters must not inject
+   *    `assembly.memory` themselves. A plugin adapter bypassing this scaffold on
+   *    a server-resumable route gets no memory at all (fail-dark — extend the
+   *    scaffold); on a stateless route the block still rides `instructions`.
+   *    Additive optional fields — no ABI version bump.
+   */
   LaneBTurnScaffold: typeof LaneBTurnScaffold;
   /** The shared bounded tool-dispatch loop (codex/gemini/grok template). */
   runBoundedDispatchLoop: typeof runBoundedDispatchLoop;
@@ -77,6 +91,7 @@ export type {
   AgentProviderTurnRequest,
   SessionSemantics,
   ReasoningEffort,
+  TurnEffort,
   GuardrailGate,
   GuardrailToolCall,
   GuardrailDecision,
@@ -110,5 +125,5 @@ export type {
   OmittedToolRecord,
 } from "./tool-transport.js";
 export type { RunResult, StreamCallback, WorkItemContext } from "../agent-runner.js";
-export type { ResourceLimits } from "../model-router.js";
+export type { ResourceLimits } from "../resource-tiers.js";
 export type { TurnHistoryStore } from "../turn-history-store.js";

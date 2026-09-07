@@ -2,10 +2,16 @@
  * KPR-349 (spec §D2): golden byte-parity gate for the Claude-lane prefix.
  *
  * COMMITTED REFACTOR-FREE: these snapshots were generated against the
- * pre-extraction buildPrefix (KPR-213 shape). Any snapshot churn in a later
- * commit is a Claude-lane parity break BY DEFINITION — fix the refactor,
- * never update the snapshots. The fixture matrix covers every branch in
- * buildPrefix; inputs are deterministic mocks so bytes are machine-stable.
+ * pre-extraction buildPrefix (KPR-213 shape) and RE-PINNED ONCE in KPR-434
+ * (D7) at the post-434 shape — agent memory (hot tier / legacy memory.md +
+ * file listing) rides the turn input, so the `## Your Memory` /
+ * `## Available Memory Files` sections left the prefix and the file-tier
+ * guidance sentence was reworded ("delivered in the conversation"). G8, G9 and
+ * G12 moved in that one sanctioned commit; nothing else did. Any LATER
+ * snapshot churn is a Claude-lane parity break BY DEFINITION — fix the
+ * refactor, never update the snapshots. The fixture matrix covers every
+ * branch in buildPrefix; inputs are deterministic mocks so bytes are
+ * machine-stable. HOT_TIER_FIXTURE stays: it is the renderMemoryBlock shape.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { AgentConfig } from "../types/agent-config.js";
@@ -160,6 +166,7 @@ describe("buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first)", () 
     expect(out).toMatchSnapshot();
   });
 
+  // KPR-434: the hot-tier block left the prefix (it rides the turn input); the guidance sentence reads "delivered in the conversation".
   it("G8: memory in coreServers → file-tier guidance + hot-tier block", async () => {
     const ctx = makeCtx({
       coreServerNames: ["memory", "structured-memory"],
@@ -169,10 +176,13 @@ describe("buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first)", () 
     });
     const out = await buildPrefix(makeAgentConfig({ coreServers: ["memory"] }), ctx);
     expect(out).toContain("## File-Tier Memory");
-    expect(out).toContain("memory_recall");
+    expect(out).not.toContain("memory_recall");
+    expect(out).not.toContain("## Your Memory");
+    expect(out).toContain("delivered in the conversation");
     expect(out).toMatchSnapshot();
   });
 
+  // KPR-434: legacy memory.md + the file listing left the prefix too (renderMemoryBlock carries them).
   it("G9: legacy memory.md + extra files fallback (hot tier null)", async () => {
     const ctx = makeCtx({
       memoryManager: makeMemoryManager({
@@ -183,8 +193,9 @@ describe("buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first)", () 
       }) as never,
     });
     const out = await buildPrefix(makeAgentConfig(), ctx);
-    expect(out).toContain("## Available Memory Files");
-    expect(out).toContain("Read relevant files via the memory MCP server (`view`)");
+    expect(out).not.toContain("## Available Memory Files");
+    expect(out).not.toContain("Read relevant files via the memory MCP server (`view`)");
+    expect(out).not.toContain("GOLDEN-LEGACY-MEMORY");
     expect(out).toMatchSnapshot();
   });
 

@@ -36,6 +36,7 @@ import {
   __resetRouterStateForTests,
   type ModelRouterResult,
 } from "./model-router.js";
+import * as tiers from "./resource-tiers.js";
 
 describe("resolveResourceLimits", () => {
   it("returns global defaults when no agent overrides", () => {
@@ -79,8 +80,10 @@ describe("resolveResourceLimits", () => {
 
   describe("top-level agentTimeoutMs participation (KPR-422)", () => {
     it("honors a custom top-level timeoutMs over the tier default (the fable shape)", () => {
-      // claude-fable-5 → modelToTier "sonnet"; timeoutMs 1_800_000 on the
-      // agent def was dead config pre-KPR-422 (turns killed at 300s).
+      // A sonnet-tier agent with timeoutMs 1_800_000 on its def — dead config
+      // pre-KPR-422 (turns killed at 300s). Historically the fable id landed
+      // here; since KPR-433 fable/mythos ids resolve to opus, so this pins the
+      // sonnet path directly (the tier argument is explicit).
       const limits = resolveResourceLimits("sonnet", undefined, 1_800_000);
       expect(limits.timeoutMs).toBe(1_800_000);
       // maxTurns/budgetUsd stay tier-defaulted — deliberately out of scope.
@@ -304,5 +307,12 @@ describe("routeModel — effort-only classifier (KPR-338, registry transport KPR
       const r = await routeModel("thanks");
       expect(r).toEqual({ costUsd: 0, durationMs: 0, effort: "low", method: "heuristic" });
     });
+  });
+});
+
+describe("KPR-433 D0: model-router re-exports the lifted resource-tiers surface (same objects)", () => {
+  it("resolveResourceLimits / RESOURCE_TIER_DEFAULTS are the resource-tiers objects, not copies", () => {
+    expect(resolveResourceLimits).toBe(tiers.resolveResourceLimits);
+    expect(RESOURCE_TIER_DEFAULTS).toBe(tiers.RESOURCE_TIER_DEFAULTS);
   });
 });

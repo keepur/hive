@@ -1,4 +1,4 @@
-import type { ResourceLimits } from "../model-router.js";
+import type { ResourceLimits } from "../resource-tiers.js";
 import type { RunResult, StreamCallback, WorkItemContext } from "../agent-runner.js";
 
 export type AgentProviderId = "claude" | "openai" | "gemini" | "codex" | "kimi" | "deepseek" | "grok";
@@ -111,6 +111,14 @@ export function persistsResumableHandle(semantics: SessionSemantics): boolean {
  */
 export type ReasoningEffort = "minimal" | "none" | "low" | "medium" | "high" | "xhigh";
 
+/**
+ * KPR-430: what the per-turn effort CHANNEL can carry — the neutral scale
+ * plus the SDK-only `max` (deliverable via the static agent `effort` field).
+ * `ReasoningEffort` itself is deliberately NOT widened: it is the Lane B
+ * `:effort` suffix scale, and `codex/gpt-5.5:max` must keep NOT parsing.
+ */
+export type TurnEffort = ReasoningEffort | "max";
+
 export interface AgentProviderTurnRequest {
   prompt: string;
   sessionId?: string;
@@ -119,15 +127,25 @@ export interface AgentProviderTurnRequest {
   resourceLimits?: ResourceLimits;
   systemPromptOverride?: string;
   /**
-   * KPR-312: per-turn reasoning effort from the model router's complexity
-   * classifier — a parallel channel beside the route (the route carries no
-   * effort). Claude adapter forwards it to runner.send → SDK Options.effort;
-   * Lane B adapters ignore it (their effort comes from the static :effort
-   * suffix), and under the KPR-311 pilot gate they never receive one.
+   * KPR-312: per-turn reasoning effort — a parallel channel beside the route
+   * (the route carries no effort). Sources (KPR-430 precedence: round-1 pin >
+   * static agent `effort` field > per-turn classifier; Lane A clamped suffix):
+   * Claude adapter forwards it to runner.send → SDK Options.effort; Lane B
+   * adapters ignore it (their effort comes from the static :effort suffix),
+   * and under the KPR-311 pilot gate they never receive one.
    * (resourceLimits, by contrast, IS consumed on Lane B: maxTurns since the
    * PR #402 fix, timeoutMs as the wall-clock turn deadline.)
    */
-  effort?: ReasoningEffort;
+  effort?: TurnEffort;
+  /**
+   * KPR-434: the session's persisted memory digest (`sessions.memoryDigest`),
+   * resolved post-lock by the manager and PAIRED to `sessionId` (undefined
+   * whenever the row does not name the session being resumed). The Claude
+   * adapter forwards it to runner.send; the Lane B scaffold reads it for
+   * server-resumable assemblies. Additive optional — frozen provider ABI, no
+   * version bump.
+   */
+  memoryDigestSeen?: string;
 }
 
 export interface AgentProviderAdapter {
