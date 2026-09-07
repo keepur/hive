@@ -12,6 +12,7 @@ describe("ClaudeAgentAdapter", () => {
     const adapter = new ClaudeAgentAdapter(runner as any);
     const onStream = vi.fn();
     const workItemContext = {
+      workItemId: "claude-item",
       adapterId: "slack",
       channelId: "C1",
       channelKind: "slack",
@@ -45,6 +46,7 @@ describe("ClaudeAgentAdapter", () => {
       "low",
       "0123456789abcdef",
     );
+    expect(runner.send.mock.calls[0][3]).toBe(workItemContext);
   });
 
   it("KPR-434: an ABSENT memoryDigestSeen is forwarded as the 8th positional (undefined) — the runner's predicate then injects", async () => {

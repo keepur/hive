@@ -1939,6 +1939,7 @@ export class AgentManager {
     // KPR-347: built BEFORE adapter construction so Lane B assembly receives
     // the turn's WorkItemContext (context-sensitive server configs).
     const bgContext: WorkItemContext = {
+      workItemId: ctx.workItem.id,
       adapterId: ctx.workItem.source.adapterId ?? ctx.workItem.source.kind,
       channelId: ctx.channelId,
       channelKind: ctx.workItem.source.kind,

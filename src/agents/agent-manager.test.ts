@@ -4615,6 +4615,34 @@ describe("AgentManager", () => {
       };
     }
 
+    it.each(["slack", "sms"] as const)("KPR-453: exact %s work identity reaches Claude send", async (kind) => {
+      const item = makeWorkItem({
+        id: " work:source/Ω#dl1 ",
+        threadId: "shared-thread",
+        source: { kind, id: "channel-identity", label: "Identity" },
+        meta: { slackTs: "100.2", slackThreadTs: "100.1" },
+      });
+      await manager.spawnTurn(makeCtx(item, kind, "provider-session"));
+      const context = mockRunnerSend.mock.calls.at(-1)![3];
+      expect(context).toMatchObject({
+        workItemId: item.id,
+        threadId: "shared-thread",
+        slackTs: "100.2",
+        slackThreadTs: "100.1",
+        channelKind: kind,
+      });
+      expect([context.threadId, context.slackTs, "provider-session"]).not.toContain(context.workItemId);
+    });
+
+    it("KPR-453: two items sharing a thread retain independent identity", async () => {
+      for (const id of ["first-item", "second-item"]) {
+        const item = makeWorkItem({ id, threadId: "same-thread" });
+        await manager.spawnTurn(makeCtx(item, "slack", "session-1"));
+      }
+      expect(mockRunnerSend.mock.calls.map((call) => call[3].workItemId))
+        .toEqual(["first-item", "second-item"]);
+    });
+
     it("prepends sender identity for slack WorkItem", async () => {
       const item = makeWorkItem({
         text: "hello team",
@@ -4833,6 +4861,7 @@ describe("AgentManager", () => {
         },
       ]);
       const item = makeWorkItem({
+        id: "sms-work-opaque",
         text: "hello codex",
         source: { kind: "sms", id: "line-1-seam", label: "May" },
         threadId: "sms:line-1:seam-inv-ctx",
@@ -4852,6 +4881,11 @@ describe("AgentManager", () => {
       expect(mockRunnerToolInventory).toHaveBeenCalledWith(
         expect.objectContaining({ channelId: "line-1-seam", threadId: "sms:line-1:seam-inv-ctx" }),
       );
+      const assembledContext = mockRunnerToolInventory.mock.calls.at(-1)![0];
+      const turnContext = mockCodexRunTurn.mock.calls.at(-1)![0].workItemContext;
+      expect(assembledContext.workItemId).toBe(item.id);
+      expect(turnContext).toBe(assembledContext);
+      expect(turnContext.threadId).toBe(item.threadId);
     });
 
     it("records telemetry, conversation index, and activity audit on success", async () => {
@@ -6692,6 +6726,8 @@ describe("AgentManager", () => {
       expect(seenArg(0)).toBe("d0");
       expect(mockRunnerSend.mock.calls[1]![1]).toBeUndefined();
       expect(seenArg(1)).toBeUndefined();
+      expect(mockRunnerSend.mock.calls.map((call) => call[3].workItemId))
+        .toEqual([ctx.workItem.id, ctx.workItem.id]);
     });
 
     it("auth-rebuild retry drops handle AND mark", async () => {
@@ -6704,6 +6740,8 @@ describe("AgentManager", () => {
       expect(seenArg(0)).toBe("dA");
       expect(mockRunnerSend.mock.calls[1]![1]).toBeUndefined();
       expect(seenArg(1)).toBeUndefined();
+      expect(mockRunnerSend.mock.calls.map((call) => call[3].workItemId))
+        .toEqual([ctx.workItem.id, ctx.workItem.id]);
     });
 
     it("KPR-313 handoff drops the mark with the handle", async () => {
