@@ -113,7 +113,7 @@ Tasks 1→3→4 establish shared persistence; Task 2 can execute after Task 1 in
 
 ```ts
 // src/admin/model-catalog-types.ts
-export const BUILTIN_CATALOG_PROVIDERS = ["claude", "codex", "grok"] as const;
+export const BUILTIN_CATALOG_PROVIDERS = ["claude", "grok", "codex"] as const;
 export type CatalogProvider = (typeof BUILTIN_CATALOG_PROVIDERS)[number];
 export type FailureCode = "auth" | "client-version" | "http" | "timeout" | "canceled" | "malformed" | "empty" | "too-large" | "storage";
 export interface SafeCatalogError { code: FailureCode; message: string; httpStatus?: number }
@@ -520,12 +520,23 @@ export class ModelCatalogStore {
     if (!BUILTIN_CATALOG_PROVIDERS.includes(attempt.provider) || !tokenPattern.test(attempt.attemptId) || !validDate(attempt.startedAt) || !validDate(attempt.leaseExpiresAt) || attempt.leaseExpiresAt <= attempt.startedAt) reject("attempt", "malformed");
   }
   private async write(provider: string, rows: ModelInput[], actor: string, operationId: string, summary?: string, attempt?: DiscoveryAttempt): Promise<ReplacementResult> {
-    try { await this.ensureIndexes(); } catch (error) { return this.knownFailure(provider, error, true); }
     for (let tries = 0; tries < 8; tries++) {
       let current: CatalogDoc | null;
       try {
+        // Existing-operation evidence precedes any fallible recovery/index writes.
+        current = await this.collections.catalogs.findOne({ _id: provider });
+        if (attempt) {
+          if (current?.pendingExport?.version._id === operationId) return this.committed(current.pendingExport.version);
+          const prior = await this.collections.versions.findOne({ _id: operationId }); if (prior) return this.committed(prior);
+          if (current?.scan?.attemptId === operationId && current.scan.outcome === "succeeded") return this.reconcile(provider, operationId, attempt);
+        }
+        await this.ensureIndexes();
         const recovered = await recoverProvider(this.collections, provider);
-        if (recovered.kind !== "recovered") return this.knownFailure(provider, new CatalogError(recovered.error), true);
+        if (recovered.kind !== "recovered") {
+          // A delayed commit may have appeared between the evidence read and recovery.
+          if (attempt) { const result = await this.reconcile(provider, operationId, attempt); if (result.kind === "committed") return result; }
+          return this.knownFailure(provider, new CatalogError(recovered.error), true);
+        }
         current = await this.collections.catalogs.findOne({ _id: provider });
         if (attempt) {
           const prior = await this.collections.versions.findOne({ _id: operationId }); if (prior) return this.committed(prior);
@@ -544,7 +555,11 @@ export class ModelCatalogStore {
           const changed = await this.collections.catalogs.updateOne(filter, success, JOURNALED);
           if (!changed.matchedCount) continue;
           return { kind: "unchanged", commitId: current.commitId, revision: current.revision ?? 0, snapshotId: current.snapshotId ?? snapshotId(provider, current.models ?? []), lastSucceededAt: now };
-        } catch { return this.reconcile(provider, operationId, attempt, { commitId: current.commitId, revision: current.revision ?? 0, snapshotId: current.snapshotId ?? snapshotId(provider, current.models ?? []) }); }
+        } catch (error) {
+          // The guard rejected before submission; there is no ambiguous acknowledgment.
+          if (error && typeof error === "object" && "code" in error && error.code === "DB_IDENTITY_MISMATCH") return this.knownFailure(provider, error, true);
+          return this.reconcile(provider, operationId, attempt, { commitId: current.commitId, revision: current.revision ?? 0, snapshotId: current.snapshotId ?? snapshotId(provider, current.models ?? []) });
+        }
       }
       try {
         const prospective: CatalogDoc = { ...(current ?? { _id: provider }), ...next.fields };
@@ -608,7 +623,7 @@ export class ModelCatalogStore {
 }
 ```
 
-**Uncertainty rules that must survive implementation:** never continue the CAS retry loop after a thrown mutation except an acknowledged first-insert duplicate-key race. `reconcile` accepts positive evidence only. If a read is negative or unavailable, return `commit-unknown` with the same UUID; do not issue a new write, call `failDiscoveryAttempt`, or allocate another ID automatically. For an unchanged completion, if a later attempt overwrote scan evidence, the conservative answer remains unknown; that old completion still cannot commit through a newer token. Catalog-first/history-second reconciliation prevents the read-order hole where projection races evidence lookup. An unchanged acknowledgment reconciles to the identity captured before its attempted CAS, never the identity of a later manual replacement; without that captured identity or retained success evidence it stays unknown. Server-side `$$NOW` additionally rejects a completion that sat in transit until its lease expired; comparing only a client timestamp would accept that late mutation. Known pre-write validation/recovery/identity-guard refusal is `not-committed`; uncertainty after sending a mutation is not a provider failure. `begin`/failure-recording storage exceptions likewise do not establish that a delayed mutation cannot finish; the caller keeps the same attempt identity and does not start external discovery until `started` is confirmed.
+**Uncertainty rules that must survive implementation:** never continue the CAS retry loop after a thrown mutation except an acknowledged first-insert duplicate-key race. `reconcile` accepts positive evidence only. If a read is negative or unavailable, return `commit-unknown` with the same UUID; do not issue a new write, call `failDiscoveryAttempt`, or allocate another ID automatically. For an unchanged completion, if a later attempt overwrote scan evidence, the conservative answer remains unknown; that old completion still cannot commit through a newer token. Catalog-first/history-second reconciliation prevents the read-order hole where projection races evidence lookup. On re-entry with the same discovery operation UUID, inspect the catalog envelope and history before recovery/index writes can fail; matching evidence returns `committed` even when its export remains pending. Recheck positive evidence if recovery fails after the initial lookup, because a delayed commit can arrive during recovery. Only a distinct, uncommitted replacement is blocked by that older export. An unchanged acknowledgment reconciles to the identity captured before its attempted CAS, never the identity of a later manual replacement; without that captured identity or retained success evidence it stays unknown. Server-side `$$NOW` additionally rejects a completion that sat in transit until its lease expired; comparing only a client timestamp would accept that late mutation. Known pre-write validation/recovery/identity-guard refusal is `not-committed`; uncertainty after sending a mutation is not a provider failure. `begin`/failure-recording storage exceptions likewise do not establish that a delayed mutation cannot finish; the caller keeps the same attempt identity and does not start external discovery until `started` is confirmed.
 
 - [ ] **Step 2:** Build the fake helper with these exact operations. Expose `collection(name)`, `rows(name)`, and `before/after` hooks on method calls. Use `structuredClone` for snapshots; evaluate filter and mutate synchronously after any `before` hook completes. Required match operators: plain equality, dotted keys, `$exists`, `$gt`, `$lte`, `$or`, and the two explicit `$expr` date comparisons against `$$NOW`; reject every unsupported operator. Required updates: dotted `$set`, `$unset`; reject unsupported operators. `insertOne` throws `{ code:11000 }` on an existing `_id`, and successful updates return `{ acknowledged:true, matchedCount, modifiedCount }`. `find` supports filter/projection, sort, limit, toArray; `createIndex` records options. The following complete primitives prevent the old mock's unconditional-write behavior:
 
@@ -652,31 +667,11 @@ export function applyUpdate(row: Row, update: Row): void {
 export function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((yes) => { resolve = yes; }); return { promise, resolve }; }
 ```
 
-- [ ] **Step 3:** Implement unit tests from this schedule table, using two store objects on the same fake. Every test asserts final catalog revision/models/scan, exact history payload/count, and outbox payload/count/delivery state. Advance an injected clock explicitly.
-
-| Schedule | Required invariant |
-| --- | --- |
-| Manual seed → identical manual → notes/name/order-only → ID change | Each manual accepted write audits; only seed/ID differences create independently pending changes; summary fallback/actor/order/timestamps remain correct. |
-| A and B read same revision, A commits, B CAS misses then retries | B revision/diff/retained `addedAt` derive from A. Eight conflicts yield retriable `not-committed`, no unconditional write. |
-| Discovery waits; manual changes membership/names/notes; discovery finishes | Discovery controls new membership/order/names; retained notes come from latest manual winner; manual never changes scan. |
-| Unchanged discovery pauses before update; manual replaces snapshot | Old revision status update matches zero; recompute and commit discovery result against new manual snapshot. |
-| Two begins; expired takeover; old success/failure arrive | One active claim; late/expired results superseded; new token/snapshot/freshness survive. Begin preserves previous success and all catalog metadata. |
-| Legacy nonempty missing revision/hash; status-only or empty doc | No false bootstrap for legacy; revision starts at 1 on history-bearing write; unchanged legacy discovery writes scan only; empty seeds exactly once. |
-| Before snapshot commit throws definite guard refusal | No snapshot/history/change; safe retriable `not-committed`. |
-| Mutation applies, throws; read sees envelope/history | One committed operation recovered; never duplicate audit. |
-| Mutation throws before applying, immediate reads miss, delayed write applies afterward | `commit-unknown` returned with original ID; no automatic replay/failure recording; later history/envelope demonstrates one commit. Repeat with a newer winner before delayed application and assert old CAS matches zero. |
-| Unchanged status mutation applies/throws, or is delayed until after negative read | Positive same-attempt evidence gives unchanged; otherwise `commit-unknown`, no freshness until actual application. A takeover or manual revision advance fences the delayed update. |
-| Every export boundary fails; fresh store recovers | Already committed catalog readable; `recoveryPending:true`; new writer blocked until export durable; exact one history/change per operation. |
-| Duplicate matching/mismatched history/change; concurrent recovery; delivery mutated | Matching duplicates accepted; mismatch leaves slot and diagnostic; mutable delivery untouched; old slot clear cannot clear a newer commit's slot. |
-| One provider export fails in all-provider recovery | Other providers still recover; per-provider error preserved; no timer or global rejection. |
-
-- [ ] **Step 4:** Verify `npx vitest run src/admin/model-catalog-value.test.ts src/admin/model-catalog-store.test.ts` and `npm run typecheck`. Expected: deterministic schedules pass with no pending promise leaks; no raw Mongo error text. Commit Tasks 3/4 with `git commit -m "feat: persist catalog replacements with recoverable CAS exports"`.
-
-- [ ] **Step 5:** Complete the fake helper by appending these implementations. `faultDb` wraps either this fake or a real guarded `Db`; faults may delay real delegation or throw after actual application. Preserve method `this` binding.
+- [ ] **Step 3:** Complete the fake helper by appending these implementations. `faultDb` wraps either this fake or a real guarded `Db`; faults may delay real delegation or throw after actual application. Preserve method `this` binding and forward the collection options unchanged, so wrapped real collections retain inherited `JOURNALED` write concern for index creation as well as mutations.
 
 ```ts
 // Append to src/admin/testing/catalog-db.test-support.ts
-import type { Db } from "mongodb";
+import type { CollectionOptions, Db } from "mongodb";
 export function createCatalogFake(serverNow: () => Date = () => new Date()) {
   const tables = new Map<string, Map<string, Row>>(), indexes: Row[] = [];
   const rows = (name: string) => { if (!tables.has(name)) tables.set(name, new Map()); return tables.get(name)!; };
@@ -703,8 +698,8 @@ export function createCatalogFake(serverNow: () => Date = () => new Date()) {
 }
 export function faultDb(db: Db, intercept: (collection: string, method: string, args: any[], run: () => Promise<any>) => Promise<any>): Db {
   return new Proxy(db, { get(target, key) {
-    if (key === "collection") return (name: string) => {
-      const collection = target.collection(name);
+    if (key === "collection") return (name: string, options?: CollectionOptions) => {
+      const collection = target.collection(name, options);
       return new Proxy(collection, { get(col, method) {
         const value = Reflect.get(col, method, col);
         if (typeof value !== "function") return value;
@@ -716,6 +711,31 @@ export function faultDb(db: Db, intercept: (collection: string, method: string, 
   } });
 }
 ```
+
+- [ ] **Step 4:** Implement unit tests from this schedule table, using two store objects on the same fake. Every test asserts final catalog revision/models/scan, exact history payload/count, and outbox payload/count/delivery state. Advance an injected clock explicitly.
+
+| Schedule | Required invariant |
+| --- | --- |
+| Manual seed → identical manual → notes/name/order-only → ID change | Each manual accepted write audits; only seed/ID differences create independently pending changes; summary fallback/actor/order/timestamps remain correct. |
+| A and B read same revision, A commits, B CAS misses then retries | B revision/diff/retained `addedAt` derive from A. Eight conflicts yield retriable `not-committed`, no unconditional write. |
+| Discovery waits; manual changes membership/names/notes; discovery finishes | Discovery controls new membership/order/names; retained notes come from latest manual winner; manual never changes scan. |
+| Unchanged discovery pauses before update; manual replaces snapshot | Old revision status update matches zero; recompute and commit discovery result against new manual snapshot. |
+| Two begins; expired takeover; old success/failure arrive | One active claim; late/expired results superseded; new token/snapshot/freshness survive. Begin preserves previous success and all catalog metadata. |
+| Legacy nonempty missing revision/hash; status-only or empty doc | No false bootstrap for legacy; revision starts at 1 on history-bearing write; unchanged legacy discovery writes scan only; empty seeds exactly once. |
+| Before snapshot commit throws definite guard refusal | No snapshot/history/change; safe retriable `not-committed`. |
+| Seed catalog → warm indexes → begin a running attempt → engage `WriteGuard` immediately before the unchanged `scan.outcome:succeeded` update is delegated | `applyDiscovery` returns safe storage `not-committed` with `retriable:true`; no `commit-unknown`. The underlying update is never called, `refusedWriteCount` increases once, and the complete catalog/scan (including prior freshness), history, and outbox equal their pre-call snapshots. Test through `faultDb(guardDb(rawDb, guard), intercept)` so the fault engages the real guard before `run()`. |
+| Mutation applies, throws; read sees envelope/history | One committed operation recovered; never duplicate audit. |
+| Discovery replacement D: defer its update carrying `pendingExport.version._id === attemptId`, throw, observe negative reconciliation and `commit-unknown`; execute the delayed update, then fail history insertion for D and re-enter `applyDiscovery` with the same attempt UUID/rows | Return `committed` with D's exact commit/revision/snapshot/diff and `recoveryPending:true`, using the envelope before the failing export. No second replacement submission, UUID, revision, or audit/change record. The saved snapshot/scan/envelope remain exact. Repeat using a fresh store whose index creation would throw to prove evidence precedes index writes. An independent next manual replacement remains retriable `not-committed` until D exports. |
+| Repeat D, but release the delayed update after re-entry's history lookup has returned null and before provider recovery reads the envelope; history insertion for D still fails | Recheck catalog-first/history-second evidence after recovery failure; return D as `committed/recoveryPending:true`, never `not-committed`. Release the barrier only once and assert one replacement submission. |
+| Mutation throws before applying, immediate reads miss, delayed write applies afterward | `commit-unknown` returned with original ID; no automatic replay/failure recording; later history/envelope demonstrates one commit. Repeat with a newer winner before delayed application and assert old CAS matches zero. |
+| Unchanged status mutation applies/throws, or is delayed until after negative read | Positive same-attempt evidence gives unchanged; otherwise `commit-unknown`, no freshness until actual application. A takeover or manual revision advance fences the delayed update. |
+| Every export boundary fails; fresh store recovers | Already committed catalog readable; `recoveryPending:true`; new writer blocked until export durable; exact one history/change per operation. |
+| Duplicate matching/mismatched history/change; concurrent recovery; delivery mutated | Matching duplicates accepted; mismatch leaves slot and diagnostic; mutable delivery untouched; old slot clear cannot clear a newer commit's slot. |
+| One provider export fails in all-provider recovery | Other providers still recover; per-provider error preserved; no timer or global rejection. |
+| `faultDb(recordingDb, intercept).collection(name, JOURNALED)` → `createIndex` and delegated write | Underlying `collection` receives the exact name/options; inherited write concern and method binding survive. Also exercise omitted options. Do not fake a successful index/write to satisfy the assertion. |
+| Unknown manual provider with plugin IDs `["sol"]` | Validation text remains `Unknown provider 'zeta'. Valid: claude, grok, codex, sol.`; built-in order matches existing admin behavior. |
+
+- [ ] **Step 5:** Verify `npx vitest run src/admin/model-catalog-value.test.ts src/admin/model-catalog-store.test.ts` and `npm run typecheck`. Expected: deterministic schedules pass with no pending promise leaks; no raw Mongo error text. Commit Tasks 3/4 with `git commit -m "feat: persist catalog replacements with recoverable CAS exports"`.
 
 ## Task 5 — Delegate the manual tool to the shared writer
 
@@ -741,7 +761,7 @@ async ({ provider, models, changeSummary }) => {
 Update tool descriptions precisely: built-in catalogs are shared between subscription discovery and full manual replacement; the manual tool itself makes no vendor calls; plugins remain manual; the next successful built-in discovery replaces membership/names/order while retaining notes. `list` still reads persisted built-ins and live Gemini and does not trigger built-in discovery. Do not claim an automatic timer runs before KPR-460 lands.
 
 - [ ] **Step 3:** Replace only the catalog portion of the admin test fake with `createCatalogFake`. Retain agent-definition/version fakes untouched. Reset the catalog fake in existing `beforeEach` blocks, route the three exact catalog collection names to its `db.collection`, and replace catalog-array assertions with `[...fake.rows("agent_model_catalog_versions").values()]`. Seed legacy list fixtures directly through `fake.rows("agent_model_catalog")`. Do not mock `ModelCatalogStore` or preserve the old two-write mock. The `.models` optional type must be narrowed safely in list iteration (`for (const m of doc.models ?? [])`), keeping unseeded notes exactly as before.
-- [ ] **Step 4:** Extend admin tests for empty models with bypassed Zod; duplicate IDs; plugin actor/diff/summary; identical audit; notes clearing; Gemini/unknown rejection; committed with projection pending is a success with explicit saved message; unknown acknowledgment returns stable operation ID without a false failure/success claim. Existing list JSON, Gemini 10-minute cache and honest failure cases remain unchanged.
+- [ ] **Step 4:** Extend admin tests for empty models with bypassed Zod; duplicate IDs; plugin actor/diff/summary; identical audit; notes clearing; Gemini/unknown rejection; committed with projection pending is a success with explicit saved message; unknown acknowledgment returns stable operation ID without a false failure/success claim. Retain the existing `Valid: claude, grok, codex, sol` assertion for unknown providers with plugin `sol`; do not reorder that expected output. Existing list JSON, Gemini 10-minute cache and honest failure cases remain unchanged.
 - [ ] **Step 5:** Run `npx vitest run src/admin/admin-mcp-server.test.ts src/admin/model-catalog-store.test.ts` and `npm run typecheck`. Expected: all old compatibility assertions and new shared-writer cases pass. Commit with `git commit -m "refactor: share manual model catalog persistence"`, staging only these two admin files.
 
 ## Task 6 — Real standalone integration, documentation, and final checks
@@ -834,9 +854,9 @@ describe("standalone model catalog", () => {
 });
 ```
 
-- [ ] **Step 3:** Complete real integration coverage with barriers around delegated real operations, not fake CAS responses: concurrent first inserts, observed-revision conflicts, late manual/discovery notes, unchanged status revision race, two claims and expiry takeover, all export failure boundaries, duplicate immutable mismatch, concurrent recoveries, mutated delivery retention, ambiguous post-commit ack, delayed unchanged success with negative reconciliation read, delayed old token after takeover, and late old CAS after a new manual winner. For the unchanged ambiguity case, seed → begin UUID attempt → delay matching `$set["scan.outcome"] === "succeeded"` update without `pendingExport` → throw → assert unknown and old freshness → run delayed mutation → assert updated freshness and unchanged history count. Repeat after manual revision advance/takeover and assert delayed update `matchedCount === 0`. Use a fresh store object for all recovery assertions.
+- [ ] **Step 3:** Complete real integration coverage with barriers around delegated real operations, not fake CAS responses: concurrent first inserts, observed-revision conflicts, late manual/discovery notes, unchanged status revision race, two claims and expiry takeover, all export failure boundaries, duplicate immutable mismatch, concurrent recoveries, mutated delivery retention, ambiguous post-commit ack, delayed unchanged success with negative reconciliation read, delayed old token after takeover, and late old CAS after a new manual winner. For the unchanged ambiguity case, seed → begin UUID attempt → delay matching `$set["scan.outcome"] === "succeeded"` update without `pendingExport` → throw → assert unknown and old freshness → run delayed mutation → assert updated freshness and unchanged history count. Repeat after manual revision advance/takeover and assert delayed update `matchedCount === 0`. Use a fresh store object for all recovery assertions. Include both combined D schedules from Task 4: delayed discovery commit becomes visible before re-entry or between its negative history read and failing recovery, and the same attempt returns the exact committed identity with recovery pending. For the first schedule, also use a fresh store with faulted index creation; positive evidence must settle the result before that write. Verify no extra replacement, revision, history, or change is created, then remove the projection fault and recover D exactly once.
 
-Instrument `client.on("commandStarted")`: assert catalog state-transition insert/update commands include `writeConcern:{w:1,j:true}`, no `startTransaction`, `autocommit:false`, `commitTransaction`, `abortTransaction`, or `$changeStream`. Driver implicit `lsid` is allowed and is not a dependency on application-managed sessions. Assert existing ObjectId history rows survive and no TTL index is created. Guard test engages `WriteGuard`, attempts replace/begin/apply/fail/recover, and checks catalog/history/outbox unchanged; reads still work and returned diagnostics omit raw DB details. The manual handler integration uses the existing SDK `tool` mock solely to obtain the real handler, with a fresh guarded real test Db; Gemini remains mocked.
+Instrument `client.on("commandStarted")`: assert catalog state-transition insert/update commands and both catalog history/change `createIndexes` commands include `writeConcern:{w:1,j:true}` through `faultDb`, no `startTransaction`, `autocommit:false`, `commitTransaction`, `abortTransaction`, or `$changeStream`. Driver implicit `lsid` is allowed and is not a dependency on application-managed sessions. Assert existing ObjectId history rows survive and no TTL index is created. Guard test engages `WriteGuard`, attempts replace/begin/apply/fail/recover, and checks catalog/history/outbox unchanged; reads still work and returned diagnostics omit raw DB details. Add the exact unchanged-completion guard schedule from Task 4 after successful index initialization, catalog seeding, and attempt acquisition; engage immediately before delegation, assert a single guard refusal and retriable storage `not-committed`, and compare complete pre/post catalog, scan freshness, history, and changes. Reads still work and neither replacement nor success status reaches Mongo. The manual handler integration uses the existing SDK `tool` mock solely to obtain the real handler, with a fresh guarded real test Db; Gemini remains mocked.
 
 - [ ] **Step 4:** Update documentation with this behavior (adapt surrounding prose without changing unrelated provider matrix rows):
 
