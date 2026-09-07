@@ -75,8 +75,8 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.258",
-    "@anthropic-ai/sdk": "^0.122.0",
-    "@google/genai": "^2.19.0",
+    "@anthropic-ai/sdk": "^0.123.0",
+    "@google/genai": "^2.21.0",
     "@linear/sdk": "^92.0.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@openai/agents": "^0.11.4",
@@ -87,11 +87,11 @@
     "brave-search-mcp": "^2.0.1",
     "csv-parse": "^7.0.2",
     "dotenv": "^17.3.1",
-    "mammoth": "^1.12.1",
+    "mammoth": "^1.12.2",
     "mongodb": "^7.6.0",
     "pdf-parse": "^2.4.5",
     "tinyglobby": "^0.2.17",
-    "undici": "^8.10.0",
+    "undici": "^8.10.1",
     "ws": "^8.21.3",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
     "yaml": "^2.8.2"
@@ -99,7 +99,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/better-sqlite3": "^9.6.0",
-    "@types/node": "^26.4.0",
+    "@types/node": "^26.4.1",
     "@types/ws": "^8.18.1",
     "esbuild": "^0.28.2",
     "eslint": "^10.9.1",
@@ -107,9 +107,9 @@
     "husky": "^9.0.0",
     "lint-staged": "^17.4.1",
     "prettier": "^3.9.6",
-    "tsx": "^4.23.12",
+    "tsx": "^4.23.13",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.68.0",
+    "typescript-eslint": "^8.69.0",
     "vitest": "^4.1.11"
   },
   "allowScripts": {
