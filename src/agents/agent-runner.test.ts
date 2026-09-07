@@ -2899,6 +2899,72 @@ describe("AgentRunner ENABLE_TOOL_SEARCH env pinning (via send) (KPR-329)", () =
   });
 });
 
+describe("AgentRunner CLAUDE_CODE_DISABLE_BACKGROUND_TASKS env pinning (via send) (KPR-438)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+  let origDisable: string | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+    // Ambient-pollution guard: the `...process.env` spread would otherwise let
+    // an operator's own value satisfy the assertions without the engine pin.
+    origDisable = process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+    delete process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+  });
+
+  afterEach(() => {
+    if (origDisable === undefined) delete process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+    else process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = origDisable;
+  });
+
+  // Negative-verify: the value must be the literal string "1" in the spawn env
+  // map — NOT merely absent/undefined. Absent lets SDK 0.3.26x run `Agent`
+  // subagents in the background, whose completion notification kills every
+  // subsequent in-process SDK MCP tool call for the rest of the session.
+  it("pins CLAUDE_CODE_DISABLE_BACKGROUND_TASKS to the literal '1', not undefined", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    const env = getCapturedOptions().env;
+    expect(env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS).not.toBeUndefined();
+    expect(env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS).toBe("1");
+  });
+
+  it("engine value overrides an ambient process.env opt-out", async () => {
+    process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "0";
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    await runner.send("hello");
+    expect(getCapturedOptions().env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS).toBe("1");
+  });
+
+  // The Lane A passthrough spread is the LAST env spread; it must not drop the
+  // pin (kimi/deepseek spawns run the same in-process MCP servers).
+  it("survives the Lane A passthrough env spread", async () => {
+    const runner = new AgentRunner(
+      makeAgentConfig({ model: "kimi/kimi-k3" }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        laneAPassthrough: {
+          provider: "kimi" as const,
+          model: "kimi-k3",
+          baseUrl: "https://api.moonshot.ai/anthropic",
+          authToken: "tok-test",
+        },
+      },
+    );
+    await runner.send("hello");
+    expect(getCapturedOptions().env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS).toBe("1");
+  });
+});
+
 // ── KPR-346 §D5: Lane A passthrough env substitution ─────────────
 describe("AgentRunner Lane A passthrough env substitution (via send) (KPR-346)", () => {
   let memoryManager: ReturnType<typeof makeMockMemoryManager>;

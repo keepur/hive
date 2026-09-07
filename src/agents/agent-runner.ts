@@ -2159,6 +2159,26 @@ export class AgentRunner {
           CLAUDECODE: undefined,
           // KPR-329: always pinned — overrides any ambient ENABLE_TOOL_SEARCH.
           ENABLE_TOOL_SEARCH: toolSearchEnvValue,
+          // KPR-438: always pinned — SDK 0.3.26x (Claude Code 2.1.26x) runs the
+          // `Agent` tool's subagents in the BACKGROUND by default and completes
+          // them with a `<task-notification>` user message that wakes the
+          // session. After that wake-up every in-process SDK MCP tool call
+          // (createSdkMcpServer servers: memory, structured-memory, team,
+          // team-roster, callback, schedule, admin, contacts, event-bus,
+          // conversation-search, code-search, workflow, worker-pool) fails
+          // instantly with "The tool call was interrupted before a result was
+          // received"; stdio servers and builtins are unaffected. Hive's
+          // `delegateServers` subagents ARE `Agent` calls, so any turn that
+          // delegates loses memory/team tools for the rest of the session.
+          // Disabling background tasks runs subagents inline and the failure
+          // disappears (the CLI reads `backgroundTasksDisabled ||
+          // CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`). Hive already awaits every
+          // delegate result, so inline execution costs no throughput here.
+          // KEEP THIS PIN until an SDK bump is verified fixed by re-running
+          // `npx tsx scripts/repro-bg-subagent-mcp.ts` and seeing
+          // post-notification pings succeed WITHOUT the flag. Unfixed as of
+          // SDK 0.3.263.
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
           // KPR-346 (§D5): Lane A pins — base URL, vendor token, foreign-model
           // pins (incl. subagents), ANTHROPIC_API_KEY scrub, tool search off.
           ...(passthrough ? buildPassthroughEnv(passthrough) : {}),
