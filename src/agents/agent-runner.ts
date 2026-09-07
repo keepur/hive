@@ -2174,10 +2174,16 @@ export class AgentRunner {
           // disappears (the CLI reads `backgroundTasksDisabled ||
           // CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`). Hive already awaits every
           // delegate result, so inline execution costs no throughput here.
-          // KEEP THIS PIN until an SDK bump is verified fixed by re-running
-          // `npx tsx scripts/repro-bg-subagent-mcp.ts` and seeing
-          // post-notification pings succeed WITHOUT the flag. Unfixed as of
-          // SDK 0.3.263.
+          // KEEP THIS PIN. The removal gate is NOT a repro: a minimal harness
+          // does not reproduce the failure (three variants pass unpinned on
+          // both 0.3.258 and the fleet-resolved 0.3.261 — `^0.3.258` floats,
+          // so deployed instances run higher than this repo's lockfile). The
+          // gate is `npx tsx scripts/repro-bg-subagent-mcp.ts --audit
+          // --since=<deploy date>`, which measures the real before/after-
+          // notification interruption rate out of the CLI transcripts; drop
+          // the pin only after a hive has run a day of delegating traffic
+          // WITHOUT it and that rate stays at the ~0.06% baseline. Unfixed as
+          // of SDK 0.3.263.
           CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
           // KPR-346 (§D5): Lane A pins — base URL, vendor token, foreign-model
           // pins (incl. subagents), ANTHROPIC_API_KEY scrub, tool search off.
