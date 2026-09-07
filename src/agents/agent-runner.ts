@@ -146,6 +146,8 @@ function buildCapabilitiesJson(plugins: LoadedPlugin[]): string {
 export type StreamCallback = (chunk: string) => void;
 
 export interface WorkItemContext {
+  /** Exact ID of the represented WorkItem. Engine-managed turns supply it; compatible callers and invocations without a WorkItem may omit it. */
+  workItemId?: string;
   adapterId: string;
   channelId: string;
   channelKind: string;
@@ -153,6 +155,11 @@ export interface WorkItemContext {
   threadId: string;
   slackTs: string;
   slackThreadTs: string;
+}
+
+/** Runner-owned runtime context for cached in-process MCP builders. */
+export interface WorkItemContextRef {
+  current: WorkItemContext | undefined;
 }
 
 export interface RunResult {
