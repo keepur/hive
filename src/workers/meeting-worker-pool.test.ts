@@ -474,7 +474,7 @@ describe("MeetingWorkerPool — spawn, completion, re-entry (Task E)", () => {
 
   it("T4: done completion stamps the ledger and re-enters the boss with the pinned WorkItem", async () => {
     const f = makeFixture();
-    await f.pool.dispatch(dispatchReq("fetch Q2 numbers"));
+    await f.pool.dispatch(dispatchReq("fetch Q2 numbers", "boss", { ...meetingCtx, workItemId: "boss-origin" }));
     await vi.waitFor(() => expect(f.onDispatch).toHaveBeenCalledTimes(1));
     const doc = f.claims.docs[0];
     expect(doc.status).toBe("done");
@@ -482,9 +482,14 @@ describe("MeetingWorkerPool — spawn, completion, re-entry (Task E)", () => {
     expect(typeof doc.durationMs).toBe("number");
     expect(doc.costUsd).toBe(0.01);
     expect(doc.toolCalls).toBe(3);
+    expect(doc).not.toHaveProperty("workItemId");
+    expect(doc.source).not.toHaveProperty("workItemId");
+    expect(JSON.stringify(doc)).not.toContain("boss-origin");
+    expect(f.runTurn.mock.calls[0][0].workItemContext).not.toHaveProperty("workItemId");
 
     const item = f.onDispatch.mock.calls[0][0] as AnyDoc;
     expect(item.id).toBe(`worker:${doc._id.toString()}`);
+    expect(JSON.stringify(item)).not.toContain("boss-origin");
     expect(item.sender).toBe("system");
     expect(item.threadId).toBe("1724680000.100");
     expect(item.source).toEqual({ kind: "slack", id: "C123", label: "conf-tahoe", adapterId: "slack-main" });
@@ -786,6 +791,17 @@ describe("MeetingWorkerPool — runRoleTurn (KPR-409 sibling)", () => {
     prompt: "summarize this",
     workItemContext: meetingCtx as any,
     ...over,
+  });
+
+  it("KPR-453: role callers can supply identity without changing detached defaults", async () => {
+    const f = makeFixture();
+    const args = roleArgs();
+    expect(args.workItemContext).not.toHaveProperty("workItemId");
+    const context = { ...args.workItemContext, workItemId: "explicit-role-item" };
+    await f.pool.runRoleTurn({ ...args, workItemContext: context });
+    expect(f.runTurn.mock.calls[0][0].workItemContext).toBe(context);
+    expect(f.claims.docs).toHaveLength(0);
+    expect(f.onDispatch).not.toHaveBeenCalled();
   });
 
   it("clones the base config with the role's model/servers, delegateServers [] and schedule []", async () => {
