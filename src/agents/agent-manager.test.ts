@@ -5871,7 +5871,26 @@ describe("AgentManager", () => {
       const runner = await setupOpenAIParent();
       mockOpenAIRunTurn.mockResolvedValueOnce(makeRunResult({ text: "delegate output" }));
 
-      expect(await call(runner)).toBe("delegate output");
+      const parentContext = {
+        workItemId: "nested-origin",
+        adapterId: "sms",
+        channelId: "line-1",
+        channelKind: "sms",
+        channelLabel: "Identity",
+        threadId: "same-thread",
+        slackTs: "",
+        slackThreadTs: "",
+      };
+      expect(
+        await runner({
+          delegate: "google",
+          prompt: "p",
+          entry: makeSubagentEntry(),
+          signal: new AbortController().signal,
+          workItemContext: parentContext,
+        }),
+      ).toBe("delegate output");
+      expect(mockOpenAIRunTurn.mock.calls.at(-1)![0].workItemContext).toBe(parentContext);
 
       const nested = nestedOpenAIConstructions();
       expect(nested.length).toBe(1);

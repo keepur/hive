@@ -3307,7 +3307,7 @@ describe("buildSystemPrompt — archetype card", () => {
   });
 
   it("KPR-222: buildHooks rebuilds with current WorkItemContext on every call (no stale context across spawns)", () => {
-    const captured: Array<unknown> = [];
+    const captured: Array<WorkItemContext | undefined> = [];
     registerArchetype({
       id: "context-capturing",
       validateConfig: (c) => c,
@@ -3325,11 +3325,20 @@ describe("buildSystemPrompt — archetype card", () => {
       archetype: "context-capturing",
       archetypeConfig: {},
     });
-    const ctxA = { channelId: "ch-a", threadId: "thr-a", source: "test" } as any;
-    const ctxB = { channelId: "ch-b", threadId: "thr-b", source: "test" } as any;
+    const ctxA = identityContext("hook-A");
+    const ctxB = identityContext("hook-B");
+    const legacyContext = identityContext();
     (runner as any).buildHooks(ctxA);
     (runner as any).buildHooks(ctxB);
-    expect(captured).toEqual([ctxA, ctxB]);
+    (runner as any).buildHooks(legacyContext);
+    (runner as any).buildHooks();
+    expect(captured).toEqual([ctxA, ctxB, legacyContext, undefined]);
+    expect(captured.map((context) => context?.workItemId)).toEqual([
+      "hook-A",
+      "hook-B",
+      undefined,
+      undefined,
+    ]);
   });
 
   it("omits card gracefully when archetype systemPromptCard throws", async () => {

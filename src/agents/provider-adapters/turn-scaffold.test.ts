@@ -8,8 +8,9 @@ import {
 } from "./turn-scaffold.js";
 import { ToolBridge } from "./tool-bridge.js";
 import { TURN_DEADLINE_SUBTYPE } from "./error-classification.js";
-import type { ProviderTurnAssembly } from "./turn-assembly.js";
-import type { AgentProviderTurnRequest } from "./types.js";
+import type { DelegateTurnCall, ProviderTurnAssembly } from "./turn-assembly.js";
+import type { AgentProviderTurnRequest, GuardrailToolCall } from "./types.js";
+import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import { MEMORY_TURN_HEADER, memoryDigest, appendDateTimeTrailer } from "../prefix-builder.js";
 
 // The real ToolBridge the scaffold constructs logs; keep the suite quiet.
@@ -106,6 +107,62 @@ afterEach(() => {
 // --- Bridge lifecycle -------------------------------------------------------
 
 describe("LaneBTurnScaffold — bridge lifecycle", () => {
+  it("KPR-453: each scaffold turn supplies its context to gate and inline delegate", async () => {
+    const delegateRunner = vi.fn(async (_call: DelegateTurnCall) => "delegate result");
+    const gate = vi.fn(async (_call: GuardrailToolCall) => ({ behavior: "allow" as const }));
+    const entry: HiveToolInventoryEntry = {
+      name: "fixture",
+      transport: "claude-subagent",
+      source: "delegate",
+      requiresTurnContext: false,
+      requiresHiveRuntime: false,
+      inProcess: false,
+      compatibility: {
+        claude: "direct",
+        openai: "requires-hive-bridge",
+        gemini: "requires-hive-bridge",
+        codex: "requires-hive-bridge",
+        grok: "requires-hive-bridge",
+      },
+      schemas: { kind: "unavailable" },
+      description: "Fixture delegate",
+    };
+    const adapter = new TestScaffoldAdapter(
+      async (harness) => {
+        const tools = await harness.bridge.connect();
+        const task = tools.find((tool) => tool.name === "Task")!;
+        expect(
+          await task.execute({ description: "fixture", prompt: "do it", subagent_type: "fixture" }),
+        ).toBe("delegate result");
+        return { kind: "success", text: "done", sessionId: "same-session" };
+      },
+      makeAssembly({ toolInventory: [entry], guardrailGate: gate, delegateTurnRunner: delegateRunner }),
+    );
+    const base = {
+      adapterId: "sms",
+      channelId: "line-1",
+      channelKind: "sms",
+      channelLabel: "Identity",
+      threadId: "same-thread",
+      slackTs: "",
+      slackThreadTs: "",
+    };
+    const contexts = [
+      { ...base, workItemId: "scaffold-A" },
+      { ...base, workItemId: "scaffold-B" },
+      base,
+      undefined,
+    ];
+    for (const context of contexts) {
+      const result = await adapter.runTurn(req({ workItemContext: context, sessionId: "same-session" }));
+      expect(result.error).toBeUndefined();
+      expect(result.text).toBe("done");
+      expect(gate.mock.calls.at(-1)![0].workItemContext).toBe(context);
+      expect(delegateRunner.mock.calls.at(-1)![0].workItemContext).toBe(context);
+    }
+    expect(closeSpy).toHaveBeenCalledTimes(4);
+  });
+
   it("closes the bridge exactly once on a success outcome", async () => {
     const adapter = new TestScaffoldAdapter(ok());
     await adapter.runTurn(req());
