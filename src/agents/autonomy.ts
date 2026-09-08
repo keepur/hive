@@ -14,15 +14,12 @@
 export interface AutonomyFlags {
   /** Outbound email/SMS via resend/quo servers */
   externalComms: boolean;
-  /** Claude Code CLI sessions via code-task server */
-  codeTask: boolean;
   /** Source code visibility via code-search server */
   codeAccess: boolean;
 }
 
 export const AUTONOMY_DEFAULTS: Readonly<AutonomyFlags> = {
   externalComms: true,
-  codeTask: false,
   codeAccess: false,
 };
 

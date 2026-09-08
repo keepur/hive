@@ -1,6 +1,5 @@
 import dotenv from "dotenv";
-import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { AUTONOMY_DEFAULTS } from "./agents/autonomy.js";
@@ -8,7 +7,7 @@ import { DEFAULT_CIRCUIT_BREAKER_CONFIG, type CircuitBreakerConfig } from "./age
 import { DEFAULT_OUTAGE_QUEUE_CONFIG, type OutageQueueConfig } from "./outage/outage-queue-store.js";
 import { DEFAULT_MEETING_WORKERS_CONFIG, type MeetingWorkersConfig } from "./workers/worker-pool-config.js";
 import { fromKeychain as fromKeychainRaw } from "./keychain/from-keychain.js";
-import { engineDir, hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
+import { hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
 
 // Load .env from resolved hive home
 const dotenvPath = resolveDotenvPath(hiveHome);
@@ -324,20 +323,6 @@ export function warnIfLegacyGoogleAccount(rawHive: Record<string, unknown> | und
   }
 }
 
-/** Auto-discover all plugin dirs under <engineDir>/plugins/claude-code/, or use explicit list from hive.yaml */
-function discoverPluginDirs(yamlDirs?: string[]): string[] {
-  // Explicit list in hive.yaml takes precedence
-  if (yamlDirs?.length) {
-    return yamlDirs.map((d) => resolve(d.replace(/^~/, process.env.HOME ?? "/tmp")));
-  }
-  // Auto-scan <engineDir>/plugins/claude-code/*/
-  const parentDir = resolve(engineDir, "plugins/claude-code");
-  if (!existsSync(parentDir)) return [];
-  return readdirSync(parentDir)
-    .map((name) => resolve(parentDir, name))
-    .filter((p) => statSync(p).isDirectory());
-}
-
 // Load hive.yaml from resolved hive home
 const hiveConfigPath = resolveConfigFile(hiveHome);
 let hive: Record<string, any> = {};
@@ -545,17 +530,6 @@ export const config = {
     port: parseInt(optional("SLACK_INTERNAL_PORT", String(ports.slackInternal ?? portBase + 6)), 10),
     authToken: optional("SLACK_INTERNAL_TOKEN", "") || randomUUID(),
   },
-  codeTask: {
-    port: parseInt(optional("CODE_TASK_PORT", String(ports.codeTask ?? portBase + 2)), 10),
-    authToken: optional("CODE_TASK_AUTH_TOKEN", "") || randomUUID(),
-    pluginDirs: discoverPluginDirs((hive.codeTask as Record<string, unknown>)?.pluginDirs as string[] | undefined),
-    defaultModel: optional("CODE_TASK_MODEL", "claude-sonnet-5"),
-    defaultMaxTurns: parseInt(optional("CODE_TASK_MAX_TURNS", "100"), 10),
-    defaultMaxBudget: parseFloat(optional("CODE_TASK_MAX_BUDGET", "5.00")),
-    maxConcurrent: parseInt(optional("CODE_TASK_MAX_CONCURRENT", "2"), 10),
-    maxLifetimeMs: parseInt(optional("CODE_TASK_MAX_LIFETIME_MS", String(8 * 60 * 60 * 1000)), 10),
-    staleGraceMs: parseInt(optional("CODE_TASK_STALE_GRACE_MS", String(30 * 60 * 1000)), 10),
-  },
   ws: {
     enabled: optional("WS_ENABLED", "false") === "true",
     port: parseInt(optional("WS_PORT", String(ports.ws ?? portBase + 3)), 10),
@@ -610,7 +584,6 @@ export const config = {
   },
   autonomy: {
     externalComms: (hive.autonomy?.externalComms ?? AUTONOMY_DEFAULTS.externalComms) as boolean,
-    codeTask: (hive.autonomy?.codeTask ?? AUTONOMY_DEFAULTS.codeTask) as boolean,
     codeAccess: (hive.autonomy?.codeAccess ?? AUTONOMY_DEFAULTS.codeAccess) as boolean,
   },
   modelRouter: {
@@ -761,10 +734,6 @@ export const config = {
     enabled: hive.codeIndex?.enabled === true || process.env.CODE_INDEX_ENABLED === "true",
     scoreThreshold: parseFloat(optional("CODE_INDEX_SCORE_THRESHOLD", String(hive.codeIndex?.scoreThreshold ?? 0.65))),
     prefetchLimit: parseInt(optional("CODE_INDEX_PREFETCH_LIMIT", String(hive.codeIndex?.prefetchLimit ?? 8)), 10),
-    sessionKnowledge: {
-      enabled:
-        (hive.codeIndex?.sessionKnowledge?.enabled ?? true) && process.env.CODE_INDEX_SESSION_KNOWLEDGE !== "false",
-    },
     repos:
       (hive.codeIndex?.repos as Record<
         string,
@@ -844,7 +813,6 @@ export const config = {
     cdpEndpoint: optional("BROWSER_CDP_ENDPOINT", ""),
   },
   tasksDir: {
-    code: optional("CODE_TASKS_DIR", `/tmp/${instanceId}-code-tasks`),
     background: optional("BG_TASKS_DIR", `/tmp/${instanceId}-bg-tasks`),
   },
 } as const;
