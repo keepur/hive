@@ -219,7 +219,7 @@ export function buildPassthroughEnv(p: PassthroughSpawnConfig): Record<string, s
     CLAUDE_CODE_SUBAGENT_MODEL: p.model,
     ENABLE_TOOL_SEARCH: "false",
     // KPR-346 spike finding: an inherited CLAUDE_CODE_ENTRYPOINT (e.g. a
-    // nested/code_task/dev-shell context) makes the CLI treat the spawn as
+    // nested/subprocess/dev-shell context) makes the CLI treat the spawn as
     // first-party interactive and force OAuth over the injected env carrier.
     // Scrub it so the SDK re-stamps sdk-ts and precedence holds everywhere.
     CLAUDE_CODE_ENTRYPOINT: undefined,
