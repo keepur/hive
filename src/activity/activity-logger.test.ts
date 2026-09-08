@@ -40,7 +40,7 @@ function makeMockCollection() {
   return {
     createIndex: vi.fn().mockResolvedValue("ok"),
     insertMany: vi.fn().mockResolvedValue({ insertedCount: 1 }),
-    estimatedDocumentCount: vi.fn().mockResolvedValue(0),
+    countDocuments: vi.fn().mockResolvedValue(0),
   };
 }
 
@@ -88,7 +88,7 @@ describe("ActivityLogger", () => {
         { timestamp: 1 },
         { expireAfterSeconds: 90 * 24 * 60 * 60 },
       );
-      expect(mockCollection.estimatedDocumentCount).toHaveBeenCalled();
+      expect(mockCollection.countDocuments).toHaveBeenCalledWith({ recordKind: { $ne: "delivery_receipt" } });
 
       await logger.stop();
     });

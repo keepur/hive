@@ -1,6 +1,6 @@
 import { type Collection, type Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
-import type { ActivityRecord } from "./types.js";
+import { type ActivityRecord, TURN_ACTIVITY_FILTER } from "./types.js";
 
 const log = createLogger("activity-logger");
 
@@ -49,7 +49,7 @@ export class ActivityLogger {
       this.flush().catch((err) => log.warn("Periodic flush failed", { error: String(err) }));
     }, this.config.flushIntervalMs);
 
-    const count = await this.collection.estimatedDocumentCount();
+    const count = await this.collection.countDocuments(TURN_ACTIVITY_FILTER);
     log.info("Activity log connected", { records: count, retentionDays: this.config.retentionDays });
   }
 
