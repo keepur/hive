@@ -344,6 +344,15 @@ interface ProviderModelRoute {
 
 const REASONING_EFFORTS = new Set<CodexReasoningEffort>(["minimal", "none", "low", "medium", "high", "xhigh"]);
 
+/** KPR-467: initialized before publication; every turn describes the Query opened for this call. */
+type WarmVoiceLease = WarmVoiceSession & {
+  readonly opening: {
+    readonly model: string;
+    readonly route: ProviderModelRoute;
+    readonly timeoutMs: number;
+  };
+};
+
 function resolveProviderModel(model: string): ProviderModelRoute {
   const normalized = model.trim();
   const slash = normalized.indexOf("/");
@@ -652,7 +661,7 @@ export class AgentManager {
   // ticket acquisition; removed by lease.close() via onClosed (identity-
   // checked). The lease's ticket lives in activeTickets like any spawn, so
   // stopAgent/stopAll/sweep and the snapshot see it without special-casing.
-  private warmLeases = new Map<string, WarmVoiceSession>();
+  private warmLeases = new Map<string, WarmVoiceLease>();
   // KPR-220 Phase 6: per-(agentId,threadId) reflection coordinator state.
   private reflectionStates = new Map<string, ReflectionState>();
   private reflectionDebounceMs: number;
@@ -824,8 +833,8 @@ export class AgentManager {
    * snapshot they read BEFORE that await, so a SIGUSR1 reload landing inside
    * the await window cannot swap the runner's config out from under them —
    * this restores the pre-extraction read ordering in `createProviderAdapter`
-   * and removes its double registry read. Callers with no such gap
-   * (`openWarmLease`) omit it and let this method read.
+   * and removes its double registry read. Warm leases also pass the exact
+   * opening definition so the Query and its pinned telemetry agree.
    */
   private createRunner(
     agentId: string,
@@ -1329,13 +1338,13 @@ export class AgentManager {
     // the outer retry, all error rows, and the 322 bridge contract are
     // untouched (spec §5). Flag off / non-eligible → the code below this
     // block is byte-identical to pre-323.
-    if (this.isWarmPathEligible(ctx)) {
+    if (this.isWarmVoiceTurn(ctx)) {
       const threadKey = `${ctx.agentId}:${ctx.threadId}`;
       const lease = this.warmLeases.get(threadKey);
       if (lease && !lease.isClosed) {
         return this.runWarmTurn(lease, ctx, onStream);
       }
-      return this.openWarmLease(ctx, onStream);
+      if (this.isWarmPathEligible(ctx)) return this.openWarmLease(ctx, onStream);
     }
 
     return this.withSpawnTicket(ctx, async (ticket) => {
@@ -1677,7 +1686,7 @@ export class AgentManager {
    *    cold path's runnerOptions — but that addition is orthogonal to this
    *    laneAPassthrough omission decision and does not reopen the gap.)
    */
-  private isWarmPathEligible(ctx: TurnContext): boolean {
+  private isWarmVoiceTurn(ctx: TurnContext): boolean {
     if (ctx.channel !== "voice" || ctx.kind === "reflection") return false;
     // Optional chaining keeps test config mocks without a `voice` key working
     // — the gate simply stays cold.
@@ -1691,7 +1700,11 @@ export class AgentManager {
     // makes a future regression degrade HONESTLY to the cold path (which
     // passes systemPromptOverride: undefined and builds the real prompt)
     // instead of silently running a whole call without identity/guardrails.
-    if (!ctx.systemPromptOverride) return false;
+    return !!ctx.systemPromptOverride;
+  }
+
+  private isWarmPathEligible(ctx: TurnContext): boolean {
+    if (!this.isWarmVoiceTurn(ctx)) return false;
     const def = this.registry.get(ctx.agentId);
     if (!def) return false;
     return resolveProviderModel(def.model).provider === "claude";
@@ -1787,6 +1800,27 @@ export class AgentManager {
     // "Lease ready" gate: acquisition errors propagate synchronously.
     await Promise.race([ready, coordinator]);
 
+    // KPR-467: admission may have waited behind a cold turn while the
+    // registry changed. Re-evaluate before opening a Claude-only Query;
+    // release our ticket before routing through the current definition.
+    if (!this.isWarmPathEligible(ctx)) {
+      lease.close("opening-ineligible");
+      await coordinator;
+      return this.spawnTurn(ctx, onStream);
+    }
+
+    // No await between this read and runner construction. Pin scalar policy
+    // separately from the registry object, and publish only the complete
+    // metadata so a turn arriving during session open never sees unset fields.
+    const definition = this.registry.get(ctx.agentId)!;
+    const pinnedLease: WarmVoiceLease = Object.assign(lease, {
+      opening: {
+        model: definition.model,
+        route: resolveProviderModel(definition.model),
+        timeoutMs: definition.timeoutMs ?? 300_000,
+      },
+    });
+
     // Published BEFORE start() deliberately (review round 1, issue 4): the
     // registry entry is what makes a second turn arriving mid-open reuse this
     // lease. Deferring the publish until after start() would send that turn
@@ -1821,7 +1855,7 @@ export class AgentManager {
     // attempt) would NOT fire — the caller would get a hard failure on the
     // very first exchange of the call rather than a graceful cold retry.
     // Acceptable given the window is a microtask.
-    this.warmLeases.set(threadKey, lease);
+    this.warmLeases.set(threadKey, pinnedLease);
 
     try {
       if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
@@ -1849,6 +1883,7 @@ export class AgentManager {
       const runner = this.createRunner(
         ctx.agentId,
         this.workerPool ? { workerPool: this.workerPool } : undefined,
+        { config: definition, eventSubscribersJson: JSON.stringify(this.registry.getSubscriberMap()) },
       );
       const q = await runner.openVoiceStreamingSession({
         input: lease.inputQueue,
@@ -1878,7 +1913,7 @@ export class AgentManager {
     // Turn 1 runs through the same per-turn path as turns 2..N. Turn 1's
     // text is the adapter's full-transcript or greet-branch render,
     // unchanged from conversation-prompt.ts (§4.2).
-    return this.runWarmTurn(lease, ctx, onStream);
+    return this.runWarmTurn(pinnedLease, ctx, onStream);
   }
 
   /**
@@ -1915,17 +1950,15 @@ export class AgentManager {
    * reflection. One reflection per call is credited at release.
    */
   private async runWarmTurn(
-    lease: WarmVoiceSession,
+    lease: WarmVoiceLease,
     ctx: TurnContext,
     onStream?: SpawnTurnStreamCallback,
   ): Promise<TurnResult> {
-    const route = resolveProviderModel(this.registry.get(ctx.agentId)?.model ?? "");
+    const { route, model, timeoutMs } = lease.opening;
     const permit = this.circuitBreakers.acquire(route.provider, {
       agentId: ctx.agentId,
       threadId: ctx.threadId,
     });
-
-    const timeoutMs = this.registry.get(ctx.agentId)?.timeoutMs ?? 300_000;
 
     let runResult: RunResult;
     try {
@@ -1971,7 +2004,7 @@ export class AgentManager {
       resourceLimits: undefined,
       routerCostUsd: 0,
       effortOverride: undefined,
-    }, runResult, resumedSession);
+    }, runResult, resumedSession, model);
     lease.lastTurn = { ctx, result: turnResult };
 
     if (runResult.error) {
@@ -2916,6 +2949,7 @@ export class AgentManager {
     shaping: SpawnShaping,
     result: RunResult,
     resumedSession: boolean,
+    model = this.registry.get(ctx.agentId)?.model,
   ): void {
     const item = ctx.workItem;
     // KPR-389 D6: turn-kind discriminators from the dispatcher's conference meta.
@@ -2939,7 +2973,7 @@ export class AgentManager {
           agentId: ctx.agentId,
           threadId: ctx.threadId,
           sessionId: result.sessionId,
-          model: this.registry.get(ctx.agentId)?.model,
+          model,
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
           cacheReadTokens: result.cacheReadTokens,
@@ -3003,7 +3037,7 @@ export class AgentManager {
     if (intentTrailer) {
       log.info("Intent trailer detected", {
         agentId: ctx.agentId,
-        model: this.registry.get(ctx.agentId)?.model ?? "unknown",
+        model: model ?? "unknown",
         toolCalls: result.toolCalls,
       });
     }
@@ -3015,7 +3049,7 @@ export class AgentManager {
       senderName: item.senderName,
       channel: item.source.label,
       channelKind: item.source.kind,
-      model: this.registry.get(ctx.agentId)?.model ?? "unknown",
+      model: model ?? "unknown",
       // KPR-338 D4: tier is a static per-agent fact — audited on every
       // claude-static turn (R-311.7's observability feed, now static).
       // Pilots carry no tier: modelToTier is a Claude-id substring heuristic,
@@ -3182,7 +3216,8 @@ export class AgentManager {
       // an older `pkg/types/` RunResult and can legitimately omit the field
       // at runtime, where `undefined` would flow into a required-number
       // TurnResult slot and log as `undefined` on C5d. Every in-engine
-      // construction site still declares it explicitly (C5a is required).
+      // construction site declares it by convention and guard tests; the
+      // exported RunResult ABI keeps the field optional for older plugins.
       toolAckInjected: result.toolAckInjected ?? 0,
       streamed: result.streamed,
       compactions: result.compactions,

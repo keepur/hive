@@ -7227,6 +7227,166 @@ describe("AgentManager", () => {
       expect(vi.mocked(AgentRunner).mock.calls.at(-1)![10]).toEqual({ workerPool: pool });
     });
 
+    describe("KPR-467 call-pinned reload routing", () => {
+      it("reuses the opening Claude lease after a cross-provider reload; the next call uses OpenAI", async () => {
+        vi.useFakeTimers();
+        const { pushed } = installEchoStreamingRunner();
+        let nextTurn: Promise<unknown> | undefined;
+        try {
+          await manager.spawnTurn(makeVoiceCtx());
+          const acquire = vi.spyOn(manager.circuitBreakers, "acquire");
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "openai/gpt-5.4-mini" }));
+          let completed = false;
+          nextTurn = manager.spawnTurn(makeVoiceCtx()).then((result) => {
+            completed = true;
+            return result;
+          });
+          // A retained lease completes without waiting for its own 120s idle release.
+          await vi.advanceTimersByTimeAsync(25);
+          expect(completed).toBe(true);
+          expect(await nextTurn).toMatchObject({ warmPath: true, warmTurnSeq: 2, finalMessage: "reply-2" });
+          expect(acquire).toHaveBeenLastCalledWith("claude", expect.anything());
+          expect(pushed).toHaveLength(2);
+          expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+          expect(turnTelemetryStore.record).toHaveBeenLastCalledWith(expect.objectContaining({ model: "claude-haiku-4-5" }));
+          expect(sessionStore.set).toHaveBeenLastCalledWith("agent-a", "voice:call-1", "sess-warm-2", "claude", expect.anything(), null);
+
+          warmLeases(manager).get(WARM_KEY)!.close("call-ended");
+          await vi.advanceTimersByTimeAsync(25);
+          const fresh = await manager.spawnTurn(makeVoiceCtx());
+          expect(fresh.warmPath).toBeUndefined();
+          expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+          expect(turnTelemetryStore.record).toHaveBeenLastCalledWith(expect.objectContaining({ model: "openai/gpt-5.4-mini" }));
+        } finally {
+          manager.stopAgent("agent-a");
+          const settled = nextTurn?.catch(() => {});
+          await vi.advanceTimersByTimeAsync(25);
+          await settled;
+          vi.useRealTimers();
+        }
+      });
+
+      it("pins model and watchdog across a same-provider reload, then opens with the latest definition", async () => {
+        vi.useFakeTimers();
+        const { interrupt } = installEchoStreamingRunner({ hangOnTurn: 2 });
+        registry._agents.get("agent-a")!.timeoutMs = 100;
+        const activityLogger = { record: vi.fn() };
+        manager = new AgentManager(
+          registry as any, memoryManager as any, sessionStore as any,
+          undefined as any, turnTelemetryStore as any, activityLogger as any,
+        );
+        try {
+          await manager.spawnTurn(makeVoiceCtx());
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "claude-sonnet-4-6", timeoutMs: 10 }));
+          const second = manager.spawnTurn(makeVoiceCtx());
+          await vi.advanceTimersByTimeAsync(10);
+          expect(interrupt).not.toHaveBeenCalled();
+          await vi.advanceTimersByTimeAsync(90);
+          expect(await second).toMatchObject({ warmTurnSeq: 2, timedOut: true });
+          expect(interrupt).toHaveBeenCalledTimes(1);
+          expect(turnTelemetryStore.record).toHaveBeenLastCalledWith(expect.objectContaining({ model: "claude-haiku-4-5" }));
+          expect(activityLogger.record).toHaveBeenLastCalledWith(expect.objectContaining({ model: "claude-haiku-4-5", modelTier: "haiku" }));
+          warmLeases(manager).get(WARM_KEY)!.close("call-ended");
+          await vi.advanceTimersByTimeAsync(25);
+
+          const freshRunner = installEchoStreamingRunner({ hangOnTurn: 2 });
+          await manager.spawnTurn(makeVoiceCtx());
+          expect(vi.mocked(AgentRunner).mock.calls.at(-1)![0]).toMatchObject({ model: "claude-sonnet-4-6", timeoutMs: 10 });
+          expect(turnTelemetryStore.record).toHaveBeenLastCalledWith(expect.objectContaining({ model: "claude-sonnet-4-6" }));
+          const freshSecond = manager.spawnTurn(makeVoiceCtx());
+          await vi.advanceTimersByTimeAsync(10);
+          expect(await freshSecond).toMatchObject({ warmTurnSeq: 2, timedOut: true });
+          expect(freshRunner.interrupt).toHaveBeenCalledTimes(1);
+        } finally {
+          manager.stopAgent("agent-a");
+          await vi.advanceTimersByTimeAsync(25);
+          vi.useRealTimers();
+        }
+      });
+
+      it.each(["reflection", "nonvoice", "flag-off"] as const)("keeps %s traffic off the active lease after reload", async (kind) => {
+        vi.useFakeTimers();
+        const { pushed } = installEchoStreamingRunner();
+        let pending: Promise<unknown> | undefined;
+        try {
+          await manager.spawnTurn(makeVoiceCtx());
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "claude-sonnet-4-6" }));
+          const ctx = kind === "reflection"
+            ? { ...makeVoiceCtx(), kind: "reflection" as const }
+            : kind === "nonvoice"
+              ? makeSmsCtx({ threadId: "voice:call-1" })
+              : makeVoiceCtx();
+          if (kind === "flag-off") appConfig.voice.warmPath.enabled = false;
+          let completed = false;
+          pending = manager.spawnTurn(ctx).then((result) => {
+            completed = true;
+            return result;
+          });
+          await vi.advanceTimersByTimeAsync(25);
+          expect(completed).toBe(false);
+          expect(pushed).toHaveLength(1);
+          warmLeases(manager).get(WARM_KEY)!.close("call-ended");
+          await vi.advanceTimersByTimeAsync(25);
+          expect(await pending).not.toHaveProperty("warmPath");
+          expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+        } finally {
+          manager.stopAgent("agent-a");
+          const settled = pending?.catch(() => {});
+          await vi.advanceTimersByTimeAsync(25);
+          await settled;
+          vi.useRealTimers();
+        }
+      });
+
+      it.each(["stop", "disable", "removal"] as const)("preserves %s lifecycle rejection after reload", async (action) => {
+        const { close, pushed } = installEchoStreamingRunner();
+        await manager.spawnTurn(makeVoiceCtx());
+        registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "openai/gpt-5.4-mini" }));
+        // The registry excludes disabled/removed agents; index.ts then stops
+        // their active tickets. Exercise that same sequence at the manager seam.
+        if (action !== "stop") {
+          registry._agents.delete("agent-a");
+          await expect(manager.spawnTurn(makeVoiceCtx())).rejects.toThrow("Unknown agent");
+        }
+        manager.stopAgent("agent-a");
+        await expect(manager.spawnTurn(makeVoiceCtx())).rejects.toThrow(action === "stop" ? /stopped/ : /Unknown agent/);
+        await Promise.resolve();
+        expect(close).toHaveBeenCalledTimes(1);
+        expect(warmLeases(manager).size).toBe(0);
+        expect(pushed).toHaveLength(1);
+        expect(mockOpenAIRunTurn).not.toHaveBeenCalled();
+        expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0);
+      });
+
+      it("rechecks opening eligibility after waiting for an existing cold turn's lock", async () => {
+        vi.useFakeTimers();
+        installEchoStreamingRunner();
+        let finishCold!: () => void;
+        mockRunnerSend.mockImplementationOnce(() => new Promise((resolve) => {
+          finishCold = () => resolve(makeRunResult());
+        }));
+        try {
+          const cold = manager.spawnTurn({ ...makeVoiceCtx(), kind: "reflection" });
+          await vi.advanceTimersByTimeAsync(0);
+          const queued = manager.spawnTurn(makeVoiceCtx());
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "openai/gpt-5.4-mini" }));
+          finishCold();
+          await cold;
+          await vi.advanceTimersByTimeAsync(25);
+          const result = await queued;
+          expect(result.warmPath).toBeUndefined();
+          expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+          expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+          expect(warmLeases(manager).size).toBe(0);
+          expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0);
+        } finally {
+          manager.stopAgent("agent-a");
+          await vi.advanceTimersByTimeAsync(25);
+          vi.useRealTimers();
+        }
+      });
+    });
+
     // ---- assertion 5 -----------------------------------------------------
     it("(5) a reflection-kind voice ctx never opens or reuses a lease", async () => {
       installEchoStreamingRunner();
