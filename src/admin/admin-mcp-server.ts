@@ -32,6 +32,12 @@ import { createLogger } from "../logging/logger.js";
 import { config as appConfig } from "../config.js";
 import { envValue } from "../agents/provider-adapters/oauth-credentials.js";
 import { getCachedGeminiModels, setCachedGeminiModels } from "./model-catalog-cache.js";
+import { ModelCatalogStore } from "./model-catalog-store.js";
+import type {
+  CatalogDoc as AgentModelCatalogDoc,
+  CatalogProvider as CuratedCatalogProvider,
+} from "./model-catalog-types.js";
+import { diffText } from "./model-catalog-value.js";
 
 const log = createLogger("admin-mcp");
 
@@ -230,40 +236,11 @@ function checkEffort(value: unknown): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// KPR-381: agent model catalog — curated model ids for claude/grok/codex
-// (subscription-auth providers with no live model-list endpoint) + a live
-// Gemini lookup. Types are inline on purpose: no second consumer exists.
+// KPR-381: agent model catalog — persisted model ids for claude/grok/codex
+// and registered plugin providers + a live Gemini lookup.
 // NOT related to src/llm/catalog.ts (LLM_CATALOG) — that is the sidecar
 // catalog for 4 fixed internal engine tasks and is untouched here.
 // ---------------------------------------------------------------------------
-
-type CuratedCatalogProvider = "claude" | "grok" | "codex";
-
-interface AgentModelCatalogEntry {
-  id: string; // e.g. "grok-4.6"
-  displayName: string; // e.g. "Grok 4.6"
-  notes?: string; // free text, e.g. "subscription default"
-  addedAt: Date;
-}
-
-interface AgentModelCatalogDoc {
-  // KPR-394 (§4.11): widened to string — curated docs can now hold
-  // plugin-registered provider ids alongside the built-in curated set.
-  _id: string;
-  provider: string;
-  models: AgentModelCatalogEntry[];
-  updatedAt: Date;
-  updatedBy: string; // agentId that called the refresh tool
-}
-
-/** Append-only audit trail — mirrors AgentDefinitionVersion's shape. */
-interface AgentModelCatalogVersion {
-  provider: string; // KPR-394: built-in curated id or a plugin provider id
-  snapshot: AgentModelCatalogEntry[];
-  changeSummary: string;
-  createdAt: Date;
-  updatedBy: string;
-}
 
 /** One row in agent_model_catalog_list's entries JSON. */
 interface CatalogListEntry {
@@ -377,17 +354,14 @@ export function buildAdminTools(deps: AdminToolDeps) {
   const agentDefs = db.collection<AgentDefinition>("agent_definitions");
   const agentVersions = db.collection<AgentDefinitionVersion>("agent_definition_versions");
   const catalogDocs = db.collection<AgentModelCatalogDoc>("agent_model_catalog");
-  const catalogVersions = db.collection<AgentModelCatalogVersion>("agent_model_catalog_versions");
+  const catalogStore = new ModelCatalogStore(db, { listPluginProviderIds: deps.listPluginProviderIds });
 
   // Lazy index creation — first call to a handler triggers it. Avoids hard
   // requirements on Mongo at module import (test harnesses, dry runs).
   let indexInit: Promise<void> | null = null;
   function ensureIndexes(): Promise<void> {
     if (!indexInit) {
-      indexInit = Promise.all([
-        agentVersions.createIndex({ agentId: 1, createdAt: -1 }),
-        catalogVersions.createIndex({ provider: 1, createdAt: -1 }),
-      ])
+      indexInit = Promise.all([agentVersions.createIndex({ agentId: 1, createdAt: -1 })])
         .then(() => undefined)
         .catch(() => undefined);
     }
@@ -1119,7 +1093,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
     ),
     tool(
       "agent_model_catalog_list",
-      "List valid LLM model ids per provider for agent `model` assignment. Gemini is resolved live from the vendor (cached ~10 min); claude/grok/codex come from the curated catalog (maintained via agent_model_catalog_refresh). Use before setting `model` on agent_create/agent_update. Returns a JSON entries array plus prose notes for any provider leg that is unseeded or unavailable. Plugin-registered providers (KPR-394) list from the curated catalog as well.",
+      "List valid LLM model ids per provider for agent `model` assignment. Gemini is resolved live from the vendor (cached ~10 min); claude/grok/codex are read from persisted catalogs shared by subscription discovery and full manual replacement. Listing does not trigger built-in discovery. Plugin-registered providers are read from manually maintained persisted catalogs. Use before setting `model` on agent_create/agent_update. Returns a JSON entries array plus prose notes for any provider leg that is unseeded or unavailable.",
       {
         provider: z
           .string()
@@ -1153,7 +1127,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
               continue;
             }
             const asOf = doc.updatedAt instanceof Date ? doc.updatedAt.toISOString() : String(doc.updatedAt);
-            for (const m of doc.models) {
+            for (const m of doc.models ?? []) {
               entries.push({
                 provider: p,
                 id: m.id,
@@ -1231,7 +1205,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
     ),
     tool(
       "agent_model_catalog_refresh",
-      "Replace the curated model list for one curated provider (claude/grok/codex, or a registered plugin provider id — KPR-394) after researching current vendor reality with your own WebSearch/WebFetch. Pass the FULL replacement list, not a delta. Upserts agent_model_catalog, appends a version-history row, returns a diff summary. Performs no vendor calls itself. Gemini is always resolved live and cannot be refreshed.",
+      "Fully replace the shared model catalog for claude/grok/codex or a registered plugin provider. Built-in catalogs are shared between subscription discovery and full manual replacement; plugin catalogs remain manual. This tool makes no vendor calls. Pass the FULL replacement list, not a delta. The next successful built-in discovery replaces membership, display names, and order while retaining notes for retained model ids. Gemini is always resolved live and cannot be refreshed.",
       {
         provider: z
           .string()
@@ -1260,84 +1234,37 @@ export function buildAdminTools(deps: AdminToolDeps) {
       },
       async ({ provider, models, changeSummary }) => {
         try {
-          await ensureIndexes();
-
-          // KPR-394 (§4.11): in-handler validation, not a zod enum — plugin
-          // ids are only known at runtime, and the admin harness mocks the
-          // SDK `tool()` wrapper (zod never runs there).
-          const pluginIds = deps.listPluginProviderIds?.() ?? [];
-          const curatedSet: string[] = [...CURATED_CATALOG_PROVIDERS, ...pluginIds];
-          if (provider === "gemini") {
+          const result = await catalogStore.replaceManual({ provider, models, updatedBy: agentId, changeSummary });
+          if (result.kind === "committed") {
             return {
-              isError: true,
-              content: [{ type: "text", text: "Gemini is always resolved live and cannot be refreshed." }],
+              content: [
+                {
+                  type: "text",
+                  text: `${provider} catalog updated: ${diffText(result.added, result.removed)}. ${models.length} models total.${changeSummary ? ` — ${changeSummary}` : ""}${result.recoveryPending ? " Catalog saved; audit/change recovery pending." : ""}`,
+                },
+              ],
             };
           }
-          if (!curatedSet.includes(provider)) {
+          if (result.kind === "commit-unknown") {
             return {
               isError: true,
-              content: [{ type: "text", text: `Unknown provider '${provider}'. Valid: ${curatedSet.join(", ")}.` }],
+              content: [
+                {
+                  type: "text",
+                  text: `Catalog commit outcome unknown (operation ${result.operationId}); reconcile this operation before retrying.`,
+                },
+              ],
             };
           }
-
-          const ids = models.map((m) => m.id);
-          if (new Set(ids).size !== ids.length) {
-            return {
-              isError: true,
-              content: [{ type: "text", text: `Duplicate model ids in input: ${ids.join(", ")}.` }],
-            };
+          if (result.kind === "not-committed") {
+            return { isError: true, content: [{ type: "text", text: result.error.message }] };
           }
-
-          const now = new Date();
-          const current = await catalogDocs.findOne({ _id: provider });
-          const prevById = new Map((current?.models ?? []).map((m) => [m.id, m]));
-          const newIds = new Set(ids);
-          const added = ids.filter((id) => !prevById.has(id));
-          const removed = [...prevById.keys()].filter((id) => !newIds.has(id));
-
-          const nextModels: AgentModelCatalogEntry[] = models.map((m) => ({
-            id: m.id,
-            displayName: m.displayName,
-            ...(m.notes ? { notes: m.notes } : {}),
-            // Preserve addedAt for retained ids; stamp now for new ones.
-            addedAt: prevById.get(m.id)?.addedAt ?? now,
-          }));
-
-          await catalogDocs.updateOne(
-            { _id: provider },
-            { $set: { provider, models: nextModels, updatedAt: now, updatedBy: agentId } },
-            { upsert: true },
-          );
-
-          const fmt = (xs: string[]) => (xs.length > 0 ? ` (${xs.join(", ")})` : "");
-          const diffText = `+${added.length}${fmt(added)}, -${removed.length}${fmt(removed)}`;
-
-          await catalogVersions.insertOne({
-            provider,
-            snapshot: nextModels,
-            // `||` not `??`: an explicit empty string is treated the same way
-            // the response text below treats it (falsy → omitted), so a blank
-            // summary never lands in the audit trail in place of the diff.
-            changeSummary: changeSummary || diffText,
-            createdAt: now,
-            updatedBy: agentId,
-          });
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: `${provider} catalog updated: ${diffText}. ${nextModels.length} models total.${
-                  changeSummary ? ` — ${changeSummary}` : ""
-                }`,
-              },
-            ],
-          };
-        } catch (err) {
           return {
             isError: true,
-            content: [{ type: "text", text: `agent_model_catalog_refresh error: ${String(err)}` }],
+            content: [{ type: "text", text: "Catalog replacement was not accepted." }],
           };
+        } catch {
+          return { isError: true, content: [{ type: "text", text: "Model catalog storage unavailable." }] };
         }
       },
     ),

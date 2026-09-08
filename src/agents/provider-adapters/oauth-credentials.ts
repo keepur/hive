@@ -110,7 +110,7 @@ function refreshCodexSession(options: CodexOAuthOptions): void {
   }
 }
 
-function defaultCodexCommand(): string {
+export function defaultCodexCommand(): string {
   const bundled = "/Applications/Codex.app/Contents/Resources/codex";
   return existsSync(bundled) ? bundled : "codex";
 }

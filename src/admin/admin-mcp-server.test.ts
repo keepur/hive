@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { createCatalogFake, faultDb } from "./testing/catalog-db.test-support.js";
 
 // ---------------------------------------------------------------------------
 // KPR-122 in-process port: the admin MCP server is now a pure builder
@@ -26,8 +27,7 @@ vi.mock("../config.js", () => ({ config: mockConfig }));
 
 let agentDocsStore = new Map<string, any>();
 let agentVersionsStore: any[] = [];
-let catalogDocsStore = new Map<string, any>();
-let catalogVersionsStore: any[] = [];
+let catalogFake = createCatalogFake();
 
 function makeAgentDefsCollection(): any {
   return {
@@ -74,40 +74,19 @@ function makeAgentVersionsCollection(): any {
   };
 }
 
-function makeCatalogDocsCollection(): any {
-  return {
-    findOne: vi.fn(async (filter: any) => catalogDocsStore.get(filter?._id) ?? null),
-    updateOne: vi.fn(async (filter: any, update: any, opts: any) => {
-      const id = filter?._id;
-      const existing = catalogDocsStore.get(id);
-      if (existing && update.$set) Object.assign(existing, update.$set);
-      else if (opts?.upsert) catalogDocsStore.set(id, { _id: id, ...update.$set });
-      return { modifiedCount: existing ? 1 : 0 };
-    }),
-    createIndex: vi.fn().mockResolvedValue("ok"),
-  };
-}
-
-function makeCatalogVersionsCollection(): any {
-  return {
-    insertOne: vi.fn(async (doc: any) => {
-      catalogVersionsStore.push({ ...doc });
-      return { insertedId: "cv" };
-    }),
-    createIndex: vi.fn().mockResolvedValue("ok"),
-  };
-}
-
-function makeFakeDb(): any {
+function makeFakeDb(catalogDb: any = catalogFake.db): any {
   const defs = makeAgentDefsCollection();
   const versions = makeAgentVersionsCollection();
-  const catalogDocs = makeCatalogDocsCollection();
-  const catalogVersions = makeCatalogVersionsCollection();
   return {
     collection: (name: string) => {
       if (name === "agent_definitions") return defs;
-      if (name === "agent_model_catalog") return catalogDocs;
-      if (name === "agent_model_catalog_versions") return catalogVersions;
+      if (
+        name === "agent_model_catalog" ||
+        name === "agent_model_catalog_versions" ||
+        name === "agent_model_catalog_changes"
+      ) {
+        return catalogDb.collection(name);
+      }
       return versions;
     },
   };
@@ -153,11 +132,12 @@ function makeBaseAgent(overrides: Record<string, any> = {}): any {
 }
 
 function makeTools(depsOverride: Record<string, any> = {}) {
+  const { catalogDb, ...deps } = depsOverride;
   return buildAdminTools({
-    db: makeFakeDb(),
+    db: makeFakeDb(catalogDb),
     agentId: "admin",
     instanceCapabilitiesJson: "{}",
-    ...depsOverride,
+    ...deps,
   });
 }
 
@@ -1029,8 +1009,7 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
   beforeEach(() => {
     agentDocsStore = new Map();
     agentVersionsStore = [];
-    catalogDocsStore = new Map();
-    catalogVersionsStore = [];
+    catalogFake = createCatalogFake();
     mockConfig.gemini.apiKey = "test-gemini-key";
   });
 
@@ -1046,25 +1025,26 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toMatch(/grok catalog updated: \+2 \(grok-4\.6, grok-4\.5\), -0\. 2 models total\./);
 
-    const doc = catalogDocsStore.get("grok");
+    const doc = catalogFake.rows("agent_model_catalog").get("grok");
     expect(doc.provider).toBe("grok");
     expect(doc.models).toHaveLength(2);
     expect(doc.models[0].addedAt).toBeInstanceOf(Date);
     expect(doc.updatedBy).toBe("admin");
     expect(doc.updatedAt).toBeInstanceOf(Date);
 
-    expect(catalogVersionsStore).toHaveLength(1);
-    expect(catalogVersionsStore[0].provider).toBe("grok");
-    expect(catalogVersionsStore[0].snapshot).toHaveLength(2);
-    expect(catalogVersionsStore[0].changeSummary).toMatch(/\+2/);
-    expect(catalogVersionsStore[0].createdAt).toBeInstanceOf(Date);
-    expect(catalogVersionsStore[0].updatedBy).toBe("admin");
+    const versions = [...catalogFake.rows("agent_model_catalog_versions").values()];
+    expect(versions).toHaveLength(1);
+    expect(versions[0].provider).toBe("grok");
+    expect(versions[0].snapshot).toHaveLength(2);
+    expect(versions[0].changeSummary).toMatch(/\+2/);
+    expect(versions[0].createdAt).toBeInstanceOf(Date);
+    expect(versions[0].updatedBy).toBe("admin");
   });
 
   it("diffs against the current doc and preserves addedAt for retained ids", async () => {
     const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
     const oldDate = new Date("2026-01-01T00:00:00Z");
-    catalogDocsStore.set("claude", {
+    catalogFake.rows("agent_model_catalog").set("claude", {
       _id: "claude",
       provider: "claude",
       models: [
@@ -1086,12 +1066,14 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
     expect(result.content[0].text).toMatch(/\+1 \(claude-opus-6\), -1 \(claude-opus-4-7\)\. 2 models total/);
     expect(result.content[0].text).toMatch(/Opus 6 shipped/);
 
-    const doc = catalogDocsStore.get("claude");
+    const doc = catalogFake.rows("agent_model_catalog").get("claude");
     const retained = doc.models.find((m: any) => m.id === "claude-opus-5");
     const fresh = doc.models.find((m: any) => m.id === "claude-opus-6");
     expect(retained.addedAt).toEqual(oldDate);
     expect(fresh.addedAt.getTime()).toBeGreaterThan(oldDate.getTime());
-    expect(catalogVersionsStore[0].changeSummary).toBe("Opus 6 shipped; 4.7 deprecated");
+    expect([...catalogFake.rows("agent_model_catalog_versions").values()][0].changeSummary).toBe(
+      "Opus 6 shipped; 4.7 deprecated",
+    );
   });
 
   it("rejects duplicate model ids", async () => {
@@ -1105,8 +1087,84 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
     });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/Duplicate model ids/);
-    expect(catalogDocsStore.size).toBe(0);
-    expect(catalogVersionsStore).toHaveLength(0);
+    expect(catalogFake.rows("agent_model_catalog").size).toBe(0);
+    expect([...catalogFake.rows("agent_model_catalog_versions").values()]).toHaveLength(0);
+  });
+
+  it("rejects an empty replacement even when the mocked SDK bypasses Zod", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    const result = await handler({ provider: "codex", models: [] });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("Model catalog codex: empty.");
+    expect(catalogFake.rows("agent_model_catalog").size).toBe(0);
+    expect([...catalogFake.rows("agent_model_catalog_versions").values()]).toHaveLength(0);
+  });
+
+  it("audits an identical manual replacement without creating another membership change", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    const input = { provider: "codex", models: [{ id: "gpt-5.5", displayName: "GPT-5.5" }] };
+    const first = await handler(input);
+    const second = await handler(input);
+
+    expect(first.isError).toBeUndefined();
+    expect(second.content[0].text).toBe("codex catalog updated: +0, -0. 1 models total.");
+    expect([...catalogFake.rows("agent_model_catalog_versions").values()]).toHaveLength(2);
+    expect([...catalogFake.rows("agent_model_catalog_changes").values()]).toHaveLength(1);
+    expect(catalogFake.rows("agent_model_catalog").get("codex")?.revision).toBe(2);
+  });
+
+  it("lets a full manual replacement clear notes from retained models", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    await handler({
+      provider: "claude",
+      models: [{ id: "claude-opus-5", displayName: "Opus 5", notes: "preferred" }],
+    });
+    const result = await handler({
+      provider: "claude",
+      models: [{ id: "claude-opus-5", displayName: "Opus 5" }],
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(catalogFake.rows("agent_model_catalog").get("claude")?.models?.[0]).not.toHaveProperty("notes");
+  });
+
+  it("reports a committed catalog as saved when audit/change projection is pending", async () => {
+    const unavailableProjection = faultDb(catalogFake.db, async (collection, method, _args, run) => {
+      if (collection === "agent_model_catalog_versions" && method === "insertOne") {
+        throw new Error("test history unavailable");
+      }
+      return run();
+    });
+    const handler = getHandler(makeTools({ catalogDb: unavailableProjection }), "agent_model_catalog_refresh");
+    const result = await handler({ provider: "grok", models: [{ id: "grok-4.6", displayName: "Grok 4.6" }] });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe(
+      "grok catalog updated: +1 (grok-4.6), -0. 1 models total. Catalog saved; audit/change recovery pending.",
+    );
+    expect(catalogFake.rows("agent_model_catalog").get("grok")?.models?.[0]?.id).toBe("grok-4.6");
+    expect(catalogFake.rows("agent_model_catalog").get("grok")?.pendingExport).toBeDefined();
+  });
+
+  it("returns the stable operation id when the catalog commit acknowledgment is unknown", async () => {
+    let operationId = "";
+    const unknownCommit = faultDb(catalogFake.db, async (collection, method, args, run) => {
+      if (collection === "agent_model_catalog" && method === "insertOne") {
+        operationId = args[0].pendingExport.version._id;
+        throw new Error("test acknowledgment unavailable");
+      }
+      return run();
+    });
+    const handler = getHandler(makeTools({ catalogDb: unknownCommit }), "agent_model_catalog_refresh");
+    const result = await handler({ provider: "codex", models: [{ id: "gpt-5.5", displayName: "GPT-5.5" }] });
+
+    expect(result.isError).toBe(true);
+    expect(operationId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(result.content[0].text).toBe(
+      `Catalog commit outcome unknown (operation ${operationId}); reconcile this operation before retrying.`,
+    );
+    expect(result.content[0].text).not.toContain("updated");
+    expect(result.content[0].text).not.toContain("saved");
   });
 
   it("an explicit empty changeSummary falls back to the diff text — no blank audit row", async () => {
@@ -1119,7 +1177,7 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
     expect(result.isError).toBeUndefined();
     // Response text omits the empty summary; the version row must not be blank.
     expect(result.content[0].text).toBe("codex catalog updated: +1 (gpt-5.5), -0. 1 models total.");
-    expect(catalogVersionsStore[0].changeSummary).toBe("+1 (gpt-5.5), -0");
+    expect([...catalogFake.rows("agent_model_catalog_versions").values()][0].changeSummary).toBe("+1 (gpt-5.5), -0");
   });
 
   // KPR-394 (§4.11): the provider schema widened from a zod enum to z.string()
@@ -1171,8 +1229,7 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
   beforeEach(() => {
     agentDocsStore = new Map();
     agentVersionsStore = [];
-    catalogDocsStore = new Map();
-    catalogVersionsStore = [];
+    catalogFake = createCatalogFake();
     invalidateGeminiModelCache();
     mockConfig.gemini.apiKey = "test-gemini-key";
     // KPR-382: the gemini leg now reads the adapter's env fallbacks — clear
@@ -1188,7 +1245,7 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
   });
 
   function seedGrok() {
-    catalogDocsStore.set("grok", {
+    catalogFake.rows("agent_model_catalog").set("grok", {
       _id: "grok",
       provider: "grok",
       models: [
@@ -1498,8 +1555,7 @@ describe("admin-mcp-server — model field discoverability (KPR-381)", () => {
 
 describe("agent_model_catalog — plugin providers (KPR-394)", () => {
   beforeEach(() => {
-    catalogDocsStore = new Map();
-    catalogVersionsStore = [];
+    catalogFake = createCatalogFake();
   });
 
   it("list accepts a registered plugin id; unseeded returns the prose note", async () => {
@@ -1510,17 +1566,29 @@ describe("agent_model_catalog — plugin providers (KPR-394)", () => {
     expect(texts).toContain("sol: not yet seeded");
   });
 
-  it("refresh upserts a plugin provider's curated doc", async () => {
+  it("refresh records a plugin provider's actor, diff, and summary", async () => {
     const tools = makeTools({ listPluginProviderIds: () => ["sol"] });
     const res = await getHandler(
       tools,
       "agent_model_catalog_refresh",
     )({
       provider: "sol",
-      models: [{ id: "sol-large-2", displayName: "Sol Large 2" }],
+      models: [
+        { id: "sol-large-2", displayName: "Sol Large 2" },
+        { id: "sol-small-2", displayName: "Sol Small 2" },
+      ],
+      changeSummary: "Sol 2 catalog",
     });
     expect(res.isError).toBeUndefined();
-    expect(catalogDocsStore.get("sol")?.models?.[0]?.id).toBe("sol-large-2");
+    expect(res.content[0].text).toBe(
+      "sol catalog updated: +2 (sol-large-2, sol-small-2), -0. 2 models total. — Sol 2 catalog",
+    );
+    expect(catalogFake.rows("agent_model_catalog").get("sol")?.models?.[0]?.id).toBe("sol-large-2");
+    const version = [...catalogFake.rows("agent_model_catalog_versions").values()][0];
+    expect(version.updatedBy).toBe("admin");
+    expect(version.added).toEqual(["sol-large-2", "sol-small-2"]);
+    expect(version.removed).toEqual([]);
+    expect(version.changeSummary).toBe("Sol 2 catalog");
   });
 
   it("refresh rejects an unknown provider naming the valid set", async () => {
