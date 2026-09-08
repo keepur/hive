@@ -29,7 +29,7 @@ export class CodeIndexPrefetcher {
   }
 
   /**
-   * Get pre-fetched codebase context for a code_task prompt.
+   * Get pre-fetched codebase context for an agent turn.
    * Returns a markdown block to prepend, or empty string if nothing relevant.
    */
   async getContext(prompt: string, agentId?: string): Promise<string> {

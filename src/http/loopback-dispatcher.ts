@@ -44,8 +44,8 @@ export function getLoopbackDispatcher(): Dispatcher {
  * Install the shared keep-alive Agent as this process's global fetch dispatcher.
  * Idempotent. Call ONCE at every Hive process entry (main engine + each stdio
  * MCP subprocess) BEFORE any fetch() is issued. Pools all outbound HTTP —
- * loopback control plane (beekeeper registration, task ledger, background /
- * code-task managers) and external HTTPS alike — eliminating per-request TCP
+ * loopback control plane (beekeeper registration, task ledger, background task
+ * manager) and external HTTPS alike — eliminating per-request TCP
  * churn (KPR-252).
  *
  * Intentionally silent: no logging, so importing this from a stdio MCP server

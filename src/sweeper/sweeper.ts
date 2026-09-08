@@ -2,7 +2,6 @@ import { createLogger } from "../logging/logger.js";
 import type { Dispatcher } from "../channels/dispatcher.js";
 import type { SlackAdapter } from "../channels/slack-adapter.js";
 import type { BackgroundTaskManager } from "../background/background-task-manager.js";
-import type { CodeTaskManager } from "../code-task/code-task-manager.js";
 import type { MeetingMonitor } from "../recall/meeting-monitor.js";
 import type { TaskLedger } from "../tasks/task-ledger.js";
 import type { SlackGateway } from "../slack/slack-gateway.js";
@@ -36,7 +35,6 @@ export interface SweeperTargets {
   dispatcher: Dispatcher;
   slackAdapters: SlackAdapter[];
   bgTaskManager: BackgroundTaskManager;
-  codeTaskManager?: CodeTaskManager;
   meetingMonitor?: MeetingMonitor;
   taskLedger?: TaskLedger;
   slackGateways: SlackGateway[];
@@ -129,31 +127,6 @@ export class Sweeper {
       results.push(await this.targets.bgTaskManager.sweep(this.config.taskFileTtlMs));
     } catch (err) {
       results.push({ component: "bg-task-manager", pruned: 0, retried: 0, bytesFreed: 0, errors: [String(err)] });
-    }
-
-    // 4b. Code task manager — prune completed code tasks + delete old files
-    if (this.targets.codeTaskManager) {
-      try {
-        results.push(await this.targets.codeTaskManager.sweep(this.config.taskFileTtlMs));
-      } catch (err) {
-        results.push({ component: "code-task-manager", pruned: 0, retried: 0, bytesFreed: 0, errors: [String(err)] });
-      }
-
-      // 4c. Reap stale code-task processes (past max lifetime, no recent stderr activity)
-      try {
-        const { reaped, spared } = await this.targets.codeTaskManager.reapStale();
-        if (reaped > 0 || spared > 0) {
-          results.push({
-            component: "code-task-reaper",
-            pruned: reaped,
-            retried: 0,
-            bytesFreed: 0,
-            errors: spared > 0 ? [`${spared} task(s) spared — still active past TTL`] : [],
-          });
-        }
-      } catch (err) {
-        results.push({ component: "code-task-reaper", pruned: 0, retried: 0, bytesFreed: 0, errors: [String(err)] });
-      }
     }
 
     // 5. Meeting monitor — remove ended sessions
