@@ -148,10 +148,10 @@ import type { WorkItem } from "../types/work-item.js";
 
 export type NoticeReason = "recipient-missing" | "multiple-defaults" | "destination-unresolved" |
   "transport-unavailable" | "turn-failed" | "turn-interrupted" | "delivery-unconfirmed" |
-  "recipient-changed" | "lease-lost" | "storage" | "invalid-state";
+  "recipient-changed" | "lease-lost" | "storage" | "invalid-state" | "retry-deadline-unrepresentable";
 export const NOTICE_REASONS = new Set<NoticeReason>(["recipient-missing", "multiple-defaults", "destination-unresolved",
   "transport-unavailable", "turn-failed", "turn-interrupted", "delivery-unconfirmed", "recipient-changed",
-  "lease-lost", "storage", "invalid-state"]);
+  "lease-lost", "storage", "invalid-state", "retry-deadline-unrepresentable"]);
 export const nonblank = (v: unknown): v is string => typeof v === "string" && Boolean(v.trim());
 export const counter = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && v < Number.MAX_SAFE_INTEGER;
 export interface NoticeBinding {
@@ -163,7 +163,7 @@ export function validBinding(b: unknown): b is NoticeBinding {
   const value = b as NoticeBinding;
   return nonblank(value.agentId) && nonblank(value.homeBase) && nonblank(value.adapterId) &&
     typeof value.channelId === "string" && /^[CDG][A-Z0-9]+$/.test(value.channelId) &&
-    (value.botLabel === undefined || nonblank(value.botLabel));
+    (!Object.hasOwn(value, "botLabel") || nonblank(value.botLabel));
 }
 export interface NoticePreparation {
   id: string; binding: NoticeBinding; processedAt: Date; text: string;
@@ -179,14 +179,16 @@ export interface ChangeDelivery {
   state: "pending" | "claimed" | "delivered";
   attempts: number; nextAttemptAt: Date; version?: number; lastAttemptAt?: Date;
   claim?: NoticeClaim; preparation?: NoticePreparation; receipt?: NoticeReceipt;
-  diagnostic?: { reason: NoticeReason; at: Date }; uncertainSend?: boolean;
+  diagnostic?: { reason: NoticeReason; at: Date }; uncertainSend?: boolean; retryBlocked?: true;
 }
-export interface NoticeDestination { channelId: string | null; retryAfterMs?: number }
-export type RouteResult = { kind: "route"; route: NoticeRoute } | { kind: "unresolved"; reason: NoticeReason; retryAfterMs?: number };
+export interface NoticeRetry { retryAfterMs?: number; retryBlocked?: true }
+export interface NoticeLookupGate { check(): Promise<boolean>; current(): boolean }
+export interface NoticeDestination extends NoticeRetry { channelId: string | null }
+export type RouteResult = { kind: "route"; route: NoticeRoute } | ({ kind: "unresolved"; reason: NoticeReason } & NoticeRetry);
 export type PrepareResult = { kind: "prepared"; preparation: NoticePreparation } |
   { kind: "unresolved"; reason: NoticeReason };
 export type SendResult = { kind: "acknowledged"; channelId: string; messageTs: string } |
-  { kind: "not-accepted" | "outcome-unknown"; reason: NoticeReason; retryAfterMs?: number };
+  ({ kind: "not-accepted" | "outcome-unknown"; reason: NoticeReason } & NoticeRetry);
 export function selectNoticeAgent(agents: readonly AgentConfig[], explicit?: string):
   { kind: "agent"; agent: AgentConfig } | { kind: "unresolved"; reason: NoticeReason } {
   const enabled = agents.filter(a => !a.disabled), defaults = enabled.filter(a => a.isDefault === true);
@@ -205,6 +207,58 @@ export const validDate = (v: unknown): v is Date => v instanceof Date && Number.
 export const digest = (v: unknown): string => createHash("sha256").update(JSON.stringify(v)).digest("hex");
 export function preparationId(changeId: string, p: Omit<NoticePreparation, "id">): string {
   return digest([changeId, bindingOf(p.binding), p.processedAt.toISOString(), p.text]);
+}
+export const record = (v: unknown): v is Record<string, unknown> =>
+  v !== null && typeof v === "object" && !Array.isArray(v) && !(v instanceof Date);
+// Shared mutable-state validation. Status omits only preparation text/digest checking.
+export function validDelivery(value: unknown, changeId?: string): boolean {
+  try {
+    if (!record(value)) return false;
+    const d = value;
+    if (typeof d.state !== "string" || !["pending", "claimed", "delivered"].includes(d.state) || !counter(d.attempts) ||
+        !validDate(d.nextAttemptAt) || (Object.hasOwn(d, "version") && !counter(d.version)) ||
+        (Object.hasOwn(d, "lastAttemptAt") && !validDate(d.lastAttemptAt)) ||
+        (Object.hasOwn(d, "uncertainSend") && typeof d.uncertainSend !== "boolean") ||
+        (Object.hasOwn(d, "retryBlocked") && (d.retryBlocked !== true || d.state !== "pending"))) return false;
+    if (Object.hasOwn(d, "diagnostic") && (!record(d.diagnostic) ||
+        !NOTICE_REASONS.has(d.diagnostic.reason as NoticeReason) || !validDate(d.diagnostic.at))) return false;
+    if (d.retryBlocked === true && (!record(d.diagnostic) || d.diagnostic.reason !== "retry-deadline-unrepresentable")) return false;
+    let p: Record<string, unknown> | undefined;
+    if (Object.hasOwn(d, "preparation")) {
+      if (!record(d.preparation)) return false;
+      p = d.preparation;
+      if (!nonblank(p.id) || !validBinding(p.binding) || !validDate(p.processedAt)) return false;
+      if (changeId !== undefined && (typeof p.text !== "string" || !p.text.trim() || p.text.length > 3900 ||
+          p.id !== preparationId(changeId, p as unknown as NoticePreparation))) return false;
+    }
+    if (d.state === "claimed") {
+      const claim = d.claim;
+      if (!record(claim) || !nonblank(claim.token) || !nonblank(claim.owner) || !validDate(claim.startedAt) ||
+          !validDate(claim.leaseExpiresAt) || claim.leaseExpiresAt <= claim.startedAt ||
+          (typeof claim.stage !== "string" || !["preparing", "sending"].includes(claim.stage))) return false;
+      if (Object.hasOwn(claim, "sendIntent")) {
+        const intent = claim.sendIntent;
+        if (!record(intent) || !p || claim.stage !== "sending" || intent.preparationId !== p.id ||
+            !validDate(intent.startedAt) || typeof intent.previouslyUncertain !== "boolean") return false;
+      } else if (claim.stage === "sending") return false;
+    } else if (Object.hasOwn(d, "claim")) return false;
+    if (d.state === "delivered") {
+      const receipt = d.receipt;
+      if (!p || !record(receipt) || !validDate(receipt.acknowledgedAt) || !nonblank(receipt.messageTs) ||
+          !validBinding(receipt.binding) || !validBinding(p.binding) || !sameBinding(receipt.binding, p.binding) ||
+          receipt.channelId !== p.binding.channelId || receipt.preparationId !== p.id) return false;
+    } else if (Object.hasOwn(d, "receipt")) return false;
+    return true;
+  } catch { return false; }
+}
+export const MAX_NOTICE_DATE_MS = 8_640_000_000_000_000;
+const retryBackoff = [60_000, 300_000, 900_000, 3_600_000];
+export function noticeRetryDeadline(at: Date, attempts: number, retry: NoticeRetry): Date | undefined {
+  if (!validDate(at) || retry.retryBlocked) return;
+  const wait = Math.max(retryBackoff[Math.max(0, Math.min(attempts - 1, retryBackoff.length - 1))]!, retry.retryAfterMs ?? 0);
+  const next = at.getTime() + wait;
+  if (!Number.isSafeInteger(wait) || wait < 0 || !Number.isSafeInteger(next) || next > MAX_NOTICE_DATE_MS) return;
+  return new Date(next);
 }
 export function makePreparation(change: CatalogChange, route: NoticeRoute, reply: string, at: Date): NoticePreparation {
   const p = { binding: bindingOf(route), processedAt: new Date(at), text: noticeText(change, route.agentName, reply) };
@@ -297,14 +351,16 @@ At the inspected 8.1.1 installation, `WebClient.js:123` defaults to roughly 30 m
 
 ```ts
 import type { WebClientOptions } from "@slack/web-api";
-import type { SendResult } from "../admin/model-catalog-notification.js";
+import type { NoticeRetry, SendResult } from "../admin/model-catalog-notification.js";
 const object = (v: unknown): Record<string, unknown> => v && typeof v === "object" ? v as Record<string, unknown> : {};
 const refused = new Set(["channel_not_found", "not_in_channel", "is_archived", "invalid_auth", "not_authed",
   "account_inactive", "token_expired", "token_revoked", "missing_scope", "no_permission", "access_denied",
   "invalid_arguments", "invalid_arg_name", "no_text", "msg_too_long", "restricted_action",
   "restricted_action_read_only_channel", "restricted_action_thread_only_channel", "ekm_access_denied"]);
-function delay(v: unknown): number | undefined {
-  return typeof v === "number" && Number.isFinite(v) && v >= 0 && v * 1000 <= Number.MAX_SAFE_INTEGER ? v * 1000 : undefined;
+function delay(v: unknown): NoticeRetry {
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return {};
+  const ms = Math.ceil(v * 1000);
+  return Number.isSafeInteger(ms) ? { retryAfterMs: ms } : { retryBlocked: true };
 }
 export const noticeClientOptions: WebClientOptions = {
   retryConfig: { retries: 0 }, rejectRateLimitedCalls: true, timeout: 30_000, maxRequestConcurrency: 1,
@@ -312,29 +368,28 @@ export const noticeClientOptions: WebClientOptions = {
   logger: { debug() {}, info() {}, warn() {}, error() {}, setLevel() {}, getLevel() { return "error" as ReturnType<NonNullable<WebClientOptions["logger"]>["getLevel"]>; }, setName() {} },
 };
 export function classifyNoticeResponse(value: unknown, channelId: string): SendResult {
-  const v = object(value), retryAfterMs = delay(object(v.response_metadata).retryAfter);
+  const v = object(value), retry = delay(object(v.response_metadata).retryAfter);
   if (v.ok === true && v.channel === channelId && typeof v.ts === "string" && v.ts.trim()) {
     return { kind: "acknowledged", channelId, messageTs: v.ts };
   }
   if (v.ok === false && (refused.has(String(v.error)) || v.error === "ratelimited" || v.error === "rate_limited")) {
-    return { kind: "not-accepted", reason: "delivery-unconfirmed", ...(retryAfterMs === undefined ? {} : { retryAfterMs }) };
+    return { kind: "not-accepted", reason: "delivery-unconfirmed", ...retry };
   }
-  return { kind: "outcome-unknown", reason: "delivery-unconfirmed", ...(retryAfterMs === undefined ? {} : { retryAfterMs }) };
+  return { kind: "outcome-unknown", reason: "delivery-unconfirmed", ...retry };
 }
 export function classifyNoticeError(error: unknown, channelId: string): SendResult {
   const e = object(error);
   if (e.code === "slack_webapi_platform_error") return classifyNoticeResponse(e.data, channelId);
   if (e.code === "slack_webapi_rate_limited_error") {
-    const retryAfterMs = delay(e.retryAfter);
-    return { kind: "not-accepted", reason: "delivery-unconfirmed", ...(retryAfterMs === undefined ? {} : { retryAfterMs }) };
+    return { kind: "not-accepted", reason: "delivery-unconfirmed", ...delay(e.retryAfter) };
   }
   return { kind: "outcome-unknown", reason: "delivery-unconfirmed" };
 }
 ```
 
-Use the installed SDK's logger interface verbatim if its type changed; the six logger methods stay silent, including SDK retry/request warnings. Do not broaden refusal to every platform/HTTP error. A generic HTTP 5xx, timeout, malformed 429, or request exception remains unknown. An explicit rate delay is a lower bound, not a substitute for local backoff.
+Use the installed SDK's logger interface verbatim if its type changed; the six logger methods stay silent, including SDK retry/request warnings. Do not broaden refusal to every platform/HTTP error. A generic HTTP 5xx, timeout, malformed 429, or request exception remains unknown. An explicit finite nonnegative numeric rate delay is a lower bound, not a substitute for local backoff. Round fractional milliseconds upward. If milliseconds are unsafe, or adding them at release exceeds ECMAScript's inclusive maximum Date timestamp `8_640_000_000_000_000`, persist pending `retryBlocked:true` with fixed `retry-deadline-unrepresentable` diagnostic. This explicit unsupported-deadline policy preserves the event/preparation and prevents all automatic claims, including after restart; it never clamps a valid lower bound earlier, constructs an Invalid Date, or lets lease expiry defeat that persisted bound. `nextAttemptAt` on a blocked row is only the observation time, never represented as a scheduled retry. Existing diagnostics expose the condition; no new repair tool or alternate destination is added.
 
-- [ ] **Step 3:** In `SlackGateway`, add the following fields/constructor addition and methods. Import `WebClientOptions`, classification/options and the `NoticeDestination`/`SendResult` types. Preserve its existing `web` client construction and ordinary methods. The optional constructor fetch seam is test-only; production passes no third argument and reuses the current token. The dedicated resolver uses the same connected gateway's caches, but its quiet focused client avoids the existing resolver's raw error logging and long automatic retry policy. Lookup rate-limit metadata stays attached to that returned result and propagates to the worker's backoff; do not use mutable gateway-wide last-error state.
+- [ ] **Step 3:** In `SlackGateway`, add the following fields/constructor addition and methods. Import `WebClientOptions`, classification/options and the `NoticeLookupGate`/`NoticeDestination`/`SendResult` types. Preserve its existing `web` client construction and ordinary methods. The optional constructor fetch seam is test-only; production passes no third argument and reuses the current token. The dedicated resolver uses the same connected gateway's caches, but its quiet focused client avoids the existing resolver's raw error logging and long automatic retry policy. Lookup rate-limit metadata stays attached to that returned result and propagates to the worker's backoff; do not use mutable gateway-wide last-error state.
 
 ```ts
 private notificationWeb: WebClient;
@@ -346,7 +401,7 @@ notificationChannelMatches(homeBase: string, channelId: string): boolean {
   const input = homeBase.trim();
   return /^[CDG][A-Z0-9]+$/.test(input) ? input === channelId : this.channelIdCache.get(input.replace(/^#/, "")) === channelId;
 }
-async resolveNotificationChannel(homeBase: string): Promise<NoticeDestination> {
+async resolveNotificationChannel(homeBase: string, gate: NoticeLookupGate): Promise<NoticeDestination> {
   const input = homeBase.trim();
   if (!input) return { channelId: null };
   if (/^[CDG][A-Z0-9]+$/.test(input)) return { channelId: input };
@@ -356,15 +411,18 @@ async resolveNotificationChannel(homeBase: string): Promise<NoticeDestination> {
     let cursor: string | undefined;
     const seen = new Set<string>();
     do {
+      if (!await gate.check() || !gate.current()) return { channelId: null };
       const response = await this.notificationWeb.conversations.list({ limit: 1000, cursor,
         exclude_archived: true, types: "public_channel,private_channel" });
       if (response.ok !== true) {
         const outcome = classifyNoticeResponse(response, "");
-        return { channelId: null, ...(outcome.kind === "acknowledged" ? {} : { retryAfterMs: outcome.retryAfterMs }) };
+        return { channelId: null, ...(outcome.kind === "acknowledged" ? {} : { retryAfterMs: outcome.retryAfterMs, retryBlocked: outcome.retryBlocked }) };
       }
       for (const channel of response.channels ?? []) if (channel.id && channel.name) {
         this.channelIdCache.set(channel.name, channel.id); this.channelNameCache.set(channel.id, channel.name);
       }
+      const found = this.channelIdCache.get(name);
+      if (found) return { channelId: found };
       cursor = response.response_metadata?.next_cursor || undefined;
       if (cursor && (seen.has(cursor) || seen.size >= 100)) return { channelId: null };
       if (cursor) seen.add(cursor);
@@ -372,7 +430,7 @@ async resolveNotificationChannel(homeBase: string): Promise<NoticeDestination> {
     return { channelId: this.channelIdCache.get(name) ?? null };
   } catch (error) {
     const outcome = classifyNoticeError(error, "");
-    return { channelId: null, ...(outcome.kind === "acknowledged" ? {} : { retryAfterMs: outcome.retryAfterMs }) };
+    return { channelId: null, ...(outcome.kind === "acknowledged" ? {} : { retryAfterMs: outcome.retryAfterMs, retryBlocked: outcome.retryBlocked }) };
   }
 }
 async postNotificationReceipt(channelId: string, text: string): Promise<SendResult> {
@@ -391,15 +449,17 @@ async postNotificationReceipt(channelId: string, text: string): Promise<SendResu
 
 This is one top-level bot post, without username/icon overrides, thread_ts, metadata, client_msg_id dedup claims, blocks, or fallback calls. SDK timeout aborts its actual fetch; do not `Promise.race` an ignored timeout and free the worker while the underlying request remains active. Injected fetches that ignore cancellation remain observed and hold the local invocation.
 
-- [ ] **Step 4:** Add `private notificationConnected = false` to SlackAdapter. Set true only immediately after its existing `await this.gateway.start()` succeeds; set false synchronously at the beginning of `stop` before gateway teardown. Add these methods (import NoticeBinding, NoticeDestination and SendResult type-only):
+- [ ] **Step 4:** Add `private notificationConnected = false` to SlackAdapter. Set true only immediately after its existing `await this.gateway.start()` succeeds; set false synchronously at the beginning of `stop` before gateway teardown. Add these methods (import NoticeBinding, NoticeLookupGate, NoticeDestination and SendResult type-only):
 
 ```ts
 notificationAvailable(binding?: string): boolean {
   return this.notificationConnected && (binding === undefined || binding === this.botLabel);
 }
 get notificationBotLabel(): string | undefined { return this.botLabel; }
-async resolveNotificationChannel(homeBase: string): Promise<NoticeDestination> {
-  return this.notificationConnected ? this.gateway.resolveNotificationChannel(homeBase) : { channelId: null };
+async resolveNotificationChannel(homeBase: string, gate: NoticeLookupGate, binding?: string): Promise<NoticeDestination> {
+  return this.notificationAvailable(binding) ? this.gateway.resolveNotificationChannel(homeBase, {
+    check: () => gate.check(), current: () => gate.current() && this.notificationAvailable(binding),
+  }) : { channelId: null };
 }
 notificationRouteMatches(route: NoticeBinding): boolean {
   return this.notificationAvailable(route.botLabel) && route.adapterId === this.id &&
@@ -413,7 +473,7 @@ async deliverNotificationReceipt(route: NoticeBinding, text: string): Promise<Se
 
 Today's primary adapter has no botLabel and cannot honor an explicitly named slackBot. Do not initialize another bot or treat any explicit label as primary. The existing normal `deliver(): Promise<void>` and formatting remain unchanged.
 
-- [ ] **Step 5:** Unit matrix: receipt ok true plus exact expected channel/nonblank ts; false/missing ok, empty/missing ts, wrong channel, undefined; allowlisted refusals; **both internal_error and fatal_error → outcome-unknown**, unknown API error, 5xx/network/timeout; rate delay invalid/0/120/large; invalid/overlong outgoing text makes zero requests; connected gate and unsupported bot binding; one call and no split/upload/fallback. Assert timestamp cache registration and inbound echo suppression for the acknowledged channel/ts. Existing gateway constructor mocks now see two clients; distinguish options, retain ordinary tests, and do not globally change the ordinary mock result semantics.
+- [ ] **Step 5:** Unit matrix: receipt ok true plus exact expected channel/nonblank ts; false/missing ok, empty/missing ts, wrong channel, undefined; allowlisted refusals; **both internal_error and fatal_error → outcome-unknown**, unknown API error, 5xx/network/timeout; rate delay invalid/0/120/large/fractional; invalid/overlong outgoing text makes zero requests; connected gate and unsupported bot binding; one call and no split/upload/fallback. Test classifier → dispatcher → release at a fixed whole-second clock with server delay `(MAX_NOTICE_DATE_MS - nowMs) / 1000` and one second above, `9_000_000_000_000` seconds, and finite seconds whose multiplication overflows: equality schedules the exact valid maximum Date; excessive values persist pending retryBlocked without throw and stay unclaimable after lease expiry/restart. Preserve preparation and uncertainty, omit misleading retry timestamps, and never clamp earlier. Test a first lookup page containing the requested channel plus a next cursor: return immediately with one request even if the unused next page would fail. Assert timestamp cache registration and inbound echo suppression for the acknowledged channel/ts. Existing gateway constructor mocks now see two clients; distinguish options, retain ordinary tests, and do not globally change the ordinary mock result semantics.
 - [ ] **Step 6:** SDK integration uses **real WebClient** with injected `fetch` returning `Response` instances and counting physical calls, and a SocketMode stub. Return 429 with Retry-After 120, assert one fetch and prompt rejection without advancing 120 seconds; test both channel lookup and posting so either's server retry lower bound reaches the worker. Return 500 or throw and assert exactly one fetch; 200 `{ok:false,error:"internal_error"}` and fatal_error stay unknown; never resolve an endpoint through a real hostname. For timeout, inspect the provided AbortSignal and register an abort listener rejecting the fetch. In this serial isolated test, save `noticeClientOptions.timeout`, set it to 20 before gateway construction and restore it immediately in `finally`; assert the production default separately equals 30,000. Use the real 20ms AbortSignal timer instead of assuming Vitest fake clocks control Node's internal AbortSignal timeout. Resolve delayed fetch after stop/takeover schedules and assert no second request. Verify raw body/token sentinel does not enter captured logs.
 - [ ] **Step 7:** Run receipt unit/integration and existing Slack/adapter test files plus `npm run typecheck`. Expected: all receipt and legacy behavior assertions pass, single physical requests, no leaked timers. Commit implementation files with `feat: add single-attempt Slack notification receipts`.
 
@@ -424,15 +484,23 @@ Today's primary adapter has no botLabel and cannot honor an explicitly named sla
 - [ ] **Step 1:** Add the following methods and a private `catalogExplicitDefault?: string` field. Add `setCatalogNotificationDefault(value: string | undefined)` that assigns this companion configuration. Import notification functions/types and CatalogChange type. Keep all existing dispatch code and signatures untouched. The engine calls these methods directly; **do not branch from `dispatch(item)` on metadata**, which can originate in generic inbound messages.
 
 ```ts
-async resolveCatalogNotificationRoute(): Promise<RouteResult> {
+async resolveCatalogNotificationRoute(gate: NoticeLookupGate): Promise<RouteResult> {
   const selected = selectNoticeAgent(this.registry.getAll(), this.catalogExplicitDefault);
   if (selected.kind !== "agent") return selected;
   const agentId = selected.agent.id, homeBase = selected.agent.homeBase?.trim();
   const adapter = this.slackAdapter, botLabel = selected.agent.slackBot;
   if (!homeBase) return { kind: "unresolved", reason: "destination-unresolved" };
   if (!adapter?.notificationAvailable(botLabel)) return { kind: "unresolved", reason: "transport-unavailable" };
-  const destination = await adapter.resolveNotificationChannel(homeBase), channelId = destination.channelId;
-  if (!channelId) return { kind: "unresolved", reason: "destination-unresolved", retryAfterMs: destination.retryAfterMs };
+  const destination = await adapter.resolveNotificationChannel(homeBase, {
+    check: () => gate.check(),
+    current: () => {
+      const current = selectNoticeAgent(this.registry.getAll(), this.catalogExplicitDefault);
+      return gate.current() && this.slackAdapter === adapter && current.kind === "agent" && current.agent.id === agentId &&
+        current.agent.homeBase?.trim() === homeBase && current.agent.slackBot === botLabel;
+    },
+  }, botLabel), channelId = destination.channelId;
+  if (!channelId) return { kind: "unresolved", reason: "destination-unresolved",
+    retryAfterMs: destination.retryAfterMs, retryBlocked: destination.retryBlocked };
   const route: NoticeRoute = { agentId, homeBase, adapterId: adapter.id, channelId,
     ...(botLabel === undefined ? {} : { botLabel }), agentName: selected.agent.name };
   return this.catalogNotificationRouteCurrent(route) ? { kind: "route", route } :
@@ -483,14 +551,16 @@ import { BSON, type Db, type Filter } from "mongodb";
 import { isDeepStrictEqual } from "node:util";
 import type { CatalogChangeDoc } from "./model-catalog-types.js";
 import { catalogCollections, JOURNALED } from "./model-catalog-export.js";
-import { validDate, preparationId, sameBinding, validBinding, NOTICE_REASONS, nonblank, counter as integer, type ChangeDelivery } from "./model-catalog-notification.js";
+import { validDate, validDelivery, nonblank, counter as integer, type ChangeDelivery } from "./model-catalog-notification.js";
 
 export type MutationKind = "claim" | "renew" | "prepare" | "send-intent" | "release" | "ack";
 export interface Transition {
   kind: MutationKind; before: CatalogChangeDoc; after: CatalogChangeDoc; localNow: Date; live: boolean;
 }
 export type Evidence = { kind: "applied"; row: CatalogChangeDoc; source: "ack" | "evidence" } |
-  { kind: "superseded" } | { kind: "unknown" } | { kind: "miss" };
+  { kind: "advanced"; row: CatalogChangeDoc } | { kind: "superseded" } | { kind: "unknown" } | { kind: "miss" };
+export interface CandidateCursor { createdAt: Date; id: string }
+export interface CandidatePage { rows: CatalogChangeDoc[]; next?: CandidateCursor }
 export const copy = <T>(value: T): T => BSON.deserialize(BSON.serialize({ value })).value as T;
 export function validChange(row: CatalogChangeDoc): boolean {
   try { return validChangeValue(row); } catch { return false; }
@@ -501,32 +571,9 @@ function validChangeValue(row: CatalogChangeDoc): boolean {
       !nonblank(row.snapshotId) || !nonblank(row.updatedBy) || !integer(row.modelCount) ||
       !["manual", "discovery"].includes(row.source) || (row.source === "discovery" && !["claude", "grok", "codex"].includes(row.provider)) || typeof row.bootstrap !== "boolean" ||
       !Array.isArray(row.added) || !row.added.every(nonblank) || !Array.isArray(row.removed) || !row.removed.every(nonblank)) return false;
-  const d = row.delivery;
-  if (!d || !["pending", "claimed", "delivered"].includes(d.state) || !integer(d.attempts) ||
-      !validDate(d.nextAttemptAt) || (Object.hasOwn(d, "version") && !integer(d.version)) ||
-      (d.lastAttemptAt !== undefined && !validDate(d.lastAttemptAt)) ||
-      (d.uncertainSend !== undefined && typeof d.uncertainSend !== "boolean") ||
-      (d.diagnostic !== undefined && (!NOTICE_REASONS.has(d.diagnostic.reason) || !validDate(d.diagnostic.at)))) return false;
-  const p = d.preparation;
-  if (p && (!validBinding(p.binding) || !validDate(p.processedAt) || typeof p.text !== "string" ||
-      !p.text.trim() || p.text.length > 3900 || p.id !== preparationId(row._id, p))) return false;
-  const claim = d.claim;
-  if (d.state === "claimed") {
-    if (!claim || !nonblank(claim.token) || !nonblank(claim.owner) || !validDate(claim.startedAt) ||
-        !validDate(claim.leaseExpiresAt) || claim.leaseExpiresAt <= claim.startedAt ||
-        !["preparing", "sending"].includes(claim.stage)) return false;
-    if (claim.sendIntent && (!p || claim.stage !== "sending" || claim.sendIntent.preparationId !== p.id ||
-        !validDate(claim.sendIntent.startedAt) || typeof claim.sendIntent.previouslyUncertain !== "boolean")) return false;
-    if (claim.stage === "sending" && !claim.sendIntent) return false;
-  } else if (claim !== undefined) return false;
-  const receipt = d.receipt;
-  if (d.state === "delivered") {
-    if (!p || !receipt || !validDate(receipt.acknowledgedAt) || !nonblank(receipt.messageTs) ||
-        !validBinding(receipt.binding) || !sameBinding(receipt.binding, p.binding) ||
-        receipt.channelId !== p.binding.channelId || receipt.preparationId !== p.id) return false;
-  } else if (receipt !== undefined) return false;
-  return true;
+  return validDelivery(row.delivery, row._id);
 }
+
 const dateExpr = (path: string) => ({ $eq: [{ $type: path }, "date"] });
 const atOrBefore = (path: string, now: Date) => ({ $and: [dateExpr(path),
   { $lte: [path, { $literal: now }] }, { $lte: [path, "$$NOW"] }] });
@@ -534,7 +581,8 @@ const activeAt = (path: string, now: Date) => ({ $and: [dateExpr(path),
   { $gt: [path, { $literal: now }] }, { $gt: [path, "$$NOW"] }] });
 export function eligibleExpression(now: Date) {
   return { $or: [
-    { $and: [{ $eq: ["$delivery.state", "pending"] }, atOrBefore("$delivery.nextAttemptAt", now)] },
+    { $and: [{ $eq: ["$delivery.state", "pending"] },
+      { $eq: [{ $type: "$delivery.retryBlocked" }, "missing"] }, atOrBefore("$delivery.nextAttemptAt", now)] },
     { $and: [{ $eq: ["$delivery.state", "claimed"] }, atOrBefore("$delivery.claim.leaseExpiresAt", now)] },
   ] };
 }
@@ -571,9 +619,17 @@ export class ModelCatalogOutbox {
     ]).then(() => undefined).catch(() => { this.indexInit = undefined; throw new Error("storage"); });
     return this.indexInit;
   }
-  async due(now: Date, limit = 10): Promise<CatalogChangeDoc[]> {
+  async due(now: Date, limit = 10, after?: CandidateCursor): Promise<CandidatePage> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 10) throw new Error("invalid-state");
-    return this.changes.find({ $expr: eligibleExpression(now) }).sort({ createdAt: 1, _id: 1 }).limit(limit).toArray();
+    const predicates: Record<string, unknown>[] = [eligibleExpression(now), dateExpr("$createdAt"),
+      { $eq: [{ $type: "$_id" }, "string"] }];
+    if (after) predicates.push({ $or: [
+      { $gt: ["$createdAt", { $literal: after.createdAt }] },
+      { $and: [{ $eq: ["$createdAt", { $literal: after.createdAt }] }, { $gt: ["$_id", { $literal: after.id }] }] },
+    ] });
+    const rows = await this.changes.find({ $expr: { $and: predicates } }).sort({ createdAt: 1, _id: 1 }).limit(limit).toArray();
+    const last = rows.at(-1);
+    return { rows, ...(rows.length === limit && last ? { next: { createdAt: last.createdAt, id: last._id } } : {}) };
   }
   async read(id: string): Promise<CatalogChangeDoc | null> { return this.changes.findOne({ _id: id }); }
   async evidence(t: Transition, mayRead: () => boolean = () => true): Promise<Evidence> {
@@ -581,8 +637,13 @@ export class ModelCatalogOutbox {
     try {
       const row = await this.read(t.before._id);
       if (row && isDeepStrictEqual(row.delivery, t.after.delivery)) return { kind: "applied", row, source: "evidence" };
-      if (row && validChange(row) && (row.delivery.version ?? 0) > (t.before.delivery.version ?? 0) &&
-          (row.delivery.state === "delivered" || row.delivery.claim?.token !== t.after.delivery.claim?.token)) {
+      if (row && validChange(row) && (row.delivery.version ?? 0) > (t.before.delivery.version ?? 0)) {
+        // Ack/release after-state has no claim. Ownership belongs to BEFORE's token.
+        const ownerToken = t.kind === "claim" ? t.after.delivery.claim!.token : t.before.delivery.claim!.token;
+        if (row.delivery.state === "claimed" && row.delivery.claim!.token === ownerToken) {
+          return { kind: "advanced", row };
+        }
+        // A newer pending row has lost the claim too; undefined tokens are not shared ownership.
         return { kind: "superseded" };
       }
     } catch { /* Negative/unavailable evidence remains unknown. */ }
@@ -606,9 +667,24 @@ export class ModelCatalogOutbox {
 
 **Implementation invariants:** `apply`'s acknowledged zero-match is a definite refusal of that submitted transition; it is not delivered. A zero-match caused by a previous identical transition is recognized only with positive exact evidence. Thrown writes remain unknown, even if their read is negative. Claim acknowledgment followed by a pause still requires the worker's new positive current read and unexpired local lease before any external stage. `$$NOW` is fixed for a Mongo operation and may be old after a server pause; it is not a wall-clock-at-mutation guarantee. [Mongo NOW semantics](https://www.mongodb.com/docs/manual/reference/aggregation-variables/).
 
-The public validator catches corrupted nested values without repairing them, validates finite diagnostics, rejects plugin/Gemini discovery rows, and distinguishes actual absent version from present undefined/null. The optional evidence gate prevents a caught late write from starting a new read after shutdown's drain has closed the store. `miss` means this submitted conditional transition matched zero; it is never positive delivery evidence, and a worker holding a receipt must keep reconciling unless it has positive terminal/supersession evidence.
+The public validator catches corrupted nested values without repairing them, validates finite diagnostics, rejects plugin/Gemini discovery rows, and distinguishes actual absent version from present undefined/null. `validDelivery` uses own-property presence for every optional field, rejecting supplied `null`, `false`, `0`, `""`, arrays and undefined when the contract requires an object/value. In particular, preparation and sendIntent are never guarded only by truthiness. The optional evidence gate prevents a caught late write from starting a new read after shutdown's drain has closed the store. `miss` means this submitted conditional transition matched zero; it is never positive delivery evidence, and a worker holding a receipt must keep reconciling unless it has positive terminal/supersession evidence.
 
-- [ ] **Step 2:** Extend the shared fake only to support the production expressions above (`$and/$or/$eq/$gt/$lte/$type/$literal` on BSON fields and fixed `$$NOW`) and exact embedded delivery equality. Retain `copy`/BSON Date behavior. Add cursor interception to the fault wrapper for `find().toArray()` when testing candidate/status read failures, preserving cursor chaining and method binding. Assert every extension against real Mongo with the same fixtures; do not return mocked outcomes based on method names.
+Candidate pagination reads at most ten rows per tick and advances one `(createdAt,_id)` cursor even when every row is invalid. The worker wraps only after a short/empty page; a fresh process starts at the beginning. A full invalid first page therefore cannot permanently hide valid eleventh/later rows. Missing/non-date creation times or non-string IDs cannot supply a reliable cursor and remain status-only invalid evidence; delivery does not normalize them. The mutable eligibility filter also excludes a supplied retryBlocked field. All invalid rows remain unchanged for diagnostics. Each page retains deterministic chronological order; newly eligible earlier rows are considered when the bounded traversal wraps.
+
+Evidence classification is mutation-specific; a greater validated version proves an older exact CAS cannot still match, while an unchanged/absent/unavailable read does not prove nonapplication:
+
+| Mutation | Exact after | Unchanged before / missing / read failure | Greater version, same owning token | Successor claim | Successor pending | Other valid terminal state |
+| --- | --- | --- | --- | --- | --- | --- |
+| claim | Applied only from acknowledged write; thrown acquisition never authorizes work | Unknown after throw | Advanced; no external work | Superseded | Superseded | Superseded |
+| renew | Applied | Unknown after throw | Advanced; stop this invocation's next stage | Superseded | Superseded | Superseded |
+| prepare | Applied exact persisted preparation | Unknown after throw | Advanced; no inferred preparation success | Superseded | Superseded | Superseded |
+| send-intent | Applied exact intent | Unknown after throw | Advanced; no inferred post permission | Superseded | Superseded | Superseded |
+| release | Applied exact pending/backoff state | Unknown after throw | Advanced; preserve observed state | Superseded | Superseded | Superseded |
+| ack | Applied exact receipt | Retain receipt; retry exact CAS only | Rebuild only ack against observed version if the same preparation/binding still belongs to BEFORE's token; preserve receipt | Superseded; retain successor | Superseded; release local latch | Superseded unless exact own receipt is independently proven; never call another receipt ours |
+
+The owning token comes from `before.claim` for renew/prepare/intent/release/ack, and from the proposed after-claim only for acquisition. A same-token acknowledgment rebuild is permitted only after positive greater-version evidence fences every old CAS; ordinary negative reconciliation never enables a rebuild or a Slack replay.
+
+- [ ] **Step 2:** Extend the shared fake only to support the production expressions above (`$and/$or/$eq/$gt/$lte/$type/$literal` on BSON fields and fixed `$$NOW`) and exact embedded delivery equality. Its `$type` must return Mongo `"object"` for ordinary documents; missing and null remain distinct. For Task 6's computed inclusion projection, evaluate `$cond` lazily and recurse into constructed objects while omitting missing-valued properties; preserve supplied scalar/null/array parents. Retain `copy`/BSON Date behavior. Add cursor interception and async iteration to the fault wrapper for candidate/status reads, preserving cursor chaining and method binding. Assert every extension, including the exact computed projection and keyset cursor predicates, against real Mongo with the same fixtures; do not return mocked outcomes based on method names.
 - [ ] **Step 3:** Add store unit and real-Mongo tests for every Task 7 schedule. Prove `version` absent/zero distinction, date type guards and both local/server clocks, sorted bounded candidate page including expired claims, pending future backoff excluded, malformed lease/unknown state excluded, strictly increasing renewals, no renewal resurrection, exact preparation digest, acknowledgment after expiry with same token/preparation, and terminal state never claimable. Assert immutable payload byte/value equivalence after every state transition and failed predecessor.
 - [ ] **Step 4:** Record actual Mongo commandStarted events: state writes have `writeConcern:{w:1,j:true}`, and created indexes inherit it from the collection. Mongo driver 7's `CreateIndexesOptions` does not take per-call `writeConcern`; retain collection options through wrappers. No TTL, transactions, sessions, change streams, upsert, deletes, retention counter, or new connection pool. Test engaged `guardDb` at claim, renew, prepare, intent, release, ack, and index call boundaries; underlying write is not delegated, original state stays unchanged, caller cannot claim delivery. Run outbox unit/integration, fake parity and sibling store tests plus typecheck. Commit `feat: fence catalog outbox delivery transitions`.
 
@@ -616,7 +692,7 @@ The public validator catches corrupted nested values without repairing them, val
 
 **Files:** `src/admin/model-catalog-notifier.ts`, `.test.ts`, `.integration.test.ts`.
 
-- [ ] **Step 1:** Implement the worker below. The serial DB gate is shared by main work and renewal; at most one renewal can be pending. Unknown transitions retain their exact before/after identity in the live stack and retry only that same idempotent transition. Waiting/reconciliation does not free the local batch latch, so a held underlying promise never permits a replacement local turn/send. A fresh process simply waits out the persisted claim and uses a new token.
+- [ ] **Step 1:** Implement the worker below. The serial DB gate is shared by main work and renewal; at most one renewal can be pending. Unknown transitions retain their exact before/after identity in the live stack and retry only that same idempotent transition; a known-receipt acknowledgment can be rebuilt only after positive same-token version advancement fences the old CAS. Waiting/reconciliation does not free the local batch latch, so a held underlying promise never permits a replacement local turn/send. A fresh process simply waits out the persisted claim and uses a new token.
 
 ```ts
 // src/admin/model-catalog-notifier.ts
@@ -624,12 +700,11 @@ import { randomUUID } from "node:crypto";
 import { createLogger } from "../logging/logger.js";
 import type { Dispatcher } from "../channels/dispatcher.js";
 import type { CatalogChangeDoc } from "./model-catalog-types.js";
-import { ModelCatalogOutbox, transition, validChange, copy, type Transition, type MutationKind } from "./model-catalog-outbox.js";
-import { sameBinding, display, type ChangeDelivery, type NoticePreparation, type NoticeReason, type RouteResult, type SendResult } from "./model-catalog-notification.js";
+import { ModelCatalogOutbox, transition, validChange, copy, type CandidateCursor, type Transition, type MutationKind } from "./model-catalog-outbox.js";
+import { sameBinding, display, noticeRetryDeadline, type NoticeRetry, type ChangeDelivery, type NoticePreparation, type NoticeReason, type RouteResult, type SendResult } from "./model-catalog-notification.js";
 
 const log = createLogger("model-catalog-notifier");
 export const NOTIFIER_DEFAULTS = { pollMs: 60_000, leaseMs: 120_000, renewMs: 30_000, drainMs: 5_000, batch: 10 } as const;
-const backoff = [60_000, 300_000, 900_000, 3_600_000];
 type Dispatch = Pick<Dispatcher, "resolveCatalogNotificationRoute" | "catalogNotificationRouteCurrent" |
   "prepareCatalogNotification" | "sendPreparedCatalogNotification">;
 interface Invocation {
@@ -648,6 +723,8 @@ export class ModelCatalogNotifier {
   private serial: Promise<unknown> = Promise.resolve();
   private wakeups = new Set<() => void>();
   private current?: Invocation;
+  private nextCandidate?: CandidateCursor;
+  private invalidPage = new Set<string>();
   private lastPollFault = false;
   constructor(private readonly outbox: ModelCatalogOutbox, private readonly dispatcher: Dispatch, options: Options = {}) {
     this.options = { ...NOTIFIER_DEFAULTS, ...options };
@@ -692,7 +769,7 @@ export class ModelCatalogNotifier {
     i.reported.add(reason);
     log.warn("Catalog notification remains unresolved", { provider: display(i.row.provider, 160), changeId: i.row._id,
       attempts: i.row.delivery.attempts, stage: i.row.delivery.claim?.stage, reason,
-      retryAt: i.row.delivery.state === "pending" ? i.row.delivery.nextAttemptAt.toISOString() : undefined });
+      retryAt: i.row.delivery.state === "pending" && !i.row.delivery.retryBlocked ? i.row.delivery.nextAttemptAt.toISOString() : undefined });
   }
   private canStart(i: Invocation): boolean {
     return this.active && this.current === i && !i.finished && i.proven &&
@@ -716,6 +793,20 @@ export class ModelCatalogNotifier {
     for (;;) {
       if (result.kind === "applied" && (t.kind !== "claim" || result.source === "ack")) {
         i.row = copy(result.row); i.proven = true; return i.row;
+      }
+      if (result.kind === "advanced") {
+        // A greater version proves the old exact CAS cannot arrive against this state.
+        // Only a known receipt can be rebased; never infer successful turn/claim from advancement.
+        const row = result.row, receipt = t.after.delivery.receipt, prepared = row.delivery.preparation;
+        if (t.kind !== "ack" || !receipt || !prepared || prepared.id !== receipt.preparationId ||
+            !sameBinding(prepared.binding, receipt.binding)) { this.report(i, "lease-lost"); return; }
+        const rest = copy(row.delivery), claim = rest.claim!;
+        delete rest.claim; delete rest.diagnostic;
+        t = transition("ack", row, { ...rest, state: "delivered", receipt: copy(receipt),
+          uncertainSend: claim.sendIntent?.previouslyUncertain ?? Boolean(rest.uncertainSend) }, this.now(), false);
+        if (!this.storeOpen) return;
+        result = await this.outbox.apply(t, () => this.storeOpen);
+        continue;
       }
       if (result.kind === "superseded") { this.report(i, "lease-lost"); return; }
       if (result.kind === "miss" && t.kind !== "ack") { this.report(i, "lease-lost"); return; }
@@ -761,22 +852,31 @@ export class ModelCatalogNotifier {
   }
   private async route(i: Invocation): Promise<RouteResult | undefined> {
     const before = await this.db(() => this.currentRow(i, true)); if (!before || !this.canStart(i)) return;
-    const route = await this.dispatcher.resolveCatalogNotificationRoute();
+    const route = await this.dispatcher.resolveCatalogNotificationRoute({
+      check: async () => {
+        if (!this.canStart(i)) return false;
+        const row = await this.db(() => this.currentRow(i, true));
+        return Boolean(row) && this.canStart(i);
+      },
+      current: () => this.canStart(i),
+    });
     const after = await this.db(() => this.currentRow(i, true)); if (!after || !this.canStart(i)) return;
     if (route.kind === "route" && !this.dispatcher.catalogNotificationRouteCurrent(route.route)) {
       return { kind: "unresolved", reason: "recipient-changed" };
     }
     return route;
   }
-  private async release(i: Invocation, reason: NoticeReason, uncertain: boolean, retryAfterMs = 0): Promise<void> {
+  private async release(i: Invocation, reason: NoticeReason, uncertain: boolean, retry: NoticeRetry = {}): Promise<void> {
     if (!this.active) return;
     await this.write(i, "release", false, (d, at) => {
       const rest = { ...d }; delete rest.claim;
-      const wait = Math.max(backoff[Math.min(d.attempts - 1, backoff.length - 1)]!, retryAfterMs);
+      const next = noticeRetryDeadline(at, d.attempts, retry);
+      if (!next) return { ...rest, state: "pending", uncertainSend: uncertain, retryBlocked: true,
+        diagnostic: { reason: "retry-deadline-unrepresentable", at }, nextAttemptAt: at };
       return { ...rest, state: "pending", uncertainSend: uncertain,
-        diagnostic: { reason, at }, nextAttemptAt: new Date(at.getTime() + wait) };
+        diagnostic: { reason, at }, nextAttemptAt: next };
     });
-    this.report(i, reason);
+    this.report(i, i.row.delivery.retryBlocked ? "retry-deadline-unrepresentable" : reason);
   }
   private async acknowledge(i: Invocation, p: NoticePreparation, receipt: Extract<SendResult, { kind: "acknowledged" }>): Promise<void> {
     await this.db(async () => {
@@ -797,7 +897,7 @@ export class ModelCatalogNotifier {
             const at = this.now(), claim = row.delivery.claim, rest = { ...row.delivery };
             delete rest.claim; delete rest.diagnostic;
             await this.settle(i, transition("ack", row, { ...rest, state: "delivered",
-              uncertainSend: claim.sendIntent?.previouslyUncertain ?? rest.uncertainSend,
+              uncertainSend: claim.sendIntent?.previouslyUncertain ?? Boolean(rest.uncertainSend),
               receipt: { preparationId: p.id, binding: copy(p.binding), channelId: receipt.channelId,
                 messageTs: receipt.messageTs, acknowledgedAt: at } }, at, false));
             return;
@@ -811,7 +911,7 @@ export class ModelCatalogNotifier {
   }
   private async process(i: Invocation): Promise<void> {
     const first = await this.route(i); if (!first) return;
-    if (first.kind !== "route") { await this.release(i, first.reason, Boolean(i.row.delivery.uncertainSend), first.retryAfterMs); return; }
+    if (first.kind !== "route") { await this.release(i, first.reason, Boolean(i.row.delivery.uncertainSend), first); return; }
     let preparation = i.row.delivery.preparation;
     if (!preparation || !sameBinding(preparation.binding, first.route)) {
       const changed = Boolean(preparation);
@@ -824,14 +924,14 @@ export class ModelCatalogNotifier {
     }
     const selected = await this.route(i); if (!selected) return;
     if (selected.kind !== "route" || !sameBinding(selected.route, preparation.binding)) {
-      await this.release(i, selected.kind === "unresolved" ? selected.reason : "recipient-changed", Boolean(i.row.delivery.uncertainSend), selected.kind === "unresolved" ? selected.retryAfterMs : undefined); return;
+      await this.release(i, selected.kind === "unresolved" ? selected.reason : "recipient-changed", Boolean(i.row.delivery.uncertainSend), selected.kind === "unresolved" ? selected : {}); return;
     }
     const prepared = preparation;
     if (!await this.write(i, "send-intent", true, (d, at) => ({ ...d, claim: { ...d.claim!, stage: "sending",
       sendIntent: { preparationId: prepared.id, startedAt: at, previouslyUncertain: Boolean(d.uncertainSend) } } }))) return;
     const finalRoute = await this.route(i); if (!finalRoute) return;
     if (finalRoute.kind !== "route" || !sameBinding(finalRoute.route, prepared.binding)) {
-      await this.release(i, finalRoute.kind === "unresolved" ? finalRoute.reason : "recipient-changed", Boolean(i.row.delivery.claim?.sendIntent?.previouslyUncertain), finalRoute.kind === "unresolved" ? finalRoute.retryAfterMs : undefined); return;
+      await this.release(i, finalRoute.kind === "unresolved" ? finalRoute.reason : "recipient-changed", Boolean(i.row.delivery.claim?.sendIntent?.previouslyUncertain), finalRoute.kind === "unresolved" ? finalRoute : {}); return;
     }
     // Re-read from the current positively persisted row, never use an unpersisted response.
     const persisted = i.row.delivery.preparation!;
@@ -839,16 +939,24 @@ export class ModelCatalogNotifier {
     const result = await this.dispatcher.sendPreparedCatalogNotification(persisted, () => this.canStart(i));
     if (result.kind === "acknowledged") { await this.acknowledge(i, persisted, result); return; }
     await this.release(i, result.reason, result.kind === "outcome-unknown" ||
-      Boolean(i.row.delivery.claim?.sendIntent?.previouslyUncertain), result.retryAfterMs);
+      Boolean(i.row.delivery.claim?.sendIntent?.previouslyUncertain), result);
   }
   private async batch(): Promise<void> {
     if (!this.active) return;
     await this.db(() => this.outbox.ensureIndexes()); if (!this.active) return;
-    const candidates = await this.db(() => this.outbox.due(this.now(), this.options.batch));
+    const page = await this.db(() => this.outbox.due(this.now(), this.options.batch, this.nextCandidate));
+    if (!page) return;
+    this.nextCandidate = page.next;
+    const invalidThisPage = new Set<string>();
     this.lastPollFault = false;
-    for (const row of candidates ?? []) {
+    for (const row of page.rows) {
       if (!this.active) break;
-      if (!validChange(row)) { log.warn("Invalid catalog notification state", { changeId: row._id, reason: "invalid-state" }); continue; }
+      if (!validChange(row)) {
+        const signature = `${row._id}:${String(row.delivery?.version)}:invalid-state`;
+        invalidThisPage.add(signature);
+        if (!this.invalidPage.has(signature)) log.warn("Invalid catalog notification state", { changeId: row._id, reason: "invalid-state" });
+        continue;
+      }
       const i: Invocation = { token: this.uuid(), row, proven: false, finished: false, reported: new Set() };
       this.current = i;
       try {
@@ -866,6 +974,7 @@ export class ModelCatalogNotifier {
         if (this.current === i) this.current = undefined;
       }
     }
+    this.invalidPage = invalidThisPage;
   }
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
@@ -884,11 +993,13 @@ export class ModelCatalogNotifier {
 }
 ```
 
-The worker rechecks `storeOpen` inside continuations that may start additional calls, including a late mutation's error-evidence handling. Store calls submitted before drain completion cannot be rolled back. Known-receipt reconciliation uses the normal polling delay even after lease expiry; it never spins at a one-millisecond expired-deadline delay. Negative or unavailable pre-ack reads retain the local receipt, and a matched-zero acknowledgment without positive supersession remains uncertain. A matching terminal preparation/binding/channel/timestamp is positive evidence; generic state `delivered` alone is not.
+The worker rechecks `storeOpen` inside continuations that may start additional calls, including a late mutation's error-evidence handling. Store calls submitted before drain completion cannot be rolled back. Known-receipt reconciliation uses the normal polling delay even after lease expiry; it never spins at a one-millisecond expired-deadline delay. Negative or unavailable pre-ack reads retain the local receipt, and a matched-zero acknowledgment without positive supersession remains uncertain. A matching terminal preparation/binding/channel/timestamp is positive evidence; generic state `delivered` alone is not. A positively observed newer pending state releases the local latch as ownership loss. A late own-token renewal instead permits a fenced acknowledgment rebuild with the same known receipt and persisted preparation; it does not discard the receipt or repeat Slack.
+
+The lookup gate reaches the gateway for every page: its asynchronous check reads current durable ownership, and its synchronous `current` check immediately before `conversations.list` verifies invocation liveness, lease, current selection and adapter availability without another await. A held page followed by stop, lost/expired ownership, changed routing or adapter teardown cannot start another page. Returning a cached/found destination still passes the notifier's post-lookup current-row and route checks before a turn/post.
 
 **Renewal/lifecycle detail:** any uncertain mutation temporarily clears `proven`. Renewal and main writes share the serial gate, so no new preparation/send can pass an unresolved renewal. A positive current read can restore proof only for an originally acknowledged acquisition of this invocation; the thrown-claim path never invokes processing. Pending external promise work remains under the tick latch, including if lease expiry means another process can recover. Lease renewal starts immediately after acquisition so destination lookup, turn admission/processing, and Slack response waits are covered. A receipt already received can be recorded during the stop drain; a turn completing during stop starts no new preparation/send. Release/terminal mutations have explicit exact-state evidence and cannot wipe a successor. Uncertain sends retain the intent across crash/reclaim and therefore may repeat with possible-duplication status.
 
-- [ ] **Step 2:** Apply a bounded diagnostic policy: keep a single last poll fault signature and a finite reason set for the current claim only. Do not warn repeatedly for invalid immutable/delivery rows on every unchanged candidate read: retain at most the current bounded page's ten `(changeId, deliveryVersion, reason)` signatures, replacing them on the next page, or filter malformed candidates into status-only diagnostics. Log a new attempt/backoff/terminal transition once; ensure successful transition clears any global storage fault so a later new failure is visible. Add info on successful acknowledgment `{provider,changeId,attempts,stage:"delivered"}` without text/receipt bodies. Diagnostic fields are fixed reason, time, stage and retry evidence, never raw caught errors. A database-wide failure is logged, not claimed persisted.
+- [ ] **Step 2:** Apply a bounded diagnostic policy: keep a single last poll fault signature, a finite reason set for the current claim and the previous/current page's at-most-ten invalid signatures as above. The keyset cursor, rather than warning deduplication, ensures progress past invalid rows. Unsortable invalid rows remain visible through read-only status. Log a new attempt/backoff/terminal transition once; ensure successful transition clears any global storage fault so a later new failure is visible. Add info on successful acknowledgment `{provider,changeId,attempts,stage:"delivered"}` without text/receipt bodies. Diagnostic fields are fixed reason, time, stage and retry evidence, never raw caught errors. A blocked unsupported deadline has no `retryAt` claim and remains visibly pending after restart. A database-wide failure is logged, not claimed persisted.
 - [ ] **Step 3:** Tests assert retry delays 1/5/15/60/60 minutes from resolved failed acquisition, server rate delay as a larger lower bound, no attempt increment on candidate read or refused claim, oldest-created deterministic page ten, no repeated terminal sends, no coalescing/revision sorting promises, later due changes passing older backoff, local tick/start single-flight with no catch-up queue, timer unref and terminal idempotent stop. During held turn/request/mutation, advance clock/lease and call tick repeatedly: local work count remains one until the original promise settles. Repair registry on the next eligible retry; same-binding preparation is reused through process restart and route changes regenerate it with a new digest. Model/catalog writes/discovery are independent.
 - [ ] **Step 4:** Run notifier units, integration schedules, outbox tests and typecheck. Inspect emitted fields/versions and all warnings. Commit `feat: retry catalog notices with durable preparation and leases`.
 
@@ -903,62 +1014,66 @@ The worker rechecks `storeOpen` inside continuations that may start additional c
 ```ts
 // src/admin/model-catalog-notification-status.ts
 import type { Db } from "mongodb";
-import { validDate, sameBinding, validBinding, NOTICE_REASONS, nonblank, counter, display, type NoticeReason } from "./model-catalog-notification.js";
+import { validDate, validDelivery, validBinding, NOTICE_REASONS, nonblank, display, type NoticeReason } from "./model-catalog-notification.js";
 const obj = (v: unknown): Record<string, unknown> => v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
 const date = (v: unknown): number | undefined => validDate(v) ? v.getTime() : undefined;
 export interface NotificationStatus {
-  provider: string; pending: number; claimed: number; prepared: number; uncertain: number; invalid: number;
+  provider: string; pending: number; claimed: number; prepared: number; uncertain: number; blocked: number; invalid: number;
   oldest?: { id: string; at?: number }; nextAt?: number; reason?: { code: NoticeReason; at: number };
   acknowledgedAt?: number; timingTrouble: boolean;
 }
 export type NotificationReport = { kind: "available"; rows: NotificationStatus[] } | { kind: "unavailable" };
 export function emptyNotificationStatus(provider: string): NotificationStatus {
-  return { provider, pending: 0, claimed: 0, prepared: 0, uncertain: 0, invalid: 0, timingTrouble: false };
+  return { provider, pending: 0, claimed: 0, prepared: 0, uncertain: 0, blocked: 0, invalid: 0, timingTrouble: false };
 }
 export function addNotificationStatus(s: NotificationStatus, raw: unknown, now: number): void {
   const row = obj(raw), d = obj(row.delivery), claim = obj(d.claim), p = obj(d.preparation), receipt = obj(d.receipt);
-  const state = d.state, createdAt = date(row.createdAt), next = date(state === "claimed" ? claim.leaseExpiresAt : d.nextAttemptAt);
-  const processed = date(p.processedAt), acknowledged = date(receipt.acknowledgedAt);
-  const binding = obj(p.binding), receiptBinding = obj(receipt.binding);
-  const numericTrouble = !counter(d.attempts) || (Object.hasOwn(d, "version") && !counter(d.version));
-  const claimTrouble = state === "claimed" && (!nonblank(claim.token) || !nonblank(claim.owner) ||
-    !validDate(claim.startedAt) || !validDate(claim.leaseExpiresAt) || claim.leaseExpiresAt <= claim.startedAt ||
-    !["preparing", "sending"].includes(String(claim.stage)));
-  const prepTrouble = d.preparation !== undefined && (!nonblank(p.id) || !validBinding(p.binding) || processed === undefined);
-  const timingTrouble = createdAt === undefined || createdAt > now ||
-    (claim.startedAt !== undefined && (date(claim.startedAt) === undefined || date(claim.startedAt)! > now)) ||
-    (p.processedAt !== undefined && (processed === undefined || processed > now)) ||
-    (receipt.acknowledgedAt !== undefined && (acknowledged === undefined || acknowledged > now));
-  if (timingTrouble) s.timingTrouble = true;
-  const terminal = state === "delivered" && typeof p.id === "string" && p.id === receipt.preparationId &&
-    acknowledged !== undefined && acknowledged <= now && typeof receipt.messageTs === "string" && Boolean(receipt.messageTs.trim()) &&
-    validBinding(binding) && validBinding(receiptBinding) && receipt.channelId === binding.channelId &&
-    sameBinding(binding, receiptBinding) && !numericTrouble && !prepTrouble && d.claim === undefined;
-  const malformed = numericTrouble || claimTrouble || prepTrouble || !["pending", "claimed", "delivered"].includes(String(state)) ||
-    (state === "delivered" && !terminal) || (state !== "delivered" && next === undefined) ||
-    (state !== "claimed" && d.claim !== undefined);
-  if (malformed) s.invalid++;
+  const state = d.state, createdAt = date(row.createdAt);
+  const next = d.retryBlocked === true ? undefined : date(state === "claimed" ? claim.leaseExpiresAt : d.nextAttemptAt);
+  const processed = date(p.processedAt), acknowledged = date(receipt.acknowledgedAt), diagnostic = obj(d.diagnostic);
+  const badTime = (parent: Record<string, unknown>, field: string) => Object.hasOwn(parent, field) &&
+    (date(parent[field]) === undefined || date(parent[field])! > now);
+  const timingTrouble = createdAt === undefined || createdAt > now || !validDate(d.nextAttemptAt) ||
+    badTime(d, "lastAttemptAt") || badTime(claim, "startedAt") || badTime(p, "processedAt") ||
+    badTime(receipt, "acknowledgedAt") || badTime(diagnostic, "at");
+  if (timingTrouble || d.retryBlocked === true) s.timingTrouble = true;
+  const mutableValid = validDelivery(row.delivery);
+  if (!mutableValid || createdAt === undefined) s.invalid++;
+  // Retained uncertainty survives a terminal receipt, including crash/rebinding recovery.
+  if (d.uncertainSend === true || Object.hasOwn(claim, "sendIntent")) s.uncertain++;
+  if (d.retryBlocked === true) s.blocked++;
+  const diagnosticAt = date(diagnostic.at);
+  if (NOTICE_REASONS.has(diagnostic.reason as NoticeReason) && diagnosticAt !== undefined && diagnosticAt <= now &&
+      (!s.reason || diagnosticAt > s.reason.at)) s.reason = { code: diagnostic.reason as NoticeReason, at: diagnosticAt };
+  const terminal = mutableValid && state === "delivered" && acknowledged !== undefined && !timingTrouble;
   if (terminal) { s.acknowledgedAt = Math.max(s.acknowledgedAt ?? -Infinity, acknowledged); return; }
   if (state === "claimed") s.claimed++; else s.pending++;
-  if (typeof p.id === "string") s.prepared++;
-  if (d.uncertainSend === true || claim.sendIntent !== undefined) s.uncertain++;
+  if (nonblank(p.id) && validBinding(p.binding) && processed !== undefined) s.prepared++;
   if (!s.oldest || (createdAt !== undefined && (s.oldest.at === undefined || createdAt < s.oldest.at))) {
     s.oldest = { id: typeof row._id === "string" ? row._id : "unavailable", at: createdAt };
   }
   if (next !== undefined) s.nextAt = Math.min(s.nextAt ?? Infinity, next);
-  const diagnostic = obj(d.diagnostic), diagnosticAt = date(diagnostic.at);
-  if (NOTICE_REASONS.has(diagnostic.reason as NoticeReason) && diagnosticAt !== undefined && diagnosticAt <= now &&
-      (!s.reason || diagnosticAt > s.reason.at)) s.reason = { code: diagnostic.reason as NoticeReason, at: diagnosticAt };
   if (next === undefined) s.timingTrouble = true;
 }
+// Computed inclusion preserves missing versus supplied scalar/null/object values. Dotted-only
+// preparation projection can erase a malformed parent; keep its original type/value instead.
+// Object fields with a missing Mongo expression remain absent, never synthesized as undefined/null.
+export const notificationStatusProjection = {
+  _id: 1, provider: 1, createdAt: 1,
+  delivery: { $cond: [{ $eq: [{ $type: "$delivery" }, "object"] }, {
+    ...Object.fromEntries(["state", "attempts", "version", "nextAttemptAt", "lastAttemptAt", "claim", "receipt",
+      "uncertainSend", "diagnostic", "retryBlocked"].map(key => [key, `$delivery.${key}`])),
+    preparation: { $cond: [{ $eq: [{ $type: "$delivery.preparation" }, "object"] }, {
+      id: "$delivery.preparation.id", binding: "$delivery.preparation.binding", processedAt: "$delivery.preparation.processedAt",
+    }, "$delivery.preparation"] },
+  }, "$delivery"] },
+};
 export async function readNotificationStatus(db: Db, now = Date.now()): Promise<NotificationReport> {
   try {
     const rows = new Map<string, NotificationStatus>();
-    const cursor = db.collection("agent_model_catalog_changes").find({ provider: { $ne: "gemini" } }, { projection: {
-      _id: 1, provider: 1, createdAt: 1, "delivery.state": 1, "delivery.attempts": 1, "delivery.version": 1, "delivery.nextAttemptAt": 1, "delivery.claim": 1,
-      "delivery.uncertainSend": 1, "delivery.diagnostic": 1, "delivery.preparation.id": 1,
-      "delivery.preparation.binding": 1, "delivery.preparation.processedAt": 1, "delivery.receipt": 1,
-    } });
+    const cursor = db.collection("agent_model_catalog_changes").find({ provider: { $ne: "gemini" } }, {
+      projection: notificationStatusProjection,
+    });
     for await (const row of cursor) {
       const provider = typeof row.provider === "string" && row.provider.trim() ? row.provider : "unknown-provider";
       const status = rows.get(provider) ?? emptyNotificationStatus(provider);
@@ -970,7 +1085,7 @@ export async function readNotificationStatus(db: Db, now = Date.now()): Promise<
 export function notificationNote(s: NotificationStatus, now = Date.now()): string {
   const oldest = s.oldest ? `${display(s.oldest.id, 160)}; age ${s.oldest.at === undefined || s.oldest.at > now ? "unavailable" : `${Math.floor((now - s.oldest.at) / 60_000)}m`}` : "none";
   return `${display(s.provider, 160)}: notifications pending ${s.pending}, in progress ${s.claimed}, prepared ${s.prepared}, ` +
-    `possibly repeated ${s.uncertain}, invalid ${s.invalid}; oldest ${oldest}; ` +
+    `possibly repeated ${s.uncertain}, retry blocked ${s.blocked}, invalid ${s.invalid}; oldest ${oldest}; ` +
     `next retry/lease expiry ${s.nextAt === undefined ? s.pending + s.claimed ? "unavailable" : "none" : new Date(s.nextAt).toISOString()}; ` +
     `reason ${s.reason?.code ?? (s.invalid ? "invalid-state" : "none")}` +
     `${s.timingTrouble ? "; timing unavailable/clock-inconsistent" : ""}` +
@@ -978,7 +1093,7 @@ export function notificationNote(s: NotificationStatus, now = Date.now()): strin
 }
 ```
 
-The status reader shares pure validators/reason codes without a store dependency. Its projected evidence can validate state/timing/binding but deliberately does not claim to recompute the preparation text digest; the delivery writer owns that check. A malformed delivered row remains unresolved storage trouble. Future creation/processing/receipt times report unavailable timing, including on terminal rows. Use finite injected `now` values. Provider/change strings remain bounded/escaped, and unknown diagnostic text never prints. A successful empty outbox renders real zero counts for each queried provider; a failed cursor is `notifications unavailable`, never an empty map.
+The status reader and outbox use the same `validDelivery` for mutable state, optional-field presence, counters/dates, claim/send-intent and receipt/preparation binding. Status omits only preparation text and its digest computation; the writer validates those with the immutable change ID. The computed projection preserves a malformed supplied parent and actual field absence, includes `lastAttemptAt`, and transfers no prepared text or immutable ID arrays. Run that exact projection against the owned Mongo in parity tests; a JavaScript projection mock is insufficient. A malformed delivered row remains unresolved storage trouble. Future creation/processing/receipt times report unavailable timing, including on terminal rows. Use finite injected `now` values. Provider/change strings remain bounded/escaped, and unknown diagnostic text never prints. A successful empty outbox renders real zero counts for each queried provider; a failed cursor is `notifications unavailable`, never an empty map.
 
 - [ ] **Step 2:** In the existing `agent_model_catalog_list` handler, sample one `statusNow`; after the existing catalog reads, call `readNotificationStatus(db, statusNow)` once. Leave the JSON entries content item first and byte/order-compatible. For the selected stored provider(s), append `notificationNote(found ?? emptyNotificationStatus(provider), statusNow)` if available, otherwise one fixed `Notifications unavailable.` note. On an all-provider request include manual-origin plugin provider IDs from the union of existing catalog and outbox status rows, excluding Gemini; do not fetch discovery or initialize indexes. Keep sibling pending-export note separate because no outbox row yet does not mean no pending notice. Update the tool description's status sentence to mention pending notification/retry and acknowledged CoS processing/Slack acceptance. No other tool behavior changes.
 - [ ] **Step 3:** In KPR-460's `modelCatalogsForDoctor`, call `readNotificationStatus` on its already connected temporary read-only Db before closing it; do not open another connection. Extend the available `ModelCatalogReport` variant with `notifications: NotificationReport`, retaining `{kind:"unavailable"}` for failed catalog reads. An outbox-only read failure preserves available catalog facts and sets only notifications unavailable. In `renderModelCatalogsSection`, append matching notification notes after each catalog row, and append outbox-only plugin notes deterministically. The explicit no-data case supplies empty status for built-ins. This remains informational and never assigns to `allPassed` or changes exit code. The doctor read-only test fake now supports an async iterable projected cursor; all write/index/dispatch methods throw, and catalog/outbox reads are separately faultable.
@@ -1004,7 +1119,7 @@ The Db is the existing identity-guarded `db`, not rawDb. Neither component belon
 
 - [ ] **Step 5:** Replace the sibling boot-order assertion with source checks (strip comments, never import index): exactly one notifier/outbox construction and start; primary Slack start completion before notification setup/start; shared guarded Db; no awaited start/index/delivery; plugin/provider and meeting wiring before any new spawn-capable operation; **both stop invocations precede the first shutdown await**, followed by the Promise.all drain and later Slack/Mongo teardown. Leave existing pre-wiring allowlists intact. Assert no scanner/notifier stops appear in stopAll/reload/admin code. Unit stop tests prove actual bounded behavior; source assertions prove the real integration locations.
 - [ ] **Step 6:** Update `CLAUDE.md` and `docs/providers.md` in place, removing KPR-459/KPR-460 placeholders saying notifications are future work. Explain bootstrap/membership/manual/plugin notices, validated CoS and home base, explicit DEFAULT_AGENT provenance, independent pending retry, durable preparation reuse, historical revision meaning, CoS processed plus Slack accepted, and possible repeats after ambiguity/crash. Saved time/discovery freshness remain separate; failed/unresolved delivery never reverts catalogs. State the fixed retry/lease/shutdown behavior concisely and that assignments still require operator decisions. Preserve Gemini live-only and provider/capability/effort scope.
-- [ ] **Step 7:** Run notification-status, catalog/admin, doctor, config/registry, boot-order and adjacent scanner tests plus typecheck. Expected: JSON entries/freshness and doctor exit semantics are unchanged; failed outbox reads are unavailable; no writer/dispatcher/index calls occur in diagnostics. Commit `feat: wire catalog notification lifecycle and status`.
+- [ ] **Step 7:** Add status fixtures for terminal delivered-after-crash and terminal delivered-after-uncertain-rebinding: both retain `possibly repeated 1` alongside their actual acknowledgment. For mutable validator parity, project each fixture with the exact Task 6 Mongo projection and compare `validDelivery(projected.delivery)` with full mutable validation before text/digest checks. Include delivered `nextAttemptAt:"invalid"`, every optional falsey/null/array/undefined value, nonboolean uncertainty, pending receipts, stray claims, missing/mismatched/malformed sending intent, malformed diagnostics and lastAttemptAt, valid initial absent version, blocked deadlines, valid pending/claimed/delivered rows. Valid digest/text fixtures must have `validChange(row)` agree too; test corrupted text/digest separately as the explicitly omitted status evidence. A malformed delivered fixture must increase invalid and never supply acknowledgedAt or healthy completion. Verify no projected text/immutable arrays appear and absence/scalar parents survive the actual Mongo read. Run notification-status, catalog/admin, doctor, config/registry, boot-order and adjacent scanner tests plus typecheck. Expected: JSON entries/freshness and doctor exit semantics are unchanged; failed outbox reads are unavailable; no writer/dispatcher/index calls occur in diagnostics. Commit `feat: wire catalog notification lifecycle and status`.
 
 ## Task 7 — Prove failure schedules against the fake and real standalone Mongo
 
@@ -1028,6 +1143,12 @@ The Db is the existing identity-guarded `db`, not rawDb. Neither component belon
 | Slack receives post; default changes before receipt returns | Valid receipt records the actual posted binding/preparation, not the new default. No second CoS turn or post in this invocation. |
 | Slack accepts; ack mutation applies then throws, exact evidence positive | Delivered with matching preparation/binding/receipt and no second Slack request. Receipt proof is distinct from old normal `Promise<void>` dispatch. |
 | Ack throws before delayed real application; first evidence negative/unavailable; later operation applies | Retain known receipt and retry only the exact idempotent ack. The late predecessor actually executes; no post replay while receipt is available. If token already changed, preserve successor and report stale outcome. |
+| A ack is uncertain; B takes over and releases to a newer pending state without a claim | Evidence compares against A's before-token, reports superseded and settles A's tick/latch. A makes no second Slack request and cannot clear B's pending state; later eligible work can run. Assert delayed old ack matchedCount zero after actual execution. |
+| A ack is uncertain; A's earlier submitted renewal applies late with the same token and greater version | Positive advancement fences the obsolete ack. Rebuild acknowledgment from the observed version with the same preparation/binding and known receipt, preserving earlier uncertainty. Old ack actually misses; rebased ack matches; exactly one Slack request, correct terminal receipt and released latch. |
+| First ten due rows have valid sortable identity/time but invalid optional preparation/sendIntent; valid eleventh follows | First tick examines at most ten and mutates none. Subsequent tick reaches/delivers the eleventh; continue ticks through wrap and prove invalid rows unchanged, no unbounded cursor/signature storage, and no repeated delivered post. Repeat beyond two full invalid pages. |
+| Supplied preparation or preparing-claim sendIntent is null/false/0/empty string/array/undefined | Pure validChange returns false; BSON-representable fixtures retain their stored shape and cause zero delivery mutations, turns or posts in actual candidate runs. Check other supplied optional fields with the shared validator and projected diagnostics. |
+| Hold first conversations.list page with next_cursor; stop notifier, stop adapter, expire lease or let B take ownership | Release the held page and observe its original promise. The gateway's per-page gate starts zero subsequent Slack requests; no turn/post and no new store call after drain. Also hold the gate's DB read and stop before it resumes. |
+| Accepted retry delay at maximum Date boundary or beyond | Run response/error classifier through lookup/post and real release. Boundary equality persists the exact representable deadline; beyond-boundary/unsafe-ms values retain blocked pending work, safe diagnostic and preparation across restart. No Invalid Date exception, early claim or expiry-based retry. |
 | Crash after accepted post but before durable ack | Fresh consumer may resend the exact persisted prep after lease expiry. Assert two possible Slack posts, one immutable event, terminal receipt and uncertainty note; never assert exactly-once external delivery. |
 | Old release/prepare/send-intent/ack is delayed while B supersedes and completes or releases | Run each operation, not just claim. Exact CAS misses against B's final state. Expired same-token ack is allowed only with matching prep; old-token/mismatched-prep receipt cannot clear successor. |
 | KPR-459 pending export is recovered repeatedly after delivery mutations | Entire delivery subdocument stays byte/value-identical across duplicate exports, for claimed/prepared/pending/uncertain/delivered states. No duplicate history/change rows. |
@@ -1083,7 +1204,7 @@ interface CatalogNotificationHarness {
   dispatcher: import("../../channels/dispatcher.js").Dispatcher;
   registry: import("../../agents/agent-registry.js").AgentRegistry;
   manual(input: { provider: string; models: { id: string; displayName: string; notes?: string }[]; changeSummary?: string }): Promise<unknown>;
-  setNow(at: Date): void;
+  setNow(at: Date): void; // Changes injected local clocks only; never Mongo's $$NOW.
   posts: { channel: string; text: string; returned: unknown }[];
   turns: { agentId: string; workItem: import("../../types/work-item.js").WorkItem }[];
   close(): Promise<void>;
@@ -1094,18 +1215,53 @@ Build it explicitly: start the owned Mongo; construct `new AgentRegistry(db.coll
 
 For the **real manual handler**, import `buildAdminTools`, keep the existing SDK `tool` wrapper test shim from `admin-mcp-server.test.ts` (definitions return `.handler`), and select the `agent_model_catalog_refresh` handler. Pass the same guarded Db, `agentId:"test-operator"`, `instanceCapabilitiesJson:"{}"`, and plugin provider resolver. Call this handler from `manual`; do not make `manual` a direct store mock. A separate direct `store.replaceManual` helper is permissible only to capture low-level operation IDs in uncertainty schedules. Preserve the actual handler's return text/error semantics in E2E assertions.
 
-- [ ] **Step 2:** Build `model-catalog-notification-agent-manager.e2e.test.ts` with **real AgentManager**, not a mock return from `runWorkItemTurn`/`spawnTurn`. Copy only the necessary isolated dependency fixtures from current `src/agents/agent-manager.test.ts`: plugin loader returns no plugins; skills/seed discovery stays in temp HIVE_HOME; memory read/list empty and writes recording; conversation index resolves; modelRouter disabled; no live Keychain/provider SDK. Use `new SessionStore(guardedDb)` plus `await init()` for actual session persistence, optional recording telemetry, and `new AgentManager(registry, memoryManager, sessionStore, guardedDb, telemetry)`. The existing SessionStore TTL is unrelated to outbox retention and must not be removed; the prohibition on new TTL applies to catalog notification collections.
+- [ ] **Step 2:** Build `model-catalog-notification-agent-manager.e2e.test.ts` with **real AgentManager**, not a mock return from `runWorkItemTurn`/`spawnTurn`. Copy only the necessary isolated dependency fixtures from current `src/agents/agent-manager.test.ts`: plugin loader returns no plugins; skills/seed discovery stays in temp HIVE_HOME; memory read/list empty and writes recording; conversation index resolves; modelRouter disabled; no live Keychain/provider SDK. Use `new SessionStore(guardedDb)` plus `await init()` for actual session persistence, `new TurnTelemetryStore(guardedDb)` plus `await telemetry.init()` as telemetry, and `new AgentManager(registry, memoryManager, sessionStore, guardedDb, telemetry)`. The existing SessionStore TTL is unrelated to outbox retention and must not be removed; the prohibition on new TTL applies to catalog notification collections.
 
 Mock **AgentRunner** at the existing boundary (`agent-manager.test.ts:121–153`): constructor returns recording `send`, `abort`, `wasAborted:false`, `buildToolTransportInventory:()=>[]`, `buildInProcessServers:()=>({})`, `resolveTurnCwd:()=>temporaryDirectory`, and async `buildProviderPrompt` with empty skillEntries and inert instructions. `send` returns the same full RunResult shape as `makeRunResult` at `agent-manager.test.ts:298`, with `text:"I will bring any proposal to the operator.", sessionId:"catalog-test-session", toolCalls:0, toolMs:0, toolSummary:null`, valid token/cost/duration metrics and no failure flags. Use current required fields/types if dependency delivery changes them. This runs real provider selection/Claude adapter/manager turn entry and its admission/session/telemetry; it never invokes actual SDK generation or tools. Do not spy-replace real `runWorkItemTurn` or `spawnTurn`; spies for call observation can delegate originals.
 
-Trigger one scanner bootstrap through the real notifier. Assert manager's real entry and spawn calls, runner's recorded WorkItem/prompt, new persisted session under the stable notification thread, actual telemetry, exact Slack request/receipt and final outbox receipt/preparation. Run a second changed catalog event and prove a distinct thread/session key. Assert agent_definitions/model/effort/default/homeBase documents and agent_versions counts are byte/value-identical before/after. Call `manager.stopAll()` and separately tick notifier on another event to prove heartbeat ownership is independent; session cleanup must not stop the notifier. All cleanup remains test-local.
+`AgentManager.finalizeSpawnResult` does not await `sessionStore.set`, observability does not await `telemetry.record`, and `SessionStore.close` is a no-op. Observe the real methods without replacing their persistence: capture bound originals, install delegating spies, retain every returned promise and attach an immediate rejection observer. For example, use the following helper with `sessionStore.set` and `telemetry.record` before constructing the manager:
+
+```ts
+function observeWrites<A extends unknown[], R>(original: (...args: A) => Promise<R>) {
+  const pending: Promise<R>[] = [];
+  return {
+    call: (...args: A): Promise<R> => {
+      const work = original(...args); pending.push(work);
+      void work.catch(() => undefined); // Observe immediately; drain still surfaces failure.
+      return work;
+    },
+    drain: async () => {
+      let observed = 0;
+      while (observed < pending.length) {
+        const batch = pending.slice(observed); observed = pending.length;
+        const results = await Promise.allSettled(batch);
+        const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        if (failed) throw failed.reason;
+      }
+    },
+  };
+}
+const sessionWrites = observeWrites(sessionStore.set.bind(sessionStore));
+const telemetryWrites = observeWrites(telemetry.record.bind(telemetry));
+vi.spyOn(sessionStore, "set").mockImplementation(sessionWrites.call);
+vi.spyOn(telemetry, "record").mockImplementation(telemetryWrites.call);
+async function drainPersistence(): Promise<void> {
+  const results = await Promise.allSettled([sessionWrites.drain(), telemetryWrites.drain()]);
+  const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failed) throw failed.reason;
+}
+// After the notifier/manager turn has settled, and again in cleanup before closing Db:
+await drainPersistence();
+```
+
+Trigger one scanner bootstrap through the real notifier. Await the observed persistence promises before asserting manager's real entry and spawn calls, runner's recorded WorkItem/prompt, new persisted session under the stable notification thread, actual telemetry documents, exact Slack request/receipt and final outbox receipt/preparation. Run a second changed catalog event and prove a distinct thread/session key. Assert agent_definitions/model/effort/default/homeBase documents and agent_versions counts are byte/value-identical before/after. Call `manager.stopAll()` and separately tick notifier on another event to prove heartbeat ownership is independent; session cleanup must not stop the notifier. In finally, stop new work, release/await held turn/notifier promises, drain observed persistence before SessionStore/Db close and release spies only afterward. All cleanup remains test-local.
 
 - [ ] **Step 3:** Required application scenarios (each inspects full catalog models/notes/addedAt/revision/freshness, history/change IDs/counts, work input and transport output, final delivery state, and unchanged assignment documents):
 
 | E2E flow | Assertions beyond unit coverage |
 | --- | --- |
 | Startup scanner seed for claude/codex/grok → notifier | Exactly three bootstrap events and historical summaries; one successful processing/accepted post per event; correct target/route; no Gemini/plugin polling. |
-| Advance to eight hours: unchanged success and failed discovery | Successful-check time advances only for success; failed provider retains models/success freshness and separate error; neither creates another notice; pending earlier notices remain. |
+| Age completed scan fixtures by eight hours, then current-clock unchanged success and failed discovery | Successful-check time advances only for success; failed provider retains models/success freshness and separate error; neither creates another notice; pending earlier notices remain. Exact eight-hour boundary remains covered by scanner fake/pure tests. |
 | Manual replacement while discovery is held | Manual response/history/change exist immediately; scanner later rebases retained notes/addedAt, owns discovered membership/names/order; each actual membership commit has its own historical notice even when later revisions reverse it. |
 | Manual plugin bootstrap/change plus identical/name/note/order-only writes | `sol` manual handler works, no plugin discovery; only bootstrap/ID differences notify; each manual audit remains intact. |
 | Missing/disabled/multiple default and unresolved home base, then repair | Catalog/scanner keep committing; event remains pending with safe reason; next eligible retry selects current valid CoS; no generic audit or guessed channel. |
@@ -1116,12 +1272,14 @@ Trigger one scanner bootstrap through the real notifier. Assert manager's real e
 
 Use controlled manager-return fixtures in the first E2E suite to hold outcomes precisely, and the separate real manager slice for actual turn-entry evidence. Stub external discovery at its existing injection function, not the scanner's outcome or saved rows. To simulate restart construct new objects over the same owned Db; do not reset its documents between phases. To simulate a crash before acknowledgment, stop/close the old worker at the barrier so no later old handler can submit fresh mutations; release and observe its original promise without falsely asserting it never reached the server.
 
+**Real-Mongo clock handling:** `setNow` affects application/fake clocks only. Keep production E2E claims/renewals on a current clock so proposed leases exceed real `$$NOW`. For the eight-hour scenario, after the initial real bootstrap finishes, use an explicitly labeled isolated fixture write to subtract eight hours from completed scan started/finished/success timestamps, then tick at current real time; do not pretend advancing setNow advances the server. For pending retry/lease takeover scenarios, first assert the production-written deadline and full preparation/uncertainty. Then, only as isolated test setup, move that pending deadline or claimed lease into the real past with a journaled exact-version fixture mutation that also increments delivery.version. Retain all other fields and never alter a blocked unsupported deadline to force eligibility. Use real short injected lease/renewal intervals with bounded elapsed waits for actual expiry/server-predicate tests; exact normal backoff and eight-hour equality are covered with the sibling fake's operation clock. No production predicate, date guard or constant is weakened for test convenience.
+
 - [ ] **Step 4:** Format only edited `.ts` paths with an explicit `npx prettier --write ...` list. Run all Testing Contract commands once after the final implementation changes, including `npm run check`, `npm run build`, and `git diff --check`. Require meaningful unit/integration/E2E execution; missing Mongo/harness is not a skip. If updated main dependencies expose a baseline failure, record exact command/version/failure and verify against the unchanged synced baseline; do not count it as passed, downgrade packages, or silently widen the ticket into unrelated repairs.
 - [ ] **Step 5:** Review the final diff for immutable payload changes, global default/routing changes, assignment mutations, provider/Gemini/plugin discovery expansion, additional live credentials, unbounded retained attempts/timers, TTL/transaction/change-stream usage on the outbox, SDK automatic replays, raw errors/replies in logs, and competing generic retry owners. Verify all three chunks' scenarios are covered by named tests. Commit only verified task files with `test: verify catalog notifications through application boundaries`; hand off for fresh code review and the epic's child-PR workflow. Deployment and final epic merge remain outside this child.
 
 ## Handoff, assumptions, and limitations
 
-- Draft-author evidence: thirteen in-memory virtual modules assembled from this plan, including dispatcher/adapter/gateway additions against installed Slack 8.1.1 declarations, passed strict TypeScript checking with zero diagnostics and no emitted files. Four in-memory probes using the siblings' planned fake passed: refusal preserves prepared pending state; fresh worker reuses exact preparation; terminal tick does not resend; applied-then-thrown acknowledgment reconciles without resend. These are plan-code checks, not Vitest, real Mongo, provider, Slack or product E2E execution. Independent plan review and the complete Testing Contract remain outstanding.
+- Revision-1 author evidence: fourteen in-memory virtual modules assembled from the revised snippets, with typed dependency scaffolding and installed Slack/Mongo declarations, passed strict Node16-resolution TypeScript checking with zero diagnostics and no emitted files. Ten plan-code probes passed for optional BSON shapes, date limits, blocked release/restart, invalid-page progression, both acknowledgment schedules, per-page cancellation/early success, and terminal uncertainty/validation. An owned temporary standalone Mongo also passed the exact status projection's parity for nine BSON fixtures, retained terminal uncertainty, malformed-terminal exclusion and keyset progression beyond ten invalid rows; its process/data directory were cleaned. These ran under the available Node 26.7.0, not the required delivery Node 24. They are focused plan-code probes, not repository Vitest/application E2E, real provider or live Slack verification. Independent plan review and the complete Testing Contract remain outstanding.
 - DRAFT_READY is a writing result, not independent plan approval or readiness labeling. No product code/test harness exists solely because it is described here; delivery must reconcile the sibling and dependency-upgrade baseline first.
 - Fixed policy choices are the approved home-base destination, sole-enabled-default/explicit fallback, successful CoS processing plus Slack acceptance, one-minute/ten-item maintenance, two-minute renewable claims, capped retries, and five-second drain. Constructor overrides are tests only.
 - Empty successful/nonresponse results deliberately post the deterministic summary. Errors/aborts/timeouts cannot take that fallback. There is no human-read or automatic assignment-approval claim.
