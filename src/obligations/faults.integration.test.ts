@@ -336,6 +336,37 @@ describe("obligation fault boundaries", () => {
     expect(h.submitted).toHaveLength(1);
     expect(await e.reader.heartbeat()).toMatchObject({ state: "ok", pendingRecoveryOccurrences: 0 });
   });
+  it.each(["store", "write_guard"] as const)(
+    "ages a successful heartbeat to unknown during persistent %s failures",
+    async (failure) => {
+      const h = await harness(),
+        e = h.engine();
+      await e.sweeper.sweepOnce();
+      const lastSuccess = h.clock();
+      expect(await e.reader.heartbeat()).toMatchObject({
+        state: "ok",
+        stale: false,
+        lastSuccessfulSweep: lastSuccess,
+      });
+      const telemetry = structuredClone([...h.fake.collection("telemetry").rows.values()]);
+      if (failure === "write_guard") h.guard.engage("fixture");
+      for (const elapsed of [30_000, 120_000, 120_001, 150_000]) {
+        h.at(new Date(lastSuccess.getTime() + elapsed));
+        if (failure === "store") h.fake.failNext(REGISTRY, "find");
+        await e.sweeper.sweepOnce();
+        const expected = {
+          state: elapsed > 120_000 ? "unknown" : "ok",
+          stale: elapsed > 120_000,
+          lastSuccessfulSweep: lastSuccess,
+          timestamp: lastSuccess,
+        };
+        expect(await e.reader.heartbeat()).toMatchObject(expected);
+        expect(await e.reader.show("demo", { limit: 20 })).toMatchObject({ heartbeat: expected });
+        expect([...h.fake.collection("telemetry").rows.values()]).toEqual(telemetry);
+      }
+      expect(h.submitted).toHaveLength(0);
+    },
+  );
   it("clears obsolete expired_unresolved scheduling without reopening its receipt write", async () => {
     const h = await pendingHistory(),
       e = h.engine();
@@ -721,6 +752,41 @@ describe("obligation fault boundaries", () => {
     }
     expect(h.fake.collection(REGISTRY).rows.size).toBe(count);
   });
+  it.each(["destination", "noticeDestination"] as const)(
+    "enforces channel length boundaries and accepts the maximum thread length for %s",
+    async (field) => {
+      const h = await harness();
+      for (const prefix of ["C", "D", "G"]) {
+        for (const length of [9, 32]) {
+          const destination = {
+            kind: "slack",
+            channelId: prefix + "A".repeat(length - 1),
+            ...(length === 32 ? { threadTs: "1".repeat(93) + ".000001" } : {}),
+          };
+          const id = "boundary-" + prefix.toLowerCase() + "-" + length;
+          await h.store.register({ ...definition, _id: id, [field]: destination }, h.clock());
+          expect((await h.store.get(id))![field]).toEqual(destination);
+        }
+      }
+      const before = h.snapshot(),
+        writes = h.fake.writes();
+      for (const length of [8, 33]) {
+        await expect(
+          h.store.register(
+            {
+              ...definition,
+              _id: "invalid-boundary",
+              [field]: { kind: "slack", channelId: "C" + "A".repeat(length - 1) },
+            },
+            h.clock(),
+          ),
+        ).rejects.toBeDefined();
+      }
+      expect(h.snapshot()).toEqual(before);
+      expect(h.fake.writes()).toBe(writes);
+      expect(h.submitted).toHaveLength(0);
+    },
+  );
   it("actual schedule removal and reload do not affect registered expectations", async () => {
     const h = await harness(),
       e = h.engine();

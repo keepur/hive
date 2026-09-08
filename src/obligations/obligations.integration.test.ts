@@ -7,6 +7,12 @@ import { DeliveryService } from "./delivery.js";
 import { SPEC_REFUSALS } from "./testing/refusals.js";
 import { definition, DUE, KEY, COLLECTION, REGISTRY, harness } from "./testing/harness.js";
 
+function expectNoRawPersistence(h: Awaited<ReturnType<typeof harness>>, marker: string): void {
+  for (const collection of [REGISTRY, COLLECTION, "activity_log"]) {
+    expect(JSON.stringify([...h.fake.collection(collection).rows.values()]), collection).not.toContain(marker);
+  }
+}
+
 describe("delivery obligation assembly", () => {
   it("rejects extra nested registration fields before writing", async () => {
     const h = await harness();
@@ -464,7 +470,7 @@ describe("delivery obligation assembly", () => {
       if (side === "notice") expect((await h.store.occurrence(KEY)).notice?.intentId).toBe(original.notice?.intentId);
     },
   );
-  it.each(["invalid_auth", "not_in_channel"])(
+  it.each(["invalid_auth", "not_in_channel", "RAW_BODY_PRIVATE_DIAGNOSTIC_456"])(
     "never retries a non-JSON %s body synthesized by the SDK",
     async (rawBody) => {
       for (const side of ["delivery", "notice"] as const) {
@@ -472,10 +478,15 @@ describe("delivery obligation assembly", () => {
           e = h.engine();
         h.at(side === "delivery" ? "2026-09-07T07:00:00Z" : DUE);
         h.scripts.push({ rawBody, accepted: true });
-        if (side === "delivery") await h.send(e.delivery);
+        if (side === "delivery")
+          expect(await h.send(e.delivery)).toEqual({ state: "unknown", retryAt: undefined, retryAllowed: false });
         else await e.sweeper.sweepOnce();
         const original = await h.store.occurrence(KEY);
-        expect(side === "delivery" ? original.delivery : original.notice).toMatchObject({ state: "unknown" });
+        expect(side === "delivery" ? original.delivery : original.notice).toMatchObject({
+          state: "unknown",
+          reason: "unconfirmed_response",
+        });
+        expectNoRawPersistence(h, rawBody);
         h.at(new Date(h.clock().getTime() + 120_000));
         for (let i = 0; i < 2; i++) {
           if (side === "delivery") await h.send(e.delivery);
@@ -484,9 +495,16 @@ describe("delivery obligation assembly", () => {
         await e.sweeper.stop();
         const next = h.engine();
         for (let i = 0; i < 2; i++) {
-          if (side === "delivery") await h.send(next.delivery);
+          if (side === "delivery")
+            expect(await h.send(next.delivery)).toEqual({ state: "unknown", retryAt: undefined, retryAllowed: false });
           else await next.sweeper.sweepOnce();
         }
+        expect(await next.reader.occurrenceView(await h.store.occurrence(KEY))).toMatchObject({
+          [side]: { state: "unknown", reason: "unconfirmed_response" },
+          acknowledgement: null,
+          notified: false,
+        });
+        expectNoRawPersistence(h, rawBody);
         expect(h.submitted).toHaveLength(1);
         expect(h.accepted).toHaveLength(1);
         expect(h.receiptInserts()).toBe(0);
@@ -496,26 +514,51 @@ describe("delivery obligation assembly", () => {
   it.each(["internal_error", "fatal_error", "unrecognized_code", "timeout", "proxy"])(
     "never reposts ambiguous %s on either side across restart",
     async (error) => {
-      for (const side of ["delivery", "notice"]) {
+      for (const side of ["delivery", "notice"] as const) {
         const h = await harness(),
           e = h.engine();
+        const rawMarker = "RAW_PRIVATE_456_" + side + "_" + error;
         h.at(side === "delivery" ? "2026-09-07T07:00:00Z" : DUE);
+        if (error === "timeout")
+          h.beforeResponse(async () => {
+            throw new Error(rawMarker);
+          });
         h.scripts.push(
           error === "timeout"
-            ? { throws: true, accepted: true }
-            : { body: { ok: false, error }, status: error === "proxy" ? 502 : 200 },
+            ? { accepted: true }
+            : {
+                body: { ok: false, error, response_metadata: { messages: [rawMarker] } },
+                status: error === "proxy" ? 502 : 200,
+              },
         );
-        if (side === "delivery") await h.send(e.delivery);
+        if (side === "delivery")
+          expect(await h.send(e.delivery)).toEqual({ state: "unknown", retryAt: undefined, retryAllowed: false });
         else await e.sweeper.sweepOnce();
+        expectNoRawPersistence(h, rawMarker);
         await e.sweeper.stop();
         const restarted = h.engine();
         for (let i = 0; i < 3; i++) {
-          if (side === "delivery") await h.send(restarted.delivery);
+          if (side === "delivery")
+            expect(await h.send(restarted.delivery)).toEqual({
+              state: "unknown",
+              retryAt: undefined,
+              retryAllowed: false,
+            });
           else await restarted.sweeper.sweepOnce();
         }
         expect(h.submitted).toHaveLength(1);
         const o = await h.store.occurrence(KEY);
-        expect(side === "delivery" ? o.delivery.state : o.notice?.state).toBe("unknown");
+        expect(side === "delivery" ? o.delivery : o.notice).toMatchObject({
+          state: "unknown",
+          reason: "unconfirmed_response",
+        });
+        expect(await restarted.reader.occurrenceView(o)).toMatchObject({
+          [side]: { state: "unknown", reason: "unconfirmed_response" },
+          acknowledgement: null,
+          notified: false,
+        });
+        expectNoRawPersistence(h, rawMarker);
+        expect(h.receiptInserts()).toBe(0);
       }
     },
   );

@@ -1,10 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { ActivityRecord } from "./types.js";
+import type { ActivityRecord, DeliveryReceiptRecord } from "./types.js";
+import { FakeDb } from "../obligations/testing/fake-db.js";
+
+const { logInfo } = vi.hoisted(() => ({ logInfo: vi.fn() }));
 
 // Mock logger
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
-    info: vi.fn(),
+    info: logInfo,
     warn: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
@@ -91,6 +94,41 @@ describe("ActivityLogger", () => {
       expect(mockCollection.countDocuments).toHaveBeenCalledWith({ recordKind: { $ne: "delivery_receipt" } });
 
       await logger.stop();
+    });
+
+    it("counts legacy and explicit turn rows without counting delivery receipts in the startup diagnostic", async () => {
+      const fake = new FakeDb(),
+        collection = fake.collection("activity_log"),
+        timestamp = new Date("2026-09-07T07:00:00Z");
+      for (const agentId of ["legacy-one", "legacy-two"]) {
+        await collection.insertOne(makeRecord({ agentId, timestamp }));
+      }
+      await collection.insertOne({ ...makeRecord({ timestamp }), recordKind: "turn" });
+      for (const obligationId of ["receipt-one", "receipt-two"]) {
+        const receipt: DeliveryReceiptRecord = {
+          recordKind: "delivery_receipt",
+          receiptId: obligationId + "/2026-09-07T08:00:00.000Z/receipt",
+          obligationId,
+          dueAt: new Date("2026-09-07T08:00:00Z"),
+          producerAgentId: "test-agent",
+          destination: { kind: "slack", channelId: "C00000001" },
+          providerMessageTs: "1.000001",
+          acknowledgedAt: timestamp,
+          timestamp,
+          schemaVersion: 1,
+        };
+        await collection.insertOne(receipt);
+      }
+      expect(collection.rows.size).toBe(5);
+      logInfo.mockClear();
+      const logger = new ActivityLogger(fake.db, makeConfig());
+      try {
+        await logger.connect();
+        expect(logInfo).toHaveBeenCalledWith("Activity log connected", { records: 3, retentionDays: 90 });
+      } finally {
+        await logger.stop();
+      }
+      expect(collection.rows.size).toBe(5);
     });
 
     it("skips setup when disabled", async () => {
