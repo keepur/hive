@@ -7228,6 +7228,106 @@ describe("AgentManager", () => {
     });
 
     describe("KPR-467 call-pinned reload routing", () => {
+      // Real adapter and manager; only the response transport and vendor runner
+      // are fake. The dispatcher hook models a reload after adapter reads but
+      // before manager admission, without mocking either side of the seam.
+      async function adapterTurn(latest: string, beforeAdmission?: () => void) {
+        const { VoiceAdapter } = await import("../channels/voice/voice-adapter.js");
+        const { EventEmitter } = await import("node:events");
+        const res = Object.assign(new EventEmitter(), {
+          destroyed: false,
+          writableEnded: false,
+          writeHead: vi.fn(),
+          write: vi.fn(),
+          end: vi.fn(),
+        });
+        const adapter = new VoiceAdapter(0, "", "", registry as any,
+          { ...memoryManager, getHotTierPrompt: vi.fn().mockResolvedValue("") } as any,
+          manager, { routeVoiceTurn: async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+            beforeAdmission?.();
+            return manager.spawnTurn(ctx, onStream);
+          } } as any);
+        await (adapter as any).handleChatCompletion({}, res, {
+          model: "voice", stream: false, call: { id: "call-1" },
+          messages: [
+            { role: "user", content: "original question" },
+            { role: "assistant", content: "earlier answer" },
+            { role: "user", content: latest },
+          ],
+        }, "agent-a", registry.get("agent-a"));
+        expect(res.writeHead).toHaveBeenCalledWith(200, expect.anything());
+      }
+
+      it.each([false, true])("adapter preserves pinned-lease incremental prompts after reload (missing store row: %s)", async (missingRow) => {
+        const { pushed } = installEchoStreamingRunner();
+        await adapterTurn("opening question");
+        expect(pushed[0]).toContain("Caller: original question");
+        registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "openai/gpt-5.4-mini" }));
+        if (missingRow) sessionStore._sessions.delete(WARM_KEY);
+        await adapterTurn("follow-up question");
+        expect(pushed[1]).toMatch(/^follow-up question\n\n\*\*Current date\/time\*\*: /);
+        expect(pushed[1]).not.toContain("original question");
+        expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+        expect(mockOpenAIRunTurn).not.toHaveBeenCalled();
+        warmLeases(manager).get(WARM_KEY)!.close("call-ended");
+        await adapterTurn("fresh route question");
+        const freshInput = mockOpenAIRunTurn.mock.calls.at(-1)![0];
+        expect(freshInput.sessionId).toBeUndefined();
+        expect(freshInput.prompt).toContain("Caller: original question");
+        expect(freshInput.prompt).toContain("You: earlier answer");
+        expect(freshInput.prompt).not.toContain("session continuity was reset");
+      });
+
+      it.each(["claude", "openai"])("adapter retains the full transcript when admission switches away from %s", async (from) => {
+        const { pushed } = installEchoStreamingRunner();
+        registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: from === "claude" ? "claude-sonnet-4-6" : "openai/gpt-5.4-mini" }));
+        sessionStore._sessions.set(WARM_KEY, { sessionId: "stored-before-reload", provider: from });
+        await adapterTurn("question after reload", () => {
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: from === "claude" ? "openai/gpt-5.4-mini" : "claude-sonnet-4-6" }));
+        });
+        if (from === "claude") {
+          const input = mockOpenAIRunTurn.mock.calls[0]![0];
+          expect(input.sessionId).toBeUndefined();
+          expect(input.prompt).toContain("Caller: original question");
+          expect(input.prompt).toContain("You: earlier answer");
+          expect(input.prompt).toContain("Caller: question after reload");
+        } else {
+          expect(mockRunnerOpenStream.mock.calls[0]![0].sessionId).toBeUndefined();
+          const lease = warmLeases(manager).get(WARM_KEY)!;
+          expect(lease.turns).toBe(1);
+          expect(pushed[0]).toContain("Caller: original question");
+          expect(pushed[0]).toContain("You: earlier answer");
+          expect(pushed[0]).toContain("Caller: question after reload");
+        }
+      });
+
+      it("keeps a long-running warm half-open probe valid under the opening watchdog after reload", async () => {
+        let now = 0;
+        (manager as any).circuitBreakers = new ProviderCircuitBreakerRegistry(undefined, () => now);
+        registry._agents.get("agent-a")!.timeoutMs = 900_000;
+        const { pushed, releaseHang } = installEchoStreamingRunner({ hangOnTurn: 2 });
+        await manager.spawnTurn(makeVoiceCtx());
+        for (let i = 0; i < 3; i++) {
+          const permit = manager.circuitBreakers.acquire("claude");
+          manager.circuitBreakers.record(permit, { outcome: "fault", kind: "connect-fail", message: "fetch failed" }, 0);
+        }
+        registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "openai/gpt-5.4-mini", timeoutMs: 10 }));
+        now = 15_000;
+        const probe = manager.spawnTurn(makeVoiceCtx());
+        try {
+          await vi.waitFor(() => expect(pushed).toHaveLength(2));
+          now += 361_000; // past the metadata-less 360s stale bound, before the pinned 900s deadline
+          expect(() => manager.circuitBreakers.acquire("claude")).toThrow(ProviderCircuitOpenError);
+          expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("half-open");
+          releaseHang();
+          expect((await probe).errors).toEqual([]);
+          expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
+        } finally {
+          releaseHang();
+          await probe;
+        }
+      });
+
       it("reuses the opening Claude lease after a cross-provider reload; the next call uses OpenAI", async () => {
         vi.useFakeTimers();
         const { pushed } = installEchoStreamingRunner();

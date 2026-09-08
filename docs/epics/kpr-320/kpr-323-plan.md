@@ -2084,3 +2084,7 @@ npx tsx scripts/voice-latency-baseline.ts \
 ---
 
 **Execution handoff:** plan saved at `docs/epics/kpr-320/kpr-323-plan.md`. Dispatcher runs the plan-review loop; on approval + W5 re-open + W3 merge + 322 T1–T3 merge, execute via `dodi-dev:implement` starting at Task 0. W0 (Tasks 8+10) may be sequenced first on its own recorded go — it has no engine dependencies and unblocks 322 P2.
+
+### KPR-467 implementation amendment
+
+The historical resume-source examples above are refined by KPR-467: the adapter supplies a resume candidate/provider and both rendered voice prompt forms. At lease opening, the manager rejects an incompatible candidate using the pinned opening route without rereading the session store. Existing leases select the latest message independently of registry reloads; cold turns select after the admission identity guard. Retry-cleared handles remain cleared. The pinned watchdog timeout is also the breaker probe's `deadlineMs`. See the spec's KPR-467 clarification for scope.

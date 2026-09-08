@@ -320,26 +320,15 @@ export class VoiceAdapter {
     const storedRef = await sessionStore.get(agentId, threadId);
     const sessionLookupMs = Date.now() - sessionLookupStartedAt;
 
-    // KPR-313 §3.5: provider eligibility applied at voice's OWN read — not
-    // left to the spawnTurn guard. Voice chooses its prompt SHAPE from
-    // resume-presence; if a mismatched-provider id flowed through and the
-    // guard stripped it downstream, the turn would succeed fresh with only
-    // the latest user message — a silent mid-call context loss the pre-313
-    // hard failure never caused. On mismatch we treat the thread as
-    // no-resume, so renderConversationPrompt fires and the full in-call
-    // transcript IS voice's handoff. providerFor is the KPR-307 static-route
-    // read (same resolveProviderModel as the breaker wrap); null (agent
-    // vanished mid-call, SIGUSR1) degrades to no-resume — fail-soft.
-    const staticProvider = agentManager.providerFor(agentId);
-    const resumableId =
-      storedRef && staticProvider && storedRef.provider === staticProvider ? storedRef.sessionId : undefined;
-
-    // Choose prompt based on resume-presence (mirrors current voice behavior).
-    const turnPrompt = resumableId
-      ? extractLatestUserMessage(request.messages)
-      : renderConversationPrompt(request.messages);
-    const safePrompt = resumableId && !turnPrompt ? renderConversationPrompt(request.messages) : turnPrompt;
-    const effectiveResume = resumableId && turnPrompt ? resumableId : undefined;
+    // KPR-467: carry both prompt forms and the stored resume candidate to
+    // admission. Only the manager knows whether this turn uses a pinned
+    // lease, a compatible resume, or a fresh route after a registry reload.
+    const voicePrompt = {
+      latestUserMessage: extractLatestUserMessage(request.messages),
+      fullConversation: renderConversationPrompt(request.messages),
+    };
+    const effectiveResume = voicePrompt.latestUserMessage ? storedRef?.sessionId : undefined;
+    const safePrompt = effectiveResume ? voicePrompt.latestUserMessage : voicePrompt.fullConversation;
 
     // Synthesize a WorkItem. ChannelKind="voice" was added in Step 1 of this
     // ticket so this compiles.
@@ -377,11 +366,8 @@ export class VoiceAdapter {
     const ctx: TurnContext = {
       agentId,
       sessionId: effectiveResume,
-      // KPR-313: tag travels only when a resume is actually attempted; on a
-      // provider mismatch BOTH stay unset — the full transcript above is
-      // voice's handoff, and the spawnTurn guard then has nothing to trip on
-      // (the voice carve-out stays annotation-free).
-      sessionProvider: effectiveResume ? (staticProvider ?? undefined) : undefined,
+      sessionProvider: effectiveResume ? storedRef?.provider : undefined,
+      voicePrompt,
       channelId: callId,
       threadId,
       workItem,
@@ -448,6 +434,7 @@ export class VoiceAdapter {
       const retryCtx: TurnContext = {
         ...ctx,
         sessionId: undefined,
+        sessionProvider: undefined,
         workItem: retryWorkItem,
       };
       outcome = await runOnce(retryCtx);

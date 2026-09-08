@@ -244,6 +244,8 @@ Per-turn `query()` with `options.resume = sessionId` is the **only** execution p
 
 `AgentManager` is a thin spawn coordinator: per-thread lock (`agentId:threadId`), per-agent in-flight budget, ticket lifecycle for abort/stop, post-quiescence reflection scheduler, and the `getSnapshot()` observability surface. There is no per-agent queue, and no `AgentRunner` reuse across turns — except within a single warm voice lease (KPR-323), the one remaining per-channel opt-in flag.
 
+Voice prompt admission (KPR-467): the adapter supplies both transcript forms and a stored resume candidate. The manager chooses the latest user message for an existing lease or compatible resume, and the full transcript when provider admission starts fresh. Active leases keep their opening route/model/watchdog across reloads; the watchdog also bounds breaker probe staleness. No transcript payload is logged, and retry-cleared handles are never recovered by a warm-open store read.
+
 **Budget:** per-agent `spawnBudget` field on the agent definition; falls back to legacy `maxConcurrent`, then the engine default (5). `maxConcurrent` is **deprecated** for spawn-coordinator purposes — set `spawnBudget` on new agents. Source of the resolved budget is surfaced in `hive doctor` ("Spawn coordinator" section) as `source=spawnBudget|maxConcurrent|default`.
 
 **Reflection:** triggered by post-quiescence debounce (30s after the last non-reflection turn) instead of the legacy queue-drain trigger. `memory.reflectionMinTurns <= 0` disables reflection entirely (queue-drain semantics treated zero as "fire every turn" which was a bug under the new debounce model).

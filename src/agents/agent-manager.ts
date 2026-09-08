@@ -119,13 +119,16 @@ export interface TurnContext {
   /**
    * KPR-313: provider tag of the stored session — set wherever sessionId is
    * resolved from the session store (runWorkItemTurn, reflection reads,
-   * voice's eligibility-filtered read). Consumed by spawnTurn's
+   * voice's candidate read). Consumed by spawnTurn's
    * session-identity guard. undefined ⇒ nothing known about the row's
    * producer (first turn, or a caller that resolved no session).
    */
   // R2 (KPR-394): widened from AgentProviderId — StoredSessionRef.provider is
   // now a string (plugin provider ids are arbitrary registered strings).
   sessionProvider?: string;
+  /** KPR-467: voice renders both forms; admission selects against the
+   * actual lease/resume. Never log this transcript-bearing payload. */
+  voicePrompt?: { latestUserMessage: string; fullConversation: string };
   /**
    * KPR-313: set ONLY by spawnTurn's session-identity guard when this turn
    * starts fresh due to a provider change; prepareSpawn prepends the handoff
@@ -1342,7 +1345,7 @@ export class AgentManager {
       const threadKey = `${ctx.agentId}:${ctx.threadId}`;
       const lease = this.warmLeases.get(threadKey);
       if (lease && !lease.isClosed) {
-        return this.runWarmTurn(lease, ctx, onStream);
+        return this.runWarmTurn(lease, this.shapeVoicePrompt(ctx, true), onStream);
       }
       if (this.isWarmPathEligible(ctx)) return this.openWarmLease(ctx, onStream);
     }
@@ -1472,6 +1475,7 @@ export class AgentManager {
         }
       }
 
+      effectiveCtx = this.shapeVoicePrompt(effectiveCtx, !!effectiveCtx.sessionId);
       if (!effectiveCtx.sessionId) this.recordSpawn(effectiveCtx.workItem.source.id);
 
       // KPR-224 + KPR-226: shape prompt + resolve model router once at the
@@ -1703,6 +1707,18 @@ export class AgentManager {
     return !!ctx.systemPromptOverride;
   }
 
+  /** Select only after admission has resolved continuity. A cleared resume
+   * stays cleared: retries must never recover a handle from the store. */
+  private shapeVoicePrompt(ctx: TurnContext, hasContinuity: boolean): TurnContext {
+    if (ctx.channel !== "voice" || ctx.kind === "reflection" || !ctx.voicePrompt) return ctx;
+    const latest = hasContinuity && ctx.voicePrompt.latestUserMessage;
+    return {
+      ...ctx,
+      ...(!latest ? { sessionId: undefined, sessionProvider: undefined, memoryDigestSeen: undefined } : {}),
+      workItem: { ...ctx.workItem, text: latest || ctx.voicePrompt.fullConversation },
+    };
+  }
+
   private isWarmPathEligible(ctx: TurnContext): boolean {
     if (!this.isWarmVoiceTurn(ctx)) return false;
     const def = this.registry.get(ctx.agentId);
@@ -1821,6 +1837,14 @@ export class AgentManager {
       },
     });
 
+    // The supplied handle is a candidate, never a new store read. A reload
+    // while admission waited may have changed its eligibility. An explicit
+    // retry with no handle remains fresh even if Mongo still has the old id.
+    if (ctx.sessionProvider && ctx.sessionProvider !== pinnedLease.opening.route.provider) {
+      ctx = { ...ctx, sessionId: undefined, sessionProvider: undefined };
+    }
+    ctx = this.shapeVoicePrompt(ctx, !!ctx.sessionId);
+
     // Published BEFORE start() deliberately (review round 1, issue 4): the
     // registry entry is what makes a second turn arriving mid-open reuse this
     // lease. Deferring the publish until after start() would send that turn
@@ -1870,10 +1894,9 @@ export class AgentManager {
       // already-degraded state — while the opened lease keeps half-open
       // probes warm mid-call (spec §5 breaker row).
       // Build the runner once; open the streaming session with resume =
-      // ctx.sessionId EXACTLY as passed (§4.2 resume-source rule — the
-      // adapter stays the single authority on resume-vs-full-prompt; the
-      // retry-shaped ctx {sessionId: undefined, full transcript} therefore
-      // opens a FRESH session and never resumes the one a retry escaped).
+      // the admitted ctx.sessionId (§4.2, amended by KPR-467): a compatible
+      // adapter candidate or undefined, never a store re-read. The retry's
+      // cleared handle therefore always opens a FRESH session.
       // KPR-390 parity with the cold path's runnerOptions (createProviderAdapter):
       // an agent with "worker-pool" in coreServers must get the in-process
       // server on a warm turn too, not just a cold one — laneAPassthrough
@@ -1958,6 +1981,7 @@ export class AgentManager {
     const permit = this.circuitBreakers.acquire(route.provider, {
       agentId: ctx.agentId,
       threadId: ctx.threadId,
+      deadlineMs: timeoutMs,
     });
 
     let runResult: RunResult;
