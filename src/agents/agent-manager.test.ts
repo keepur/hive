@@ -4615,9 +4615,14 @@ describe("AgentManager", () => {
       };
     }
 
-    it.each(["slack", "sms"] as const)("KPR-453: exact %s work identity reaches Claude send", async (kind) => {
+    it.each([
+      ["slack", " work:source/Ω#dl1 "],
+      ["slack", ""],
+      ["sms", " work:source/Ω#dl1 "],
+      ["sms", ""],
+    ] as const)("KPR-453: exact %s work identity %j reaches Claude send", async (kind, id) => {
       const item = makeWorkItem({
-        id: " work:source/Ω#dl1 ",
+        id,
         threadId: "shared-thread",
         source: { kind, id: "channel-identity", label: "Identity" },
         meta: { slackTs: "100.2", slackThreadTs: "100.1" },
@@ -4631,7 +4636,8 @@ describe("AgentManager", () => {
         slackThreadTs: "100.1",
         channelKind: kind,
       });
-      expect([context.threadId, context.slackTs, "provider-session"]).not.toContain(context.workItemId);
+      expect([context.threadId, context.slackTs, context.slackThreadTs, "provider-session"])
+        .not.toContain(context.workItemId);
     });
 
     it("KPR-453: two items sharing a thread retain independent identity", async () => {

@@ -403,7 +403,7 @@ it("KPR-453: every enabled cached MCP gets live identity without cross-runner le
     const otherRefs = names.map((_, i) => refAt(i, 1));
     otherRefs.forEach((ref, i) => expect(ref).not.toBe(refs[i]));
 
-    for (const next of [identityContext("B"), identityContext(), undefined]) {
+    for (const next of [identityContext("B"), identityContext(""), identityContext(), undefined]) {
       const nextServers = first.buildInProcessServers(next);
       expect(Object.keys(nextServers)).toEqual(names);
       for (const name of names) expect(nextServers[name]).toBe(servers[name]);
