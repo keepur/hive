@@ -34,13 +34,11 @@ function makeAgentFixture(): AgentConfig {
     icon: "",
     coreServers: ["memory", "structured-memory", "schedule", "team", "team-roster", "slack", "skill-author"],
     delegateServers: [],
-    soul:
-      "You are BenchAgent. " +
-      "You are calm, direct, and prefer evidence over speculation. ".repeat(20),
+    soul: "You are BenchAgent. " + "You are calm, direct, and prefer evidence over speculation. ".repeat(20),
     systemPrompt:
       "Role: representative system prompt for benchmark. " +
       "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(40),
-    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    autonomy: { externalComms: true, codeAccess: false },
   };
 }
 
