@@ -115,8 +115,6 @@ function makeFakeDb(): any {
 
 import { buildAdminTools } from "./admin-mcp-server.js";
 import { invalidateGeminiModelCache } from "./model-catalog-cache.js";
-// Ensure the software-engineer archetype is registered in the registry.
-await import("../archetypes/software-engineer/index.js");
 
 function getHandler(tools: any[], name: string): any {
   const t = tools.find((x) => x.name === name);
@@ -239,7 +237,7 @@ describe("admin-mcp-server — agent_create homeBase validation", () => {
   });
 });
 
-describe("agent_create — schema promotion and archetype support", () => {
+describe("agent_create — schema promotion", () => {
   beforeEach(() => {
     agentDocsStore = new Map();
     agentVersionsStore = [];
@@ -281,39 +279,6 @@ describe("agent_create — schema promotion and archetype support", () => {
       fields: { coreServers: ["admin"] },
     });
     expect(agentDocsStore.get("explicit-server-agent").coreServers).toEqual(["admin"]);
-  });
-
-  it("writes archetype, title, and archetypeConfig into the document", async () => {
-    const handler = getHandler(makeTools(), "agent_create");
-    await handler({
-      _id: "alex-test",
-      name: "Alex",
-      model: "claude-sonnet-4-6",
-      homeBase: "agent-alex",
-      roles: ["Engineering Lead"],
-      archetype: "software-engineer",
-      title: "Head of Product",
-      fields: { archetypeConfig: { workshop: "/tmp", workspaces: [] } },
-    });
-    const doc = agentDocsStore.get("alex-test");
-    expect(doc.archetype).toBe("software-engineer");
-    expect(doc.title).toBe("Head of Product");
-    expect(doc.archetypeConfig).toEqual({ workshop: "/tmp", workspaces: [] });
-  });
-
-  it("rejects unknown archetype", async () => {
-    const handler = getHandler(makeTools(), "agent_create");
-    const res = await handler({
-      _id: "bad-archetype",
-      name: "Bad",
-      model: "claude-haiku-4-5",
-      homeBase: "agent-bad",
-      roles: ["Generic"],
-      archetype: "bookkeeper",
-    });
-    expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain("Unknown archetype");
-    expect(agentDocsStore.has("bad-archetype")).toBe(false);
   });
 
   it("still requires homeBase", async () => {
@@ -454,41 +419,6 @@ describe("admin-mcp-server — agent_update homeBase passthrough", () => {
     expect(result.content[0].text).toMatch(/not found/);
   });
 
-  it("accepts archetype via top-level promotion", async () => {
-    agentDocsStore.set("alex-test", {
-      _id: "alex-test",
-      name: "Alex",
-      model: "claude-sonnet-4-6",
-      homeBase: "agent-alex",
-      coreServers: ["memory"],
-    });
-    const handler = getHandler(makeTools(), "agent_update");
-    const res = await handler({
-      agent_id: "alex-test",
-      archetype: "software-engineer",
-      title: "Head of Product",
-      fields: { archetypeConfig: { workshop: "/tmp", workspaces: [] } },
-    });
-    expect(res.isError).toBeFalsy();
-    const doc = agentDocsStore.get("alex-test");
-    expect(doc.archetype).toBe("software-engineer");
-    expect(doc.title).toBe("Head of Product");
-    expect(doc.archetypeConfig).toEqual({ workshop: "/tmp", workspaces: [] });
-  });
-
-  it("rejects unknown archetype on update", async () => {
-    agentDocsStore.set("someone", {
-      _id: "someone",
-      name: "S",
-      model: "claude-haiku-4-5",
-      homeBase: "agent-s",
-    });
-    const handler = getHandler(makeTools(), "agent_update");
-    const res = await handler({ agent_id: "someone", archetype: "bookkeeper" });
-    expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain("Unknown archetype");
-  });
-
   it("errors when no updatable fields are provided", async () => {
     agentDocsStore.set("empty-update", {
       _id: "empty-update",
@@ -546,44 +476,6 @@ describe("admin-mcp-server — agent_update homeBase passthrough", () => {
   });
 });
 
-describe("list_archetypes", () => {
-  it("returns the registered archetype catalog with discovery fields", async () => {
-    const handler = getHandler(makeTools(), "list_archetypes");
-    const result = await handler({});
-    const text = result.content[0].text as string;
-    const catalog = JSON.parse(text) as Array<{
-      id: string;
-      description: string | null;
-      whenToUse: string | null;
-      configSchema: Record<string, unknown> | null;
-    }>;
-    const se = catalog.find((c) => c.id === "software-engineer");
-    expect(se).toBeDefined();
-    expect(se?.description).toContain("codebases");
-    expect(se?.whenToUse).toContain("production code");
-    expect(se?.configSchema).toHaveProperty("workshop");
-    expect(se?.configSchema?.workshop).toMatchObject({ type: "string", required: true });
-    expect(se?.configSchema?.workspaces).toMatchObject({ type: "array", required: false });
-  });
-});
-
-describe("agent_create — archetype edge cases", () => {
-  it("accepts archetype without archetypeConfig (validateConfig runs at load time, not create)", async () => {
-    const handler = getHandler(makeTools(), "agent_create");
-    const res = await handler({
-      _id: "se-no-config",
-      name: "NoConfig",
-      model: "claude-sonnet-4-6",
-      homeBase: "agent-nc",
-      archetype: "software-engineer",
-    });
-    expect(res.isError).toBeFalsy();
-    const doc = agentDocsStore.get("se-no-config");
-    expect(doc.archetype).toBe("software-engineer");
-    expect(doc.archetypeConfig).toBeUndefined();
-  });
-});
-
 describe("verify_path", () => {
   it("returns exists+isDirectory for a real directory", async () => {
     const handler = getHandler(makeTools(), "verify_path");
@@ -635,23 +527,6 @@ describe("verify_path", () => {
     const handler = getHandler(makeTools(), "verify_path");
     const res = await handler({ path: "" });
     expect(res.isError).toBe(true);
-  });
-});
-
-describe("agent_update — archetype clear semantics", () => {
-  it("accepts empty-string archetype as an explicit clear (skips registry validation)", async () => {
-    agentDocsStore.set("to-clear", {
-      _id: "to-clear",
-      name: "TC",
-      model: "claude-sonnet-4-6",
-      homeBase: "agent-tc",
-      archetype: "software-engineer",
-    });
-    const handler = getHandler(makeTools(), "agent_update");
-    const res = await handler({ agent_id: "to-clear", archetype: "" });
-    expect(res.isError).toBeFalsy();
-    const doc = agentDocsStore.get("to-clear");
-    expect(doc.archetype).toBe("");
   });
 });
 
@@ -914,7 +789,7 @@ describe("KPR-221 — delegateServers validation rejects context-dependent serve
   // The unique-to-KPR-221 set: context-dependent but not also in-process
   // ported. Memory, structured-memory, and callback overlap with KPR-184
   // and are caught there first; the other three are uniquely caught here.
-  const CONTEXT_DEPENDENT_NEW = ["background", "code-task", "recall"];
+  const CONTEXT_DEPENDENT_NEW = ["background", "recall"];
 
   it.each(CONTEXT_DEPENDENT_NEW)("agent_create rejects delegateServers containing '%s'", async (server) => {
     const handler = getHandler(makeTools(), "agent_create");
@@ -974,7 +849,7 @@ describe("KPR-221 — delegateServers validation rejects context-dependent serve
     expect(res.isError).toBe(true);
     const text = res.content[0].text;
     // The full set is enumerated so the operator can see what to avoid.
-    for (const s of ["callback", "background", "code-task", "recall", "structured-memory", "memory"]) {
+    for (const s of ["callback", "background", "recall", "structured-memory", "memory"]) {
       expect(text).toContain(s);
     }
   });
@@ -1712,5 +1587,161 @@ describe("KPR-433 — effective envelope visibility (agent_get D3, write notes D
     expect(updateRes.content[0].text).not.toContain("Note:");
     expect(updateRes.content[0].text).not.toContain("agent_update error");
     expect(agentDocsStore.get("fable").resourceTiers).toBe(throwingResourceTiers); // the write persisted regardless
+  });
+});
+
+describe("KPR-435 — admin tools reject code-task and archetype at write time", () => {
+  beforeEach(() => {
+    agentDocsStore = new Map();
+    agentVersionsStore = [];
+  });
+
+  const create = (args: Record<string, unknown>) =>
+    getHandler(
+      makeTools(),
+      "agent_create",
+    )({
+      _id: "k435",
+      name: "K",
+      model: "claude-haiku-4-5",
+      homeBase: "agent-k435",
+      roles: ["Generic"],
+      ...args,
+    });
+
+  const update = (args: Record<string, unknown>) =>
+    getHandler(makeTools(), "agent_update")({ agent_id: "existing-agent", ...args });
+
+  // ── code-task in coreServers / delegateServers ──
+
+  it("agent_create rejects coreServers containing code-task (fields bag)", async () => {
+    const res = await create({ fields: { coreServers: ["memory", "code-task"] } });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("removed servers: code-task");
+    expect(res.content[0].text).toContain("KPR-435");
+    expect(agentDocsStore.has("k435")).toBe(false);
+  });
+
+  it("agent_create rejects delegateServers containing code-task (fields bag)", async () => {
+    const res = await create({ fields: { delegateServers: ["code-task"] } });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("removed servers: code-task");
+    expect(agentDocsStore.has("k435")).toBe(false);
+  });
+
+  it("agent_update rejects coreServers containing code-task with NO delegateServers key present", async () => {
+    // Step-5 placement guard: this exact shape (coreServers only, no
+    // delegateServers key at all) would silently pass if the check lived
+    // inside the `"delegateServers" in merged` block.
+    agentDocsStore.set("existing-agent", makeBaseAgent({ coreServers: ["memory"] }));
+    const res = await update({ fields: { coreServers: ["memory", "code-task"] } });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("removed servers: code-task");
+    // Doc must be unchanged.
+    expect(agentDocsStore.get("existing-agent").coreServers).toEqual(["memory"]);
+    expect(agentVersionsStore).toHaveLength(0);
+  });
+
+  it("agent_update rejects delegateServers containing code-task", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const res = await update({ fields: { delegateServers: ["code-task"] } });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("removed servers: code-task");
+    expect(agentDocsStore.get("existing-agent").delegateServers).toEqual([]);
+  });
+
+  // ── archetype / archetypeConfig ──
+
+  it("agent_create rejects a top-level archetype param", async () => {
+    const res = await create({ archetype: "anything" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("archetype/archetypeConfig are retired (KPR-435)");
+    expect(agentDocsStore.has("k435")).toBe(false);
+  });
+
+  it("agent_create rejects archetype in the fields bag (the pre-existing gap)", async () => {
+    const res = await create({ fields: { archetype: "anything" } });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("archetype/archetypeConfig are retired (KPR-435)");
+    expect(agentDocsStore.has("k435")).toBe(false);
+  });
+
+  it("agent_create rejects archetypeConfig alone (no archetype)", async () => {
+    const res = await create({ fields: { archetypeConfig: { workshop: "/tmp" } } });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("archetype/archetypeConfig are retired (KPR-435)");
+    expect(agentDocsStore.has("k435")).toBe(false);
+  });
+
+  it("agent_update rejects a top-level archetype param", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const res = await update({ archetype: "anything" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("archetype/archetypeConfig are retired (KPR-435)");
+    expect(agentVersionsStore).toHaveLength(0);
+  });
+
+  it("agent_update rejects an empty-string archetype (the retired clear convention)", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent({ archetype: "software-engineer" }));
+    const res = await update({ archetype: "" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("archetype/archetypeConfig are retired (KPR-435)");
+    expect(agentDocsStore.get("existing-agent").archetype).toBe("software-engineer");
+  });
+
+  it("agent_update rejects archetype in the fields bag", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const res = await update({ fields: { archetype: "anything" } });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("archetype/archetypeConfig are retired (KPR-435)");
+  });
+
+  it("agent_update rejects archetypeConfig alone (no archetype)", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const res = await update({ fields: { archetypeConfig: { workshop: "/tmp" } } });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("archetype/archetypeConfig are retired (KPR-435)");
+  });
+
+  // ── Step 10: the supported cleanup path ──
+
+  it("agent_update clears a legacy archetype via fields: { archetype: null, archetypeConfig: null }", async () => {
+    agentDocsStore.set(
+      "existing-agent",
+      makeBaseAgent({ archetype: "software-engineer", archetypeConfig: { workshop: "/tmp" } }),
+    );
+    const res = await update({ fields: { archetype: null, archetypeConfig: null } });
+    expect(res.isError).toBeFalsy();
+    const doc = agentDocsStore.get("existing-agent");
+    // The write is $set, never $unset — the keys persist with a literal null.
+    expect(doc.archetype).toBeNull();
+    expect(doc.archetypeConfig).toBeNull();
+    // Which is exactly what makes the registry's `rawDoc.archetype != null`
+    // load-time check (KPR-435, agent-registry.ts) stop logging on the doc.
+    expect(doc.archetype != null).toBe(false);
+    expect(doc.archetypeConfig != null).toBe(false);
+  });
+
+  // ── Regression guard: ordinary writes must not false-positive ──
+
+  it("agent_create with none of these fields still succeeds", async () => {
+    const res = await create({ fields: { coreServers: ["memory", "slack"], delegateServers: ["google"] } });
+    expect(res.isError).toBeFalsy();
+    const doc = agentDocsStore.get("k435");
+    expect(doc.coreServers).toEqual(["memory", "slack"]);
+    expect(doc.delegateServers).toEqual(["google"]);
+    expect(doc.archetype).toBeUndefined();
+    expect(doc.archetypeConfig).toBeUndefined();
+  });
+
+  it("agent_update with none of these fields still succeeds", async () => {
+    agentDocsStore.set("existing-agent", makeBaseAgent());
+    const res = await update({ fields: { coreServers: ["memory", "slack"] } });
+    expect(res.isError).toBeFalsy();
+    expect(agentDocsStore.get("existing-agent").coreServers).toEqual(["memory", "slack"]);
+  });
+
+  it("list_archetypes is no longer registered", () => {
+    expect(makeTools().find((t: any) => t.name === "list_archetypes")).toBeUndefined();
   });
 });
