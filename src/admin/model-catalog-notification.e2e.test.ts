@@ -99,11 +99,13 @@ import { rmSync } from "node:fs";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AgentDefinition } from "../types/agent-definition.js";
 import { JOURNALED } from "./model-catalog-export.js";
+import { digest, noticePrompt, type NoticeBinding } from "./model-catalog-notification.js";
 import { copy } from "./model-catalog-outbox.js";
 import type { CatalogChangeDoc, CatalogDoc, CatalogVersion } from "./model-catalog-types.js";
 import { CatalogError } from "./model-catalog-value.js";
 import {
   createCatalogNotificationHarness,
+  DEFAULT_DISCOVERY,
   makeCatalogAgent,
   startCatalogNotificationMongo,
   type CatalogNotificationHarness,
@@ -126,7 +128,7 @@ function installExternalFetch(fetch: typeof externalSlack.fetch): void {
 async function assignments(db: CatalogNotificationHarness["db"]) {
   return {
     definitions: await db.collection<AgentDefinition>(AGENTS).find().sort({ _id: 1 }).toArray(),
-    versionCount: await db.collection(AGENT_VERSIONS).countDocuments(),
+    versions: await db.collection(AGENT_VERSIONS).find().sort({ _id: 1 }).toArray(),
   };
 }
 
@@ -136,6 +138,197 @@ async function providerState(db: CatalogNotificationHarness["db"], provider: str
     versions: await db.collection<CatalogVersion>(VERSIONS).find({ provider }).sort({ revision: 1 }).toArray(),
     changes: await db.collection<CatalogChangeDoc>(CHANGES).find({ provider }).sort({ revision: 1 }).toArray(),
   };
+}
+
+type ProviderState = Awaited<ReturnType<typeof providerState>>;
+type ExpectedRoute = NoticeBinding;
+
+const DEFAULT_NOTICE_ROUTE: ExpectedRoute = {
+  agentId: "chief-of-staff",
+  homeBase: "CNOTICE1",
+  adapterId: "slack",
+  channelId: "CNOTICE1",
+};
+
+function immutableChange(row: CatalogVersion | CatalogChangeDoc) {
+  return {
+    _id: row._id,
+    provider: row.provider,
+    revision: row.revision,
+    snapshotId: row.snapshotId,
+    createdAt: row.createdAt,
+    source: row.source,
+    updatedBy: row.updatedBy,
+    modelCount: row.modelCount,
+    bootstrap: row.bootstrap,
+    added: row.added,
+    removed: row.removed,
+  };
+}
+
+function expectCatalogHistoryUnchanged(before: ProviderState, after: ProviderState): void {
+  expect(after.catalog).toEqual(before.catalog);
+  expect(after.versions).toEqual(before.versions);
+  expect(after.changes.map(immutableChange)).toEqual(before.changes.map(immutableChange));
+}
+
+function expectCompleteProviderState(
+  state: ProviderState,
+  expected: {
+    provider: string;
+    models: unknown[];
+    revision: number;
+    source: "manual" | "discovery";
+    updatedBy: string;
+    scanOutcome?: "succeeded" | "failed";
+    versionRevisions: number[];
+    changeRevisions: number[];
+    deliveryStates: Array<CatalogChangeDoc["delivery"]["state"]>;
+  },
+): CatalogDoc {
+  const catalog = state.catalog;
+  expect(catalog).not.toBeNull();
+  if (!catalog) throw new Error(`Missing ${expected.provider} catalog`);
+
+  expect(state.versions.map(({ revision }) => revision)).toEqual(expected.versionRevisions);
+  expect(state.changes.map(({ revision }) => revision)).toEqual(expected.changeRevisions);
+  expect(state.changes.map(({ delivery }) => delivery.state)).toEqual(expected.deliveryStates);
+  expect(new Set(state.versions.map(({ _id }) => _id)).size).toBe(state.versions.length);
+  expect(new Set(state.changes.map(({ _id }) => _id)).size).toBe(state.changes.length);
+
+  const latest = state.versions.at(-1);
+  expect(latest).toBeDefined();
+  if (!latest) throw new Error(`Missing ${expected.provider} history`);
+  expect(catalog).toEqual({
+    _id: expected.provider,
+    provider: expected.provider,
+    models: expected.models,
+    updatedAt: expect.any(Date),
+    updatedBy: expected.updatedBy,
+    source: expected.source,
+    revision: expected.revision,
+    commitId: latest._id,
+    snapshotId: latest.snapshotId,
+    ...(expected.scanOutcome
+      ? {
+          scan: {
+            attemptId: expect.any(String),
+            startedAt: expect.any(Date),
+            finishedAt: expect.any(Date),
+            outcome: expected.scanOutcome,
+            lastSucceededAt: expect.any(Date),
+            ...(expected.scanOutcome === "failed"
+              ? { error: { code: expect.any(String), message: expect.any(String) } }
+              : {}),
+          },
+        }
+      : {}),
+  });
+  expect(catalog.models).toEqual(latest.snapshot);
+  expect(catalog).not.toHaveProperty("pendingExport");
+
+  for (const version of state.versions) {
+    expect(version).toEqual({
+      _id: expect.any(String),
+      provider: expected.provider,
+      revision: expect.any(Number),
+      snapshotId: expect.any(String),
+      createdAt: expect.any(Date),
+      source: expect.stringMatching(/^(manual|discovery)$/),
+      updatedBy: expect.any(String),
+      modelCount: version.snapshot.length,
+      bootstrap: expect.any(Boolean),
+      added: expect.any(Array),
+      removed: expect.any(Array),
+      snapshot: expect.any(Array),
+      changeSummary: expect.any(String),
+    });
+    for (const model of version.snapshot) {
+      expect(model).toEqual({
+        id: expect.any(String),
+        displayName: expect.any(String),
+        addedAt: expect.any(Date),
+        ...(Object.hasOwn(model, "notes") ? { notes: expect.any(String) } : {}),
+      });
+    }
+  }
+  for (const change of state.changes) {
+    const version = state.versions.find(({ revision }) => revision === change.revision);
+    expect(version).toBeDefined();
+    expect(immutableChange(change)).toEqual(immutableChange(version!));
+  }
+
+  return catalog;
+}
+
+function expectSingleExactTurn(
+  turns: CatalogNotificationHarness["turns"],
+  change: CatalogChangeDoc,
+  route: ExpectedRoute,
+): void {
+  const matching = turns.filter(
+    ({ agentId, workItem }) => agentId === route.agentId && workItem.meta?.catalogCommitId === change._id,
+  );
+  expect(matching).toHaveLength(1);
+  expect(matching[0]).toEqual({
+    agentId: route.agentId,
+    workItem: {
+      id: `catalog-change:${change._id}`,
+      sender: "system",
+      text: noticePrompt(change),
+      threadId: `catalog-change:${change._id}:${digest(route.agentId)}`,
+      timestamp: change.createdAt,
+      source: { kind: "slack", id: route.channelId, label: route.homeBase, adapterId: route.adapterId },
+      meta: {
+        systemNotification: "catalog-change",
+        catalogCommitId: change._id,
+        targetAgentId: route.agentId,
+      },
+    },
+  });
+  expect(matching[0]!.workItem.text).toContain(
+    `Provider: ${JSON.stringify(change.provider)}; revision: ${change.revision}; source: ${change.source}`,
+  );
+  expect(matching[0]!.workItem.text).toContain(`Change: ${change._id}; models: ${change.modelCount}`);
+  expect(matching[0]!.workItem.text.length).toBeLessThanOrEqual(12_000);
+}
+
+function expectDeliveredTransport(
+  posts: CatalogNotificationHarness["posts"],
+  change: CatalogChangeDoc,
+  route: ExpectedRoute,
+  matchingAttemptCount = 1,
+): void {
+  const { delivery } = change;
+  expect(delivery.state).toBe("delivered");
+  expect(delivery.claim).toBeUndefined();
+  expect(delivery.preparation).toEqual({
+    id: expect.any(String),
+    binding: route,
+    processedAt: expect.any(Date),
+    text: expect.any(String),
+  });
+  expect(delivery.preparation!.text.length).toBeLessThanOrEqual(3_900);
+  expect(delivery.preparation!.text).toContain(
+    `Provider: ${JSON.stringify(change.provider)}; revision: ${change.revision}; source: ${change.source}`,
+  );
+  expect(delivery.preparation!.text).toContain(`Change: ${change._id}; models: ${change.modelCount}`);
+  expect(delivery.receipt).toEqual({
+    preparationId: delivery.preparation!.id,
+    binding: route,
+    channelId: route.channelId,
+    messageTs: expect.any(String),
+    acknowledgedAt: expect.any(Date),
+  });
+  const matchingPosts = posts.filter(
+    ({ channel, text }) => channel === route.channelId && text === delivery.preparation!.text,
+  );
+  expect(matchingPosts).toHaveLength(matchingAttemptCount);
+  expect(matchingPosts).toContainEqual({
+    channel: route.channelId,
+    text: delivery.preparation!.text,
+    returned: { ok: true, channel: route.channelId, ts: delivery.receipt!.messageTs },
+  });
 }
 
 async function ageCompletedScan(
@@ -252,6 +445,10 @@ describe("catalog notification application E2E", () => {
     const assignmentBefore = await assignments(harness.db);
 
     await harness.scanner.tick();
+    const beforeDelivery = new Map<string, ProviderState>();
+    for (const provider of ["claude", "codex", "grok"] as const) {
+      beforeDelivery.set(provider, await providerState(harness.db, provider));
+    }
     await harness.notifier.tick();
 
     expect(discoveries.sort()).toEqual(["claude", "codex", "grok"]);
@@ -266,6 +463,20 @@ describe("catalog notification application E2E", () => {
 
     for (const provider of ["claude", "codex", "grok"] as const) {
       const state = await providerState(harness.db, provider);
+      expectCatalogHistoryUnchanged(beforeDelivery.get(provider)!, state);
+      expectCompleteProviderState(state, {
+        provider,
+        models: [
+          { id: `${provider}-primary`, displayName: `${provider.toUpperCase()} Primary`, addedAt: expect.any(Date) },
+        ],
+        revision: 1,
+        source: "discovery",
+        updatedBy: "system:model-catalog-scanner",
+        scanOutcome: "succeeded",
+        versionRevisions: [1],
+        changeRevisions: [1],
+        deliveryStates: ["delivered"],
+      });
       expect(state.catalog).toMatchObject({
         _id: provider,
         provider,
@@ -315,29 +526,11 @@ describe("catalog notification application E2E", () => {
         },
       });
       const turn = harness.turns.find(({ workItem }) => workItem.meta?.catalogCommitId === state.changes[0]?._id);
-      expect(turn).toMatchObject({
-        agentId: "chief-of-staff",
-        workItem: {
-          id: `catalog-change:${state.changes[0]?._id}`,
-          sender: "system",
-          source: { kind: "slack", id: "CNOTICE1", label: "CNOTICE1", adapterId: "slack" },
-          meta: {
-            systemNotification: "catalog-change",
-            catalogCommitId: state.changes[0]?._id,
-            targetAgentId: "chief-of-staff",
-          },
-        },
-      });
+      expectSingleExactTurn(harness.turns, state.changes[0]!, DEFAULT_NOTICE_ROUTE);
+      expectDeliveredTransport(harness.posts, state.changes[0]!, DEFAULT_NOTICE_ROUTE);
       expect(turn?.workItem.text).toContain("Initial catalog seed");
       expect(turn?.workItem.text).toContain(`Provider: "${provider}"`);
       expect(turn?.workItem.text).toContain("Historical revision; it may no longer be the latest catalog.");
-    }
-    for (const post of harness.posts) {
-      expect(post).toMatchObject({
-        channel: "CNOTICE1",
-        text: expect.stringContaining("processed this catalog notice"),
-        returned: { ok: true, channel: "CNOTICE1", ts: expect.stringMatching(/^1900000000\./) },
-      });
     }
     expect(await assignments(harness.db)).toEqual(assignmentBefore);
   });
@@ -358,9 +551,11 @@ describe("catalog notification application E2E", () => {
         },
       ],
     });
+    const bootstrapPending = await providerState(harness.db, "sol");
     await harness.notifier.tick();
 
     const first = await providerState(harness.db, "sol");
+    expectCatalogHistoryUnchanged(bootstrapPending, first);
     expect(first.catalog).toMatchObject({
       _id: "sol",
       models: [{ id: "sol-a", displayName: "Sol A", notes: "operator note", addedAt: expect.any(Date) }],
@@ -407,9 +602,11 @@ describe("catalog notification application E2E", () => {
         changeSummary: "order only",
       }),
     ).resolves.toMatchObject({ content: [{ text: expect.stringContaining("+0, -0") }] });
+    const beforeSecondDelivery = await providerState(harness.db, "sol");
     await harness.notifier.tick();
 
     const final = await providerState(harness.db, "sol");
+    expectCatalogHistoryUnchanged(beforeSecondDelivery, final);
     expect(final.catalog).toMatchObject({
       revision: 5,
       models: [
@@ -434,6 +631,28 @@ describe("catalog notification application E2E", () => {
     expect(final.changes.every((change) => change.delivery.state === "delivered")).toBe(true);
     expect(harness.turns).toHaveLength(2);
     expect(harness.posts).toHaveLength(2);
+    expectCompleteProviderState(final, {
+      provider: "sol",
+      models: [
+        { id: "sol-b", displayName: "Sol B", addedAt: expect.any(Date) },
+        {
+          id: "sol-a",
+          displayName: "Renamed Sol A",
+          notes: "revised note",
+          addedAt: first.catalog?.models?.[0]?.addedAt,
+        },
+      ],
+      revision: 5,
+      source: "manual",
+      updatedBy: "test-operator",
+      versionRevisions: [1, 2, 3, 4, 5],
+      changeRevisions: [1, 4],
+      deliveryStates: ["delivered", "delivered"],
+    });
+    for (const change of final.changes) {
+      expectSingleExactTurn(harness.turns, change, DEFAULT_NOTICE_ROUTE);
+      expectDeliveredTransport(harness.posts, change, DEFAULT_NOTICE_ROUTE);
+    }
     expect(await assignments(harness.db)).toEqual(assignmentBefore);
   });
 
@@ -452,10 +671,10 @@ describe("catalog notification application E2E", () => {
     });
     const assignmentBefore = await assignments(harness.db);
     await harness.scanner.tick();
-    const originallySeeded = new Map<string, CatalogDoc>();
+    const originallySeeded = new Map<string, ProviderState>();
     for (const provider of ["claude", "codex", "grok"]) {
-      const aged = await ageCompletedScan(harness.db, provider);
-      originallySeeded.set(provider, copy(aged));
+      await ageCompletedScan(harness.db, provider);
+      originallySeeded.set(provider, copy(await providerState(harness.db, provider)));
     }
 
     await harness.scanner.tick();
@@ -466,8 +685,12 @@ describe("catalog notification application E2E", () => {
     expect(harness.turns).toEqual([]);
     expect(harness.posts).toEqual([]);
     for (const provider of ["claude", "grok"]) {
-      const before = originallySeeded.get(provider)!;
-      const after = (await providerState(harness.db, provider)).catalog!;
+      const beforeState = originallySeeded.get(provider)!;
+      const before = beforeState.catalog!;
+      const state = await providerState(harness.db, provider);
+      const after = state.catalog!;
+      expect(state.versions).toEqual(beforeState.versions);
+      expect(state.changes).toEqual(beforeState.changes);
       expect(after.models).toEqual(before.models);
       expect(after.revision).toBe(1);
       expect(after.commitId).toBe(before.commitId);
@@ -480,9 +703,24 @@ describe("catalog notification application E2E", () => {
       expect(after.scan?.attemptId).not.toBe(before.scan?.attemptId);
       expect(after.scan?.lastSucceededAt?.getTime()).toBeGreaterThan(before.scan!.lastSucceededAt!.getTime());
       expect(after.scan?.error).toBeUndefined();
+      expectCompleteProviderState(state, {
+        provider,
+        models: before.models!,
+        revision: 1,
+        source: "discovery",
+        updatedBy: "system:model-catalog-scanner",
+        scanOutcome: "succeeded",
+        versionRevisions: [1],
+        changeRevisions: [1],
+        deliveryStates: ["pending"],
+      });
     }
-    const codexBefore = originallySeeded.get("codex")!;
-    const codexAfter = (await providerState(harness.db, "codex")).catalog!;
+    const codexBeforeState = originallySeeded.get("codex")!;
+    const codexBefore = codexBeforeState.catalog!;
+    const codexState = await providerState(harness.db, "codex");
+    const codexAfter = codexState.catalog!;
+    expect(codexState.versions).toEqual(codexBeforeState.versions);
+    expect(codexState.changes).toEqual(codexBeforeState.changes);
     expect(codexAfter.models).toEqual(codexBefore.models);
     expect(codexAfter.revision).toBe(1);
     expect(codexAfter.commitId).toBe(codexBefore.commitId);
@@ -495,6 +733,17 @@ describe("catalog notification application E2E", () => {
       error: { code: "auth", message: "Model catalog codex: auth." },
     });
     expect(codexAfter.scan?.attemptId).not.toBe(codexBefore.scan?.attemptId);
+    expectCompleteProviderState(codexState, {
+      provider: "codex",
+      models: codexBefore.models!,
+      revision: 1,
+      source: "discovery",
+      updatedBy: "system:model-catalog-scanner",
+      scanOutcome: "failed",
+      versionRevisions: [1],
+      changeRevisions: [1],
+      deliveryStates: ["pending"],
+    });
     const pending = await harness.db.collection<CatalogChangeDoc>(CHANGES).find().toArray();
     expect(pending).toHaveLength(3);
     expect(pending.every((change) => change.delivery.state === "pending" && change.delivery.attempts === 0)).toBe(true);
@@ -592,7 +841,43 @@ describe("catalog notification application E2E", () => {
 
     await harness.notifier.tick();
     const delivered = await providerState(harness.db, "codex");
+    expectCatalogHistoryUnchanged(final, delivered);
     expect(delivered.changes.every((change) => change.delivery.state === "delivered")).toBe(true);
+    expectCompleteProviderState(delivered, {
+      provider: "codex",
+      models: [
+        { id: "model-b", displayName: "Discovery B2", addedAt: expect.any(Date) },
+        { id: "model-a", displayName: "Discovery A2", notes: "retain this note", addedAt: initialAddedAt },
+      ],
+      revision: 3,
+      source: "discovery",
+      updatedBy: "system:model-catalog-scanner",
+      scanOutcome: "succeeded",
+      versionRevisions: [1, 2, 3],
+      changeRevisions: [1, 2, 3],
+      deliveryStates: ["delivered", "delivered", "delivered"],
+    });
+    for (const provider of ["claude", "grok"] as const) {
+      expectCompleteProviderState(await providerState(harness.db, provider), {
+        provider,
+        models: [{ id: `${provider}-only`, displayName: `${provider} only`, addedAt: expect.any(Date) }],
+        revision: 1,
+        source: "discovery",
+        updatedBy: "system:model-catalog-scanner",
+        scanOutcome: "succeeded",
+        versionRevisions: [1],
+        changeRevisions: [1],
+        deliveryStates: ["delivered"],
+      });
+    }
+    const allDelivered = await harness.db.collection<CatalogChangeDoc>(CHANGES).find().toArray();
+    expect(allDelivered).toHaveLength(5);
+    expect(harness.turns).toHaveLength(5);
+    expect(harness.posts).toHaveLength(5);
+    for (const change of allDelivered) {
+      expectSingleExactTurn(harness.turns, change, DEFAULT_NOTICE_ROUTE);
+      expectDeliveredTransport(harness.posts, change, DEFAULT_NOTICE_ROUTE);
+    }
     const codexIds = new Set(delivered.changes.map((change) => change._id));
     const historicalTurns = harness.turns.filter(({ workItem }) =>
       codexIds.has(String(workItem.meta?.catalogCommitId)),
@@ -607,6 +892,7 @@ describe("catalog notification application E2E", () => {
 
   it("keeps scanner and manual events pending across invalid recipients and routes every event after repair", async () => {
     harness = await createCatalogNotificationHarness({ installExternalFetch });
+    const assignmentVersionsBefore = (await assignments(harness.db)).versions;
     const definitions = harness.db.collection<AgentDefinition>(AGENTS);
     await definitions.deleteMany({});
     await definitions.insertOne(
@@ -674,9 +960,13 @@ describe("catalog notification application E2E", () => {
     ]);
     expect(harness.turns).toEqual([]);
     expect(harness.posts).toEqual([]);
-    expect((await providerState(harness.db, "sol")).versions).toHaveLength(3);
+    const unresolvedStates = new Map<string, ProviderState>();
+    const unresolvedSol = await providerState(harness.db, "sol");
+    unresolvedStates.set("sol", unresolvedSol);
+    expect(unresolvedSol.versions).toHaveLength(3);
     for (const provider of ["claude", "codex", "grok"]) {
       const state = await providerState(harness.db, provider);
+      unresolvedStates.set(provider, state);
       expect(state.catalog).toMatchObject({ revision: 1, scan: { outcome: "succeeded" } });
       expect(state.versions).toHaveLength(1);
       expect(state.changes).toHaveLength(1);
@@ -713,7 +1003,45 @@ describe("catalog notification application E2E", () => {
     expect(harness.turns).toHaveLength(6);
     expect(harness.posts).toHaveLength(6);
     expect(harness.posts.every((post) => post.channel === "CNOTICE1")).toBe(true);
-    expect(await assignments(harness.db)).toEqual(assignmentAtRepair);
+    const repairedRoute = { ...DEFAULT_NOTICE_ROUTE, homeBase: "catalog-notices" };
+    for (const provider of ["claude", "codex", "grok"] as const) {
+      const state = await providerState(harness.db, provider);
+      expectCatalogHistoryUnchanged(unresolvedStates.get(provider)!, state);
+      expectCompleteProviderState(state, {
+        provider,
+        models: DEFAULT_DISCOVERY[provider].map((model) => ({ ...model, addedAt: expect.any(Date) })),
+        revision: 1,
+        source: "discovery",
+        updatedBy: "system:model-catalog-scanner",
+        scanOutcome: "succeeded",
+        versionRevisions: [1],
+        changeRevisions: [1],
+        deliveryStates: ["delivered"],
+      });
+    }
+    const finalSol = await providerState(harness.db, "sol");
+    expectCatalogHistoryUnchanged(unresolvedSol, finalSol);
+    expectCompleteProviderState(finalSol, {
+      provider: "sol",
+      models: [
+        { id: "sol-a", displayName: "Sol A", addedAt: expect.any(Date) },
+        { id: "sol-b", displayName: "Sol B", addedAt: expect.any(Date) },
+        { id: "sol-c", displayName: "Sol C", addedAt: expect.any(Date) },
+      ],
+      revision: 3,
+      source: "manual",
+      updatedBy: "test-operator",
+      versionRevisions: [1, 2, 3],
+      changeRevisions: [1, 2, 3],
+      deliveryStates: ["delivered", "delivered", "delivered"],
+    });
+    for (const change of delivered) {
+      expectSingleExactTurn(harness.turns, change, repairedRoute);
+      expectDeliveredTransport(harness.posts, change, repairedRoute);
+    }
+    const assignmentAfter = await assignments(harness.db);
+    expect(assignmentAfter).toEqual(assignmentAtRepair);
+    expect(assignmentAfter.versions).toEqual(assignmentVersionsBefore);
   });
 
   it.each(applicationRetryCases)(
@@ -732,8 +1060,19 @@ describe("catalog notification application E2E", () => {
         const assignmentBefore = await assignments(first.db);
         await first.manual({ provider: "sol", models: [{ id: "sol-refusal", displayName: "Sol Refusal" }] });
         await first.notifier.tick();
-        const pending = (await providerState(first.db, "sol")).changes[0]!;
+        const pendingState = await providerState(first.db, "sol");
+        const pending = pendingState.changes[0]!;
         const preparation = copy(pending.delivery.preparation!);
+        expectCompleteProviderState(pendingState, {
+          provider: "sol",
+          models: [{ id: "sol-refusal", displayName: "Sol Refusal", addedAt: expect.any(Date) }],
+          revision: 1,
+          source: "manual",
+          updatedBy: "test-operator",
+          versionRevisions: [1],
+          changeRevisions: [1],
+          deliveryStates: ["pending"],
+        });
         expect(pending.delivery).toMatchObject({
           state: "pending",
           attempts: 1,
@@ -744,6 +1083,7 @@ describe("catalog notification application E2E", () => {
         expect(pending.delivery.claim).toBeUndefined();
         expect(pending.delivery.receipt).toBeUndefined();
         expect(first.turns).toHaveLength(1);
+        expectSingleExactTurn(first.turns, pending, DEFAULT_NOTICE_ROUTE);
         expect(first.posts).toEqual([{ channel: "CNOTICE1", text: preparation.text, returned }]);
 
         await first.close();
@@ -761,7 +1101,19 @@ describe("catalog notification application E2E", () => {
         await restarted.notifier.tick();
         await restarted.notifier.tick();
 
-        const final = (await providerState(restarted.db, "sol")).changes[0]!;
+        const finalState = await providerState(restarted.db, "sol");
+        const final = finalState.changes[0]!;
+        expectCatalogHistoryUnchanged(pendingState, finalState);
+        expectCompleteProviderState(finalState, {
+          provider: "sol",
+          models: [{ id: "sol-refusal", displayName: "Sol Refusal", addedAt: expect.any(Date) }],
+          revision: 1,
+          source: "manual",
+          updatedBy: "test-operator",
+          versionRevisions: [1],
+          changeRevisions: [1],
+          deliveryStates: ["delivered"],
+        });
         expect(final.delivery).toMatchObject({
           state: "delivered",
           attempts: 2,
@@ -782,6 +1134,7 @@ describe("catalog notification application E2E", () => {
             returned: { ok: true, channel: "CNOTICE1", ts: expect.stringMatching(/^1900000000\./) },
           },
         ]);
+        expectDeliveredTransport([...first.posts, ...restarted.posts], final, DEFAULT_NOTICE_ROUTE, 2);
         expect(await assignments(restarted.db)).toEqual(assignmentBefore);
       } finally {
         await first?.close();
@@ -895,6 +1248,34 @@ describe("catalog notification application E2E", () => {
 
       await harness.notifier.tick();
       const delivered = await providerState(harness.db, "codex");
+      expectCatalogHistoryUnchanged(recovered, delivered);
+      expectCompleteProviderState(delivered, {
+        provider: "codex",
+        models: [
+          { id: "codex-a", displayName: "CODEX A renamed", addedAt: retainedAddedAt },
+          { id: "codex-b", displayName: "CODEX B", addedAt: expect.any(Date) },
+        ],
+        revision: 2,
+        source: "discovery",
+        updatedBy: "system:model-catalog-scanner",
+        scanOutcome: "succeeded",
+        versionRevisions: [1, 2],
+        changeRevisions: [1, 2],
+        deliveryStates: ["delivered", "delivered"],
+      });
+      for (const provider of ["claude", "grok"] as const) {
+        expectCompleteProviderState(await providerState(harness.db, provider), {
+          provider,
+          models: [{ id: `${provider}-a`, displayName: `${provider.toUpperCase()} A`, addedAt: expect.any(Date) }],
+          revision: 1,
+          source: "discovery",
+          updatedBy: "system:model-catalog-scanner",
+          scanOutcome: "succeeded",
+          versionRevisions: [1],
+          changeRevisions: [1],
+          deliveryStates: ["delivered"],
+        });
+      }
       expect(delivered.changes[1]?.delivery).toMatchObject({
         state: "delivered",
         attempts: 1,
@@ -903,6 +1284,14 @@ describe("catalog notification application E2E", () => {
       });
       expect(harness.posts).toHaveLength(initialPosts + 1);
       expect(harness.posts.at(-1)?.text).toContain('Added IDs: "codex-b"');
+      const allDelivered = await harness.db.collection<CatalogChangeDoc>(CHANGES).find().toArray();
+      expect(allDelivered).toHaveLength(4);
+      expect(harness.turns).toHaveLength(4);
+      expect(harness.posts).toHaveLength(4);
+      for (const change of allDelivered) {
+        expectSingleExactTurn(harness.turns, change, DEFAULT_NOTICE_ROUTE);
+        expectDeliveredTransport(harness.posts, change, DEFAULT_NOTICE_ROUTE);
+      }
       expect(await assignments(harness.db)).toEqual(assignmentBefore);
     } finally {
       await harness?.close();
@@ -953,7 +1342,8 @@ describe("catalog notification application E2E", () => {
       await localReceipt.manual({ provider: "sol", models: [{ id: "sol-a", displayName: "Sol A" }] });
       const receiptFlight = localReceipt.notifier.tick();
       await ackNegative.promise;
-      const whileUnknown = (await providerState(localReceipt.db, "sol")).changes[0]!;
+      const whileUnknownState = await providerState(localReceipt.db, "sol");
+      const whileUnknown = whileUnknownState.changes[0]!;
       expect(whileUnknown.delivery).toMatchObject({
         state: "claimed",
         attempts: 1,
@@ -965,7 +1355,19 @@ describe("catalog notification application E2E", () => {
       expect(delayedResult.acknowledged).toBe(true);
       expect(delayedResult.matchedCount).toBe(1);
       await receiptFlight;
-      const settled = (await providerState(localReceipt.db, "sol")).changes[0]!;
+      const settledState = await providerState(localReceipt.db, "sol");
+      const settled = settledState.changes[0]!;
+      expectCatalogHistoryUnchanged(whileUnknownState, settledState);
+      expectCompleteProviderState(settledState, {
+        provider: "sol",
+        models: [{ id: "sol-a", displayName: "Sol A", addedAt: expect.any(Date) }],
+        revision: 1,
+        source: "manual",
+        updatedBy: "test-operator",
+        versionRevisions: [1],
+        changeRevisions: [1],
+        deliveryStates: ["delivered"],
+      });
       expect(settled.delivery).toMatchObject({
         state: "delivered",
         attempts: 1,
@@ -978,6 +1380,8 @@ describe("catalog notification application E2E", () => {
       });
       expect(localReceipt.turns).toHaveLength(1);
       expect(localReceipt.posts).toHaveLength(1);
+      expectSingleExactTurn(localReceipt.turns, settled, DEFAULT_NOTICE_ROUTE);
+      expectDeliveredTransport(localReceipt.posts, settled, DEFAULT_NOTICE_ROUTE);
       await localReceipt.close();
       localReceipt = undefined;
       harness = undefined;
@@ -1003,7 +1407,8 @@ describe("catalog notification application E2E", () => {
       });
       crashFlight = crashWorker.notifier.tick();
       await crashPostEntered.promise;
-      const beforeCrash = (await providerState(crashWorker.db, "sol")).changes[1]!;
+      const beforeCrashState = await providerState(crashWorker.db, "sol");
+      const beforeCrash = beforeCrashState.changes[1]!;
       const crashPreparation = copy(beforeCrash.delivery.preparation!);
       expect(beforeCrash.delivery).toMatchObject({
         state: "claimed",
@@ -1075,9 +1480,25 @@ describe("catalog notification application E2E", () => {
       ]);
       expect([...crashPosts, ...recoveredWorker.posts].map((post) => post.channel)).toEqual(["CNOTICE1", "CNOTICE1"]);
       const sol = await providerState(recoveredWorker.db, "sol");
+      expectCatalogHistoryUnchanged(beforeCrashState, sol);
       expect(sol.versions).toHaveLength(2);
       expect(sol.changes).toHaveLength(2);
       expect(sol.changes.every((change) => change.delivery.state === "delivered")).toBe(true);
+      expectCompleteProviderState(sol, {
+        provider: "sol",
+        models: [
+          { id: "sol-a", displayName: "Sol A", addedAt: expect.any(Date) },
+          { id: "sol-b", displayName: "Sol B", addedAt: expect.any(Date) },
+        ],
+        revision: 2,
+        source: "manual",
+        updatedBy: "test-operator",
+        versionRevisions: [1, 2],
+        changeRevisions: [1, 2],
+        deliveryStates: ["delivered", "delivered"],
+      });
+      expectSingleExactTurn(crashTurns, recovered, DEFAULT_NOTICE_ROUTE);
+      expectDeliveredTransport([...crashPosts, ...recoveredWorker.posts], recovered, DEFAULT_NOTICE_ROUTE, 2);
       expect(await assignments(recoveredWorker.db)).toEqual(assignmentBefore);
     } finally {
       await localReceipt?.close();
@@ -1101,10 +1522,22 @@ describe("catalog notification application E2E", () => {
         return slackJson({ ok: true, channel: request.body.get("channel"), ts: "1920000000.000001" });
       },
     });
+    const assignmentVersionsBefore = (await assignments(harness.db)).versions;
     await harness.manual({ provider: "sol", models: [{ id: "sol-rebind", displayName: "Sol Rebind" }] });
     await harness.notifier.tick();
-    const original = (await providerState(harness.db, "sol")).changes[0]!;
+    const originalState = await providerState(harness.db, "sol");
+    const original = originalState.changes[0]!;
     const firstPreparation = copy(original.delivery.preparation!);
+    expectCompleteProviderState(originalState, {
+      provider: "sol",
+      models: [{ id: "sol-rebind", displayName: "Sol Rebind", addedAt: expect.any(Date) }],
+      revision: 1,
+      source: "manual",
+      updatedBy: "test-operator",
+      versionRevisions: [1],
+      changeRevisions: [1],
+      deliveryStates: ["pending"],
+    });
     expect(original.delivery).toMatchObject({
       state: "pending",
       attempts: 1,
@@ -1114,6 +1547,7 @@ describe("catalog notification application E2E", () => {
     });
     expect(harness.posts).toHaveLength(1);
     expect(harness.posts[0]).toMatchObject({ channel: "CNOTICE1", text: firstPreparation.text });
+    expectSingleExactTurn(harness.turns, original, DEFAULT_NOTICE_ROUTE);
 
     const definitions = harness.db.collection<AgentDefinition>(AGENTS);
     await definitions.updateOne({ _id: "chief-of-staff" }, { $set: { isDefault: false, updatedAt: new Date() } });
@@ -1133,6 +1567,17 @@ describe("catalog notification application E2E", () => {
     await harness.notifier.tick();
 
     const finalState = await providerState(harness.db, "sol");
+    expectCatalogHistoryUnchanged(originalState, finalState);
+    expectCompleteProviderState(finalState, {
+      provider: "sol",
+      models: [{ id: "sol-rebind", displayName: "Sol Rebind", addedAt: expect.any(Date) }],
+      revision: 1,
+      source: "manual",
+      updatedBy: "test-operator",
+      versionRevisions: [1],
+      changeRevisions: [1],
+      deliveryStates: ["delivered"],
+    });
     expect(finalState.versions).toHaveLength(1);
     expect(finalState.changes).toHaveLength(1);
     const final = finalState.changes[0]!;
@@ -1157,6 +1602,16 @@ describe("catalog notification application E2E", () => {
     expect(harness.posts.map((post) => post.channel)).toEqual(["CNOTICE1", "CNOTICE2"]);
     expect(harness.posts[0]?.returned).toEqual({ threw: "catalog test transport outcome unknown" });
     expect(harness.posts[1]?.returned).toEqual({ ok: true, channel: "CNOTICE2", ts: "1920000000.000001" });
-    expect(await assignments(harness.db)).toEqual(assignmentAtRepair);
+    const currentRoute: ExpectedRoute = {
+      agentId: "current-chief",
+      homeBase: "CNOTICE2",
+      adapterId: "slack",
+      channelId: "CNOTICE2",
+    };
+    expectSingleExactTurn(harness.turns, final, currentRoute);
+    expectDeliveredTransport(harness.posts, final, currentRoute);
+    const assignmentAfter = await assignments(harness.db);
+    expect(assignmentAfter).toEqual(assignmentAtRepair);
+    expect(assignmentAfter.versions).toEqual(assignmentVersionsBefore);
   });
 });
