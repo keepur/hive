@@ -39,6 +39,13 @@ function expression(row: Row, input: any, serverNow: Date): any {
   if (Array.isArray(input)) return input.map((item) => expression(row, item, serverNow));
   if (!input || typeof input !== "object" || input instanceof Date) return input;
   const entries = Object.entries(input);
+  if (!entries.some(([key]) => key.startsWith("$"))) {
+    return Object.fromEntries(
+      entries
+        .map(([key, value]) => [key, expression(row, value, serverNow)] as const)
+        .filter(([, value]) => value !== MISSING),
+    );
+  }
   if (entries.length !== 1) throw new Error("Unsupported test expression");
   const [op, operands] = entries[0] as [string, any];
   const resolve = (value: any) => expression(row, value, serverNow);
@@ -55,7 +62,9 @@ function expression(row: Row, input: any, serverNow: Date): any {
             ? "array"
             : typeof value === "boolean"
               ? "bool"
-              : typeof value;
+              : typeof value === "object"
+                ? "object"
+                : typeof value;
   }
   if (op === "$isArray") return Array.isArray(resolve(operands));
   if (op === "$cond") return resolve(operands[0]) ? resolve(operands[1]) : resolve(operands[2]);
@@ -88,6 +97,7 @@ export function matches(row: Row, filter: Row, serverNow = new Date()): boolean 
     ) {
       return Object.entries(value).every(([op, expected]) => {
         if (op === "$exists") return (actual !== MISSING) === expected;
+        if (op === "$ne") return actual === MISSING || !bsonEqual(actual, expected);
         if (op === "$gt") return actual !== MISSING && actual > (expected as any);
         if (op === "$lte") return actual !== MISSING && actual <= (expected as any);
         throw new Error(`Unsupported test operator ${op}`);
@@ -222,17 +232,22 @@ export function createCatalogFake(
                   return 0;
                 })
                 .slice(0, maximum);
-              return result.map((row) =>
-                cloneBson(
-                  options.projection
-                    ? Object.fromEntries(
-                        Object.keys(options.projection)
-                          .filter((key) => options.projection[key])
-                          .map((key) => [key, row[key]]),
-                      )
-                    : row,
-                ),
-              );
+              return result.map((row) => {
+                if (!options.projection) return cloneBson(row);
+                const projected = Object.fromEntries(
+                  Object.entries(options.projection)
+                    .filter(([, value]) => value !== 0 && value !== false)
+                    .map(([key, value]) => [
+                      key,
+                      value === 1 || value === true ? getPath(row, key) : expression(row, value, operationNow),
+                    ])
+                    .filter(([, value]) => value !== MISSING),
+                );
+                return cloneBson(projected);
+              });
+            },
+            async *[Symbol.asyncIterator]() {
+              for (const row of await cursor.toArray()) yield row;
             },
           };
           return cursor;
@@ -247,6 +262,39 @@ export function faultDb(
   db: Db,
   intercept: (collection: string, method: string, args: any[], run: () => Promise<any>) => Promise<any>,
 ): Db {
+  const cursor = (name: string, findArgs: any[], raw: any): any =>
+    new Proxy(raw, {
+      get(target, method) {
+        const value = Reflect.get(target, method, target);
+        if (typeof value !== "function") return value;
+        if (method === Symbol.asyncIterator) {
+          return () => {
+            const iterator = value.call(target);
+            let first = true;
+            return {
+              next: (...args: any[]) => {
+                const run = () => iterator.next(...args);
+                if (!first) return run();
+                first = false;
+                return intercept(name, "find", findArgs, run);
+              },
+              return: typeof iterator.return === "function" ? (...args: any[]) => iterator.return(...args) : undefined,
+              throw: typeof iterator.throw === "function" ? (...args: any[]) => iterator.throw(...args) : undefined,
+              [Symbol.asyncIterator]() {
+                return this;
+              },
+            };
+          };
+        }
+        if (method === "toArray") {
+          return (...args: any[]) => intercept(name, "find", findArgs, () => value.apply(target, args));
+        }
+        return (...args: any[]) => {
+          const result = value.apply(target, args);
+          return result === target ? cursor(name, findArgs, target) : result;
+        };
+      },
+    });
   return new Proxy(db, {
     get(target, key) {
       if (key === "collection") {
@@ -256,6 +304,9 @@ export function faultDb(
             get(col, method) {
               const value = Reflect.get(col, method, col);
               if (typeof value !== "function") return value;
+              if (method === "find") {
+                return (...args: any[]) => cursor(name, args, value.apply(col, args));
+              }
               if (["findOne", "insertOne", "updateOne", "createIndex"].includes(String(method))) {
                 return (...args: any[]) => intercept(name, String(method), args, () => value.apply(col, args));
               }
