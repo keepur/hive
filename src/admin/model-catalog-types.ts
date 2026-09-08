@@ -1,3 +1,7 @@
+import type { ChangeDelivery } from "./model-catalog-notification.js";
+
+export type { ChangeDelivery } from "./model-catalog-notification.js";
+
 export const BUILTIN_CATALOG_PROVIDERS = ["claude", "grok", "codex"] as const;
 export type CatalogProvider = (typeof BUILTIN_CATALOG_PROVIDERS)[number];
 export type FailureCode =
@@ -55,11 +59,6 @@ export interface CatalogChange extends CatalogDiff {
   source: CatalogSource;
   updatedBy: string;
   modelCount: number;
-}
-export interface ChangeDelivery {
-  state: "pending";
-  attempts: number;
-  nextAttemptAt: Date;
 }
 export interface CatalogChangeDoc extends CatalogChange {
   delivery: ChangeDelivery;

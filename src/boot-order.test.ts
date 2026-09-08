@@ -57,6 +57,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     offsetOf("await bgTaskManager.scanOrphans()");
     offsetOf("await codeTaskManager.start()");
     offsetOf("await slackAdapter.start(");
+    offsetOf("modelCatalogNotifier.start()");
     offsetOf("await smsAdapter.start(");
     offsetOf("scheduler.start()");
   });
@@ -73,6 +74,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("await bgTaskManager.scanOrphans()"),
       offsetOf("await codeTaskManager.start()"),
       offsetOf("await slackAdapter.start("),
+      offsetOf("modelCatalogNotifier.start()"),
       offsetOf("await smsAdapter.start("),
       offsetOf("scheduler.start()"),
     ];
@@ -130,7 +132,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     ).toEqual([]);
   });
 
-  it("wires one catalog scanner to the guarded database after engine wiring and starts it without awaiting", () => {
+  it("wires the catalog scanner and notifier to the guarded database at their required lifecycle points", () => {
     expect(codeOnly.match(/\bnew\s+ModelCatalogStore\s*\(/g) ?? []).toHaveLength(1);
     expect(codeOnly.match(/new ModelCatalogStore\s*\(\s*db\s*\)/g) ?? []).toHaveLength(1);
     expect(codeOnly.match(/\bnew\s+ModelCatalogScanner\s*\(/g) ?? []).toHaveLength(1);
@@ -139,6 +141,21 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     ).toHaveLength(1);
     expect(codeOnly.match(/\bmodelCatalogScanner\.start\(\)/g) ?? []).toHaveLength(1);
     expect(codeOnly).not.toMatch(/\bawait\s+modelCatalogScanner\.start\(\)/);
+    expect(codeOnly.match(/\bnew\s+ModelCatalogOutbox\s*\(/g) ?? []).toHaveLength(1);
+    expect(codeOnly.match(/new ModelCatalogOutbox\s*\(\s*db\s*\)/g) ?? []).toHaveLength(1);
+    expect(codeOnly.match(/\bnew\s+ModelCatalogNotifier\s*\(/g) ?? []).toHaveLength(1);
+    expect(
+      codeOnly.match(/new ModelCatalogNotifier\s*\(\s*modelCatalogOutbox\s*,\s*dispatcher\s*\)/g) ?? [],
+    ).toHaveLength(1);
+    expect(codeOnly.match(/\bdispatcher\.setCatalogNotificationDefault\s*\(/g) ?? []).toHaveLength(1);
+    expect(
+      codeOnly.match(/dispatcher\.setCatalogNotificationDefault\(config\.explicitDefaultAgent\)/g) ?? [],
+    ).toHaveLength(1);
+    expect(codeOnly.match(/\bmodelCatalogNotifier\.start\(\)/g) ?? []).toHaveLength(1);
+    expect(codeOnly).not.toMatch(/\bawait\s+modelCatalogNotifier\.start\(\)/);
+    expect(codeOnly).not.toMatch(/\bmodelCatalogOutbox\.ensureIndexes\s*\(/);
+    expect(codeOnly).not.toMatch(/\bmodelCatalogNotifier\.tick\s*\(/);
+    expect(codeOnly).not.toMatch(/\bdispatcher\.(?:prepare|sendPrepared)CatalogNotification\s*\(/);
 
     const guardedDb = offsetOf("const db = guardDb(rawDb, writeGuard)");
     const pluginActivation = offsetOf("await agentManager.activateProviderPlugins()");
@@ -149,7 +166,15 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       "const modelCatalogScanner = new ModelCatalogScanner(modelCatalogStore, discoverProviderModels)",
     );
     const scannerStart = offsetOf("modelCatalogScanner.start()");
+    const registerSlack = offsetOf("dispatcher.registerAdapter(slackAdapter)");
+    const setSlack = offsetOf("dispatcher.setSlackAdapter(slackAdapter)");
     const slackStart = offsetOf("await slackAdapter.start(");
+    const setNotificationDefault = offsetOf("dispatcher.setCatalogNotificationDefault(config.explicitDefaultAgent)");
+    const outboxConstruction = offsetOf("const modelCatalogOutbox = new ModelCatalogOutbox(db)");
+    const notifierConstruction = offsetOf(
+      "const modelCatalogNotifier = new ModelCatalogNotifier(modelCatalogOutbox, dispatcher)",
+    );
+    const notifierStart = offsetOf("modelCatalogNotifier.start()");
 
     expect(guardedDb).toBeLessThan(storeConstruction);
     expect(pluginActivation).toBeLessThan(storeConstruction);
@@ -161,25 +186,50 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     expect(storeConstruction).toBeLessThan(scannerConstruction);
     expect(scannerConstruction).toBeLessThan(scannerStart);
     expect(scannerStart).toBeLessThan(slackStart);
+    expect(registerSlack).toBeLessThan(slackStart);
+    expect(setSlack).toBeLessThan(slackStart);
+    expect(slackStart).toBeLessThan(setNotificationDefault);
+    expect(meetingWiring).toBeLessThan(notifierStart);
+    expect(pluginActivation).toBeLessThan(notifierStart);
+    expect(setNotificationDefault).toBeLessThan(outboxConstruction);
+    expect(outboxConstruction).toBeLessThan(notifierConstruction);
+    expect(notifierConstruction).toBeLessThan(notifierStart);
+    expect(codeOnly).toMatch(
+      /await slackAdapter\.start\(\(item\) => \{[\s\S]*?\n {2}\}\);\s*dispatcher\.setCatalogNotificationDefault\(config\.explicitDefaultAgent\);\s*const modelCatalogOutbox = new ModelCatalogOutbox\(db\);\s*const modelCatalogNotifier = new ModelCatalogNotifier\(modelCatalogOutbox, dispatcher\);\s*modelCatalogNotifier\.start\(\);/,
+    );
   });
 
-  it("stops the catalog scanner first during shutdown and does not tie it to reload or stopAll", () => {
+  it("stops both catalog lifecycles before the first shutdown await and does not tie them to reload or stopAll", () => {
     const shutdownDeclaration = "const shutdown = async (signal: string) => {";
     const shutdownStart = offsetOf(shutdownDeclaration) + shutdownDeclaration.length;
     const shutdownEnd = offsetOf('process.on("SIGTERM"');
     const shutdownBody = codeOnly.slice(shutdownStart, shutdownEnd);
-    const scannerStop = shutdownBody.indexOf("await modelCatalogScanner.stop()");
+    const scannerStop = shutdownBody.indexOf("const scannerDrain = modelCatalogScanner.stop()");
+    const notifierStop = shutdownBody.indexOf("const notifierDrain = modelCatalogNotifier.stop()");
+    const drain = shutdownBody.indexOf("await Promise.all([scannerDrain, notifierDrain])");
     const shutdownLog = shutdownBody.indexOf('log.info("Shutdown signal received"');
+    const slackStop = shutdownBody.indexOf("await slackAdapter.stop()");
     const mongoClose = shutdownBody.indexOf("await mongoClient.close()");
     const awaits = [...shutdownBody.matchAll(/\bawait\s+[^;\n]+/g)];
 
-    expect(shutdownBody.trimStart().startsWith("await modelCatalogScanner.stop();")).toBe(true);
-    expect(awaits[0]?.[0]).toBe("await modelCatalogScanner.stop()");
-    expect(awaits[1]?.index).toBeGreaterThan(scannerStop);
+    expect(shutdownBody.trimStart()).toMatch(
+      /^const scannerDrain = modelCatalogScanner\.stop\(\);\s*const notifierDrain = modelCatalogNotifier\.stop\(\);\s*await Promise\.all\(\[scannerDrain, notifierDrain\]\);/,
+    );
+    expect(awaits[0]?.[0]).toBe("await Promise.all([scannerDrain, notifierDrain])");
+    expect(scannerStop).toBeLessThan(drain);
+    expect(notifierStop).toBeLessThan(drain);
+    expect(awaits[1]?.index).toBeGreaterThan(drain);
     expect(scannerStop).toBeLessThan(shutdownLog);
+    expect(notifierStop).toBeLessThan(shutdownLog);
+    expect(drain).toBeLessThan(slackStop);
+    expect(drain).toBeLessThan(mongoClose);
     expect(scannerStop).toBeLessThan(mongoClose);
     expect(shutdownBody.match(/\bmodelCatalogScanner\b/g) ?? []).toHaveLength(1);
+    expect(shutdownBody.match(/\bmodelCatalogNotifier\b/g) ?? []).toHaveLength(1);
     expect(codeOnly.match(/\bmodelCatalogScanner\b/g) ?? []).toHaveLength(3);
+    expect(codeOnly.match(/\bmodelCatalogNotifier\b/g) ?? []).toHaveLength(3);
+    expect(codeOnly.match(/\bmodelCatalogScanner\.stop\(\)/g) ?? []).toHaveLength(1);
+    expect(codeOnly.match(/\bmodelCatalogNotifier\.stop\(\)/g) ?? []).toHaveLength(1);
 
     const reloadStart = offsetOf("const reload = async () => {");
     const reloadEnd = offsetOf("const safeReload = () => {");
@@ -187,5 +237,10 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     const stopAllLine = codeOnly.split("\n").find((line) => line.includes("agentManager.stopAll()"));
     expect(stopAllLine).toBeDefined();
     expect(stopAllLine).not.toContain("modelCatalog");
+    const adminStart = offsetOf("let adminApi: AdminApi | undefined");
+    const shutdownDeclarationOffset = offsetOf(shutdownDeclaration);
+    expect(codeOnly.slice(adminStart, shutdownDeclarationOffset)).not.toMatch(
+      /modelCatalog(?:Scanner|Notifier)\.stop\(\)/,
+    );
   });
 });

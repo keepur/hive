@@ -15,6 +15,7 @@ import {
   resolveRequiredEnvVars,
 } from "./doctor.js";
 import type { DatastoreIdentityReport } from "./doctor-checks.js";
+import { emptyNotificationStatus } from "../admin/model-catalog-notification-status.js";
 import { catalogStatus, catalogStatusNote } from "../admin/model-catalog-status.js";
 
 describe("resolveRequiredEnvVars", () => {
@@ -425,7 +426,7 @@ describe("renderCircuitBreakerSection (KPR-306)", () => {
   });
 });
 
-describe("renderModelCatalogsSection (KPR-460, informational)", () => {
+describe("renderModelCatalogsSection (KPR-460/KPR-461, informational)", () => {
   const capture = () => {
     const lines: string[] = [];
     return { lines, emit: (line: string) => lines.push(line) };
@@ -470,15 +471,53 @@ describe("renderModelCatalogsSection (KPR-460, informational)", () => {
     ];
     const { lines, emit } = capture();
 
-    renderModelCatalogsSection({ kind: "available", rows }, emit);
+    const codexNotifications = {
+      ...emptyNotificationStatus("codex"),
+      pending: 1,
+      oldest: { id: "codex-change", at: now - 60_000 },
+      nextAt: now + 60_000,
+      reason: { code: "turn-failed" as const, at: now - 30_000 },
+      timingTrouble: true,
+    };
+    const outboxOnly = {
+      ...emptyNotificationStatus("zeta-plugin"),
+      pending: 1,
+      oldest: { id: "plugin-change", at: now - 120_000 },
+      nextAt: now + 120_000,
+    };
+    const notifications = {
+      kind: "available" as const,
+      rows: [emptyNotificationStatus("claude"), codexNotifications, emptyNotificationStatus("sol"), outboxOnly],
+    };
 
-    expect(lines).toEqual(["\nModel catalogs", ...rows.map((row) => `  ${catalogStatusNote(row)}`)]);
+    renderModelCatalogsSection({ kind: "available", rows, notifications }, emit);
+
+    expect(lines[0]).toBe("\nModel catalogs");
+    expect(lines[1]).toBe(`  ${catalogStatusNote(rows[0]!)}`);
+    expect(lines[2]).toMatch(/^ {2}"claude": notifications pending 0/);
+    expect(lines[3]).toBe(`  ${catalogStatusNote(rows[1]!)}`);
+    expect(lines[4]).toMatch(/^ {2}"codex": notifications pending 1/);
+    expect(lines[4]).toContain("reason turn-failed");
+    expect(lines[4]).toContain("timing unavailable/clock-inconsistent");
+    expect(lines[5]).toBe(`  ${catalogStatusNote(rows[2]!)}`);
+    expect(lines[6]).toMatch(/^ {2}"sol": notifications pending 0/);
+    expect(lines[7]).toMatch(/^ {2}"zeta-plugin": notifications pending 1/);
     expect(lines.join("\n")).toContain("claude: not yet seeded");
     expect(lines.join("\n")).toContain("codex: saved");
     expect(lines.join("\n")).toContain("latest attempt failed");
     expect(lines.join("\n")).toContain("sol: saved");
     expect(lines.join("\n")).toContain("manually maintained");
     expect(lines.join("\n")).not.toContain("test-secret");
+  });
+
+  it("keeps catalog rows visible when notification status alone is unavailable", () => {
+    const rows = [catalogStatus("claude", undefined, Date.now())];
+    const { lines, emit } = capture();
+
+    expect(
+      renderModelCatalogsSection({ kind: "available", rows, notifications: { kind: "unavailable" } }, emit),
+    ).toBeUndefined();
+    expect(lines).toEqual(["\nModel catalogs", `  ${catalogStatusNote(rows[0]!)}`, "  Notifications unavailable."]);
   });
 
   it("is wired as a standalone informational call immediately after circuit breakers", () => {

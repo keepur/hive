@@ -10,6 +10,8 @@ const mongo = vi.hoisted(() => ({
   collection: vi.fn(),
   find: vi.fn(),
   toArray: vi.fn(),
+  outboxFind: vi.fn(),
+  outboxToArray: vi.fn(),
   forbiddenWrite: vi.fn(),
 }));
 
@@ -28,12 +30,21 @@ describe("modelCatalogsForDoctor", () => {
     mongo.connect.mockResolvedValue(undefined);
     mongo.close.mockResolvedValue(undefined);
     mongo.toArray.mockResolvedValue([]);
+    mongo.outboxToArray.mockResolvedValue([]);
     mongo.find.mockImplementation(() => ({ toArray: mongo.toArray }));
+    mongo.outboxFind.mockImplementation((filter: { provider?: { $ne?: string } } = {}) => ({
+      async *[Symbol.asyncIterator]() {
+        for (const row of await mongo.outboxToArray()) {
+          if (filter.provider?.$ne !== undefined && row.provider === filter.provider.$ne) continue;
+          yield row;
+        }
+      },
+    }));
     mongo.forbiddenWrite.mockImplementation(() => {
       throw new Error("doctor catalog adapter attempted a write");
     });
-    mongo.collection.mockImplementation(() => ({
-      find: mongo.find,
+    mongo.collection.mockImplementation((name: string) => ({
+      find: name === "agent_model_catalog_changes" ? mongo.outboxFind : mongo.find,
       createIndex: mongo.forbiddenWrite,
       insertOne: mongo.forbiddenWrite,
       updateOne: mongo.forbiddenWrite,
@@ -56,11 +67,15 @@ describe("modelCatalogsForDoctor", () => {
     if (report.kind !== "available") throw new Error("expected available report");
     expect(report.rows.map((row) => row.provider)).toEqual(["claude", "grok", "codex"]);
     expect(report.rows.every((row) => !row.seeded && row.freshness === "never")).toBe(true);
+    expect(report.notifications).toEqual({ kind: "available", rows: [] });
     expect(mongo.MongoClient).toHaveBeenCalledWith("mongodb://doctor", { serverSelectionTimeoutMS: 2000 });
     expect(mongo.connect).toHaveBeenCalledTimes(1);
     expect(mongo.db).toHaveBeenCalledWith("hive_doctor");
+    expect(mongo.db).toHaveBeenCalledTimes(1);
     expect(mongo.collection).toHaveBeenCalledWith("agent_model_catalog");
+    expect(mongo.collection).toHaveBeenCalledWith("agent_model_catalog_changes");
     expect(mongo.find).toHaveBeenCalledWith({ _id: { $ne: "gemini" } });
+    expect(mongo.outboxFind).toHaveBeenCalledWith({ provider: { $ne: "gemini" } }, { projection: expect.any(Object) });
     expect(mongo.close).toHaveBeenCalledTimes(1);
     expect(mongo.forbiddenWrite).not.toHaveBeenCalled();
   });
@@ -115,6 +130,86 @@ describe("modelCatalogsForDoctor", () => {
     expect(catalogStatusNote(solRow)).toBe(catalogStatusNote(catalogStatus("sol", sol, NOW.getTime())));
     expect(catalogStatusNote(solRow)).toContain("manually maintained");
     expect(catalogStatusNote(solRow)).not.toContain("discovery");
+    expect(report.notifications).toEqual({ kind: "available", rows: [] });
+    expect(mongo.forbiddenWrite).not.toHaveBeenCalled();
+  });
+
+  it("keeps catalog facts available when only the outbox read fails", async () => {
+    mongo.outboxToArray.mockRejectedValue(new Error("test-secret outbox failure"));
+
+    const report = await modelCatalogsForDoctor("mongodb://doctor", "hive_doctor", NOW.getTime());
+
+    expect(report.kind).toBe("available");
+    if (report.kind !== "available") throw new Error("expected available report");
+    expect(report.rows.map((row) => row.provider)).toEqual(["claude", "grok", "codex"]);
+    expect(report.notifications).toEqual({ kind: "unavailable" });
+    expect(mongo.close).toHaveBeenCalledTimes(1);
+    expect(mongo.forbiddenWrite).not.toHaveBeenCalled();
+  });
+
+  it("streams projected outbox-only plugin and future-intent timing on the same temporary database", async () => {
+    mongo.outboxToArray.mockResolvedValue([
+      {
+        _id: "sol-change",
+        provider: "sol",
+        createdAt: at(-HOUR),
+        delivery: { state: "pending", attempts: 0, nextAttemptAt: at(-1) },
+      },
+      {
+        _id: "codex-future-intent",
+        provider: "codex",
+        createdAt: at(-HOUR),
+        delivery: {
+          state: "claimed",
+          attempts: 1,
+          nextAttemptAt: at(-HOUR),
+          preparation: {
+            id: "preparation-1",
+            binding: {
+              agentId: "chief",
+              homeBase: "catalog-alerts",
+              adapterId: "slack",
+              channelId: "C123ABC",
+            },
+            processedAt: at(-30 * 60 * 1000),
+          },
+          claim: {
+            token: "claim-1",
+            owner: "notifier-1",
+            startedAt: at(-30 * 60 * 1000),
+            leaseExpiresAt: at(HOUR),
+            stage: "sending",
+            sendIntent: {
+              preparationId: "preparation-1",
+              startedAt: at(HOUR / 2),
+              previouslyUncertain: false,
+            },
+          },
+        },
+      },
+      {
+        _id: "gemini-change",
+        provider: "gemini",
+        createdAt: at(-HOUR),
+        delivery: { state: "pending", attempts: 0, nextAttemptAt: at(-1) },
+      },
+    ]);
+
+    const report = await modelCatalogsForDoctor("mongodb://doctor", "hive_doctor", NOW.getTime());
+
+    expect(report.kind).toBe("available");
+    if (report.kind !== "available" || report.notifications.kind !== "available") {
+      throw new Error("expected available reports");
+    }
+    expect(report.notifications.rows.map((row) => row.provider)).toEqual(["codex", "sol"]);
+    expect(report.notifications.rows.find((row) => row.provider === "codex")).toMatchObject({
+      claimed: 1,
+      prepared: 1,
+      uncertain: 1,
+      timingTrouble: true,
+    });
+    expect(mongo.MongoClient).toHaveBeenCalledTimes(1);
+    expect(mongo.db).toHaveBeenCalledTimes(1);
     expect(mongo.forbiddenWrite).not.toHaveBeenCalled();
   });
 

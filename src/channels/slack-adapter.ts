@@ -3,6 +3,12 @@ import type { ChannelAdapter } from "./channel-adapter.js";
 import type { WorkItem, WorkResult, ChannelKind } from "../types/work-item.js";
 import type { SlackGateway } from "../slack/slack-gateway.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
+import type {
+  NoticeBinding,
+  NoticeDestination,
+  NoticeLookupGate,
+  SendResult,
+} from "../admin/model-catalog-notification.js";
 import { formatError, formatResponse } from "../slack/response-formatter.js";
 import type { WebClient } from "@slack/web-api";
 import type { SweepResult } from "../sweeper/sweeper.js";
@@ -37,6 +43,7 @@ export class SlackAdapter implements ChannelAdapter {
   private excludeChannels: Set<string>;
   private defaultAgentId?: string;
   private botLabel?: string;
+  private notificationConnected = false;
   private threadContextMap = new Map<string, string>();
   private threadContextLastSeen = new Map<string, number>();
 
@@ -129,7 +136,43 @@ export class SlackAdapter implements ChannelAdapter {
     });
 
     await this.gateway.start();
+    this.notificationConnected = true;
     log.info("Slack adapter started");
+  }
+
+  notificationAvailable(binding?: string): boolean {
+    return this.notificationConnected && (binding === undefined || binding === this.botLabel);
+  }
+
+  get notificationBotLabel(): string | undefined {
+    return this.botLabel;
+  }
+
+  async resolveNotificationChannel(
+    homeBase: string,
+    gate: NoticeLookupGate,
+    binding?: string,
+  ): Promise<NoticeDestination> {
+    return this.notificationAvailable(binding)
+      ? this.gateway.resolveNotificationChannel(homeBase, {
+          check: () => gate.check(),
+          current: () => gate.current() && this.notificationAvailable(binding),
+        })
+      : { channelId: null };
+  }
+
+  notificationRouteMatches(route: NoticeBinding): boolean {
+    return (
+      this.notificationAvailable(route.botLabel) &&
+      route.adapterId === this.id &&
+      this.gateway.notificationChannelMatches(route.homeBase, route.channelId)
+    );
+  }
+
+  async deliverNotificationReceipt(route: NoticeBinding, text: string): Promise<SendResult> {
+    return this.notificationRouteMatches(route)
+      ? this.gateway.postNotificationReceipt(route.channelId, text)
+      : { kind: "not-accepted", reason: "transport-unavailable" };
   }
 
   async deliver(result: WorkResult): Promise<void> {
@@ -186,6 +229,7 @@ export class SlackAdapter implements ChannelAdapter {
   }
 
   async stop(): Promise<void> {
+    this.notificationConnected = false;
     await this.gateway.stop();
     log.info("Slack adapter stopped");
   }

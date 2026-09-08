@@ -42,6 +42,7 @@ import {
   renderProviderPluginsSection,
 } from "./doctor-checks.js";
 import { catalogStatusNote } from "../admin/model-catalog-status.js";
+import { emptyNotificationStatus, notificationNote } from "../admin/model-catalog-notification-status.js";
 import { describeLimitSource } from "../agents/resource-tiers.js";
 import { engineDir, hiveHome } from "../paths.js";
 
@@ -255,7 +256,22 @@ export function renderModelCatalogsSection(
     emit("  catalog storage unavailable");
     return;
   }
-  for (const row of report.rows) emit(`  ${catalogStatusNote(row)}`);
+  if (report.notifications.kind === "unavailable") {
+    for (const row of report.rows) emit(`  ${catalogStatusNote(row)}`);
+    emit("  Notifications unavailable.");
+    return;
+  }
+  const notificationByProvider = new Map(report.notifications.rows.map((row) => [row.provider, row]));
+  const catalogProviders = new Set(report.rows.map((row) => row.provider));
+  for (const row of report.rows) {
+    emit(`  ${catalogStatusNote(row)}`);
+    emit(`  ${notificationNote(notificationByProvider.get(row.provider) ?? emptyNotificationStatus(row.provider))}`);
+  }
+  for (const row of report.notifications.rows.filter(
+    (row) => row.provider !== "gemini" && !catalogProviders.has(row.provider),
+  )) {
+    emit(`  ${notificationNote(row)}`);
+  }
 }
 
 /**

@@ -15,6 +15,19 @@ import type { TaskLedger } from "../tasks/task-ledger.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import type { RetryQueue } from "../sweeper/retry-queue.js";
 import type { SlackAdapter, ThreadMessage } from "./slack-adapter.js";
+import type { CatalogChange } from "../admin/model-catalog-types.js";
+import {
+  catalogWorkItem,
+  makePreparation,
+  selectNoticeAgent,
+  type NoticeBinding,
+  type NoticeLookupGate,
+  type NoticePreparation,
+  type NoticeRoute,
+  type PrepareResult,
+  type RouteResult,
+  type SendResult,
+} from "../admin/model-catalog-notification.js";
 import type { MeetingScribe, MeetingSummary } from "../workers/meeting-scribe.js";
 import type { RunResult } from "../agents/agent-runner.js";
 import { classifyMeetingMessage, type RosterMember } from "../agents/meeting-classifier.js";
@@ -199,6 +212,7 @@ export class Dispatcher {
   private outage?: OutageHandlingDeps;
   private teamStore?: import("../team/team-store.js").TeamStore;
   private slackAdapter?: SlackAdapter;
+  private catalogExplicitDefault?: string;
   /** KPR-409: optional running-summary source for the full-arm anchor.
    *  Absent ⇒ every conference path behaves exactly as pre-KPR-409. */
   private meetingScribe?: MeetingScribe;
@@ -273,6 +287,109 @@ export class Dispatcher {
 
   setSlackAdapter(adapter: SlackAdapter): void {
     this.slackAdapter = adapter;
+  }
+
+  setCatalogNotificationDefault(value: string | undefined): void {
+    this.catalogExplicitDefault = value;
+  }
+
+  async resolveCatalogNotificationRoute(gate: NoticeLookupGate): Promise<RouteResult> {
+    const selected = selectNoticeAgent(this.registry.getAll(), this.catalogExplicitDefault);
+    if (selected.kind !== "agent") return selected;
+    const agentId = selected.agent.id;
+    const homeBase = selected.agent.homeBase?.trim();
+    const adapter = this.slackAdapter;
+    const botLabel = selected.agent.slackBot;
+    if (!homeBase) return { kind: "unresolved", reason: "destination-unresolved" };
+    if (!adapter?.notificationAvailable(botLabel)) {
+      return { kind: "unresolved", reason: "transport-unavailable" };
+    }
+    const destination = await adapter.resolveNotificationChannel(
+      homeBase,
+      {
+        check: () => gate.check(),
+        current: () => {
+          const current = selectNoticeAgent(this.registry.getAll(), this.catalogExplicitDefault);
+          return (
+            gate.current() &&
+            this.slackAdapter === adapter &&
+            current.kind === "agent" &&
+            current.agent.id === agentId &&
+            current.agent.homeBase?.trim() === homeBase &&
+            current.agent.slackBot === botLabel
+          );
+        },
+      },
+      botLabel,
+    );
+    const channelId = destination.channelId;
+    if (!channelId) {
+      return {
+        kind: "unresolved",
+        reason: "destination-unresolved",
+        retryAfterMs: destination.retryAfterMs,
+        retryBlocked: destination.retryBlocked,
+      };
+    }
+    const route: NoticeRoute = {
+      agentId,
+      homeBase,
+      adapterId: adapter.id,
+      channelId,
+      ...(botLabel === undefined ? {} : { botLabel }),
+      agentName: selected.agent.name,
+    };
+    return this.catalogNotificationRouteCurrent(route)
+      ? { kind: "route", route }
+      : { kind: "unresolved", reason: "recipient-changed" };
+  }
+
+  catalogNotificationRouteCurrent(route: NoticeBinding): boolean {
+    const selected = selectNoticeAgent(this.registry.getAll(), this.catalogExplicitDefault);
+    return (
+      selected.kind === "agent" &&
+      selected.agent.id === route.agentId &&
+      selected.agent.homeBase?.trim() === route.homeBase &&
+      selected.agent.slackBot === route.botLabel &&
+      this.slackAdapter?.notificationRouteMatches(route) === true
+    );
+  }
+
+  async prepareCatalogNotification(
+    change: CatalogChange,
+    route: NoticeRoute,
+    mayStart: () => boolean,
+    now: () => Date,
+  ): Promise<PrepareResult> {
+    if (!mayStart() || !this.catalogNotificationRouteCurrent(route)) {
+      return { kind: "unresolved", reason: "recipient-changed" };
+    }
+    try {
+      const result = await this.agentManager.runWorkItemTurn(route.agentId, catalogWorkItem(change, route));
+      if (result.aborted === true || result.timedOut === true) {
+        return { kind: "unresolved", reason: "turn-interrupted" };
+      }
+      if (result.errors.length) return { kind: "unresolved", reason: "turn-failed" };
+      const reply = result.finalMessage.trim();
+      return {
+        kind: "prepared",
+        preparation: makePreparation(
+          change,
+          route,
+          NON_RESPONSE_PATTERNS.some((pattern) => pattern.test(reply)) ? "" : reply,
+          now(),
+        ),
+      };
+    } catch {
+      return { kind: "unresolved", reason: "turn-failed" };
+    }
+  }
+
+  async sendPreparedCatalogNotification(preparation: NoticePreparation, mayStart: () => boolean): Promise<SendResult> {
+    if (!mayStart() || !this.catalogNotificationRouteCurrent(preparation.binding)) {
+      return { kind: "not-accepted", reason: "recipient-changed" };
+    }
+    return this.slackAdapter!.deliverNotificationReceipt(preparation.binding, preparation.text);
   }
 
   setMeetingScribe(scribe: MeetingScribe): void {

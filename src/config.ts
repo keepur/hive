@@ -301,6 +301,8 @@ export interface QuoLine {
   label: string;
 }
 
+const explicitlyResolvedDefaultAgent = process.env.DEFAULT_AGENT || fromKeychain("DEFAULT_AGENT") || undefined;
+
 export const config = {
   instance: { id: instanceId, portBase },
   business: {
@@ -373,7 +375,8 @@ export const config = {
     uri: optional("MONGODB_URI", "mongodb://localhost:27017"),
     dbName: optional("MONGODB_DB", `hive_${instanceId}`),
   },
-  defaultAgent: optional("DEFAULT_AGENT", "chief-of-staff"),
+  defaultAgent: explicitlyResolvedDefaultAgent || "chief-of-staff",
+  explicitDefaultAgent: explicitlyResolvedDefaultAgent?.trim() || undefined,
   google: {
     client: optional("GOG_CLIENT", hive.google?.client ?? ""),
     accounts: normalizeGoogleAccounts(hive.google?.accounts),
