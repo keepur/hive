@@ -430,7 +430,6 @@ describe("MeetingWorkerPool — claim ledger + gates (Task D)", () => {
       "worker-pool",
       "background",
       "keychain",
-      "code-task",
       "admin",
       "recall",
       "voice",

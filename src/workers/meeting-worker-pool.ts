@@ -48,7 +48,7 @@ const CLAIMS_TTL_SECONDS = 7 * 86_400;
  * re-entry minting (callback/schedule); recursion (worker-pool); agent-def
  * editing (admin); detached-process escape hatch that would outlive every
  * kill path (background — E5 load-bearing); credential-read leak
- * amplification (keychain); long-lived CLI session spawning (code-task).
+ * amplification (keychain).
  * Memory servers deliberately STAY (same trust domain, reviewer-confirmed r1).
  */
 export const WORKER_SERVER_DENYLIST = new Set<string>([
@@ -66,7 +66,6 @@ export const WORKER_SERVER_DENYLIST = new Set<string>([
   "worker-pool",
   "background",
   "keychain",
-  "code-task",
 ]);
 
 /** The WorkItemContext seven — per-turn metadata from the boss's dispatching turn. */
