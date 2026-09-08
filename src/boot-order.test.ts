@@ -129,4 +129,63 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       "an unallowlisted spawn-capable start/scanOrphans precedes the wiring — classify it (allowlist if inert, move the wiring if not)",
     ).toEqual([]);
   });
+
+  it("wires one catalog scanner to the guarded database after engine wiring and starts it without awaiting", () => {
+    expect(codeOnly.match(/\bnew\s+ModelCatalogStore\s*\(/g) ?? []).toHaveLength(1);
+    expect(codeOnly.match(/new ModelCatalogStore\s*\(\s*db\s*\)/g) ?? []).toHaveLength(1);
+    expect(codeOnly.match(/\bnew\s+ModelCatalogScanner\s*\(/g) ?? []).toHaveLength(1);
+    expect(
+      codeOnly.match(/new ModelCatalogScanner\s*\(\s*modelCatalogStore\s*,\s*discoverProviderModels\s*\)/g) ?? [],
+    ).toHaveLength(1);
+    expect(codeOnly.match(/\bmodelCatalogScanner\.start\(\)/g) ?? []).toHaveLength(1);
+    expect(codeOnly).not.toMatch(/\bawait\s+modelCatalogScanner\.start\(\)/);
+
+    const guardedDb = offsetOf("const db = guardDb(rawDb, writeGuard)");
+    const pluginActivation = offsetOf("await agentManager.activateProviderPlugins()");
+    const meetingWiring = offsetOf("dispatcher.setMeetingAckEnabled(config.meetingWorkers.ackEnabled)");
+    const memoryHeartbeat = offsetOf("memoryLifecycleHeartbeat.start()");
+    const storeConstruction = offsetOf("const modelCatalogStore = new ModelCatalogStore(db)");
+    const scannerConstruction = offsetOf(
+      "const modelCatalogScanner = new ModelCatalogScanner(modelCatalogStore, discoverProviderModels)",
+    );
+    const scannerStart = offsetOf("modelCatalogScanner.start()");
+    const slackStart = offsetOf("await slackAdapter.start(");
+
+    expect(guardedDb).toBeLessThan(storeConstruction);
+    expect(pluginActivation).toBeLessThan(storeConstruction);
+    expect(meetingWiring).toBeLessThan(storeConstruction);
+    expect(memoryHeartbeat).toBeLessThan(storeConstruction);
+    expect(codeOnly).toMatch(
+      /memoryLifecycleHeartbeat\.start\(\);\s*const modelCatalogStore = new ModelCatalogStore\(db\);/,
+    );
+    expect(storeConstruction).toBeLessThan(scannerConstruction);
+    expect(scannerConstruction).toBeLessThan(scannerStart);
+    expect(scannerStart).toBeLessThan(slackStart);
+  });
+
+  it("stops the catalog scanner first during shutdown and does not tie it to reload or stopAll", () => {
+    const shutdownDeclaration = "const shutdown = async (signal: string) => {";
+    const shutdownStart = offsetOf(shutdownDeclaration) + shutdownDeclaration.length;
+    const shutdownEnd = offsetOf('process.on("SIGTERM"');
+    const shutdownBody = codeOnly.slice(shutdownStart, shutdownEnd);
+    const scannerStop = shutdownBody.indexOf("await modelCatalogScanner.stop()");
+    const shutdownLog = shutdownBody.indexOf('log.info("Shutdown signal received"');
+    const mongoClose = shutdownBody.indexOf("await mongoClient.close()");
+    const awaits = [...shutdownBody.matchAll(/\bawait\s+[^;\n]+/g)];
+
+    expect(shutdownBody.trimStart().startsWith("await modelCatalogScanner.stop();")).toBe(true);
+    expect(awaits[0]?.[0]).toBe("await modelCatalogScanner.stop()");
+    expect(awaits[1]?.index).toBeGreaterThan(scannerStop);
+    expect(scannerStop).toBeLessThan(shutdownLog);
+    expect(scannerStop).toBeLessThan(mongoClose);
+    expect(shutdownBody.match(/\bmodelCatalogScanner\b/g) ?? []).toHaveLength(1);
+    expect(codeOnly.match(/\bmodelCatalogScanner\b/g) ?? []).toHaveLength(3);
+
+    const reloadStart = offsetOf("const reload = async () => {");
+    const reloadEnd = offsetOf("const safeReload = () => {");
+    expect(codeOnly.slice(reloadStart, reloadEnd)).not.toContain("modelCatalog");
+    const stopAllLine = codeOnly.split("\n").find((line) => line.includes("agentManager.stopAll()"));
+    expect(stopAllLine).toBeDefined();
+    expect(stopAllLine).not.toContain("modelCatalog");
+  });
 });

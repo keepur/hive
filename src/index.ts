@@ -56,6 +56,9 @@ import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
 import { MemoryLifecycleHeartbeat } from "./memory/memory-lifecycle-heartbeat.js";
 import { getLLMRegistry } from "./llm/registry.js";
 import { AdminApi } from "./admin/admin-api.js";
+import { ModelCatalogStore } from "./admin/model-catalog-store.js";
+import { ModelCatalogScanner } from "./admin/model-catalog-scanner.js";
+import { discoverProviderModels } from "./admin/model-catalog-discovery.js";
 import { ActivityLogger } from "./activity/activity-logger.js";
 import { runMigrations } from "./migrations/run-migrations.js";
 import { checkFirstBoot } from "./startup/first-boot.js";
@@ -619,6 +622,10 @@ async function main(): Promise<void> {
   await memoryLifecycleHeartbeat.writeOnce();
   memoryLifecycleHeartbeat.start();
 
+  const modelCatalogStore = new ModelCatalogStore(db);
+  const modelCatalogScanner = new ModelCatalogScanner(modelCatalogStore, discoverProviderModels);
+  modelCatalogScanner.start();
+
   // Start Slack adapter
   // Exclude SMS channels — those are handled directly by the SmsAdapter
   const smsChannels = config.sms.lines.map((l) => l.slackChannel).filter(Boolean);
@@ -933,6 +940,7 @@ async function main(): Promise<void> {
 
   // Graceful shutdown
   const shutdown = async (signal: string) => {
+    await modelCatalogScanner.stop();
     log.info("Shutdown signal received", { signal });
     sweeper.stop();
     retentionSweeper.stop();
