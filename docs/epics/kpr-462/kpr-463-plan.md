@@ -27,11 +27,11 @@ The code blocks prescribe complete core functions/types and exact replacement bl
 ### Required Test Groups
 
 - Unit: **required**.
-  - Scope: release/lock validation; configuration/port derivation; XML generation; accepted ledger and barrier transitions; job completion wrapper; heartbeat field ownership; boot/health classification; transaction state machine; CLI argument routing.
+  - Scope: release/lock validation and development-lock ownership across build/install/repack; configuration/port derivation and basename-based alternate dotenv selection; XML generation; accepted ledger and barrier transitions; job completion wrapper; heartbeat field ownership; boot/health classification; transaction state machine; CLI argument routing.
   - Reason: false idle or false success can interrupt a live call or leave an unrecoverable mixed release.
   - Minimum assertions: all T3–T8 branches below, especially no ledger deletion on `accept()` resolution, no signal before quiescence, exact release/PID/boot matching, and nonzero deployment result after successful recovery.
 - Integration: **required**.
-  - Scope: actual pinned SDK JobRequest and job-child loader, filesystem IPC, candidate package installation, local HTTP auth boundary, fake launchctl/process ownership boundary, migration bootstrap and rollback profiles.
+  - Scope: actual pinned SDK JobRequest and job-child loader, filesystem IPC, isolated retained bundle-smoke subprocesses, candidate package installation, local HTTP auth boundary, fake launchctl/process ownership boundary, migration bootstrap and rollback profiles.
   - Reason: mocks alone cannot prove SDK callback timing, native asset resolution, bundle relocation, self-replacement, or instance isolation.
   - Harness: **setup-required**, building on Vitest, `src/voice-worker/*.test.ts`, `src/channels/voice/voice-adapter.integration.test.ts`, and `service/deploy.test.sh`.
   - Minimum assertions: real SDK acceptance behavior and forked initialization; real packed `.tgz` production installation; native RTC and Silero/ONNX loading; engine and worker path/config equivalence; complete failure injection matrix; no vendor/model/launchd calls from automated tests.
@@ -63,8 +63,9 @@ Run from the implementing worktree, with disposable test fixtures created by the
 
 ```bash
 npm ci
-npx vitest run src/voice-worker/admission.test.ts src/voice-worker/job-lifecycle.test.ts src/deployment/release.test.ts src/deployment/ports.test.ts src/deployment/health.test.ts src/deployment/transaction.test.ts
+npx vitest run src/paths.test.ts src/voice-worker/admission.test.ts src/voice-worker/job-lifecycle.test.ts src/deployment/release.test.ts src/deployment/ports.test.ts src/deployment/health.test.ts src/deployment/transaction.test.ts
 npx vitest run src/voice-worker/sdk-lifecycle.integration.test.ts src/voice-worker/maintenance-ipc.integration.test.ts src/deployment/lifecycle.integration.test.ts src/deployment/adoption.integration.test.ts src/channels/voice/voice-adapter.integration.test.ts
+node --test scripts/generate-shrinkwrap.test.mjs scripts/check-bundle-runtime.test.mjs
 npm run check:artifact
 bash service/deploy.test.sh
 bash service/install.test.sh
@@ -104,10 +105,10 @@ No required test group is waived. Live-call conversation/audio E2E is outside KP
 
 | Spec ID | Primary files/tests | Required cases |
 | --- | --- | --- |
-| T1 | `scripts/check-bundle-pack.mjs`, `scripts/check-artifact-install.mjs` | actual tarball, worker/helpers/manifest/shrinkwrap/MCP present; no src/dist/secrets/node_modules; unchanged size/string guards |
+| T1 | `scripts/check-bundle-pack.mjs`, `scripts/generate-shrinkwrap.test.mjs`, `scripts/check-artifact-install.mjs` | actual tarball, worker/helpers/manifest/shrinkwrap/MCP present; no src/dist/secrets/node_modules; build → lock change → install → rebuild/repack follows package-lock; no development-root shrinkwrap after success/failure; unchanged size/string guards |
 | T2 | `src/voice-worker/runtime-diagnostic.ts`, `scripts/check-artifact-install.mjs` | fresh locked production install, RTC/ONNX/Silero load, SDK child imports packaged default agent |
 | T3 | `src/voice-worker/main.test.ts`, `src/deployment/services.test.ts`, artifact harness | relocate root; spaces, `&`, symlink home; actual direct/import distinction; missing entrypoint fails before writes |
-| T4 | `worker-config.test.ts`, bridge integration tests, `health.test.ts` | shared selectors and dotenv/Keychain precedence; no secret output; correct/missing/wrong token results; zero model spawns |
+| T4 | `src/paths.test.ts`, `worker-config.test.ts`, bridge integration tests, `health.test.ts`, `scripts/check-bundle-runtime.test.mjs` | shared selectors and dotenv/Keychain precedence, including absolute/relative alternate selectors; retained smoke isolates HOME/config/env and Keychain; no secret output; correct/missing/wrong token results; zero model spawns |
 | T5 | `src/deployment/lifecycle.integration.test.ts` | both service labels, order/idempotency, disabled transition, target-only ownership, port/collision validation |
 | T6 | `transaction.test.ts`, `adoption.integration.test.ts`, shell tests | every failure stage; old updater is never invoked; exact checked recovery; incompatible prior release rejected; separate legacy profile |
 | T7 | admission/IPC/SDK tests, transaction and health tests | call race >30s, unresolved assignment, after-close rejection, missing/wrong-boot/release acknowledgements, dead owner/marker, KeepAlive, stale health/logs, wrong owner |
@@ -119,7 +120,7 @@ No required test group is waived. Live-call conversation/audio E2E is outside KP
 | File(s) | Responsibility |
 | --- | --- |
 | `src/deployment/release.ts` + `.test.ts` | versioned manifest, artifact validation, runtime identity/containment |
-| `scripts/generate-shrinkwrap.mjs`, `build/bundle.ts`, `package.json`, `package-lock.json`, `.gitignore` | pinned production packaging, generated shrinkwrap and release manifest |
+| `scripts/generate-shrinkwrap.mjs` + `.test.mjs`, `build/bundle.ts`, `package.json`, `package-lock.json`, `.gitignore` | pinned production packaging, scratch-only generated shrinkwrap, development-lock regression and release manifest |
 | `src/voice-worker/runtime-diagnostic.ts`, `scripts/check-artifact-install.mjs` | offline native and packaged SDK-import acceptance |
 | `src/voice-worker/admission.ts` + `.test.ts` | synchronous admission/accepted ledger state machine |
 | `src/voice-worker/maintenance-ipc.ts` + `.integration.test.ts` | private local mailbox protocol and boot/operation ownership |
@@ -127,6 +128,7 @@ No required test group is waived. Live-call conversation/audio E2E is outside KP
 | `src/voice-worker/sdk-lifecycle.integration.test.ts`, `src/voice-worker/fixtures/sdk-agent.ts` | real pinned SDK acceptance and child lifecycle proof, no calls |
 | `src/voice-worker/main.ts`, `worker-config.ts`, `telemetry.ts` and existing tests | wire gate, lazy job imports, port and immutable supervisor identity |
 | `src/deployment/ports.ts`, `src/config.ts` and tests | worker health port validation alongside resolved engine ports |
+| `src/paths.ts`, `src/paths.test.ts` | shared resolveDotenvPath basename correction and alternate-config dotenv regression (Task 7) |
 | `src/deployment/runtime-probe.ts`, `health.ts` and tests | config/auth/registration/dependency evidence, separate acceptance profiles |
 | `src/deployment/services.ts` + tests | service descriptions, XML and launchd/process ownership adapters |
 | `src/deployment/operation.ts`, `transaction.ts`, `artifact.ts` + tests | lock/marker/frozen helper, paired transaction, extraction/install/rotation |
@@ -135,7 +137,7 @@ No required test group is waived. Live-call conversation/audio E2E is outside KP
 | `src/setup/populate-engine.ts` + tests | share validated package entries and complete locked install/resume |
 | `src/cli/doctor.ts`, `doctor-checks.ts` + tests | installed versus observed identity and accurate worker-health display |
 | `service/deploy.sh`, `deploy-check.sh`, `install.sh`, `setup/generate-plist.ts`, shell tests | packaged single-instance delegation and developer-mode isolation |
-| `scripts/check-bundle-pack.mjs`, `.github/workflows/ci.yml`, `publish.yml` | required artifact guard and runtime matrix |
+| `scripts/check-bundle-pack.mjs`, `scripts/check-bundle-runtime.mjs` + `.test.mjs`, `.github/workflows/ci.yml`, `publish.yml` | required artifact guard, retained-smoke isolation and runtime matrix |
 | `CLAUDE.md`, `AGENTS.md`, `docs/epics/kpr-462/kpr-463-operations.md` | supported paths, native prerequisites, adoption/recovery/runbook |
 | `docs/epics/kpr-462/kpr-463-deployment-evidence.md` | sanitized actual delivery evidence; create only during delivery |
 
@@ -211,9 +213,9 @@ git commit -m "feat: track voice admission and job completion for maintenance"
 
 ## Task 2: Package a reproducible worker release
 
-**Files:** `package.json`, `package-lock.json`, `.gitignore`, `scripts/generate-shrinkwrap.mjs`, `build/bundle.ts`, `src/deployment/release.ts`, `src/deployment/release.test.ts`, `scripts/check-bundle-pack.mjs`.
+**Files:** `package.json`, `package-lock.json`, `.gitignore`, `scripts/generate-shrinkwrap.mjs`, `scripts/generate-shrinkwrap.test.mjs`, `build/bundle.ts`, `src/deployment/release.ts`, `src/deployment/release.test.ts`, `scripts/check-bundle-pack.mjs`, `.github/workflows/publish.yml`.
 
-- [ ] **Step 1:** Move these exact six entries from devDependencies to dependencies, preserve all other selected versions, then regenerate the repository lock with the same npm version used for release validation:
+- [ ] **Step 1:** Assert this worktree has no repository-root `npm-shrinkwrap.json` before any npm dependency command; remove only a known generated leftover from an earlier packaging attempt. Move these exact six entries from devDependencies to dependencies, preserve all other selected versions, then regenerate the repository lock with the same npm version used for release validation:
 
 ```json
 {
@@ -232,37 +234,87 @@ npm install --package-lock-only --ignore-scripts
 
 Expected: root dependency classification and affected lock `dev` flags change; unrelated version upgrades require investigation, not acceptance by default. Keep the Node engine string `>=22.19.0` and all native install-script requirements. Do not remove ElevenLabs or change configured vendor selection.
 
-- [ ] **Step 2:** Add generated `/npm-shrinkwrap.json` to `.gitignore`; generate it byte-for-byte from the reviewed development lock during `bundle`. Add `prepack: node scripts/generate-shrinkwrap.mjs --check` so a stale tarball cannot package a mismatched lock. Complete generator:
+- [ ] **Step 2:** Keep the development root free of `npm-shrinkwrap.json`: generate that filename only inside a disposable packaging directory. Add `/npm-shrinkwrap.json` to `.gitignore` as a guard against accidental tooling output, not permission to retain it. Bundling only validates `package-lock.json` and hashes those bytes; it never writes a root shrinkwrap. npm prefers root shrinkwrap over package-lock, so post-install hooks are too late to preserve lock selection.
+
+Add `pack:release: node scripts/generate-shrinkwrap.mjs --pack` and `prepack: node scripts/generate-shrinkwrap.mjs --reject-root-pack`. All source-package pack callers use `pack:release`; its implementation invokes real `npm pack` against a scratch copy of the built package. The prepack guard makes an accidental direct source `npm pack`/`npm publish` fail with the supported command. Do not add install/prepare hooks: installed production packages must need no source scripts. Complete generator/packer core:
 
 ```javascript
-import { readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-const source = readFileSync("package-lock.json");
+
+const cwd = process.cwd();
+const [mode, ...args] = process.argv.slice(2);
+if (mode === "--reject-root-pack") throw new Error("Use npm run pack:release; publish its validated .tgz");
+if (!["--check-source", "--check", "--pack"].includes(mode)) throw new Error("unknown shrinkwrap mode");
+if (existsSync(resolve(cwd, "npm-shrinkwrap.json"))) throw new Error("development root must not contain npm-shrinkwrap.json");
+const source = readFileSync(resolve(cwd, "package-lock.json"));
 const lock = JSON.parse(source.toString("utf8"));
-const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+const pkg = JSON.parse(readFileSync(resolve(cwd, "package.json"), "utf8"));
 const root = lock.packages?.[""];
 if (lock.lockfileVersion !== 3 || !root || root.name !== pkg.name || root.version !== pkg.version) {
   throw new Error("package-lock root identity mismatch");
 }
 for (const field of ["dependencies", "devDependencies", "optionalDependencies"]) {
-  if (!isDeepStrictEqual(root[field] ?? {}, pkg[field] ?? {})) {
-    throw new Error(`package-lock ${field} mismatch`);
+  if (!isDeepStrictEqual(root[field] ?? {}, pkg[field] ?? {})) throw new Error(`package-lock ${field} mismatch`);
+}
+if (mode !== "--check-source") {
+  const manifest = JSON.parse(readFileSync(resolve(cwd, "pkg/release.json"), "utf8"));
+  const digest = createHash("sha256").update(source).digest("hex");
+  if (manifest.packageVersion !== pkg.version || manifest.dependencyLockSha256 !== digest) {
+    throw new Error("bundle lock is stale; rebuild before packing");
   }
 }
-if (process.argv.includes("--check")) {
-  if (!source.equals(readFileSync("npm-shrinkwrap.json"))) throw new Error("stale generated shrinkwrap");
-} else {
-  writeFileSync("npm-shrinkwrap.json", source);
+if (mode === "--pack") {
+  let destination = cwd;
+  let dryRun = false;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--json") continue;
+    if (args[i] === "--dry-run") { dryRun = true; continue; }
+    if (args[i] === "--pack-destination" && args[i + 1]) { destination = resolve(cwd, args[++i]); continue; }
+    throw new Error("unsupported pack argument");
+  }
+  const scratch = mkdtempSync(resolve(tmpdir(), "hive-release-pack-"));
+  const stage = resolve(scratch, "package");
+  try {
+    mkdirSync(stage);
+    const entries = new Set([...pkg.files, "package.json", "README.md", "LICENSE", "LICENSE-APACHE-2.0.txt", "NOTICE"]);
+    for (const entry of entries) {
+      const rel = relative(cwd, resolve(cwd, entry));
+      if (!rel || isAbsolute(entry) || rel === ".." || rel.startsWith(`..${sep}`) || /[*?[\]{}!]/.test(entry)) {
+        throw new Error("pack files must be explicit contained paths");
+      }
+      const from = resolve(cwd, entry);
+      if (!existsSync(from)) continue;
+      const to = resolve(stage, entry);
+      mkdirSync(dirname(to), { recursive: true });
+      cpSync(from, to, { recursive: true, dereference: false });
+    }
+    writeFileSync(resolve(stage, "npm-shrinkwrap.json"), source, { flag: "wx" });
+    if (!source.equals(readFileSync(resolve(stage, "npm-shrinkwrap.json")))) throw new Error("shrinkwrap copy mismatch");
+    const npmArgs = ["pack", "--ignore-scripts", "--json", "--pack-destination", destination];
+    if (dryRun) npmArgs.push("--dry-run");
+    process.stdout.write(execFileSync("npm", npmArgs, {
+      cwd: stage, encoding: "utf8", timeout: 120000, stdio: ["ignore", "pipe", "pipe"],
+    }));
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 }
 ```
 
-npm automatically includes root shrinkwrap in a package. Add it explicitly to `PACKAGE_ENTRIES` and required pack assertions; never ship `package-lock.json` as the deployment source of truth. This follows [npm shrinkwrap](https://docs.npmjs.com/cli/v11/configuring-npm/npm-shrinkwrap-json/) and uses [npm ci](https://docs.npmjs.com/cli/v11/commands/npm-ci/) for manifest/lock mismatch rejection.
+`npm pack --ignore-scripts` is restricted to this already-built scratch tree, where source-only build hooks are unavailable; dependency installation still runs its required native scripts. Preserve all files allowed by the existing package manifest and npm's automatic README/license inclusion; fixture tests compare the staging packlist against that published surface. Keep the real archive's required/excluded-file guards. The scratch directory is removed after successful/dry-run/failed packing; even abrupt process death leaves any shrinkwrap outside the development repository. No second hand-maintained dependency tree is introduced.
+
+Change `scripts/check-bundle-pack.mjs` to invoke this script with `--pack --dry-run --json`, and Task 3's artifact harness to invoke it with `--pack --json --pack-destination <scratch>`. Keep their existing npm array/object JSON parsing. In `.github/workflows/publish.yml`, build/validate first, pack once through this command, parse and retain its exact archive filename/digest, and publish that validated archive with `npm publish <absolute-tgz> --access public`; preserve publication authorization and token handling. Task 11 and the operations runbook must use this same source packaging entrypoint. Registry downloads such as `npm pack @keepur/hive@<version>` are unaffected. npm automatically includes the staged root shrinkwrap; add it to `PACKAGE_ENTRIES` and required pack assertions. These choices follow [npm shrinkwrap precedence](https://docs.npmjs.com/cli/v11/configuring-npm/npm-shrinkwrap-json/) and [npm packaging lifecycle](https://docs.npmjs.com/cli/v11/using-npm/scripts/).
 
 - [ ] **Step 3:** In `build/bundle.ts`, add the six package names to `external` and these named entries to the existing shared build: `voice-worker: dist/voice-worker/main.js`, `voice-worker-diagnostic: dist/voice-worker/runtime-diagnostic.js`, `runtime-probe: dist/deployment/runtime-probe.js`. Keep existing server/CLI/MCP bundles and externalizations.
 
 Build the orchestration helper separately with `entryPoints: { deploy: "dist/deployment/main.js" }`, existing Node/ESM/minification settings, and **no third-party externals**. Its import graph is restricted to `node:*`, bundled YAML parsing and `src/deployment/{operation,transaction,artifact,services,health,release,ports}`; it must never import `config.ts`, MongoDB, SDKs or the CLI module. Runtime/vendor probes run in explicit child diagnostics. Reject a non-`node:` external in this helper's esbuild metafile. This produces one frozen JS file that survives `.hive` replacement without copying or borrowing a dependency tree.
 
-At the start of bundling, execute `node scripts/generate-shrinkwrap.mjs`; at the end emit `pkg/release.json`:
+At the start of bundling, execute `node scripts/generate-shrinkwrap.mjs --check-source`; at the end emit `pkg/release.json` from the reviewed development lock, without writing a repository-root shrinkwrap:
 
 ```typescript
 import { createHash } from "node:crypto";
@@ -278,7 +330,7 @@ const release = {
   packageVersion: pkg.version,
   sourceRevision,
   sourceDirty,
-  dependencyLockSha256: createHash("sha256").update(readFileSync("npm-shrinkwrap.json")).digest("hex"),
+  dependencyLockSha256: createHash("sha256").update(readFileSync("package-lock.json")).digest("hex"),
   voiceWorker: { path: "pkg/voice-worker.min.js", admissionProtocol: 1 },
 };
 writeFileSync(resolve(PKG_DIR, "release.json"), JSON.stringify(release, null, 2) + "\n");
@@ -339,11 +391,12 @@ export type BootIdentity = ReturnType<typeof bootIdentity>;
 
 Also compare all three dependency maps in `readRelease` using `isDeepStrictEqual`, as in the generator, before accepting an artifact; this closes the forged-manifest/lock-root mismatch path before npm runs. `readRelease` is a strict packaged-release decoder. Separate legacy classification returns unavailable fields; it never synthesizes a Release from the installed candidate.
 
-- [ ] **Step 5:** Extend `scripts/check-bundle-pack.mjs` required files with worker, both diagnostic helpers, deploy helper, manifest and shrinkwrap. Preserve all MCP/ABI requirements, exclusions and the 10 MB compressed failure threshold. Add `readRelease`/manifest fixture tests for missing file, external symlink, bad digest, unknown schema, dirty migration, mismatched package/version/dependency maps. Verify and commit the artifact slice only after passing:
+- [ ] **Step 5:** Extend `scripts/check-bundle-pack.mjs` required files with worker, both diagnostic helpers, deploy helper, manifest and shrinkwrap. Preserve all MCP/ABI requirements, exclusions and the 10 MB compressed failure threshold. Add `readRelease`/manifest fixture tests for missing file, external symlink, bad digest, unknown schema, dirty migration, mismatched package/version/dependency maps. Add `scripts/generate-shrinkwrap.test.mjs` with real npm subprocesses against a disposable source-package fixture and two locally packed versions of a tiny dependency. Run the actual generator and packaging command: fixture bundle → assert no root shrinkwrap → update package/lock to the second dependency using `npm install --package-lock-only --ignore-scripts` → `npm install --ignore-scripts` → assert the second version is installed and package-lock remains authoritative → assert packing the stale bundle fails → rebuild its manifest → repack → extract and compare published shrinkwrap bytes/digest with the new package-lock. The fixture's build runs the same `--check-source` and manifest-hash path; separately assert the actual repository `npm run bundle` leaves no root shrinkwrap. Test malformed lock/maps, accidental root shrinkwrap rejection, direct source prepack rejection, packlist preservation, packing failure and dry-run cleanup. Inspect only fixture roots and never publish these packages. Append this Node test to `check:bundle` before the pack guard. Verify and commit the artifact slice only after passing:
 
 ```bash
 npm run bundle
 node scripts/generate-shrinkwrap.mjs --check
+node --test scripts/generate-shrinkwrap.test.mjs
 node scripts/check-bundle-pack.mjs
 npx vitest run src/deployment/release.test.ts
 ```
@@ -352,7 +405,7 @@ Expected: all exit 0, worker assets appear in real pack listing and no forbidden
 
 ## Task 3: Fresh production installation and native/SDK artifact acceptance
 
-**Files:** `src/setup/populate-engine.ts`, `src/setup/populate-engine.test.ts`, `src/voice-worker/runtime-diagnostic.ts`, `scripts/check-artifact-install.mjs`, `package.json`.
+**Files:** `src/setup/populate-engine.ts`, `src/setup/populate-engine.test.ts`, `src/voice-worker/runtime-diagnostic.ts`, `scripts/check-artifact-install.mjs`, `scripts/check-bundle-runtime.mjs`, `scripts/check-bundle-runtime.test.mjs`, `package.json`.
 
 - [ ] **Step 1:** Add `npm-shrinkwrap.json` to `PACKAGE_ENTRIES`. Replace `ensureEngineDeps`'s node_modules-exists shortcut with strict artifact validation followed by complete `npm ci --omit=dev --no-audit --no-fund --no-progress` on every explicit resume/install attempt. Never run this repair against a loaded active release during update; stage in `.hive.next`. A complete install marker can be diagnostic, but is not permission to skip revalidation after an interrupted attempt.
 
@@ -397,7 +450,7 @@ Resolve and inspect the actual RTC addon, ONNX shared library and installed `sil
 
 - [ ] **Step 3:** In `scripts/check-artifact-install.mjs`, implement this exact flow using `execFileSync`/`spawn` argument arrays, a disposable scratch HOME and bounded subprocesses:
 
-1. `npm pack --json --pack-destination <scratch>` against the built repository; parse npm array/object JSON formats as the existing guard does. Hash the actual archive.
+1. `node scripts/generate-shrinkwrap.mjs --pack --json --pack-destination <scratch>` against the built repository; this runs real `npm pack` in the Task 2 disposable package stage. Parse npm array/object JSON formats as the existing guard does. Hash the actual archive and require its shrinkwrap bytes to equal the reviewed development lock without creating a repository-root shrinkwrap.
 2. List archive entries; require `package/` prefix, reject absolute/traversal members, unexpected links and forbidden content. Extract into `<scratch>/instance & space/.hive` with no links to repository files. The extraction adapter from Task 8 performs the same checks for update.
 3. Confirm no ancestor/global `node_modules` and unset `NODE_PATH`/`NODE_OPTIONS`; set scratch `HOME`, plain host `PATH`, no voice/model/Slack/Mongo keys. Run `npm ci --omit=dev --no-audit --no-fund --no-progress` inside the extracted root with install scripts enabled.
 4. Run installed `pkg/voice-worker-diagnostic.min.js offline`, require its structured success marker and validate every reported realpath under this release. Check both service entries are real files under this root.
@@ -409,10 +462,34 @@ Also execute the installed server with a separate empty scratch configuration an
 
 Use a temporary child Node launcher if necessary to assert no source/dev/global resolution. Never install dev dependencies into the extracted release, symlink node_modules, use tsx for installed commands, replace the SDK loader with `import()` alone, or accept an arbitrary config error as native success.
 
-- [ ] **Step 4:** Add `check:artifact: node scripts/check-artifact-install.mjs`; append `npm run check:artifact` to `check:bundle` after existing bundle guards. `check:artifact` requires an already-built package to avoid recursive `npm pack`/bundle hooks. Test partial node_modules resume, missing/mismatched shrinkwrap, native-install failure, relocation, source package absence and library symlink escape. Run:
+- [ ] **Step 4:** Add `check:artifact: node scripts/check-artifact-install.mjs`; append `npm run check:artifact` to `check:bundle` after existing bundle guards. `check:artifact` requires an already-built package to avoid recursive pack/bundle hooks. Keep the existing lightweight runtime smoke, but revise **all four subprocess paths** in `scripts/check-bundle-runtime.mjs` (CLI version/help, source-package server, relocated server) to use one explicit isolated launcher. Export its fixture/environment factory for `scripts/check-bundle-runtime.test.mjs`; guard execution so importing the module for tests does not launch checks.
+
+Create one `mkdtempSync` scratch root per run with separate `home`, `instance`, `bin` and `tmp` directories. Create an explicit scratch config containing only `instance.id: bundle-smoke`, and an empty matching dotenv file. Prepend a fixture `security` executable that records its argument array to a scratch-only log and exits 44. It must never delegate to `/usr/bin/security`. Use this complete environment allowlist for every retained-smoke child; do not spread `process.env` or reuse an inherited PATH:
+
+```javascript
+const childEnv = {
+  HOME: scratchHome,
+  HIVE_HOME: scratchInstance,
+  HIVE_CONFIG: scratchConfigPath,
+  PATH: [scratchBin, dirname(process.execPath), "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":"),
+  TMPDIR: scratchTmp,
+  NODE_ENV: "test",
+  HIVE_SMOKE_KEYCHAIN_LOG: scratchKeychainLog,
+};
+```
+
+Every `execFileSync` uses `process.execPath`, argument arrays, `cwd: scratchInstance`, this `env`, and a 10-second timeout. `NODE_PATH`, `NODE_OPTIONS`, npm environment selectors, inherited `HIVE_*` selectors and all operator credential variables are absent. The source-package server still loads its actual built entrypoint by absolute path, while the relocation check retains its existing copied-bundle/repository-node_modules arrangement solely as a path regression. Copy `pkg/release.json` and the generated lock into a **scratch** relocated package when required for its new startup identity checks; obtain the lock bytes from the same validated package-lock, never write it into the repository. CLI output assertions remain exact; neither CLI command gets operator settings.
+
+Replace both permissive server catches: require a nonzero ordinary exit with the exact `Missing required env var: SLACK_APP_TOKEN` error, no timeout/signal, and no syntax/module/native-load error. Successful exit, Mongo connection errors or arbitrary config errors fail this smoke. The empty scratch config/Keychain shim must stop startup at this named required-key boundary before any vendor/database connection. The launcher closes/reaps only its own children and removes scratch files in `finally`.
+
+In `scripts/check-bundle-runtime.test.mjs`, seed a second **fake operator** fixture with conflicting HOME, HIVE_HOME, absolute HIVE_CONFIG, dotenv credentials, NODE_PATH/NODE_OPTIONS and dummy vendor keys. Inject those values into the parent environment after the test process starts, then assert the factory drops them all, preserves only the explicit allowlist, and restores parent environment after each test. Run every launcher branch with test-owned entrypoint probes that report environment/cwd, attempt a Keychain read and attempt config/dotenv selection; assert scratch selectors/paths in all four branches, the shim's exit 44, and no fake-operator sentinel values or path reads. Separately run the actual retained bundle smoke and assert both server failures are exactly the missing Slack key; on macOS require the shim log's `hive/bundle-smoke/SLACK_APP_TOKEN` lookup. Use test-owned connection spies/denial guards to assert zero Mongo/vendor connection attempts rather than waiting for a connection error. Test timeout, unexpected clean exit and wrong error rejection. Add `node --test scripts/check-bundle-runtime.test.mjs` before the retained runtime smoke in `check:bundle`; these tests are isolation evidence, while T2 still requires the fresh installed artifact.
+
+Test partial node_modules resume, missing/mismatched shrinkwrap, native-install failure, relocation, source package absence and library symlink escape. Run:
 
 ```bash
 npm run bundle
+node --test scripts/check-bundle-runtime.test.mjs
+node scripts/check-bundle-runtime.mjs
 npm run check:artifact
 npx vitest run src/setup/populate-engine.test.ts
 ```

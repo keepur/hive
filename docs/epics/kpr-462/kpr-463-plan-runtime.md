@@ -20,6 +20,7 @@ export interface AdmissionSnapshot {
   supervisor: SupervisorRef;
   operationId: string | null;
   admission: "open" | "closed";
+  persistenceFault: boolean;
   unresolved: AcceptedJob[];
   childPids: number[];
 }
@@ -28,71 +29,141 @@ export interface RequestLike {
   accept(): Promise<void>;
   reject(): Promise<void>;
 }
+interface LedgerState {
+  operationId: string | null;
+  persistenceFault: boolean;
+  pending: Map<string, AcceptedJob>;
+  seen: Set<string>;
+  childPids: Set<number>;
+}
+// Leave 4 KiB of the 16 KiB envelope for protocol fields and diagnostics.
+const SNAPSHOT_BUDGET = 12 * 1024;
+const RESERVED_OPERATION = "00000000-0000-4000-8000-000000000000";
 export class AdmissionLedger {
-  private operationId: string | null = null;
-  private readonly pending = new Map<string, AcceptedJob>();
-  private readonly seen = new Set<string>();
-  private readonly childPids = new Set<number>();
+  private state: LedgerState = {
+    operationId: null, persistenceFault: false,
+    pending: new Map(), seen: new Set(), childPids: new Set(),
+  };
   constructor(
     private readonly supervisor: SupervisorRef,
-    private readonly changed: (snapshot: AdmissionSnapshot) => void = () => {},
+    private readonly changed: (snapshot: AdmissionSnapshot) => void,
     private readonly now: () => number = Date.now,
   ) {}
-  snapshot(): AdmissionSnapshot {
+  private copy(): LedgerState {
+    return { ...this.state,
+      pending: new Map([...this.state.pending].map(([id, job]) => [id, { ...job }])),
+      seen: new Set(this.state.seen), childPids: new Set(this.state.childPids) };
+  }
+  private describe(state: LedgerState): AdmissionSnapshot {
     return {
-      supervisor: { ...this.supervisor }, operationId: this.operationId,
-      admission: this.operationId === null ? "open" : "closed",
-      unresolved: [...this.pending.values()].map((job) => ({ ...job })),
-      childPids: [...this.childPids],
+      supervisor: { ...this.supervisor }, operationId: state.operationId,
+      admission: state.operationId === null && !state.persistenceFault ? "open" : "closed",
+      persistenceFault: state.persistenceFault,
+      unresolved: [...state.pending.values()].map((job) => ({ ...job })),
+      childPids: [...state.childPids],
     };
   }
-  private publish(): void { this.changed(this.snapshot()); }
+  snapshot(): AdmissionSnapshot { return this.describe(this.state); }
+  private commit(next: LedgerState, failed: LedgerState = this.state): AdmissionSnapshot {
+    try { this.changed(this.describe(next)); }
+    catch (error) {
+      // Retain conservative state even if the failed write renamed before fsync failed.
+      this.state = { ...failed, persistenceFault: true };
+      throw error;
+    }
+    this.state = next;
+    return this.snapshot();
+  }
+  refresh(): AdmissionSnapshot { return this.commit(this.copy()); }
+  faultClosed(operationId?: string): void {
+    const next = this.copy();
+    if (next.operationId === null && operationId) next.operationId = operationId;
+    next.persistenceFault = true;
+    this.commit(next, next);
+  }
+  private fits(next: LedgerState): boolean {
+    const projected = this.describe(next);
+    projected.operationId = RESERVED_OPERATION;
+    projected.admission = "closed";
+    projected.persistenceFault = false;
+    // Account now for every future entry's maximum PID and phase expansion.
+    projected.childPids.push(...projected.unresolved.filter((j) => j.childPid === undefined)
+      .map(() => Number.MAX_SAFE_INTEGER));
+    projected.unresolved = projected.unresolved.map((job) => ({ ...job,
+      phase: "entered-awaiting-completion", childPid: Number.MAX_SAFE_INTEGER }));
+    return Buffer.byteLength(JSON.stringify(projected), "utf8") <= SNAPSHOT_BUDGET;
+  }
   async request(req: RequestLike): Promise<void> {
-    if (this.operationId !== null || this.seen.has(req.id) || !req.id) {
+    if (this.state.operationId !== null || this.state.persistenceFault || this.state.seen.has(req.id) || !req.id) {
       await req.reject();
       return;
     }
-    this.seen.add(req.id);
-    this.pending.set(req.id, { jobId: req.id, acceptedAt: this.now(), phase: "accepted-awaiting-entry" });
-    this.publish();
+    const next = this.copy();
+    next.seen.add(req.id);
+    next.pending.set(req.id, { jobId: req.id, acceptedAt: this.now(), phase: "accepted-awaiting-entry" });
+    if (!this.fits(next)) {
+      // Emit only the named tracking-capacity diagnostic, without dropping prior jobs.
+      await req.reject();
+      return;
+    }
+    try { this.commit(next, next); }
+    catch (error) {
+      try { await req.reject(); } finally { throw error; }
+    }
     // Do not delete in a then/finally/catch: this promise does not await assignment.
     await req.accept();
   }
   close(operationId: string): AdmissionSnapshot {
     if (!operationId) throw new Error("operation ID required");
-    if (this.operationId !== null && this.operationId !== operationId) throw new Error("maintenance owned by another operation");
-    this.operationId = operationId;
-    this.publish();
-    return this.snapshot();
+    if (this.state.operationId !== null && this.state.operationId !== operationId) {
+      throw new Error("maintenance owned by another operation");
+    }
+    const next = this.copy();
+    next.operationId = operationId;
+    return this.commit(next, next);
   }
-  release(operationId: string): AdmissionSnapshot {
-    if (this.operationId !== operationId) throw new Error("maintenance release ownership mismatch");
-    this.operationId = null;
-    this.publish();
-    return this.snapshot();
+  release(operationId: string, finalize: () => void): AdmissionSnapshot {
+    // release also cancels an unseen close: claim ownership while persisting the fence.
+    this.close(operationId);
+    try { finalize(); }
+    catch (error) { this.state.persistenceFault = true; throw error; }
+    const next = this.copy();
+    next.operationId = null;
+    next.persistenceFault = false;
+    return this.commit(next);
   }
   entered(ref: SupervisorRef, jobId: string, childPid: number): void {
     this.assertSupervisor(ref);
-    const job = this.pending.get(jobId);
+    const next = this.copy();
+    const job = next.pending.get(jobId);
     if (!job || !Number.isSafeInteger(childPid) || childPid <= 1) throw new Error("unknown job entry");
     if (job.childPid !== undefined && job.childPid !== childPid) throw new Error("job child mismatch");
     job.childPid = childPid;
     job.phase = "entered-awaiting-completion";
-    this.childPids.add(childPid);
-    this.publish();
+    next.childPids.add(childPid);
+    this.commit(next, next);
   }
   completed(ref: SupervisorRef, jobId: string, childPid: number): void {
     this.assertSupervisor(ref);
-    const job = this.pending.get(jobId);
+    const next = this.copy();
+    const job = next.pending.get(jobId);
     if (!job || job.childPid !== childPid || job.phase !== "entered-awaiting-completion") {
       throw new Error("completion lacks matching entry");
     }
-    this.pending.delete(jobId);
-    this.publish();
+    next.pending.delete(jobId);
+    this.commit(next);
+  }
+  pruneExitedChildren(verifiedAbsent: ReadonlySet<number>): void {
+    const next = this.copy();
+    const unresolvedPids = new Set([...next.pending.values()].map((job) => job.childPid));
+    for (const pid of next.childPids) {
+      if (!unresolvedPids.has(pid) && verifiedAbsent.has(pid)) next.childPids.delete(pid);
+    }
+    if (next.childPids.size !== this.state.childPids.size) this.commit(next);
   }
   canStop(operationId: string, sdkActiveJobs: number | null, telemetryActiveCalls: number | null): boolean {
-    return this.operationId === operationId && this.pending.size === 0 &&
-      sdkActiveJobs === 0 && telemetryActiveCalls === 0;
+    return !this.state.persistenceFault && this.state.operationId === operationId &&
+      this.state.pending.size === 0 && sdkActiveJobs === 0 && telemetryActiveCalls === 0;
   }
   private assertSupervisor(ref: SupervisorRef): void {
     if (ref.pid !== this.supervisor.pid || ref.bootId !== this.supervisor.bootId) throw new Error("supervisor mismatch");
@@ -100,7 +171,9 @@ export class AdmissionLedger {
 }
 ```
 
-A failed ledger persistence before accept causes request-hook rejection and closed/uncertain diagnostics; it must never proceed to accept after an unsuccessful persistence. Do not clear this uncertain entry automatically. A failed persistence during close prevents acknowledgement; lifecycle aborts before any signal. `changed` must never swallow an I/O failure. Once a callback starts, request reservation and gate close are serialized by the same supervisor event loop.
+`changed` is required in packaged mode and synchronously persists the **complete** snapshot before committing a transition. Inject an explicit no-op only in in-memory unit fixtures. A failed reservation write retains the attempted unresolved entry, rejects that request without calling accept, and latches closed admission even if the next write succeeds. A failed close retains its operation owner; a failed completion/prune keeps the prior unresolved job/child; a failed release retains closed admission and the same owner. `refresh`/status/heartbeat never clear `persistenceFault`; fresh status must classify it `persistence-fault`, not return a successful quiescence or open-admission result. Recovery is the explicit same-owner `release`: first persist the entire retained **closed** state, then durably finalize that operation, then persist open state before acknowledging. None of these steps clears unresolved jobs. An unowned fault can be claimed by close/release under the instance operation lock; a different existing owner cannot be replaced. Any failing step keeps the fault/owner and reports `maintenance-unresolved` before signals. Do not swallow `changed` failures; record sanitized failure classes, and retry persistence of the latched snapshot on subsequent refreshes without clearing the latch. If even diagnostics cannot be written, the fresh acknowledgement is unavailable, never inferred from the older on-disk snapshot. Once a callback starts, request reservation and gate changes are serialized by the same supervisor event loop.
+
+`childPids` means observed children whose exit has **not yet been verified**, not lifetime history. Once per second, use the injected read-only process adapter to build `verifiedAbsent`: only a successful process census proving the PID absent qualifies; permission/parse/command errors, a still-present or reused PID, and elapsed time do not. Apply pruning synchronously against the current ledger and never remove any PID still referenced by an unresolved job, even when the process is absent. Completed children still present remain listed for Task 7's shutdown census; genuine completion plus verified exit permits pruning. `fits` reserves all future entry expansion before accepting each request, so both unresolved diagnostics and completed-but-not-exited PIDs fit without truncation. Capacity exhaustion rejects **new** requests with `tracking-capacity`; it never evicts existing entries. This bounded admission guard has no operator override/configuration and recovers capacity only through genuine completion and verified-exit pruning. The admission ledger retains all unresolved jobs independently of display convenience.
 
 - [ ] **Step 2:** Implement a private filesystem mailbox, avoiding Unix-socket pathname limits for long/symlinked macOS homes. It lives at `<canonical instance>/.hive-state/voice-worker/<bootId>/`, with mode 0700 directories and 0600 JSON files, never under `.hive`.
 
@@ -129,7 +202,9 @@ File layout and ownership:
 | --- | --- | --- |
 | `.hive-state/voice-worker/current.json` | supervisor | protocol, supervisor PID/bootId, boot time, canonical state directory, configured SDK host/port and instance ID; no credentials |
 | `<bootId>/commands/<requestId>.json` | lifecycle process | one immutable command; random UUID filename; consumer validates exact body/filename and ref |
-| `<bootId>/replies/<requestId>.json` | supervisor | reply after mutation and snapshot have been durably written; matching operation/request/ref required |
+| `<bootId>/replies/<requestId>.json` | supervisor | fresh reply after mutation, snapshot and command receipt have been durably written; matching operation/request/ref required |
+| `<bootId>/command-receipts/<requestId>.json` | supervisor | immutable validated command body and applied outcome; reject conflicting reuse; retain until command deletion and directory fsync succeed |
+| `<bootId>/finalized/<operationId>.json` | supervisor | immutable protocol/supervisor/operation terminal fence; release writes this before opening admission; retain for the entire supervisor boot |
 | `<bootId>/jobs/<eventId>.json` | job child | entered sequence 1 or completed sequence 2; no call metadata/transcripts/numbers |
 | `<bootId>/snapshot.json` | supervisor | latest ledger plus supervisor identity and liveness timestamp |
 | `.hive-state/deployment/operation.json` | locked lifecycle process | barrier ownership retained across interruptions, described in Task 8 |
@@ -137,32 +212,96 @@ File layout and ownership:
 Use this atomic write function, with caller-provided paths restricted to validated UUID filenames and the owned directory:
 
 ```typescript
-import { closeSync, fsyncSync, openSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { dirname } from "node:path";
 export function writeJsonAtomic(path: string, value: unknown): void {
   const temp = `${path}.${randomUUID()}.tmp`;
-  const fd = openSync(temp, "wx", 0o600);
+  const errors: unknown[] = [];
+  let fd: number | undefined;
+  let directoryFd: number | undefined;
+  let tempCreated = false;
+  let renamed = false;
   try {
+    directoryFd = openSync(dirname(path), constants.O_RDONLY | constants.O_DIRECTORY);
+    fd = openSync(temp, "wx", 0o600);
+    tempCreated = true;
     writeFileSync(fd, JSON.stringify(value) + "\n");
     fsyncSync(fd);
-  } finally {
     closeSync(fd);
+    fd = undefined;
+    renameSync(temp, path);
+    renamed = true;
+    fsyncSync(directoryFd);
+  } catch (error) { errors.push(error); }
+  finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch (error) { errors.push(error); }
+    }
+    if (tempCreated && !renamed) {
+      try { unlinkSync(temp); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") errors.push(error);
+      }
+    }
+    if (directoryFd !== undefined) {
+      try { closeSync(directoryFd); } catch (error) { errors.push(error); }
+    }
   }
-  renameSync(temp, path);
+  if (errors.length) throw new AggregateError(errors, "atomic state write failed");
 }
 ```
 
-Validate `.hive-state`, boot directories and mailbox entries with `lstat`/realpath before use: reject a symlinked state child, wrong owner, non-regular message file, file above 16 KiB, bad protocol/UUID, unknown kind or a ref that differs from this supervisor. Resolve an intentional symlink of the **instance home** once, then require all state descendants to remain within that real root. Bind mailbox creation and snapshot initialization before SDK workers can fork. Do not place credential values in these records.
+Validate `.hive-state`, boot directories and mailbox entries with `lstat`/realpath before use: reject a symlinked state child, wrong owner, non-regular message file, file above 16 KiB, bad protocol/UUID, unknown kind or a ref that differs from this supervisor. Resolve an intentional symlink of the **instance home** once, then require all state descendants to remain within that real root. Bind mailbox creation and snapshot initialization before SDK workers can fork. Do not place credential values in these records. Check UTF-8 serialized size before each mailbox write as well as before reads; snapshot reservation leaves 4 KiB for the strictly bounded envelope, classification and liveness fields. Receipt files contain command/event identity and outcome, not another full snapshot. Never truncate unresolved entries to make a reply fit. Directory creation and consumed-message/receipt deletion also fsync their parent directory; do not claim durable deletion while unlink/fsync failed. If atomic rename succeeded but directory fsync failed, leave the target for reconciliation and classify the write as failed; never undo it by blindly deleting the destination. Temp cleanup is best effort with failures retained in the thrown aggregate, so cleanup cannot hide the primary write failure.
 
-The supervisor polls every 50 ms, draining job events in `(jobId, sequence)` order before commands; it also publishes liveness at least every second. Processing is synchronous between timer callbacks so close and request reservation cannot interleave inside a mutation. On `close`, call ledger.close then write matching reply; `release` calls ledger.release then replies with admission open and operationId null; `status` returns a fresh snapshot if the caller owns the closed gate, or if admission is currently open; an open reply must explicitly contain `operationId: null`. A different operation’s closed gate is an ownership error. This permits a fresh acknowledgement that a lost close command never took effect. Delete consumed commands/events only after their resulting snapshot/reply is written. Event application is idempotent: retain bounded event-ID receipts until the corresponding message is deleted; if replayed after a completed job, verify the receipt rather than reapply completion. This prevents a crash/retry from turning a valid completion into an unknown-job error. Invalid messages produce sanitized diagnostic classifications and cannot alter the gate.
+The supervisor polls every 50 ms, draining job events in `(jobId, sequence)` order before commands; it also publishes liveness at least every second. Processing is synchronous between timer callbacks so close and request reservation cannot interleave inside a mutation. Use the following command state machine after structural/ref validation; these are the only production callers of ledger close/release. `FinalizedOperations` reads/writes the boot-local `finalized` files above using atomic writes; an existing exact marker is idempotent after revalidating its contents and fsyncing its parent directory, conflicting/corrupt/unreadable state is uncertainty rather than absence. Only ENOENT means not finalized.
 
-The supervisor should not auto-open a barrier merely because a timer expires or the client disappears: expiration might overlap launchd shutdown. The next lifecycle invocation reconciles the recorded operation with the current PID/boot as specified in Task 8. Requests remain rejectable until release is positively acknowledged.
+```typescript
+export interface FinalizedOperations {
+  has(operationId: string): boolean;
+  finalize(operationId: string, supervisor: SupervisorRef): void;
+}
+export function applyMaintenance(
+  command: MaintenanceCommand, ledger: AdmissionLedger, finalized: FinalizedOperations,
+): AdmissionSnapshot {
+  const snapshot = ledger.snapshot();
+  if (snapshot.supervisor.pid !== command.supervisor.pid ||
+      snapshot.supervisor.bootId !== command.supervisor.bootId) throw new Error("supervisor mismatch");
+  switch (command.kind) {
+    case "close":
+      if (finalized.has(command.operationId)) throw new Error("operation-finalized");
+      return ledger.close(command.operationId);
+    case "release":
+      if (finalized.has(command.operationId) && snapshot.operationId === null && !snapshot.persistenceFault) {
+        // Already terminal and open: duplicate release does not close/reopen admission.
+        finalized.finalize(command.operationId, command.supervisor);
+        return ledger.refresh();
+      }
+      return ledger.release(command.operationId, () => finalized.finalize(command.operationId, command.supervisor));
+    case "status":
+      if (snapshot.operationId !== null && snapshot.operationId !== command.operationId) {
+        throw new Error("maintenance owned by another operation");
+      }
+      return ledger.refresh();
+  }
+}
+```
+
+Import `AdmissionLedger` as a value in this module in addition to the two type imports. `MaintenanceReply.operationId` is **always the requesting operation's correlation ID**, including release and open status. Only `MaintenanceReply.snapshot.operationId` describes gate ownership and becomes null when the gate is open. No reply with `snapshot.persistenceFault: true` can have `ok: true`. A successful release reply requires `snapshot.admission === "open"`, `snapshot.operationId === null`, `snapshot.persistenceFault === false` and the matching durable finalized-operation marker. A successful close requires closed admission, the matching owner and no persistence fault. An ordinary status reply reports current ownership/fault state; **even a fresh open status cannot prove that a delayed close will never execute**.
+
+Release is terminal cancellation for that operation on that boot, including when admission is open and no close has been observed. It first claims/persists closed ownership, durably writes the finalization marker, then persists open admission. The finalization marker rejects every later close with `operation-finalized`, including a close with a different request UUID. A release that fails after writing its marker is retryable by the same operation and retains its closed fault/owner until reconciled. Release from a different current owner is an ownership error and never opens that owner's gate. Retain every finalization marker for the entire boot: no TTL or fixed-count eviction may re-enable an old close. Markers are separate small files, not accumulated in snapshots/replies or an unbounded in-memory cache. Old boot state may be cleaned only after independently proving that supervisor/tree exited and no retained lifecycle operation needs its evidence.
+
+Before applying a command, validate any existing receipt against the **entire immutable command**; conflicting request-ID reuse is invalid. Check the terminal fence before replaying any close receipt so a pre-release close acknowledgement can never be returned as current closed-gate evidence. A matching applied close receipt causes no second mutation; reply from a freshly persisted current snapshot, with success only if that operation still owns a nonfaulted closed gate. Status always refreshes current state. Release retries use the idempotent terminal cancellation above to reconcile any fault left by the first attempt, never reopen another owner's gate. After a first application, durably persist its bounded receipt, write the fresh reply, then delete the command and fsync its directory before collecting the receipt. If unlink or its directory fsync fails, retain the receipt and retry cleanup; a surviving command must not be reapplied. Transport retries preserve the request UUID/body. An interrupted receipt/reply write retains the command, latches `faultClosed(command.operationId)` before further requests, and reports a sanitized persistence failure; repeated failures keep the same in-memory owner/fault even if the diagnostic write fails. A serialized command is never acknowledged from an older snapshot or cached reply. Corrupt/invalid/ref-mismatched messages only produce sanitized diagnostics and cannot select or steal an operation owner.
+
+Event application is idempotent: retain event-ID receipts containing exact ref/job/PID/sequence/kind until the corresponding message has been durably deleted; if replayed after a completed job, verify the receipt rather than reapply completion. Write the receipt as part of the event's snapshot persistence callback before committing the mutation; a snapshot/receipt failure therefore retains the unresolved entry and command processing observes a latched fault. A receipt found on retry is only applied evidence when the same live ledger already reflects that transition; if the prior commit faulted, reapply the matching still-unresolved transition, never drop it from a receipt alone. Do not evict receipts while messages remain merely to meet a count bound. Keep receipt files out of reply snapshots; reap completed receipts after durable message deletion. This prevents retry from turning valid completion into an unknown-job error while preserving uncertain work.
+
+The supervisor should not auto-open a barrier merely because a timer expires or the client disappears: expiration might overlap launchd shutdown. The next lifecycle invocation reconciles the recorded operation with the current PID/boot as specified in Task 8. Requests remain rejectable until release has durably reconciled/finalized the owner; lifecycle may report resumed admission only after its matching successful release reply.
 
 Job children inherit **only local identity additions** before `cli.runApp`: `HIVE_VOICE_SUPERVISOR_PID`, `HIVE_VOICE_SUPERVISOR_BOOT_ID`, `HIVE_VOICE_STATE_DIR`. Existing LiveKit auth environment inheritance remains unchanged. These variables do not select a different instance or secret store. Child event writer validates its local environment, job ID, own PID and state containment and writes entered/completed atomically. Missing/invalid tracking state in a packaged worker fails before starting call work; developer/source runs can explicitly use a local in-memory reporter, but no packaged acceptance mode may disable tracking.
 
-- [ ] **Step 3:** Add `requestMaintenance` client with exact matching and a hard supplied deadline. Send commands using a new UUID, record request timestamp, poll its one reply at 50 ms. Require same protocol, operation/request ID, PID/boot, reply timestamp at or after request, and expected admission/ownership. Verify live launchd PID/process identity independently before trusting current.json, before close, and immediately before stop. A fresh file from an old boot cannot pass.
+- [ ] **Step 3:** Add `requestMaintenance` client with exact matching and a hard supplied deadline. Use a new UUID for each logical command, record its initial request timestamp, poll its one reply at 50 ms, and preserve UUID/body on transport retries. Require same protocol, request/correlation operation ID, PID/boot, reply timestamp at or after the initial request, `ok: true`, `persistenceFault: false`, and expected snapshot admission/ownership. Verify live launchd PID/process identity independently before trusting current.json, before close, and immediately before stop. A fresh file from an old boot cannot pass. Do not reissue close after starting release; a new maintenance attempt uses a new operation UUID only after the previous release is acknowledged/reconciled.
 
-Close/status polling shares the **same** 30-second maintenance deadline. Abort release has a separate bounded 2-second acknowledgement budget so a timeout can be reported safely. Do not reset the 30 seconds per request. If release acknowledgement is missing or mismatched, retain operation/barrier ownership and report `maintenance-unresolved`; leave services/artifacts intact.
+Close/status polling shares the **same** 30-second maintenance deadline. Abort release has a separate bounded 2-second acknowledgement budget so a timeout can be reported safely. Do not reset the 30 seconds per request. On every abort after recording a barrier request, send release for that exact operation/supervisor even when close timed out or fresh status says open. Require its terminal successful release reply before clearing the lifecycle marker or reporting availability restored; status alone never finalizes the operation. If release acknowledgement is missing, faulted or mismatched, retain operation/barrier ownership and report `maintenance-unresolved`; leave services/artifacts intact. The next locked invocation retries the same release against the same live boot. Before signals, status must confirm the still-owned closed gate with no persistence fault/unresolved jobs; a reply for a finalized operation cannot establish quiescence.
 
 - [ ] **Step 4:** Expose diagnostics for unresolved entries in CLI/probe output: job ID, supervisor PID/boot, accepted timestamp/age, phase and observed child PID if available. In particular, `accepted-awaiting-entry` after assignment/prewarm/import failure and `entered-awaiting-completion` after lost acknowledgement remain unresolved until the genuine completion path settles them. SDK job-count zero, assignment timeout, dead child, stale heartbeat or elapsed time **never** clear these records. A planned lifecycle operation defers; this ticket introduces no `--force`, ledger-clear or call-termination flag. An operator can investigate retained state; a separate incident recovery decision is not disguised as a normal update.
 
@@ -172,7 +311,22 @@ Close/status polling shares the **same** 30-second maintenance deadline. Abort r
 npx vitest run src/voice-worker/admission.test.ts src/voice-worker/maintenance-ipc.integration.test.ts
 ```
 
-Minimum cases: close/release/status happy path; request-after-close rejection; reserve-before-accept; duplicate job ID; completion from wrong boot/job/PID; sequence 2 before sequence 1 file order; idempotent event replay; ledger-write/command/reply failure; stale current/reply; request-owner conflict; second instance; special-path/symlink home; missing entry/completion; timed-out release; retained unresolved diagnostics. No test calls drain or signals a real worker.
+Minimum cases: close/release/status happy path; request-after-close rejection; reserve-before-accept; duplicate job ID; completion from wrong boot/job/PID; sequence 2 before sequence 1 file order; idempotent event replay; ledger-write/command/reply failure; stale current/reply; request-owner conflict; second instance; special-path/symlink home; missing entry/completion; timed-out release; retained unresolved diagnostics. Add these regression assertions using injected filesystem/process adapters and a deterministic mailbox clock:
+
+| Scenario | Required assertions |
+| --- | --- |
+| close command survives failed unlink, then release succeeds | replay original close and a new-request-ID close for that operation; admission stays open, owner stays null, response is `operation-finalized`; a new operation may close normally |
+| close delayed beyond timeout; status overtakes it and reports open | lifecycle still sends release, persists finalization, and only then resolves cleanup; deliver delayed close after release and prove it cannot close admission |
+| release arrives before close; release response is lost; repeated release/status/close are reordered | same-operation release is idempotent, status alone never resolves abort, terminal fence wins over old close receipt, and another operation's closed gate is untouched |
+| one-shot reservation write failure, then successful writes | first request reject exactly once/accept zero; unknown reservation retained; second request rejected; fresh status has closed/faulted state and cannot authorize stop; explicit release persists retained state and opens only after finalization |
+| fail close write, terminal-marker write, release closed-state write or release open-state write separately | same owner and closed/faulted gate survive; fresh successful refresh does not clear the latch; release retry reconciles without deleting jobs; no signal/bootout/drain occurs |
+| completion snapshot/receipt failure, or event deletion failure | unresolved entry survives failed commit; a receipt alone cannot clear it; matching retry completes once; a consumed-event replay never clears another job or errors as unknown |
+| 4,000 accept/enter/complete/verified-exit cycles in one supervisor boot | every reply stays below 16 KiB, completed-child storage does not grow with cycles, and subsequent close/status/release succeeds; repeat while retaining one unresolved job and prove its full entry/PID survives |
+| completed child still present/unknown, unresolved child absent, or tracking capacity exhausted | no unverified/unresolved PID pruned; new oversized request rejected before accept; existing jobs/diagnostics unchanged; completing and verifying exits restores capacity without a force flag |
+| write, file fsync, close, rename, directory fsync and cleanup failures | pre-rename failure leaves old target intact; temps removed when cleanup succeeds; after-rename fsync failure is uncertain and never acknowledged; all opened descriptors are closed; cleanup error preserves primary error |
+| release and open-status correlation | top-level operationId equals request operation UUID, nested snapshot.operationId is null, and only successful terminal release clears the lifecycle record |
+
+Expected: both Vitest files exit 0 with every case executed. No test calls drain or signals a real worker.
 
 ## Task 5: Wire tracking and immutable boot evidence without altering conversation logic
 
@@ -314,7 +468,7 @@ Add `voice.workerPort: voiceWorkerPort(hive.instance?.portBase, ports.voiceWorke
 
 The secret-free YAML reader used for CLI identity should report configured worker port as a planning hint only. A candidate `runtime-probe config` under the intended service environment supplies authoritative resolved listeners/config compatibility. Voice-disabled flow never calls loadWorkerConfig or a vendor probe; it still identifies and quiesces an already-running stale worker using that supervisor's recorded port/config selection before removal.
 
-- [ ] **Step 2:** Implement a packaged `runtime-probe.min.js` with explicit `config`, `bridge`, `worker`, `outbound` modes and JSON output. It uses dynamic config imports only inside selected modes, and must run with exactly the intended service's explicit HOME/PATH/HIVE_HOME/HIVE_CONFIG and captured allowed non-secret environment settings. Never spread an interactive shell's secret environment into a launchd-compatibility test. Normal service secrets come from matching dotenv/Honeypot. Request/response output is whitelist-only.
+- [ ] **Step 2:** Implement a packaged `runtime-probe.min.js` with explicit `config`, `bridge`, `worker`, `outbound` modes and JSON output. It uses dynamic config imports only inside selected modes. Every corresponding probe subprocess must use Task 7's shared `buildServiceEnvironment` from `src/deployment/services.ts`, with exactly the intended service's explicit HOME/PATH/HIVE_HOME/HIVE_CONFIG and captured, validated non-secret overrides, including `VOICE_PORT`. Deep-compare the probe environment with the generated service environment before importing config; they must match. Never spread an interactive shell's secret environment into a launchd-compatibility test. Normal service secrets come from matching dotenv/Honeypot through Task 7's basename-correct `resolveDotenvPath`. Request/response output is whitelist-only.
 
 | Mode | Required behavior | Forbidden behavior |
 | --- | --- | --- |

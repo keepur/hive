@@ -4,11 +4,16 @@ This is chunk 3 of the [parent plan](./kpr-463-plan.md). Its Testing Contract, a
 
 ## Task 7: Generate and operate the target service pair
 
-**Files:** Create `src/deployment/services.ts`, `src/deployment/services.test.ts`; modify `src/cli/daemon.ts`, `src/cli/daemon.test.ts`, `setup/generate-plist.ts`, `service/install.sh`; create `service/install.test.sh`.
+**Files:** Create `src/deployment/services.ts`, `src/deployment/services.test.ts`; modify `src/paths.ts`, `src/paths.test.ts`, `src/cli/daemon.ts`, `src/cli/daemon.test.ts`, `setup/generate-plist.ts`, `service/install.sh`; create `service/install.test.sh`.
 
 - [ ] **Step 1:** Replace engine-only plist construction with this reusable pure serializer. Keep `getLabel/getPlistPath/getLaunchAgentLink` as engine-compatible wrappers; add component-aware helpers used by both labels. Validate instance ID against `^[a-zA-Z0-9][a-zA-Z0-9_-]*$` before constructing labels/paths; config selectors remain explicit file paths, not label content.
 
 ```typescript
+const servicePortKeys = [
+  "BG_TASK_PORT", "MEETING_MONITOR_PORT", "CODE_TASK_PORT", "WS_PORT",
+  "ADMIN_API_PORT", "VOICE_PORT", "SLACK_INTERNAL_PORT", "BEEKEEPER_PORT",
+] as const;
+export type ServiceOverrides = Partial<Record<typeof servicePortKeys[number], string>>;
 export interface ServiceDefinition {
   label: string;
   nodePath: string;
@@ -18,8 +23,24 @@ export interface ServiceDefinition {
   configPath: string;
   home: string;
   pathEnv: string;
+  overrides: ServiceOverrides;
   stdout: string;
   stderr: string;
+}
+export function buildServiceEnvironment(s: Pick<ServiceDefinition,
+  "hiveHome" | "configPath" | "home" | "pathEnv" | "overrides"
+>): Record<string, string> {
+  const env: Record<string, string> = {
+    HIVE_HOME: s.hiveHome, HIVE_CONFIG: s.configPath, HOME: s.home, PATH: s.pathEnv,
+  };
+  for (const [key, value] of Object.entries(s.overrides)) {
+    if (!servicePortKeys.some((allowed) => allowed === key)) throw new Error("unsupported service override");
+    if (typeof value !== "string" || !/^[0-9]+$/.test(value) || Number(value) < 1 || Number(value) > 65535) {
+      throw new Error(`invalid service port override: ${key}`);
+    }
+    env[key] = value;
+  }
+  return env;
 }
 const xml = (value: string): string => value.replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;",
@@ -33,10 +54,7 @@ export function buildServicePlist(s: ServiceDefinition): string {
 <key>ProgramArguments</key><array>${[s.nodePath, s.entrypoint, ...s.args].map(string).join("")}</array>
 <key>WorkingDirectory</key>${string(s.hiveHome)}
 <key>EnvironmentVariables</key><dict>
-<key>HIVE_HOME</key>${string(s.hiveHome)}
-<key>HIVE_CONFIG</key>${string(s.configPath)}
-<key>HOME</key>${string(s.home)}
-<key>PATH</key>${string(s.pathEnv)}
+${Object.entries(buildServiceEnvironment(s)).map(([key, value]) => `<key>${xml(key)}</key>${string(value)}`).join("")}
 </dict>
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -55,6 +73,18 @@ Definition inputs:
 | worker | `com.hive.<id>.voice-worker` | `<home>/.hive/pkg/voice-worker.min.js`, `["start"]` | `<home>/logs/voice-worker.log`, `voice-worker.err` |
 
 Node is the validated absolute `process.execPath`, recorded as a host prerequisite. HOME is the same user home used by launchd/Keychain; PATH is the explicit operational PATH. Both definitions use the exact same resolved absolute HIVE_HOME and HIVE_CONFIG, including alternate config selection. Resolve canonical root for containment, while preserving the selected usable instance symlink spelling in explicit selectors if intended. Entrypoints/dependency realpaths must lie under canonical `.hive`; Node is the sole external executable prerequisite. Never fall back to `dist`, `src`, npx or a checkout when package files are absent.
+
+In shared `src/paths.ts`, add `basename` to the `node:path` import and replace only `resolveDotenvPath` with the following. Determine the suffix from the selector's basename, while keeping the dotenv file under HIVE_HOME; do not move dotenv lookup to the selected config's directory. All engine/worker/config-probe imports use this shared resolver, preserving the existing dotenv then env-first/Honeypot behavior.
+
+```typescript
+export function resolveDotenvPath(hiveHome: string): string {
+  const configFile = basename(process.env.HIVE_CONFIG || "hive.yaml");
+  const suffix = configFile.match(/^hive-(.+)\.yaml$/)?.[1];
+  return resolve(hiveHome, suffix ? `.env-${suffix}` : ".env");
+}
+```
+
+Capture supported overrides from the inventoried effective service definitions, validate them before any write or shutdown, and use `buildServiceEnvironment` for both generated plists and every corresponding Task 6 config/health probe subprocess. Never obtain this map by spreading the invoking shell's environment. Preserve the captured values exactly, including `VOICE_PORT`; absent overrides continue through the shared dotenv/Honeypot loader. Reconcile engine/worker values before staging: conflicting settings that select different shared listeners fail preflight. Any other required legacy service environment override must either be explicitly classified, validated and added to this shared non-secret allowlist in implementation, or cause a named preflight rejection before shutdown; silently dropping it is forbidden. Credentials remain in the shared secret loader and are never allowlisted into generated plists. The sanitized probe subprocess env must deep-equal the generated service env before config import; private prior definitions remain available for exact recovery.
 
 - [ ] **Step 2:** Implement the following concrete adapters in `services.ts`; commands use `execFile` argument arrays and captured output, never shell evaluation. Inject one `ServiceIO` interface for fixture use.
 
@@ -85,11 +115,13 @@ Make `setup/generate-plist.ts` share `buildServicePlist` for production definiti
 - [ ] **Step 5:** Verify and checkpoint:
 
 ```bash
-npx vitest run src/deployment/services.test.ts src/cli/daemon.test.ts
+npx vitest run src/paths.test.ts src/deployment/services.test.ts src/cli/daemon.test.ts src/voice-worker/worker-config.test.ts src/deployment/health.test.ts
 bash service/install.test.sh
 ```
 
 Require XML special characters, absolute paths, alternate config, symlink containment, enabled/disabled/previously installed transitions, all start/stop orders, owner mismatch, child survival, missing entrypoint before write, repeated no-op behavior and second-instance exclusion.
+
+Add `resolveDotenvPath` cases for absent/default, relative `hive-personal.yaml`, the generated absolute `<home>/hive-personal.yaml`, absolute selectors whose parent directory also contains `hive-`, and selected symlink-home spelling. Assert every personal selector resolves `<home>/.env-personal`, default resolves `<home>/.env`, and an out-of-home absolute config still derives its dotenv path under the selected home. The disposable loader integration fixture has distinct dummy bridge-token/port values in `.env` and `.env-personal`, no default hive.yaml, and the generated engine/worker environments with absolute personal selectors. Dynamically import the actual engine config, worker loader and packaged config/bridge probe in separate sanitized processes with the fake Keychain shim; require all three to select the personal dotenv and resolve the same bridge listener/token classification without printing values. Preserve env-first precedence with a captured valid `VOICE_PORT` override in both plist dictionaries and every probe env; assert malformed/unsupported overrides and conflicting service overrides fail before any signal/plist write, and generated plists omit dummy secret values.
 
 ## Task 8: Serialize, stage and recover the paired transaction
 
@@ -119,12 +151,26 @@ export interface OperationRecord {
   priorSnapshotPath: string;
   candidateArchiveSha256?: string;
   retainedPaths: string[];
+  resolution?: "healthy" | "deferred" | "recovered";
+  artifactMove?: {
+    from: string;
+    to: string;
+    directoryIdentity: { device: number; inode: number };
+    state: "intended" | "observed";
+  };
+  artifactDisposal?: {
+    path: string;
+    directoryIdentity: { device: number; inode: number };
+    state: "intended" | "observed";
+  };
 }
 ```
 
-The lock covers start/stop/update/rollback, restart and supported deploy-check through final verification/recovery. An existing live owner returns busy before writes. A stale owner PID alone is not permission to remove a lock: compare PID/start time and inspect operation phase/service identities/artifact locations. Before signals, the next invocation can release a same-boot barrier, verify open, remove only its owned incomplete stage, archive the resolved record and begin anew. After signals or uncertain rotation, refuse a new destructive rotation until the recovery adapter has reconciled the recorded prior/candidate identities and exact path inventory. A crash after mkdir but before owner metadata is an uncertain lock, not automatically stale.
+The lock covers start/stop/update/rollback, restart and supported deploy-check through final verification/recovery. An existing live owner returns busy before writes. A stale owner PID alone is not permission to remove a lock: compare PID/start time and inspect operation phase/service identities/artifact locations. When `barrierOperationId` was recorded before signals, the next invocation must obtain a fresh same-boot terminal release acknowledgement for that operation, including when its close might never have arrived, before removing only its owned incomplete stage, archiving the resolved record and beginning anew. A pre-barrier failure requires only its owned filesystem reconciliation. An open status snapshot alone cannot finalize a recorded barrier operation or rule out a delayed close. After signals or uncertain rotation, refuse a new destructive rotation until the recovery adapter has reconciled the recorded prior/candidate identities and exact path inventory. A crash after mkdir but before owner metadata is an uncertain lock, not automatically stale.
 
-Atomic marker writes bracket every irreversible step: write intended phase before action, then record observed result. The prior snapshot includes presence/identity of `.hive`, `.hive.prev`, `.hive.next`, effective service definitions, link/loaded/enabled state, prior health profile and exact tool hash. This is one operation marker/snapshot, not a general journal. On ordinary resolved failure remove its lock/staging; retain `.hive.broken`, prior recovery files and final diagnostic record. On unresolved failure release process ownership only after persisting `unresolved`; subsequent invocations still refuse rotation until reconciliation. Do not erase another `.hive-state` consumer's files.
+Atomic marker writes bracket every irreversible step: write intended phase before action, then record observed result. The prior snapshot includes presence/identity of `.hive`, `.hive.prev`, `.hive.next`, **`.hive.broken`**, effective service definitions, link/loaded/enabled state, prior health profile and exact tool hash. Every occupied artifact slot records canonical path, `lstat` device/inode, release/lock identity and owning operation/snapshot; capture absence explicitly for reserved operation slots `prior-prev`, `prior-broken`, `rollback-current` and `failed-prev`. Require same-user ownership, real directories within the canonical instance and no symlinked ancestors. Existing `.hive.broken` must match a retained resolved operation's target-instance inventory, or the explicitly registered first-adoption snapshot; package contents alone are not proof of ownership. Unowned, changed, symlinked or recovery-essential broken paths fail preflight before signals or rotation. This is one operation marker/snapshot, not a general journal.
+
+Before every rename, atomically write `artifactMove` with `state: "intended"`, source identity and absent destination; revalidate both paths, perform the rename, then record its observed location and `state: "observed"`. Recovery locates identities against the original snapshot and this last move even if the post-rename marker write failed; never infer ownership from a slot name alone. Before any owned diagnostic directory is removed, write `artifactDisposal` with its exact identity/path and `state: "intended"`, then `state: "observed"` after verified absence. Interrupted removal may resume only against that recorded directory identity and the already-durable verified resolution. `retainedPaths` names all surviving operation and instance slots. `finishResolved` persists the verified `resolution` and final inventory before diagnostic cleanup or lock removal. On ordinary resolved failure remove its lock/staging; retain the newest `.hive.broken`, prior recovery files and final diagnostic record according to Step 5. On unresolved failure release process ownership only after persisting `unresolved`; subsequent invocations still refuse rotation until reconciliation. Do not erase another `.hive-state` consumer's files.
 
 - [ ] **Step 2:** Freeze the dependency-free `pkg/deploy.min.js` into `<home>/.hive-state/deployment/operations/<id>/deploy.min.js` before running the transaction. Compute/record its SHA-256, invoke the frozen file with `process.execPath`, and pass the explicit operation record path and command arguments. The original CLI/shell wrapper performs no deferred code reads from its replaced package. The frozen helper's esbuild external check proves its runtime graph needs only builtins. Diagnostic subprocess paths are chosen explicitly for the candidate/current/recovery release and validated before each use.
 
@@ -145,6 +191,8 @@ Dry-run branches **before** lock/directory creation, freeze, npm lookup or confi
 Stage while existing pair remains up. If `.hive.next` exists without this operation's ownership record, fail/reconcile rather than delete it. Do not extract over a symlink or nonempty unowned directory. Native install has its own bounded staging budget (10 minutes); no service signal occurs during it. This budget is distinct from maintenance/health budgets.
 
 Before moving an old `.hive.prev`, ensure the captured current release/recovery route remains intact. Keep the old previous directory under this operation's private `prior-prev` until candidate health succeeds; do not delete the only usable prior generation during staging.
+
+After complete artifact/config/prior-profile validation and before requesting maintenance or sending any signal, reserve an empty `.hive.broken` slot by moving an existing validated diagnostic to this operation's absent `prior-broken` slot with the Step 1 markers. Do not delete it here. Prove it is not referenced by any current/prior/pilot recovery profile or retained bootstrap tooling. If there is no existing broken directory, record that absence without a move. This preparation applies to update and ordinary rollback; pilot operations apply it only if their captured artifact moves use the broken slot. Any pre-signal failure restores the original broken directory from `prior-broken` after identity validation, so a deferred operation leaves the original diagnostic layout intact. An unexpected destination or unreconciled move retains `unresolved` and blocks a new rotation.
 
 - [ ] **Step 4:** Implement reversible quiescence using these complete orchestration types/function. The adapter resolves current running configuration/port from corroborated supervisor identity, never blindly from the candidate's changed YAML.
 
@@ -203,7 +251,7 @@ export async function quiesce(io: QuiescenceIO, operationId: string): Promise<Id
 }
 ```
 
-The adapter's close/status/release validates protocol, request/operation/PID/boot and expected state exactly; a lost close request can be reconciled as “never applied, admission already open” only by a **fresh same-supervisor status acknowledgement**, not by a stale open snapshot. Add an `inspect-admission` command or allow fresh status for the supplied operation when open to support that proof. For successful close, only the owning operation can release. At the last instruction before bootout, recheck same PID/start time and confirmed closed gate/no unresolved ledger; no new request can enter after the barrier.
+The adapter uses Task 4's exact `close`/`status`/`release` protocol. Validate the reply envelope's `operationId` as request correlation, separately from `snapshot.operationId`, which identifies the current gate owner. Close/status proof requires the expected owning operation, closed admission, no `snapshot.persistenceFault`, and matching protocol/request/PID/boot. For abort or stale-owner reconciliation, require a fresh matching terminal **release** acknowledgement: its envelope retains the supplied operationId, its snapshot is open with `operationId: null`, and the supervisor has durably finalized that operation against delayed/replayed close. This release is required even if the close never arrived and fresh status reports open; status is observation only. Release cannot open another operation's gate, and any persistence fault or unacknowledged release yields `UnresolvedMaintenance` with ownership/evidence retained. At the last instruction before bootout, recheck same PID/start time and confirmed closed gate/no unresolved ledger/no persistence fault; no new request can enter after the barrier.
 
 All paths after `recordBarrierRequested` but before a signal must use the release/reconcile cleanup, including filesystem errors while writing `quiescent`. Treat no-running-worker as separate evidence, not `activeJobs=0`. A previously existing worker that exited or became unregistered during preflight is uncertain/deferred, not an idle result. An already-active call never receives a shutdown signal.
 
@@ -296,10 +344,12 @@ Rotation/recovery table (write marker before/after each rename):
 
 | Mode | After old services exit | On candidate success | On any partial failure |
 | --- | --- | --- | --- |
-| update | move previous `.hive.prev` to op `prior-prev`; move old `.hive` to `.hive.prev`; move owned `.hive.next` to `.hive` | retain prior current `.hive.prev`; remove saved older generation only after durable health | identify actual paths from operation marker and manifests; move failed candidate to `.hive.broken`; restore original `.hive` and older `.hive.prev` positions |
-| ordinary rollback | validate `.hive.prev` before stop; move current `.hive` to a retained operation slot; move `.hive.prev` to `.hive` | retain replaced current as `.hive.broken`; preserve existing one-generation semantics (previous consumed) | move failed selected previous to diagnostic owned path; restore original current and previous positions |
+| update | `.hive.broken` already reserved absent; move previous `.hive.prev` to op `prior-prev`; move old `.hive` to `.hive.prev`; move owned `.hive.next` to `.hive` | retain prior current `.hive.prev`; return any `prior-broken` to the still-absent `.hive.broken`; remove saved older previous generation only after durable health | identify actual paths from operation marker, device/inode and manifests; move this operation's failed candidate from its observed `.hive`/`.hive.next` position into the reserved `.hive.broken`; restore original `.hive` and older `.hive.prev` positions |
+| ordinary rollback | validate `.hive.prev` before stop; `.hive.broken` already reserved absent; move current `.hive` to op `rollback-current`; move `.hive.prev` to `.hive` | after durable health, move `rollback-current` into the reserved `.hive.broken`; preserve existing one-generation semantics (previous consumed) | move failed selected previous, if activated, from `.hive` to absent op `failed-prev`; restore `rollback-current` to `.hive`; restore selected previous from `failed-prev` to `.hive.prev`; return `prior-broken` to absent `.hive.broken`; if a move never happened, retain that original identity in its existing slot |
 | first migration update | capture effective pilot definitions/paths; stage package as update while preserving unrelated old `.hive` inventory | `.hive` is candidate; pilot snapshot/worktrees/tooling remain available; `.prev` may still be incompatible | restore captured artifact directory positions and exact pilot definitions; check pilot profile |
 | pilot rollback/reapply | restore captured pilot definitions without modifying pilot checkout/deps; candidate retained under operation-owned path; use verified dispatch hold before stopping pilot on reapply | rollback proves pilot recovery; final reapply restores selected candidate and full packaged profile | restore last usable captured pair; never delete pilot or claim candidate acceptance from pilot health |
+
+The broken-slot lifecycle retains one diagnostic generation. A recovered failed update leaves its candidate in `.hive.broken`; a successful ordinary rollback leaves the replaced current release there. Only after checking the resulting candidate/prior pair and persisting the matching healthy/recovered resolution may `finishResolved` dispose of the superseded owned `prior-broken` directory. Validate its original identity, canonical containment and absence from every remaining recovery reference again immediately before removal, and bracket disposal with the Step 1 markers. Never delete it merely to make a rename succeed. Successful updates and aborted/failed rollbacks return the captured older diagnostic to `.hive.broken` instead of discarding it. If disposal or restoration fails, retain exact locations and report unresolved cleanup; a healthy result never triggers another artifact rotation. This temporary holding slot is part of one operation's recovery, not an additional retained-release system.
 
 `recoverPriorPair` first stops only positively identified candidate services/children (worker before engine) and verifies their exit. It then restores original artifact positions and exact definitions/link state, starts engine, requires fresh boot, starts the prior worker, then checks the captured packaged or pilot profile. A bootstrap/plist/link/rename/health exception all enter this path; shell `set -e` cannot bypass it because the supported transaction runs inside this bundled helper. If a process cannot be stopped or a file move cannot be reconciled, do not start a conflicting prior pair on occupied ports; retain and report both failures.
 
@@ -308,11 +358,14 @@ Rotation/recovery table (write marker before/after each rename):
 | Injection | Required result |
 | --- | --- |
 | registry/archive/root/lock/native/config/prior compatibility | no signal/bootout/plist rotation; same prior PIDs/definitions/config |
-| close lost/wrong boot, accepted-but-unassigned job, running race, timeout | no signal/swap; release same supervisor and verify open; preserve call |
+| close lost/wrong boot, accepted-but-unassigned job, running race, timeout | no signal/swap; require same-supervisor terminal release acknowledgement with matching envelope operationId and null snapshot.operationId; preserve call |
+| close delayed until after terminal release, replayed close/release, fresh open status without release, snapshot persistence fault | no signal/swap; delayed/replayed close cannot reclose finalized operation; open status alone never permits cleanup; failed persistence retains ownership/unresolved evidence |
 | release ack lost | no signal/swap; unresolved marker and diagnostic; no restored-availability claim |
 | failure after quiescence marker but before bootout | admission released with acknowledgement |
 | worker stop timeout, reparented child, engine stop timeout | checked recovery or unresolved; never claim reversible cancellation after signal |
 | old-prev/current/next rename at each point | reconcile actual paths, restore exact prior pair, retain candidate artifact |
+| existing owned broken; before/after-marker failure around broken-to-prior-broken, candidate-to-broken, prior-broken restore/disposal | no destination overwrite; reconcile recorded identities after each crash point; retain prior recovery/diagnostic routes until verified resolution; unknown/symlinked/changed/recovery-essential broken fails before signals |
+| two consecutive failed update activations in the same instance, then ordinary rollback with existing broken | each failed update returns nonzero with the original running pair/previous positions restored; second failure retains the second candidate at `.hive.broken` and disposes the first diagnostic only after durable recovered outcome; from that fixture test both rollback branches: success leaves selected previous running and replaced current at `.hive.broken`; injected failure restores original current/previous/broken identities and verifies prior pair |
 | plist write, link write, enable/bootstrap, engine markers, worker registration | checked prior recovery; failure exit even on healthy recovery |
 | wrong current release/PID/start time, stale logs/heartbeat, foreign socket | candidate never accepted |
 | recovery bootstrap/auth/registration failure | both primary/recovery failures plus retained paths; nonzero |
@@ -327,7 +380,7 @@ Also create sentinels with content hash and mode in `hive.yaml`, alternate doten
 
 - [ ] **Step 1:** Add string option `artifact` and boolean option `dry-run` to the CLI parser/helper types. Extend UpdateOptions to `{ tag?: string; artifact?: string; instance?: string; dryRun?: boolean }`, RollbackOptions with `dryRun?: boolean`. Reject `--artifact` plus `--tag`, nonabsolute/nonregular/non-tgz artifact, and explicit instance ID unequal to selected config before writes. Help describes update/rollback as the engine and enabled worker release unit.
 
-Also fix `ensureHiveInstallOrExit` to check `resolve(home, process.env.HIVE_CONFIG ?? "hive.yaml")`, so an instance with only an explicitly selected alternate config can start; test it with no default hive.yaml.
+Also fix `ensureHiveInstallOrExit` to check `resolve(home, process.env.HIVE_CONFIG ?? "hive.yaml")`, so an instance with only an explicitly selected alternate config can start; test it with no default hive.yaml and with both relative and generated absolute `hive-personal.yaml` selectors. This validation shares Task 7's basename-based `resolveDotenvPath` fix; checking config existence alone is insufficient. The CLI-to-helper-to-service/probe handoff must preserve the same absolute selector and select `.env-personal` throughout.
 
 `runUpdate`/`runRollback` resolve their **own running CLI package's** `pkg/deploy.min.js` from `import.meta.url`, validate it, freeze/invoke it through Task 8. Never choose the installed target's `.hive/service/deploy.sh` by default; this is essential when candidate CLI runs from bootstrap tooling. For development source invocation, use the built helper in the same source package only when explicitly present; no live target fallback. `deriveSingleInstanceEnv` becomes a non-secret identity/config handoff, not a port kill set. Any derived ports are ownership/preflight hints only.
 
