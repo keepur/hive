@@ -248,7 +248,9 @@ const realTimers: Timers = {
 };
 export class ModelCatalogScanner {
   private readonly lanes = new Map<CatalogProvider, Lane>(BUILTIN_CATALOG_PROVIDERS.map((p) => [p, { startup: true }]));
-  private readonly lastDiagnostic = new Map<string, string>();
+  // One current diagnostic epoch per built-in lane and the export lane.
+  // Fixed status/code combinations are retained only for its current UUID.
+  private readonly diagnostics = new Map<string, { attemptId?: string; seen: Set<string> }>();
   private readonly now: () => number;
   private readonly timers: Timers;
   private readonly log: Pick<ReturnType<typeof createLogger>, "info" | "warn">;
@@ -269,9 +271,13 @@ export class ModelCatalogScanner {
     void this.tick();
   }
   private report(provider: string, status: string, attemptId?: string, code?: string, recoveryPending = false): void {
-    const key = JSON.stringify([status, attemptId, code, recoveryPending]);
-    if (this.lastDiagnostic.get(provider) === key) return;
-    this.lastDiagnostic.set(provider, key);
+    let diagnostic = this.diagnostics.get(provider);
+    if (!diagnostic || diagnostic.attemptId !== attemptId) {
+      diagnostic = { attemptId, seen: new Set() }; this.diagnostics.set(provider, diagnostic);
+    }
+    const key = JSON.stringify([status, code, recoveryPending]);
+    if (diagnostic.seen.has(key)) return;
+    diagnostic.seen.add(key);
     const data = { provider, status, attemptId, code, recoveryPending };
     if (code) this.log.warn("Model catalog scanner status", data);
     else this.log.info("Model catalog scanner status", data);
@@ -301,7 +307,7 @@ export class ModelCatalogScanner {
         if (this.stopped) return;
         const pending = results.some((r) => r.kind !== "recovered");
         if (pending) this.report("*", "export-recovery-pending", undefined, "storage", true);
-        else this.lastDiagnostic.delete("*");
+        else this.diagnostics.delete("*");
       }).catch(() => {
         if (!this.stopped) this.report("*", "export-recovery-pending", undefined, "storage", true);
       }).finally(() => { if (this.recovery === task) this.recovery = undefined; });
@@ -352,10 +358,10 @@ export class ModelCatalogScanner {
         // cannot reconstruct the original saved snapshot identity.
         lane.pending = undefined;
         this.report(provider, `observed-${scan.outcome}`, unresolved.attempt.attemptId);
-      } else if (typeof scan.attemptId === "string" && scan.attemptId !== unresolved.attempt.attemptId) {
-        lane.pending = undefined; // supersession, not a failure claim
       } else if (unresolved.attempt.leaseExpiresAt.getTime() > this.now()) return;
       else {
+        // A different persisted UUID can still be the predecessor of an
+        // uncertain begin. It never resolves this identity before expiry.
         // A negative read after expiry permits only recovery + a new due
         // observation; it never means the earlier mutation did not happen.
         if (!this.current(lane, invocation)) return;
@@ -525,6 +531,74 @@ it("discards a consumed missing-catalog startup decision when another scanner fa
 // Merge with imports: CatalogError, safeError from ./model-catalog-value.js.
 ```
 
+Add this predecessor-still-visible regression beside that test. The interceptor retains an actual delegated mutation even though the store call rejects; discarding `run` would miss the uncertainty being tested. Both releases are mandatory.
+
+```ts
+// Merge ATTEMPT_LEASE_MS into the scanner import above.
+it.each(["before-expiry", "after-successor"] as const)("retains an uncertain begin while its predecessor is visible: %s", async (releaseAt) => {
+  let now = Date.parse("2026-09-07T12:00:00Z") - SCAN_INTERVAL_MS - 1;
+  const fake = createCatalogFake(() => new Date(now));
+  const seed = new ModelCatalogStore(fake.db, { now: () => new Date(now) });
+  await seed.replaceManual({ provider: "codex", updatedBy: "test", models: [{ id: "old", displayName: "Old" }] });
+  const due = await seed.readCatalogState("codex");
+  const prior = await seed.beginDiscoveryAttempt("codex", { attemptId: randomUUID(), startedAt: new Date(now),
+    leaseExpiresAt: new Date(now + ATTEMPT_LEASE_MS), observed: due.observed });
+  expect(prior.kind).toBe("started"); if (prior.kind !== "started") throw new Error("Seed did not acquire");
+  expect((await seed.failDiscoveryAttempt(prior.attempt, safeError("codex", "auth"), new Date(now))).kind).toBe("recorded");
+  now += SCAN_INTERVAL_MS + 1; const originalStart = now;
+  const release = deferred<void>(); let delegated: Promise<{ matchedCount: number }> | undefined;
+  const db = faultDb(fake.db, async (name, method, args, run) => {
+    if (!delegated && name === "agent_model_catalog" && method === "updateOne" && args[0]._id === "codex" && args[1].$set?.["scan.outcome"] === "running") {
+      delegated = release.promise.then(run); void delegated.catch(() => {});
+      throw new Error("test acknowledgment lost before delegation");
+    }
+    return run();
+  });
+  const store = new ModelCatalogStore(db, { now: () => new Date(now) });
+  const begin = vi.spyOn(store, "beginDiscoveryAttempt"), apply = vi.spyOn(store, "applyDiscovery"), fail = vi.spyOn(store, "failDiscoveryAttempt");
+  const allocated: string[] = [];
+  const discover = vi.fn(async (provider: string) => [{ id: `${provider}-new`, displayName: provider }]);
+  const scanner = new ModelCatalogScanner(store, discover, { now: () => now, uuid: () => { const id = randomUUID(); allocated.push(id); return id; } });
+  const persisted = () => ["agent_model_catalog", "agent_model_catalog_versions", "agent_model_catalog_changes"]
+    .map((name) => [...fake.rows(name).values()].filter((row) => row.provider === "codex").map((row) => cloneBson(row)));
+  const attempts = () => begin.mock.calls.filter(([provider]) => provider === "codex");
+  const before = persisted();
+  try {
+    await scanner.tick(); expect(delegated).toBeDefined();
+    expect(attempts()).toHaveLength(1); const original = attempts()[0][1], allocatedBefore = allocated.length;
+    expect(original.attemptId).not.toBe(prior.attempt.attemptId);
+    for (const elapsed of [0, ATTEMPT_LEASE_MS - 1]) {
+      now = originalStart + elapsed; await scanner.tick();
+      expect(attempts()).toHaveLength(1); expect(allocated).toHaveLength(allocatedBefore);
+      expect(discover.mock.calls.filter(([provider]) => provider === "codex")).toHaveLength(0);
+      expect(apply.mock.calls.filter(([attempt]) => attempt.provider === "codex")).toHaveLength(0);
+      expect(fail.mock.calls.filter(([attempt]) => attempt.provider === "codex")).toHaveLength(0);
+      expect(persisted()).toEqual(before);
+    }
+    if (releaseAt === "before-expiry") {
+      release.resolve(); expect((await delegated!).matchedCount).toBe(1);
+      const accepted = persisted(); expect(accepted[0][0].scan.attemptId).toBe(original.attemptId);
+      expect(accepted[0][0].scan.outcome).toBe("running");
+      expect(accepted[0][0].scan.startedAt).toEqual(original.startedAt);
+      expect(accepted[0][0].scan.leaseExpiresAt).toEqual(original.leaseExpiresAt);
+      const { scan: _oldScan, ...savedBefore } = before[0][0], { scan: _newScan, ...savedAfter } = accepted[0][0];
+      expect(savedAfter).toEqual(savedBefore); expect(accepted.slice(1)).toEqual(before.slice(1));
+      expect(accepted[0][0].scan.lastSucceededAt).toEqual(before[0][0].scan.lastSucceededAt);
+      await scanner.tick(); expect(attempts()).toHaveLength(1);
+      expect(discover.mock.calls.filter(([provider]) => provider === "codex")).toHaveLength(0);
+    }
+    now = original.leaseExpiresAt.getTime(); await scanner.tick();
+    expect(attempts()).toHaveLength(2); expect(attempts()[1][1].attemptId).not.toBe(original.attemptId);
+    expect(discover.mock.calls.filter(([provider]) => provider === "codex")).toHaveLength(1);
+    const successor = persisted(); expect(successor[0][0].scan.outcome).toBe("succeeded");
+    expect(successor[0][0].scan.attemptId).toBe(attempts()[1][1].attemptId);
+    expect(successor[1]).toHaveLength(before[1].length + 1); expect(successor[2]).toHaveLength(before[2].length + 1);
+    if (releaseAt === "after-successor") { release.resolve(); expect((await delegated!).matchedCount).toBe(0); }
+    expect(persisted()).toEqual(successor);
+  } finally { release.resolve(); await delegated; await scanner.stop(); }
+});
+```
+
 - [ ] **Step 2:** Implement every schedule below as named/table-driven tests. For outcome cases compare complete `scan`, saved fields, versions and changes, including delivery state; assertions merely counting `begin` calls are insufficient.
 
 | Cases | Schedule and minimum assertions |
@@ -536,7 +610,7 @@ it("discards a consumed missing-catalog startup decision when another scanner fa
 | Observation scope | Manual first seed between due read/claim invalidates seeded bit, yields busy; manual seeded edit retaining scan/seeded bit and export recovery alone do not reject an otherwise eligible claim. Manual write during discovery is rebased with retained notes and does not move scan cadence. |
 | Typed failures | Auth/http/client-version/empty/malformed/too-large/timeout → fenced failed scan, original saved fields and last success preserved. Untyped thrown discovery is fixed unfinished/storage diagnostic and cannot expose raw error or invent success. Successful next attempt clears prior persisted error. |
 | Outcomes | `committed` with/without pending recovery and `unchanged` never fail; `not-committed` gets one safe failure if still usable, including retriable refusal with no immediate replay; `superseded` cannot fail a successor. |
-| Unknown begin | Hold actual begin promise: overlapping ticks skip forever until settlement, even expired. Throw after delegated claim with evidence read unavailable → preserve UUID, no discovery/placeholder apply/failure; active original lease waits. Recover after expiry from fresh read with new UUID. Negative read alone never permits early replacement. |
+| Unknown begin | Hold actual begin promise: overlapping ticks skip forever until settlement, even expired. Throw after delegated claim with evidence read unavailable → preserve UUID, no discovery/placeholder apply/failure; active original lease waits. Also retain the original delegated claim before execution while an overdue failed predecessor remains visible, as in Step 1; repeated ticks at unchanged time and just before expiry cannot allocate any UUID or clear the pending attempt merely because the persisted UUID differs. Release before expiry → one real match with no discovery authority; release after safe fresh-observation takeover completes → zero match and unchanged successor. Recover after expiry from fresh read with new UUID. Negative read alone never permits early replacement. |
 | Unknown apply | Both changed/unchanged writes throw ambiguously; delay mutation until after negative reconciliation. Keep UUID and discard rows, never fail/replay. Later positive envelope/history or succeeded scan resolves truth; unavailable evidence, failed recovery/index/guard read paths stay unknown. Only apply-entered uncertainty uses `[]`; begin/failure uncertainty does not. |
 | Unknown failure | Throw failure acknowledgment/evidence read; later failed state resolves cadence; absent evidence waits through original lease. No placeholder application through its ready proof and no fabricated failure during expiration. |
 | Three timestamp schedules | Delay before delegation beyond proposal expiry → unmatched claim, with and without successor. Use fake `afterTimestamp` to freeze pre-expiry `$$NOW`, then advance local/server clocks beyond expiry: unchanged observation allows expired running claim (`matchedCount: 1`, returned started) with no proof/request/apply/failure/freshness/history. Changing predecessor observation during pause forces miss despite old timestamp. Hold a matched ack past expiry separately; original dates are unchanged and no request starts. |
@@ -544,7 +618,7 @@ it("discards a consumed missing-catalog startup decision when another scanner fa
 | Restart/takeover | Fresh scanner/store observes active old token → wait. Expired running → bounded read/recovery and fresh same-read observation acquisition. Predecessor success between recovery reread and claim → busy then normal cadence. Old shell/claim/apply/failure released after successor completes must miss and preserve successor. Late positive success observed before takeover avoids a fresh request. |
 | Export maintenance | Recover on startup/minute ticks even with no due provider, including plugin manual changes; pending warnings persist until cleared; double recovery preserves delivery fields; failed/stuck sweep leaves provider lanes free. List/status does not initiate recovery. |
 | Stop matrix | Stop during read/begin/discovery/apply/failure/recovery; latch clears interval and aborts active signals synchronously; no subsequent scanner-level method starts. Already-entered store sequence may finish. Repeated stop returns same promise; direct tick/start after stop inert. Hold matched begin ack until after stop and drain, both before/after lease expiry; no new step. Fake timers prove 4999ms unfinished, 5000ms drain resolves once; release later failures and assert observed rejection/no new writes. New scanner recovers persisted state. |
-| Sanitization/logging | Raw injected SDK/HTTP/Mongo/command message containing `test-secret`, bearer URL and account metadata never enters logger/tool/doctor text. Repeated unchanged storage uncertainty emits one warning for same provider/attempt/status; successful outcomes and later distinct attempts remain observable. |
+| Sanitization/logging | Raw injected SDK/HTTP/Mongo/command message containing `test-secret`, bearer URL and account metadata never enters logger/tool/doctor text. Hold an ambiguous apply and make catalog/history reads unavailable across repeated ticks: each tick reports `commit-unknown` then `storage-unavailable`, but each warning appears once for that provider/attempt/status even as they alternate. A successful resolution remains observable; a later distinct attempt emits its own warnings. Diagnostic state retains only the current attempt's finite status/code combinations per built-in plus the export lane (at most four map entries), replaces old UUID state, and clears the export entry after recovery; repeated ticks/attempts cannot grow retained history. |
 
 - [ ] **Step 3:** Run unit commands from Tasks 1–2 plus `npx vitest run src/admin/model-catalog-store.test.ts`. Expected: all schedules pass, timers cleared, zero leaked/unhandled promises, all persistence invariants preserved. Stage scanner and its test, then commit `feat: run fenced catalog discovery in bounded provider lanes`.
 
@@ -603,6 +677,7 @@ it("accepts a matched claim but does not discover after its acknowledgment expir
 6. Restart with old active lease → no new request; expired running takeover → new UUID from scanner's fresh due read. Delay old shell/claim and old success/failure until after successor starts **and completes**; all obsolete conditional mutations miss. Complete predecessor between takeover's observed read and delegation → zero match; next tick waits eight hours from observed completed start.
 7. Shutdown with acquisition and completion still outstanding: no new scanner step after latch/drain; already-started store mutation can succeed without a successor or miss after newer observation. New scanner recovers interrupted token/pending export. Doctor/list truth reads the final durable state, not shutdown's local conclusion.
 8. Commit envelope with failed projection; provider not due on next tick; export lane recovers exact history/change including a manual plugin change. Duplicate recovery leaves any existing delivery subdocument byte-identical. One failed export cannot cancel other providers.
+9. Run both releases of Task 3 Step 1's predecessor-still-visible uncertain-begin test against real Mongo. Seed a journaled manual catalog plus failed predecessor whose `startedAt` is over eight hours old relative to `hello.localTime`; leave that predecessor visible while `faultDb` holds `release.promise.then(run)` for the new conditional claim and throws its acknowledgment. Preserve and observe that detached promise. The begin evidence read and subsequent ticks really read the old UUID. At unchanged client time and just before the original lease expiry, assert one codex begin, unchanged allocated-UUID count, zero codex discovery/apply/failure, and identical complete catalog/scan/history/change state. Release before both client/server expiry in one variant and assert actual `matchedCount: 1`, the original dates/UUID in running state, no saved/freshness/audit/change mutation, and no provider request from later reads of that token. In the other variant retain the original claim until a fresh-observation successor commits, then release and assert actual `matchedCount: 0` and byte-identical successor state. Use a short injected test lease with ample release headroom; wait for actual server and client expiry with a bounded `hello.localTime` loop before takeover when the original claim installed a lease. Advancing only the injected client clock does not expire that persisted lease on Mongo. Assert one successful successor and exactly one additional version/change; release and await the original delegated promise in `finally` in both variants.
 
 Reuse KPR-459's separate client/server-clock, exact timestamp equality, and malformed-lease predicate tests in its store suites. The frozen-`$$NOW` server-pause schedule remains in Task 3's exact stateful fake; a real client barrier must never be reported as equivalent server-pause evidence.
 
@@ -698,9 +773,10 @@ modelCatalogScanner.start();
 ## Handoff and evidence
 
 - KPR-461 can consume durable `agent_model_catalog_changes` and recovery independently of a successful discovery. No ephemeral callback is needed, and scanner status never acknowledges delivery.
-- The per-provider process state is bounded: one lane promise/controller/current invocation plus at most one unresolved identity, and no replay payload. Pending exports remain in KPR-459's existing durable envelope.
+- The per-provider process state is bounded: one lane promise/controller/current invocation plus at most one unresolved identity, and no replay payload. Diagnostics retain only each current UUID's finite status/code combinations across three built-ins and one export entry, replacing old UUID state instead of collecting attempt history. Pending exports remain in KPR-459's existing durable envelope.
 - No-plan-to-product shortcut: status/scanner modules and harnesses are future implementation. Report actual product test commands/results only when delivery executes them. This draft itself does not apply readiness labels, approve its review, or authorize bypassing waterfall maturity.
 - Draft-author scratch evidence: 11 virtual modules assembled from the two plans (including scanner/status, dependent store/fake, example tests and doctor adapter) passed strict TypeScript checking with zero diagnostics and no emitted files. Five in-memory probes passed: same-store changed/unchanged cadence; stale missing-catalog claim after a competing failure; frozen-operation-timestamp expired acceptance and recovery; held acknowledgment after terminal stop; and future-success/manual-timestamp status. These did not run Vitest/product code, real Mongo, providers, credentials, or the engine. Independent plan review and delivery verification remain outstanding.
+- Revision 1 scratch evidence: nine virtual modules from these plans passed strict TypeScript checking with zero diagnostics and no emitted files. The two new predecessor-visible release schedules and the existing success/cadence and stale-decision examples passed in-memory execution against the planned store/fake. A full uncertain-apply/read-failure probe emitted only two codex warnings across 20 alternating ticks, then one positive commit; a separate diagnostic probe verified later UUID visibility and bounded retained state. This is plan-code evidence, not Vitest/product or real-Mongo execution; the required real-Mongo schedules remain delivery work.
 
 ## Assumptions
 
