@@ -6974,6 +6974,31 @@ describe("AgentManager — KPR-390 worker pool handshake", () => {
     );
   });
 
+  it.each(["claude", "openai"] as const)("forwards obligation capability for the normal %s runner", async (provider) => {
+    const capability = { discover: vi.fn(async () => ({})), deliver: vi.fn(async () => ({})) };
+    manager.setDeliveryObligations(capability);
+    await (
+      manager as unknown as {
+        createProviderAdapter(id: string, route: { provider: string; model: string }): Promise<unknown>;
+      }
+    ).createProviderAdapter("agent-a", {
+      provider,
+      model: provider === "claude" ? "claude-sonnet-4-6" : "gpt-5.4-mini",
+    });
+    expect(vi.mocked(AgentRunner).mock.calls.at(-1)?.[10]?.obligations).toBe(capability);
+  });
+  it("does not forward the obligation sender to contained workers", () => {
+    const capability = { discover: vi.fn(async () => ({})), deliver: vi.fn(async () => ({})) };
+    manager.setDeliveryObligations(capability);
+    const pool = makeFakePool();
+    manager.setWorkerPool(pool as never);
+    const hooks = pool.bindManager.mock.calls[0]![0];
+    hooks.buildWorkerAdapter(makeAgentConfig({ id: "worker" }));
+    const options = vi.mocked(AgentRunner).mock.calls.at(-1)?.[10];
+    expect(options?.suppressAutoInjectedServers).toBe(true);
+    expect(options?.obligations).toBeUndefined();
+  });
+
   it("setWorkerPool binds hooks whose breakerStateFor proxies the breaker registry", () => {
     const pool = makeFakePool();
     manager.setWorkerPool(pool as any);

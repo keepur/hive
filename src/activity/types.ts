@@ -49,3 +49,10 @@ export interface ActivityRecord {
   aborted?: boolean;
   timedOut?: boolean;
 }
+
+/** Legacy documents without recordKind remain turn records. */
+export type { DeliveryReceiptRecord } from "../obligations/types.js";
+export type ActivityDocument =
+  (ActivityRecord & { recordKind?: "turn" }) | import("../obligations/types.js").DeliveryReceiptRecord;
+
+export const TURN_ACTIVITY_FILTER = { recordKind: { $ne: "delivery_receipt" } } as const;

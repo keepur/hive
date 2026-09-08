@@ -1,3 +1,4 @@
+import type { DeliveryCapability } from "../obligations/types.js";
 import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type McpSdkServerConfigWithInstance, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions, type EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
 import { existsSync, mkdirSync, symlinkSync, lstatSync } from "node:fs";
@@ -357,6 +358,7 @@ export interface AgentRunnerOptions {
    *  once index.ts has wired the pool. Absent ⇒ the worker-pool in-process
    *  server is never built (tools invisible even if listed in coreServers). */
   workerPool?: MeetingWorkerPool;
+  obligations?: DeliveryCapability;
   /** KPR-390: worker-mode runner (set ONLY by the pool's buildWorkerAdapter
    *  factory). Suppresses the unconditional auto-injection of implicit core
    *  servers (schedule, team, team-roster, skill-author, workflow) at all
@@ -399,6 +401,7 @@ export class AgentRunner {
   private workerPoolMcpServer?: ReturnType<typeof createWorkerPoolMcpServer>;
   private workerPoolContextRef: { current: WorkerPoolTurnContext } = { current: {} };
   private workerPool?: MeetingWorkerPool;
+  private readonly obligations?: DeliveryCapability;
   private readonly suppressAutoInjectedServers: boolean;
   private contactsMcpServer?: ReturnType<typeof createContactsMcpServer>;
   private scheduleMcpServer?: ReturnType<typeof createScheduleMcpServer>;
@@ -427,6 +430,7 @@ export class AgentRunner {
     this.memoryLifecycle = memoryLifecycle;
     this.laneAPassthrough = runnerOptions?.laneAPassthrough;
     this.workerPool = runnerOptions?.workerPool;
+    this.obligations = runnerOptions?.obligations;
     this.suppressAutoInjectedServers = runnerOptions?.suppressAutoInjectedServers ?? false;
   }
 
@@ -1541,6 +1545,7 @@ export class AgentRunner {
           db: this.db,
           agentId: this.agentConfig.id,
           workItemContext: this.workItemContextRef,
+          obligations: this.obligations,
         });
       }
       servers["schedule"] = this.scheduleMcpServer;

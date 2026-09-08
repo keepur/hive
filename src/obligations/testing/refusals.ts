@@ -1,0 +1,15 @@
+export const SPEC_REFUSALS = [
+  "not_authed",
+  "invalid_auth",
+  "token_expired",
+  "token_revoked",
+  "missing_scope",
+  "no_permission",
+  "not_in_channel",
+  "channel_not_found",
+  "is_archived",
+  "ekm_access_denied",
+  "restricted_action",
+  "rate_limited",
+  "ratelimited",
+] as const;

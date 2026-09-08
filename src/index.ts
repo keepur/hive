@@ -57,6 +57,7 @@ import { MemoryLifecycleHeartbeat } from "./memory/memory-lifecycle-heartbeat.js
 import { getLLMRegistry } from "./llm/registry.js";
 import { AdminApi } from "./admin/admin-api.js";
 import { ActivityLogger } from "./activity/activity-logger.js";
+import { ObligationRuntime } from "./obligations/runtime.js";
 import { runMigrations } from "./migrations/run-migrations.js";
 import { checkFirstBoot } from "./startup/first-boot.js";
 import { SlackInternalApi } from "./slack/slack-internal-api.js";
@@ -324,6 +325,9 @@ async function main(): Promise<void> {
   const turnTelemetryStore = new TurnTelemetryStore(db);
   await turnTelemetryStore.init();
 
+  const obligations = new ObligationRuntime(db, config.activity.retentionDays, () => !writeGuard.engaged);
+  await obligations.init();
+
   // Activity logger — queryable audit trail for agent turns
   let activityLogger: ActivityLogger | undefined;
   if (config.activity.enabled) {
@@ -389,6 +393,7 @@ async function main(): Promise<void> {
     memoryLifecycle,
     turnHistoryStore,
   );
+  agentManager.setDeliveryObligations(obligations);
   // KPR-394 (§4.3 phase b / §4.6): activate declared provider plugins
   // BEFORE any spawn-capable surface starts — bgTaskManager.start()/
   // scanOrphans() completion callbacks can already dispatch turns, so the
@@ -631,6 +636,7 @@ async function main(): Promise<void> {
       log.error("Slack dispatch failed", { error: String(err), source: item.source.label });
     });
   });
+  await obligations.start(config.slack.botToken, (channel, ts) => slack.registerOutboundTs(channel, ts));
   log.info("Slack adapter connected");
 
   // Audit routing: every agent mirrors non-Slack conversations to their own
@@ -934,6 +940,7 @@ async function main(): Promise<void> {
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     log.info("Shutdown signal received", { signal });
+    await obligations.stop();
     sweeper.stop();
     retentionSweeper.stop();
     adminApi?.stop();

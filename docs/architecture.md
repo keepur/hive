@@ -36,6 +36,7 @@ The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, thr
 
 - `src/index.ts` — entry point; wires every subsystem.
 - `src/config.ts` — loads env + `hive.yaml` into a typed config.
+- `src/obligations/runtime.ts` — independent recurring-delivery registry, receipt recovery and missed-deadline checker; `src/cli/obligations.ts` supplies instance-bound administration and inspection.
 - `src/agents/agent-runner.ts` — per-spawn `AgentRunner` (fresh instance per turn); assembles the system prompt (cache-friendly prefix: soul → systemPrompt → constitution → toolkit → memory → date), configures MCP servers, builds hooks with the current `WorkItemContext` each spawn.
 - `src/agents/agent-manager.ts` — spawn coordinator: lock, budget, ticket lifecycle, reflection scheduler, snapshot surface.
 - `src/agents/provider-adapters/` — one-turn provider boundary and tool transport classification. `AgentManager` selects the adapter from the selected agent's `model` string: Claude by default, or provider-prefixed `codex/...`, `openai/...`, and `gemini/...` models for the non-Claude adapters. `ClaudeAgentAdapter` delegates to `AgentRunner`; `OpenAIAgentsAdapter`, `GeminiInteractionsAdapter`, and `CodexSubscriptionAdapter` execute real hive tools through the hive tool bridge; `kimi/...`, `deepseek/...`, and `grok/...` route through the Claude runtime with per-spawn env substitution (Lane A passthrough), the last of these authenticating from the `grok` CLI's own subscription OAuth file rather than an API key.
@@ -53,6 +54,14 @@ The agent manager is a thin spawn coordinator: per-thread lock on `(agentId, thr
 - **Qdrant** — vector storage for semantic recall (conversation search, code search, structured memory). Local Ollama (`bge-large`) generates embeddings.
 - **macOS Keychain (Honeypot)** — third-party API keys. Per-instance prefix `hive/<instance-id>/<KEY>`. The cloud language model never sees these — local MCP servers fetch credentials via Keychain at the moment of use.
 
+## Delivery obligations
+
+`ObligationRuntime` monitors operator-registered expectations independently of cron, agent availability and turn completion. The existing schedule server exposes producer-bound discovery and explicit delivery on Claude/Lane A and Lane B; contained workers do not receive the capability. A new admitted delivery attempt names one `(obligationId, dueAt)` occurrence and sends a single bounded Slack text post to its registered destination. Registration and producing-workflow enrollment remain explicit operator actions; an empty registry creates no deadlines or messages. See [delivery obligations](delivery-obligations.md) for commands and deadline semantics.
+
+The shared guarded Mongo connection holds `delivery_obligations` and `delivery_obligation_occurrences` without TTL. These retain definition snapshots, admission/attempt state and acknowledgement/receipt-write checkpoints. Append-only `recordKind: "delivery_receipt"` rows in `activity_log` use its existing timestamp TTL and are awaited independently of optional buffered turn logging. Turn aggregates must exclude receipt rows while accepting legacy turns without `recordKind`. These obligation records store metadata, not deliverable text or raw transport errors; confirmed checkpoints survive receipt-history expiry without recreating deleted history.
+
+Indexes and the manager capability initialize before spawn-capable surfaces; the checker starts after Slack and runs a bounded, non-overlapping sweep every 30 seconds without invoking a model. Shutdown drains it and in-flight tools before Slack/Mongo close. `telemetry` rows with `kind=delivery_obligations_stats` expose sweep freshness and recovery backlog through read-only `hive obligations list/show`. A separate Slack client disables implicit retries: ambiguous submissions stay `unknown`, and only a closed allowlist proving nonacceptance permits retry. Notices use the explicitly registered notice destination. Slack acknowledgement proves transport acceptance, not human reading or content completeness, and ambiguous outcomes can leave no visible message.
+
 ## MCP servers
 
 Each agent gets a subset of MCP servers — listed in its `coreServers` and `delegateServers` arrays. The engine ships a generic baseline:
@@ -63,7 +72,7 @@ Each agent gets a subset of MCP servers — listed in its `coreServers` and `del
 - `contacts-mcp-server.ts` — contact lookups.
 - `events/event-bus-mcp-server.ts` — cross-agent event bus.
 - `team/team-mcp-server.ts` — direct agent-to-agent messaging.
-- `schedule/schedule-mcp-server.ts` — cron-style scheduled tasks.
+- `schedule/schedule-mcp-server.ts` — cron-style scheduled tasks plus `my_delivery_obligations` and `deliver_obligation` for explicitly registered Slack deliverables.
 - `callback/callback-mcp-server.ts` — delayed-response timers.
 - `slack/slack-mcp-server.ts` — Slack tooling.
 - `linear/linear-mcp-server.ts` — Linear issues.
@@ -135,7 +144,7 @@ Post-KPR-213, `SIGUSR1` is **no longer load-bearing for prefix freshness** — t
 
 - **Keychain isolation** — cloud LLMs never see secrets. Keychain reads happen inside MCP servers, scoped by `hive/<instance>/<KEY>`.
 - **Per-agent MCP whitelist** — an agent only sees the servers in its `coreServers`/`delegateServers`. Tool selection is enforced by what's spawned, not by prompt instructions.
-- **Confirm-before-send for outbound** — by default, customer-facing tools (resend, slack outbound, sms) draft for human approval rather than send autonomously.
+- **Confirm-before-send for outbound** — by default, customer-facing tools (resend, slack outbound, sms) draft for human approval rather than send autonomously. The explicit obligation tool and engine missed-deadline notices post to registered destinations without a per-post approval step.
 - **No shell-string subprocess invocation** — all subprocess spawns pass argv as an array (`spawnSync(binary, [args])`), never as a shell string. Prevents command injection from interpolated input.
 - **Background task auth** — bearer token (`BG_TASK_AUTH_TOKEN`) on the background task HTTP API.
 
