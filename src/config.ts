@@ -214,6 +214,103 @@ export function resolveToolSearchEnv(agentToolSearch: string | undefined, hiveMo
 }
 
 /**
+ * KPR-322 E3: resolve the optional hive.yaml `voice.livekit` section.
+ * Liberal-loader style (KPR-225 F3): all keys optional, unknown keys ignored,
+ * non-object input → defaults. Exported pure for unit tests.
+ */
+export interface VoiceLivekitConfig {
+  enabled: boolean;
+  /** wss://<project>.livekit.cloud — non-secret. */
+  url: string;
+  /** SIPOutboundTrunk id from SIP-1 (ST_...). */
+  sipTrunkId: string;
+  /** E.164 → hive agent id map for inbound dispatch (S5). */
+  inboundAgents: Record<string, string>;
+  /** Cartesia voice id per hive agent id (Phase-0 scope, Cartesia only — KPR-325). */
+  agentVoices: Record<string, string>;
+  /** A/B cell defaults (S7); per-dispatch metadata overrides. */
+  defaultStt: string;
+  defaultTts: string;
+}
+
+export function resolveVoiceLivekitConfig(raw: unknown): VoiceLivekitConfig {
+  const src = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  const str = (v: unknown, fallback: string): string => (typeof v === "string" && v.trim() ? v.trim() : fallback);
+  const inboundAgents: Record<string, string> = {};
+  if (src.inboundAgents && typeof src.inboundAgents === "object" && !Array.isArray(src.inboundAgents)) {
+    for (const [num, agent] of Object.entries(src.inboundAgents as Record<string, unknown>)) {
+      if (typeof agent === "string" && agent.trim()) inboundAgents[num] = agent.trim();
+    }
+  }
+  const agentVoices: Record<string, string> = {};
+  if (src.agentVoices && typeof src.agentVoices === "object" && !Array.isArray(src.agentVoices)) {
+    for (const [agentId, voiceId] of Object.entries(src.agentVoices as Record<string, unknown>)) {
+      if (typeof voiceId === "string" && voiceId.trim()) agentVoices[agentId] = voiceId.trim();
+    }
+  }
+  return {
+    enabled: src.enabled === true,
+    url: str(src.url, ""),
+    sipTrunkId: str(src.sipTrunkId, ""),
+    inboundAgents,
+    agentVoices,
+    defaultStt: str(src.defaultStt, "deepgram/flux-general-en"),
+    defaultTts: str(src.defaultTts, "cartesia/sonic-3"),
+  };
+}
+
+/**
+ * KPR-323 C4: resolve the optional hive.yaml `voice.warmPath` section.
+ * Liberal-loader style (KPR-225 F3): literal `true` only; absent/garbage →
+ * disabled. `false` = the warm branch is never taken — byte-identical
+ * today-path (the rollback lever, spec §4.7). Idle timeout (120s) and
+ * lifetime cap (2h) are named constants in warm-voice-session.ts —
+ * deliberately NOT config. Exported pure for unit tests.
+ */
+export interface VoiceWarmPathConfig {
+  enabled: boolean;
+}
+
+export function resolveVoiceWarmPathConfig(raw: unknown): VoiceWarmPathConfig {
+  const src = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  return { enabled: src.enabled === true };
+}
+
+/**
+ * KPR-324 C6/S7: resolve the optional hive.yaml `voice.toolAck` section.
+ * Liberal-loader style (KPR-225 F3) with the INVERSE default of 323's
+ * warm-path flag: masking IS the ticket, so absent/garbage → ENABLED.
+ * Only a literal `false` disables injection (the rollback lever, spec §8).
+ * Accepts a bare `voice.toolAck: false` scalar as well as `{ enabled: false }`
+ * — the rollback lever is the one setting an operator reaches for under
+ * pressure, so the scalar shorthand must not silently no-op (child-PR/1
+ * finding: the object-coercion below previously collapsed a bare `false`
+ * to `{}`, which resolved as enabled).
+ * Phrases, rotation, and the fixture delay cap are constants in
+ * voice-tool-ack.ts / voice-fixture-mcp-server.ts — deliberately NOT config.
+ * Exported pure for unit tests.
+ */
+export interface VoiceToolAckConfig {
+  enabled: boolean;
+}
+
+export function resolveVoiceToolAckConfig(raw: unknown): VoiceToolAckConfig {
+  if (raw === false) return { enabled: false };
+  const src = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  return { enabled: src.enabled !== false };
+}
+
+/**
+ * KPR-322: env-first / Honeypot-second secret resolution for out-of-engine
+ * processes (the voice worker reuses the engine loader). Delegates to the
+ * loader's own `optional()` so the semantics can never drift from the
+ * engine's resolution order.
+ */
+export function resolveSecretEnv(key: string): string {
+  return optional(key, "");
+}
+
+/**
  * KPR-242: warn once at config load if hive.yaml still carries the deprecated
  * `google.account` field. Exported so unit tests can exercise it directly.
  */
@@ -485,6 +582,34 @@ export const config = {
     apiKey: optional("VAPI_API_KEY", ""),
     serverSecret: optional("VAPI_SERVER_SECRET", ""),
     port: parseInt(optional("VOICE_PORT", String(ports.voice ?? portBase + 5)), 10),
+    // KPR-322 E1/E3: shared bridge secret (worker → adapter) + bind host.
+    // Loopback default — both callers are local (worker directly; Vapi via
+    // the cloudflared tunnel, which connects from localhost ⚠ verify tunnel
+    // topology at delivery; escape hatch: voice.bindHost: "0.0.0.0").
+    bridgeToken: optional("HIVE_VOICE_BRIDGE_TOKEN", ""),
+    bindHost: ((hive.voice as Record<string, unknown> | undefined)?.bindHost as string) || "127.0.0.1",
+    // KPR-322 E3: LiveKit worker section + worker/server API pair.
+    livekit: resolveVoiceLivekitConfig((hive.voice as Record<string, unknown> | undefined)?.livekit),
+    livekitApiKey: optional("LIVEKIT_API_KEY", ""),
+    livekitApiSecret: optional("LIVEKIT_API_SECRET", ""),
+    // KPR-323 C4: per-call warm session lease master switch. Default false
+    // on merge; flipped per-instance after W2 passes.
+    warmPath: resolveVoiceWarmPathConfig((hive.voice as Record<string, unknown> | undefined)?.warmPath),
+    // KPR-324 C6: mid-call tool-start acknowledgment master switch. Default
+    // ON (S7 — masking is the ticket); literal `false` is the rollback lever.
+    toolAck: resolveVoiceToolAckConfig((hive.voice as Record<string, unknown> | undefined)?.toolAck),
+  },
+  // KPR-322 E3: names reserved by 321 §9, wired here. Consumed by
+  // scripts/livekit-setup.ts (SIP-1) — never by cloud-model-facing code.
+  telephony: {
+    twilio: {
+      number:
+        ((hive.telephony as Record<string, { number?: string; trunkDomain?: string }> | undefined)?.twilio
+          ?.number as string) ?? "",
+      trunkDomain:
+        ((hive.telephony as Record<string, { number?: string; trunkDomain?: string }> | undefined)?.twilio
+          ?.trunkDomain as string) ?? "",
+    },
   },
   autonomy: {
     externalComms: (hive.autonomy?.externalComms ?? AUTONOMY_DEFAULTS.externalComms) as boolean,

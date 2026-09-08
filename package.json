@@ -87,6 +87,7 @@
     "brave-search-mcp": "^2.0.1",
     "csv-parse": "^7.0.2",
     "dotenv": "^17.3.1",
+    "livekit-server-sdk": "2.14.1",
     "mammoth": "^1.12.2",
     "mongodb": "^7.6.0",
     "pdf-parse": "^2.4.5",
@@ -98,6 +99,12 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@livekit/agents": "1.6.4",
+    "@livekit/agents-plugin-cartesia": "1.6.4",
+    "@livekit/agents-plugin-deepgram": "1.6.4",
+    "@livekit/agents-plugin-elevenlabs": "1.6.4",
+    "@livekit/agents-plugin-silero": "1.6.4",
+    "@livekit/rtc-node": "0.13.33",
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.4.1",
     "@types/ws": "^8.18.1",
@@ -113,10 +120,12 @@
     "vitest": "^5.0.0"
   },
   "allowScripts": {
-    "better-sqlite3@12.9.0": true,
     "esbuild@0.28.2": true,
     "protobufjs@7.6.5": true,
     "fsevents@2.3.3": true,
-    "@google/genai@2.18.0": true
+    "@google/genai@2.18.0": true,
+    "better-sqlite3@13.0.3": true,
+    "onnxruntime-node@1.24.3": true,
+    "@livekit/local-inference@0.2.7": true
   }
 }

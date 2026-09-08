@@ -54,6 +54,13 @@ const SERVER_CREDENTIAL_CHECKS: Record<string, () => boolean> = {
   "code-search": () => !!config.codeIndex?.enabled,
   browser: () => !!config.browser?.cdpEndpoint,
   tasks: () => (config.taskLedger?.apiUrl ?? "") !== "http://localhost:3002",
+  "voice-livekit": () =>
+    !!(
+      config.voice?.livekit?.enabled &&
+      config.voice?.livekitApiKey &&
+      config.voice?.livekitApiSecret &&
+      config.voice?.livekit?.url
+    ),
 };
 
 /** Infrastructure servers — always available, don't need credential checks */

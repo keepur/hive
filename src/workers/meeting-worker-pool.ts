@@ -44,7 +44,7 @@ const CLAIMS_TTL_SECONDS = 7 * 86_400;
  * team-roster are auto-injected for every normal agent regardless of
  * coreServers, so the strip alone would be a no-op without the flag.
  * Rationale per entry (spec §A3): outbound message surfaces
- * (slack/quo/resend/team/event-bus/recall/voice); self-scheduling &
+ * (slack/quo/resend/team/event-bus/recall/voice/voice-livekit); self-scheduling &
  * re-entry minting (callback/schedule); recursion (worker-pool); agent-def
  * editing (admin); detached-process escape hatch that would outlive every
  * kill path (background — E5 load-bearing); credential-read leak
@@ -61,6 +61,7 @@ export const WORKER_SERVER_DENYLIST = new Set<string>([
   "schedule",
   "recall",
   "voice",
+  "voice-livekit",
   "admin",
   "worker-pool",
   "background",

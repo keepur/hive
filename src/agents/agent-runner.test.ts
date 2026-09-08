@@ -194,7 +194,16 @@ vi.mock("../config.js", async (importOriginal) => {
       browser: { cdpEndpoint: "" },
       memory: { hotBudgetTokens: 3000 },
       workflow: { enabled: false },
-      voice: { apiKey: "", phoneNumberId: "", assistants: {} },
+      voice: {
+        apiKey: "",
+        phoneNumberId: "",
+        assistants: {},
+        livekit: { enabled: false, url: "", sipTrunkId: "", inboundAgents: {}, defaultStt: "", defaultTts: "" },
+        livekitApiKey: "",
+        livekitApiSecret: "",
+        // KPR-324 C6: the runner reads this at every tool_use boundary.
+        toolAck: { enabled: true },
+      },
       // KPR-329: engine-default tool-search config for the mocked module.
       toolSearch: { mode: "auto", source: "default" },
     },
@@ -263,6 +272,19 @@ import {
 } from "./prefix-builder.js";
 import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
+import { config } from "../config.js";
+// Round-2 finding B: cross-file KPR-401 accounting parity (see the describe
+// block near the end of this file) drives WarmVoiceSession's consumeOneTurn
+// through an equivalent scenario to AgentRunner.send() — both implement the
+// same sawResult/countedUsageIds/wall-clock-fallback/clamped-llmMs pattern
+// with nothing else pinning them to stay in sync.
+import { WarmVoiceSession, AsyncPushQueue } from "./warm-voice-session.js";
+// KPR-324 C2: the cold-path injection tests assert against the real phrase
+// constants, so a wording retune can never silently pass a stale literal.
+import { VOICE_TOOL_ACK_PHRASES, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
+// KPR-324 C7: the runner-belt tests read the real constants, so renaming the
+// server or the allowed agent id cannot silently orphan the belt coverage.
+import { VOICE_FIXTURE_SERVER_NAME, VOICE_FIXTURE_ALLOWED_AGENT_ID } from "./in-process-servers.js";
 
 const mockFromKeychain = vi.mocked(fromKeychain);
 
@@ -347,6 +369,63 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     expect(servers).toHaveProperty("background");
     expect(servers).toHaveProperty("callback");
     expect(servers).toHaveProperty("admin");
+    expect(servers).not.toHaveProperty("voice-livekit");
+  });
+
+  it("registers voice-livekit when livekit is enabled with credentials", async () => {
+    const origVoice = config.voice;
+    (config as any).voice = {
+      ...origVoice,
+      livekit: {
+        enabled: true,
+        url: "wss://example.livekit.cloud",
+        sipTrunkId: "",
+        inboundAgents: {},
+        defaultStt: "",
+        defaultTts: "",
+      },
+      livekitApiKey: "lk-key",
+      livekitApiSecret: "lk-secret",
+    };
+    try {
+      runner = new AgentRunner(
+        makeAgentConfig({ coreServers: ["voice-livekit"] }),
+        memoryManager as any,
+        [],
+        new Map(),
+        "{}",
+        undefined,
+        undefined,
+        makeFakeInProcessDb(),
+      );
+      await runner.send("hello");
+      const servers = getCapturedServers();
+      expect(servers).toHaveProperty("voice-livekit");
+      expect(servers["voice-livekit"].env).toMatchObject({
+        LIVEKIT_URL: "wss://example.livekit.cloud",
+        LIVEKIT_API_KEY: "lk-key",
+        LIVEKIT_API_SECRET: "lk-secret",
+        AGENT_ID: "test-agent",
+        AGENT_NAME: "TestAgent",
+      });
+    } finally {
+      (config as any).voice = origVoice;
+    }
+  });
+
+  it("does not register voice-livekit when livekit is disabled", async () => {
+    runner = new AgentRunner(
+      makeAgentConfig({ coreServers: ["voice-livekit"] }),
+      memoryManager as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(),
+    );
+    await runner.send("hello");
+    expect(getCapturedServers()).not.toHaveProperty("voice-livekit");
   });
 
   it("filters servers by agent coreServers allowlist", async () => {
@@ -4095,6 +4174,192 @@ describe("buildProviderPrompt cache neutrality (KPR-349 §D2, T1)", () => {
   });
 });
 
+describe("AgentRunner C1 stage stamps (KPR-323)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  it("stamps bootToInitMs and initToFirstTokenMs on init then text_delta then result", async () => {
+    mockMessages = [
+      { type: "system", subtype: "init", session_id: "s-c1" },
+      {
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          delta: { type: "text_delta", text: "hi" },
+        },
+      },
+      {
+        type: "result",
+        subtype: "success",
+        result: "hi",
+        total_cost_usd: 0.001,
+        duration_ms: 100,
+        session_id: "s-c1",
+      },
+    ];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello", undefined, () => {});
+
+    expect(typeof result.bootToInitMs).toBe("number");
+    expect(result.bootToInitMs).toBeGreaterThanOrEqual(0);
+    expect(typeof result.initToFirstTokenMs).toBe("number");
+    expect(result.initToFirstTokenMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("leaves bootToInitMs and initToFirstTokenMs undefined when neither init nor text_delta is emitted", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const result = await runner.send("hello");
+
+    expect(result.bootToInitMs).toBeUndefined();
+    expect(result.initToFirstTokenMs).toBeUndefined();
+  });
+
+  // Round-3 review fix: the T3 anchor must be stamped BEFORE query-envelope
+  // assembly, otherwise envelope cost (server configs, in-process MCP
+  // construction, skill projections, cwd mkdir) lands between spawnPrepMs and
+  // bootToInitMs and is attributed to neither. Negative-verify: with the
+  // pre-fix placement (queryStartedAt after buildQueryEnvelope) bootToInitMs
+  // is ~0 here and this assertion fails.
+  it("bootToInitMs includes query-envelope assembly time (no unattributed T2→T5 gap)", async () => {
+    const ENVELOPE_MS = 60;
+    mockMessages = [
+      { type: "system", subtype: "init", session_id: "s-c1-gap" },
+      {
+        type: "result",
+        subtype: "success",
+        result: "hi",
+        total_cost_usd: 0.001,
+        duration_ms: 100,
+        session_id: "s-c1-gap",
+      },
+    ];
+
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const realBuild = (runner as any).buildQueryEnvelope.bind(runner);
+    vi.spyOn(runner as any, "buildQueryEnvelope").mockImplementation(async (params: any) => {
+      await new Promise((r) => setTimeout(r, ENVELOPE_MS));
+      return realBuild(params);
+    });
+
+    const result = await runner.send("hello");
+
+    expect(result.bootToInitMs).toBeGreaterThanOrEqual(ENVELOPE_MS - 5);
+  });
+});
+
+// Epic-integration review round 1 (2edb14e, ratified by May): RunResult.toolAckInjected
+// went from required to optional so RunResult stays source-compatible as frozen
+// plugin-facing ABI (provider-abi.ts). That drops the compile-time guarantee that
+// every construction site declares the field — this pins the practical runtime
+// property instead: the ordinary send() return path (the one construction site
+// testable at this level) still yields a defined number, never undefined, under a
+// plain default invocation with no voice context and no tool use. The KPR-324 C2
+// "cold-path tool-start ack injection" suite below separately pins the same
+// definedness across voice-channel ack/no-ack branches (0/1/2) — this test covers
+// the non-voice default case those don't.
+describe("AgentRunner RunResult.toolAckInjected ABI guard (epic-integration round 1)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+  });
+
+  it("send() yields a defined toolAckInjected number on a plain default invocation", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), makeMockMemoryManager() as any);
+    const result = await runner.send("hello");
+
+    expect(typeof result.toolAckInjected).toBe("number");
+    expect(result.toolAckInjected).toBe(0);
+  });
+});
+
+describe("AgentRunner.openVoiceStreamingSession (KPR-323 C2)", () => {
+  let memoryManager: ReturnType<typeof makeMockMemoryManager>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    memoryManager = makeMockMemoryManager();
+  });
+
+  const fakeCtx = {
+    adapterId: "voice",
+    channelId: "call-1",
+    channelKind: "voice",
+    channelLabel: "Voice",
+    threadId: "call-1",
+    slackTs: "",
+    slackThreadTs: "",
+  } as any;
+
+  it("opens a streaming-input query with resume, partial messages, and the override prompt", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+    const input = (async function* () {})();
+
+    await runner.openVoiceStreamingSession({
+      input,
+      sessionId: "s-1",
+      context: fakeCtx,
+      systemPromptOverride: "vp",
+    });
+
+    const call = mockQuery.mock.calls[mockQuery.mock.calls.length - 1];
+    expect(typeof call[0].prompt).not.toBe("string");
+    expect(call[0].prompt).toBe(input);
+
+    const options = getCapturedOptions();
+    expect(options.resume).toBe("s-1");
+    expect(options.includePartialMessages).toBe(true);
+    expect(options.systemPrompt).toBe("vp");
+  });
+
+  it("omits resume entirely when sessionId is undefined", async () => {
+    const runner = new AgentRunner(makeAgentConfig(), memoryManager as any);
+
+    await runner.openVoiceStreamingSession({
+      input: (async function* () {})(),
+      sessionId: undefined,
+      context: fakeCtx,
+      systemPromptOverride: "vp",
+    });
+
+    const options = getCapturedOptions();
+    expect("resume" in options).toBe(false);
+  });
+
+  it("strips maxTurns and maxBudgetUsd from the warm envelope (per-turn bounds must not apply per-call)", async () => {
+    // Fixture carries maxTurns: 25 / budgetUsd: 10 — both would otherwise
+    // flow into the envelope via buildQueryEnvelope's agentConfig fallback
+    // and be enforced CUMULATIVELY across every turn of the warm call.
+    const agentConfig = makeAgentConfig({ maxTurns: 200, budgetUsd: 5 });
+    const runner = new AgentRunner(agentConfig, memoryManager as any);
+
+    await runner.openVoiceStreamingSession({
+      input: (async function* () {})(),
+      sessionId: "s-1",
+      context: fakeCtx,
+      systemPromptOverride: "vp",
+    });
+
+    const options = getCapturedOptions();
+    expect(options.maxTurns).toBeUndefined();
+    expect(options.maxBudgetUsd).toBeUndefined();
+    expect("maxTurns" in options).toBe(false);
+    expect("maxBudgetUsd" in options).toBe(false);
+
+    // Control: the cold per-turn path still carries both.
+    await runner.send("hello");
+    const coldOptions = getCapturedOptions();
+    expect(coldOptions.maxTurns).toBe(200);
+    expect(coldOptions.maxBudgetUsd).toBe(5);
+  });
+});
+
 // ── KPR-390: worker-pool wiring + worker-mode auto-injection suppression ──────
 describe("AgentRunner — KPR-390 worker-pool wiring", () => {
   let memoryManager: ReturnType<typeof makeMockMemoryManager>;
@@ -4246,6 +4511,598 @@ describe("AgentRunner — KPR-390 worker-pool wiring", () => {
     expect(
       noMembership.buildToolTransportInventory().find((e) => e.name === "worker-pool"),
     ).toBeUndefined();
+  });
+});
+
+// ── KPR-324 C7: the runner's voice-fixture belt ──────────────────────────
+// The registry strip (agent-registry.test.ts) is the first gate; THIS is the
+// second — the runner refuses to BUILD the fixture for any agent id but
+// voice-pilot, so a bypassed registry (direct DB write + SIGUSR1 race) still
+// cannot arm a production agent. Per CLAUDE.md's containment rule, both
+// assertions target the runner's BUILT surfaces (in-process server set +
+// tool-transport inventory), never the config array.
+describe("KPR-324 C7: voice-fixture is refused for non-voice-pilot agent ids (runner belt)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+  });
+
+  it("a non-pilot agent carrying voice-fixture in coreServers gets it on NEITHER built surface", () => {
+    const runner = makeRunner({ id: "chief-of-staff", coreServers: ["voice-fixture"] });
+    expect(Object.keys(runner.buildInProcessServers())).not.toContain(VOICE_FIXTURE_SERVER_NAME);
+    expect(runner.buildToolTransportInventory().map((e) => e.name)).not.toContain(
+      VOICE_FIXTURE_SERVER_NAME,
+    );
+  });
+
+  it("voice-pilot with voice-fixture in coreServers gets BOTH the built server and the Lane B descriptor", () => {
+    const runner = makeRunner({
+      id: VOICE_FIXTURE_ALLOWED_AGENT_ID,
+      coreServers: ["voice-fixture"],
+    });
+    const servers = runner.buildInProcessServers();
+    expect(Object.keys(servers)).toContain(VOICE_FIXTURE_SERVER_NAME);
+    expect(servers[VOICE_FIXTURE_SERVER_NAME].type).toBe("sdk");
+
+    const entry = runner
+      .buildToolTransportInventory()
+      .find((e) => e.name === VOICE_FIXTURE_SERVER_NAME);
+    expect(entry).toBeDefined();
+    expect(entry).toMatchObject({
+      transport: "sdk-in-process",
+      inProcess: true,
+      requiresTurnContext: false,
+      requiresHiveRuntime: true,
+    });
+    // KPR-327 compensation: in-process-only, so Lane B must bridge it.
+    expect(entry!.compatibility.openai).toBe("requires-hive-bridge");
+  });
+
+  it("voice-pilot WITHOUT coreServers membership still gets nothing (coreServers gate intact)", () => {
+    const runner = makeRunner({ id: VOICE_FIXTURE_ALLOWED_AGENT_ID, coreServers: [] });
+    expect(Object.keys(runner.buildInProcessServers())).not.toContain(VOICE_FIXTURE_SERVER_NAME);
+    expect(runner.buildToolTransportInventory().map((e) => e.name)).not.toContain(
+      VOICE_FIXTURE_SERVER_NAME,
+    );
+  });
+
+  it("the fixture server instance is cached across builds (one construction per runner)", () => {
+    const runner = makeRunner({
+      id: VOICE_FIXTURE_ALLOWED_AGENT_ID,
+      coreServers: ["voice-fixture"],
+    });
+    const first = runner.buildInProcessServers()[VOICE_FIXTURE_SERVER_NAME];
+    const second = runner.buildInProcessServers()[VOICE_FIXTURE_SERVER_NAME];
+    expect(second).toBe(first);
+  });
+});
+
+// ── Cross-file turn-usage-accounting parity (round-2 coherence review,
+// finding B) ─────────────────────────────────────────────────────────────
+// The KPR-401 accumulator pattern — `sawResult` + `countedUsageIds` + a
+// wall-clock `durationMs` fallback + a clamped `llmMs` — is hand-duplicated
+// ~15 lines apart between this file's `AgentRunner.send()` and
+// `WarmVoiceSession.consumeOneTurn()` (src/agents/warm-voice-session.ts).
+// Nothing pins the two to stay in sync, which is exactly the drift class a
+// round-1 coherence review caught (one side got KPR-401, the other didn't,
+// until that review's issue 3 flagged it).
+//
+// A shared-helper extraction was deliberately NOT attempted here: both are
+// hot spawn-turn paths with materially different control flow around the
+// shared accumulator (`send()`'s `for await` loop vs. the lease's manual
+// `next()` loop + `break turnLoop`, required so `break` never invokes the
+// streaming generator's `return()` and closes the whole call) — a subtly
+// wrong extraction risks being worse than the duplication it removes.
+// Instead this suite drives BOTH implementations through an equivalent
+// result-less-turn scenario (repeated-id streamed usage, no `result`
+// message) and asserts the identical invariant on both `RunResult`s. A
+// future KPR-40x-class fix landing in only one of the two files fails here.
+describe("cross-file turn-usage-accounting parity (KPR-401, round-2 finding B)", () => {
+  beforeEach(() => {
+    mockQueryOverride = null;
+    mockMessages = null;
+  });
+  afterEach(() => {
+    mockQueryOverride = null;
+    mockMessages = null;
+  });
+
+  const USAGE = {
+    input_tokens: 500,
+    output_tokens: 20,
+    cache_read_input_tokens: 100,
+    cache_creation_input_tokens: 5,
+  };
+
+  /** AgentRunner.send() side: streams messages, then hangs until the deadline abort()s the query. */
+  function yieldingThenHangingQuery(messages: unknown[]) {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    mockQueryOverride = () => ({
+      close: () => release(),
+      [Symbol.asyncIterator]: async function* () {
+        for (const m of messages) yield m;
+        await gate;
+      },
+    });
+  }
+
+  /** WarmVoiceSession side: a minimal fake streaming Query driven by an AsyncPushQueue. */
+  function makeFakeWarmQuery() {
+    const out = new AsyncPushQueue<any>();
+    const it = out[Symbol.asyncIterator]();
+    return {
+      q: {
+        next: () => it.next(),
+        interrupt: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn(() => out.end()),
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+      } as any,
+      emit: (m: Record<string, unknown>) => out.push(m),
+      endOutput: () => out.end(),
+    };
+  }
+
+  it("both sides count a repeated message.id's streamed usage exactly once, fall back to a positive wall-clock durationMs, and clamp llmMs >= 0 on a result-less turn", async () => {
+    // ── AgentRunner.send() ──
+    yieldingThenHangingQuery([
+      {
+        type: "assistant",
+        session_id: "s-parity",
+        message: { id: "msg_shared", usage: USAGE, content: [{ type: "text", text: "a" }] },
+      },
+      {
+        type: "assistant",
+        session_id: "s-parity",
+        message: { id: "msg_shared", usage: USAGE, content: [{ type: "tool_use", name: "Bash", id: "toolu_1" }] },
+      },
+    ]);
+    const runner = makeRunner({ timeoutMs: 25 });
+    const runnerResult = await runner.send("hi");
+
+    // ── WarmVoiceSession.consumeOneTurn() (via runTurn) ──
+    const { q, emit, endOutput } = makeFakeWarmQuery();
+    const lease = new WarmVoiceSession({ agentId: "agent-a", threadKey: "agent-a:voice:call-1", onClosed: vi.fn() });
+    lease.start(q);
+    // round-3 finding: mirror the runner-side fixture's second message with a
+    // tool_use block too, so totalToolMs > 0 on the warm side as well — a
+    // text-only fixture left the `Math.max(0, durationMs - toolMs)` recompute
+    // below trivially true (0 subtraction) with or without the clamp.
+    // Nonzero toolMs alone still isn't enough to make the clamp load-bearing:
+    // consumeOneTurn's `!sawResult` duration fallback (line ~615) and the
+    // last active tool call's endMs (line ~618) are both plain `Date.now()`
+    // reads of the SAME real clock a few synchronous statements apart, so
+    // toolMs structurally never outruns durationMs by more than sub-ms
+    // scheduler jitter — real-clock racing alone was empirically observed
+    // (dozens of local runs) to never trip Math.max's clamp. So the 4th
+    // `Date.now()` call inside this scenario's consumeOneTurn — pushedAt,
+    // the tool's startMs, the duration fallback, then the tool's endMs, in
+    // that fixed order — is deterministically pushed far into the future,
+    // forcing totalToolMs to deterministically exceed durationMs and proving
+    // the clamp is actually exercised rather than a same-tick coincidence.
+    const realDateNow = Date.now.bind(Date);
+    let dateNowCalls = 0;
+    const dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      dateNowCalls += 1;
+      return dateNowCalls === 4 ? realDateNow() + 50_000 : realDateNow();
+    });
+    const leasePromise = lease.runTurn({ text: "hi", timeoutMs: 60_000 });
+    await Promise.resolve();
+    emit({ type: "assistant", message: { id: "msg_shared", usage: USAGE, content: [{ type: "text", text: "a" }] } });
+    emit({
+      type: "assistant",
+      message: { id: "msg_shared", usage: USAGE, content: [{ type: "tool_use", name: "Bash", id: "toolu_1" }] },
+    });
+    // Real elapsed time so the `!sawResult` wall-clock fallback is provably
+    // nonzero rather than a same-tick 0 (matches the stream-death pin in
+    // warm-voice-session.test.ts).
+    await new Promise((r) => setTimeout(r, 5));
+    endOutput();
+    const leaseResult = await leasePromise;
+    dateNowSpy.mockRestore();
+    expect(dateNowCalls).toBe(4); // pins the call-count this fixture depends on
+    lease.close("test-cleanup");
+
+    for (const result of [runnerResult, leaseResult]) {
+      // Exactly-once accumulation on a repeated message.id — never doubled.
+      expect(result.inputTokens).toBe(USAGE.input_tokens);
+      expect(result.outputTokens).toBe(USAGE.output_tokens);
+      expect(result.cacheReadTokens).toBe(USAGE.cache_read_input_tokens);
+      expect(result.cacheCreationTokens).toBe(USAGE.cache_creation_input_tokens);
+      // Wall-clock fallback fired — no `result` message ever arrived.
+      expect(result.durationMs).toBeGreaterThan(0);
+      // llmMs stays clamped non-negative and identity-matches the shared
+      // `max(0, durationMs - toolMs)` formula on both sides.
+      expect(result.llmMs).toBeGreaterThanOrEqual(0);
+      expect(result.llmMs).toBe(Math.max(0, result.durationMs - result.toolMs));
+    }
+  });
+});
+
+describe("KPR-324 C2: cold-path tool-start ack injection (AgentRunner.send)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    mockQueryOverride = null;
+  });
+  afterEach(() => {
+    mockMessages = null;
+    mockQueryOverride = null;
+  });
+
+  const voiceCtx = {
+    adapterId: "voice",
+    channelId: "call-1",
+    channelKind: "voice",
+    channelLabel: "voice:call-1",
+    threadId: "voice:call-1",
+    slackTs: "",
+    slackThreadTs: "",
+  };
+
+  const INIT = { type: "system", subtype: "init", session_id: "s-324" };
+  const RESULT = {
+    type: "result",
+    subtype: "success",
+    result: "all set",
+    total_cost_usd: 0.001,
+    duration_ms: 100,
+    session_id: "s-324",
+  };
+
+  function toolUseMsg(id: string, blocks: any[]) {
+    return { type: "assistant", session_id: "s-324", message: { id, content: blocks } };
+  }
+
+  // Subagent/delegate-nested twin: identical shape with parent_tool_use_id set
+  // (the SDK forwards subagent tool_use blocks by default).
+  function nestedToolUseMsg(id: string, blocks: any[], parentToolUseId = "toolu_parent") {
+    return {
+      type: "assistant",
+      session_id: "s-324",
+      parent_tool_use_id: parentToolUseId,
+      message: { id, content: blocks },
+    };
+  }
+
+  function toolBlock(id: string) {
+    return {
+      type: "tool_use",
+      name: "mcp__voice-fixture__voice_fixture_lookup",
+      id,
+      input: {},
+    };
+  }
+
+  function deltaMsg(text: string) {
+    return {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text } },
+    };
+  }
+
+  const ACK0 = VOICE_TOOL_ACK_PHRASES[0]! + VOICE_TOOL_ACK_SEPARATOR;
+  const ACK1 = VOICE_TOOL_ACK_PHRASES[1]! + VOICE_TOOL_ACK_SEPARATOR;
+
+  it("silent tool injects exactly once, before the result message reaches the loop", async () => {
+    const onStream = vi.fn();
+    // The generator snapshots the spy's call count immediately before the
+    // result message is yielded — the ordering assertion (spec §12.1 #2):
+    // the ack must already have been spoken while the tool was running.
+    let streamCallsBeforeResult = -1;
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [toolBlock("t1")]);
+        yield toolUseMsg("m2", [{ type: "text", text: "all set" }]);
+        streamCallsBeforeResult = onStream.mock.calls.length;
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(onStream.mock.calls[0]?.[0]).toBe(ACK0);
+    expect(streamCallsBeforeResult).toBe(1);
+    expect(result.toolAckInjected).toBe(1);
+    // SSE-only: never in resultText, and never flips `streamed` (not model text).
+    expect(result.text).toBe("all set");
+    expect(result.streamed).toBe(false);
+  });
+
+  it("text-then-tool does not inject (the model already spoke this segment)", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield deltaMsg("let me check");
+        yield toolUseMsg("m1", [toolBlock("t1")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(result.toolAckInjected).toBe(0);
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual(["let me check"]);
+    expect(result.streamed).toBe(true);
+  });
+
+  it("two silent tools inject twice in rotation — sequential assistant messages", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [toolBlock("t1")]);
+        yield toolUseMsg("m2", [toolBlock("t2")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual([ACK0, ACK1]);
+    expect(result.toolAckInjected).toBe(2);
+  });
+
+  it("two silent tools inject twice in rotation — ONE assistant message, two tool_use blocks", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [toolBlock("t1"), toolBlock("t2")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual([ACK0, ACK1]);
+    expect(result.toolAckInjected).toBe(2);
+  });
+
+  it("text + tool in the SAME assistant message does not inject (text scanned first)", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [{ type: "text", text: "let me check" }, toolBlock("t1")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(result.toolAckInjected).toBe(0);
+    expect(onStream).not.toHaveBeenCalled();
+  });
+
+  it("channel gate: an identical silent-tool script on slack never injects", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [toolBlock("t1")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, {
+      ...voiceCtx,
+      adapterId: "slack",
+      channelKind: "slack",
+    } as any);
+
+    expect(result.toolAckInjected).toBe(0);
+    expect(onStream).not.toHaveBeenCalled();
+  });
+
+  it("disabled (config.voice.toolAck.enabled = false) never injects — the S7 rollback lever", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [toolBlock("t1")]);
+        yield RESULT;
+      },
+    });
+
+    (config as any).voice.toolAck.enabled = false;
+    try {
+      const runner = makeRunner();
+      const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+      expect(result.toolAckInjected).toBe(0);
+      expect(onStream).not.toHaveBeenCalled();
+    } finally {
+      (config as any).voice.toolAck.enabled = true;
+    }
+  });
+
+  // ── Pre-PR R1: delegate/subagent-nested tool_use is excluded ──────────
+  it("subagent-nested silent tool_use never injects (delegate machinery the caller never hears)", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        // The boss's own Task call is top-level; the two tool calls the
+        // subagent makes inside it arrive with parent_tool_use_id set.
+        yield nestedToolUseMsg("m2", [toolBlock("t2")], "toolu_task");
+        yield nestedToolUseMsg("m3", [toolBlock("t3")], "toolu_task");
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(result.toolAckInjected).toBe(0);
+    expect(onStream).not.toHaveBeenCalled();
+  });
+
+  it("one Task delegation acks ONCE (top level) even though nested calls follow", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [{ type: "tool_use", name: "Task", id: "toolu_task", input: {} }]);
+        yield nestedToolUseMsg("m2", [toolBlock("t2")], "toolu_task");
+        yield nestedToolUseMsg("m3", [toolBlock("t3")], "toolu_task");
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    // Exactly one ack — the top-level Task — not one per nested call.
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual([ACK0]);
+    expect(result.toolAckInjected).toBe(1);
+  });
+
+  it("parent_tool_use_id: null is top level and still injects (regression lock)", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield { ...toolUseMsg("m1", [toolBlock("t1")]), parent_tool_use_id: null };
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual([ACK0]);
+    expect(result.toolAckInjected).toBe(1);
+  });
+
+  it("nested tool calls are still timed/counted — the exclusion is ack-only", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield nestedToolUseMsg("m2", [toolBlock("t2")], "toolu_task");
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(result.toolAckInjected).toBe(0);
+    expect(result.toolCalls).toBe(1);
+    expect(result.toolSummary).toContain("voice-fixture");
+  });
+
+  // ── Pre-PR R3: nested messages must not mutate SEGMENT STATE either ────
+  // R1 gated the ack DECISION on !subagentNested but left the surrounding
+  // `streamedThisSegment` mutations ungated. That variable models what the
+  // LIVE CALLER has heard in the current segment, so delegate machinery the
+  // caller never hears must not move it in EITHER direction.
+
+  it("nested TEXT does not mark the segment spoken — the next silent top-level tool still acks", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        // Boss delegates (top-level, silent) → ACK0, segment resets.
+        yield toolUseMsg("m1", [{ type: "tool_use", name: "Task", id: "toolu_task", input: {} }]);
+        // The SUBAGENT's own prose: forwarded by the SDK, never spoken to
+        // the caller — it must not count as "the model spoke this segment".
+        yield nestedToolUseMsg("m2", [{ type: "text", text: "I found three records" }], "toolu_task");
+        // Boss's next tool call. From the caller's ear this segment is still
+        // silent, so it must ack.
+        yield toolUseMsg("m3", [toolBlock("t3")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    // Pre-fix the nested text set streamedThisSegment = true and swallowed
+    // the second ack, leaving the caller in an unannounced silent gap.
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual([ACK0, ACK1]);
+    expect(result.toolAckInjected).toBe(2);
+  });
+
+  it("nested tool_use does not reset the segment — no spurious ack right after the model spoke", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield deltaMsg("let me check on that"); // the caller genuinely heard this
+        yield nestedToolUseMsg("m2", [toolBlock("t2")], "toolu_task");
+        yield toolUseMsg("m3", [toolBlock("t3")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    // Pre-fix the nested tool_use reset streamedThisSegment = false, so the
+    // top-level call acked on top of speech the caller had just heard.
+    expect(result.toolAckInjected).toBe(0);
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual(["let me check on that"]);
+  });
+
+  it("a silent top-level tool_use after nested tool calls still acks (state is gated, the ack path is not)", async () => {
+    const onStream = vi.fn();
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield nestedToolUseMsg("m1", [toolBlock("t1")], "toolu_task");
+        yield nestedToolUseMsg("m2", [toolBlock("t2")], "toolu_task");
+        yield toolUseMsg("m3", [toolBlock("t3")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, onStream, voiceCtx as any);
+
+    expect(onStream.mock.calls.map((c) => c[0])).toEqual([ACK0]);
+    expect(result.toolAckInjected).toBe(1);
+  });
+
+  it("no onStream: the silent-tool voice script neither throws nor counts an inject", async () => {
+    mockQueryOverride = () => ({
+      close: vi.fn(),
+      [Symbol.asyncIterator]: async function* () {
+        yield INIT;
+        yield toolUseMsg("m1", [toolBlock("t1")]);
+        yield RESULT;
+      },
+    });
+
+    const runner = makeRunner();
+    const result = await runner.send("hi", undefined, undefined, voiceCtx as any);
+
+    expect(result.toolAckInjected).toBe(0);
+    expect(result.text).toBe("all set");
   });
 });
 

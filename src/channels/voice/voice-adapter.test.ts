@@ -1,23 +1,25 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
-import { VoiceAdapter, isAuthError } from "./voice-adapter.js";
+import { VoiceAdapter, isAuthError, timingSafeTokenEqual } from "./voice-adapter.js";
 import type { OpenAIChatRequest } from "./openai-translator.js";
 import type { TurnContext, TurnResult } from "../../agents/agent-manager.js";
 import { ProviderCircuitOpenError } from "../../agents/provider-circuit-breaker.js";
 import { VOICE_OUTAGE_SPOKEN_NOTICE } from "../../outage/outage-notices.js";
+import { VOICE_TOOL_ACK_PHRASES } from "../../agents/voice-tool-ack.js";
 
 // ---------------------------------------------------------------------------
 // Mocks shared across the file
 // ---------------------------------------------------------------------------
 
+const mockLog = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+}));
 vi.mock("../../logging/logger.js", () => ({
-  createLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }),
+  createLogger: () => mockLog,
 }));
 
 // Stub out the SDK `query` so the legacy direct-query path in
@@ -64,6 +66,7 @@ interface AgentManagerStub {
   sessionStoreGet: ReturnType<typeof vi.fn>;
   sessionStoreSet: ReturnType<typeof vi.fn>;
   providerFor: ReturnType<typeof vi.fn>;
+  abortThread: ReturnType<typeof vi.fn>;
   calls: Array<{ ctx: TurnContext; onStream?: (chunk: string) => void }>;
 }
 
@@ -72,9 +75,11 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
   const sessionStoreGet = vi.fn().mockResolvedValue(undefined as string | undefined);
   const sessionStoreSet = vi.fn().mockResolvedValue(undefined);
   const providerFor = vi.fn().mockReturnValue("claude");
+  const abortThread = vi.fn().mockReturnValue(false);
 
   const spawnTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
     calls.push({ ctx, onStream });
+    ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
     if (throwError) throw new Error(throwError);
     return {
       finalMessage: "agent reply",
@@ -93,10 +98,14 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
     } satisfies TurnResult;
   });
 
-  return { spawnTurn, sessionStoreGet, sessionStoreSet, providerFor, calls };
+  return { spawnTurn, sessionStoreGet, sessionStoreSet, providerFor, abortThread, calls };
 }
 
-function makeVoiceAdapter(am?: AgentManagerStub, dispatcher?: { routeVoiceTurn: ReturnType<typeof vi.fn> }) {
+function makeVoiceAdapter(
+  am?: AgentManagerStub,
+  dispatcher?: { routeVoiceTurn: ReturnType<typeof vi.fn> },
+  opts: { serverSecret?: string; bridgeToken?: string } = {},
+) {
   const registry: any = {
     get: vi.fn((id: string) =>
       id === "mokie" ? { id: "mokie", name: "Mokie", model: "claude-sonnet-4-6" } : undefined,
@@ -114,14 +123,24 @@ function makeVoiceAdapter(am?: AgentManagerStub, dispatcher?: { routeVoiceTurn: 
           set: am.sessionStoreSet,
         }),
         providerFor: am.providerFor,
+        abortThread: am.abortThread,
       }
     : undefined;
-  return new VoiceAdapter(0, "shared-secret", registry, memoryManager, agentManager, dispatcher as any);
+  return new VoiceAdapter(
+    0,
+    opts.serverSecret ?? "shared-secret",
+    opts.bridgeToken ?? "",
+    registry,
+    memoryManager,
+    agentManager,
+    dispatcher as any,
+  );
 }
 
 class MockServerResponse extends EventEmitter {
   headersSent = false;
   writableEnded = false;
+  destroyed = false;
   statusCode = 0;
   headers: Record<string, string> = {};
   written: string[] = [];
@@ -162,6 +181,39 @@ async function callHandle(adapter: VoiceAdapter, req: OpenAIChatRequest, res: Mo
   );
 }
 
+async function invokeHandleRequest(
+  adapter: VoiceAdapter,
+  opts: { headers?: Record<string, string>; body: unknown },
+): Promise<MockServerResponse> {
+  const res = new MockServerResponse();
+  const req: any = new EventEmitter();
+  req.method = "POST";
+  req.url = "/v1/chat/completions";
+  req.headers = opts.headers ?? {};
+  const handlePromise = (adapter as any).handleRequest(req, res);
+  req.emit("data", Buffer.from(typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body)));
+  req.emit("end");
+  await handlePromise;
+  return res;
+}
+
+function workerBody(agentId = "mokie"): Record<string, unknown> {
+  return {
+    stream: true,
+    messages: [{ role: "user", content: "hi" }],
+    call: { id: "call-abc", metadata: { hive_agent_id: agentId } },
+  };
+}
+
+function vapiBody(): Record<string, unknown> {
+  return {
+    stream: true,
+    messages: [{ role: "user", content: "hi" }],
+    assistant: { metadata: { hive_agent_id: "mokie" } },
+    call: { id: "call-abc" },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // isAuthError (unchanged from baseline) — keep guarding the regex.
 // ---------------------------------------------------------------------------
@@ -190,6 +242,19 @@ describe("isAuthError", () => {
   });
 });
 
+describe("timingSafeTokenEqual", () => {
+  it("returns false for empty strings", () => {
+    expect(timingSafeTokenEqual("", "")).toBe(false);
+    expect(timingSafeTokenEqual("", "tok")).toBe(false);
+    expect(timingSafeTokenEqual("tok", "")).toBe(false);
+  });
+
+  it("returns true for equal tokens and false for unequal", () => {
+    expect(timingSafeTokenEqual("tok-1", "tok-1")).toBe(true);
+    expect(timingSafeTokenEqual("tok-1", "tok-2")).toBe(false);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // KPR-219: per-turn-via-AgentManager path tests
 // ---------------------------------------------------------------------------
@@ -212,7 +277,7 @@ describe("VoiceAdapter — KPR-220 Phase 8 retirement", () => {
     expect(
       () =>
         // Test wiring: pass undefined (typed-undefined coercion mirrors prod misconfig).
-        new VoiceAdapter(0, "shared-secret", {} as any, {} as any, undefined as unknown as any),
+        new VoiceAdapter(0, "shared-secret", "", {} as any, {} as any, undefined as unknown as any),
     ).toThrow(/AgentManager/);
   });
 
@@ -265,6 +330,122 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
 
     const ctx = am.calls[0]!.ctx;
     expect(ctx.systemPromptOverride).toBe("voice-prompt:qualify lead:warm inbound");
+  });
+
+  it("KPR-323 C1: Voice turn complete carries promptBuildMs, sessionLookupMs, and warmPath false", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: false });
+
+    await callHandle(adapter, req, res);
+
+    const completeCall = mockLog.info.mock.calls.find((c) => c[0] === "Voice turn complete");
+    expect(completeCall).toBeDefined();
+    const fields = completeCall![1] as Record<string, unknown>;
+    expect(typeof fields.promptBuildMs).toBe("number");
+    expect(fields.promptBuildMs as number).toBeGreaterThanOrEqual(0);
+    expect(typeof fields.sessionLookupMs).toBe("number");
+    expect(fields.sessionLookupMs as number).toBeGreaterThanOrEqual(0);
+    expect(fields.warmPath).toBe(false);
+    // Absent-coordinator-stamps branch: the `...(result.stageTimings ?? {})`
+    // and `warmTurnSeq` spreads degrade to nothing rather than logging
+    // undefined-valued keys.
+    expect(fields).not.toHaveProperty("bootToInitMs");
+    expect(fields).not.toHaveProperty("warmTurnSeq");
+  });
+
+  // The populated branch of the same two spreads. Without this, every
+  // assertion above runs against a TurnResult carrying NO stageTimings and no
+  // warmTurnSeq, so nothing proves the coordinator's C1 numbers — the exact
+  // inputs Task 11's falsification gate reads — actually reach the log line.
+  it("KPR-323 C1/C2: a populated stageTimings + warmTurnSeq from the coordinator reach the log line verbatim", async () => {
+    const am = makeAgentManager({
+      stageTimings: {
+        lockWaitMs: 3,
+        spawnPrepMs: 17,
+        bootToInitMs: 741,
+        initToFirstTokenMs: 1263,
+      },
+      warmPath: true,
+      warmTurnSeq: 4,
+    });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: false });
+
+    await callHandle(adapter, req, res);
+
+    const completeCall = mockLog.info.mock.calls.find((c) => c[0] === "Voice turn complete");
+    expect(completeCall).toBeDefined();
+    const fields = completeCall![1] as Record<string, unknown>;
+    expect(fields).toMatchObject({
+      lockWaitMs: 3,
+      spawnPrepMs: 17,
+      bootToInitMs: 741,
+      initToFirstTokenMs: 1263,
+      warmPath: true,
+      warmTurnSeq: 4,
+    });
+  });
+
+  // KPR-324 C5d/S4: the tool-observability quartet on the same log line.
+  // Mirrors the C1/C2 populated-branch case above: drive a TurnResult that
+  // carries real tool numbers and prove they reach the log entry verbatim.
+  // The no-content assertion is spec §12.1 #5 — only COUNTS may be logged;
+  // the ack phrase text itself must never appear in telemetry.
+  it("KPR-324 C5d: Voice turn complete carries toolCalls/toolMs/toolSummary/toolAckInjected without leaking ack text", async () => {
+    const am = makeAgentManager({
+      toolCalls: 2,
+      toolMs: 1800,
+      toolSummary: "voice-fixture:1x/1.5s",
+      toolAckInjected: 1,
+    });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: false });
+
+    await callHandle(adapter, req, res);
+
+    const completeCall = mockLog.info.mock.calls.find((c) => c[0] === "Voice turn complete");
+    expect(completeCall).toBeDefined();
+    const fields = completeCall![1] as Record<string, unknown>;
+    expect(fields).toMatchObject({
+      toolCalls: 2,
+      toolMs: 1800,
+      toolSummary: "voice-fixture:1x/1.5s",
+      toolAckInjected: 1,
+    });
+
+    // No-content check: serialize every field and assert none of the canned
+    // ack phrases appear anywhere in the entry.
+    const serialized = JSON.stringify(fields);
+    for (const phrase of VOICE_TOOL_ACK_PHRASES) {
+      expect(serialized).not.toContain(phrase);
+    }
+  });
+
+  // The null-toolSummary branch of the `?? "none"` fallback — a turn that ran
+  // no tools logs the literal "none", never `null`/undefined.
+  it('KPR-324 C5d: a null toolSummary degrades to the literal "none"', async () => {
+    const am = makeAgentManager({
+      toolCalls: 0,
+      toolMs: 0,
+      toolSummary: null,
+      toolAckInjected: 0,
+    });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: false });
+
+    await callHandle(adapter, req, res);
+
+    const completeCall = mockLog.info.mock.calls.find((c) => c[0] === "Voice turn complete");
+    expect(completeCall).toBeDefined();
+    const fields = completeCall![1] as Record<string, unknown>;
+    expect(fields.toolSummary).toBe("none");
+    expect(fields.toolCalls).toBe(0);
+    expect(fields.toolAckInjected).toBe(0);
   });
 
   it("populates the in-adapter callId→agentId map on first turn (used as fast in-flight cache)", async () => {
@@ -336,6 +517,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     // Simulate text-delta chunks while spawnTurn is awaited.
     am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       // No headers yet (no chunks emitted).
       expect(res.headersSent).toBe(false);
       onStream!("Hel");
@@ -394,6 +576,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     // First call errors (in errors[]), second succeeds.
     am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       return {
         finalMessage: "",
         newSessionId: "",
@@ -437,6 +620,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
 
     const failingTurn = async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       return {
         finalMessage: "",
         newSessionId: "",
@@ -472,6 +656,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     am.spawnTurn.mockReset();
     am.spawnTurn.mockImplementation(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       return {
         finalMessage: "fresh",
         newSessionId: "new-sid",
@@ -517,7 +702,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     expect(body.error).toBe("Voice unavailable");
   });
 
-  it("KPR-313: provider mismatch at the read ⇒ no resume, no tag, FULL-transcript prompt (voice's native handoff), no annotation", async () => {
+  it("KPR-467: forwards the stored candidate and both prompt forms for authoritative admission", async () => {
     const am = makeAgentManager();
     am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "resp_openai_123", provider: "openai" });
     const adapter = makeVoiceAdapter(am);
@@ -534,16 +719,13 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     await callHandle(adapter, req, res);
 
     const ctx = am.calls[0]!.ctx;
-    expect(ctx.sessionId).toBeUndefined(); // mismatched handle never attempted
-    expect(ctx.sessionProvider).toBeUndefined(); // spawnTurn guard has nothing to trip on
-    // FULL transcript, not latest-message-only — pre-313 the doomed resume
-    // failed HARD and the outer retry re-sent the transcript; a naive
-    // guard-strip downstream would have silently sent only the last line.
-    expect(ctx.workItem.text).toContain("Caller: first user line");
-    expect(ctx.workItem.text).toContain("You: first agent line");
-    expect(ctx.workItem.text).toContain("Caller: latest user line");
-    // Voice carve-out: annotation-free (the transcript IS the handoff).
-    expect(ctx.workItem.text).not.toContain("session continuity was reset");
+    expect(ctx.sessionId).toBe("resp_openai_123");
+    expect(ctx.sessionProvider).toBe("openai");
+    expect(ctx.voicePrompt?.latestUserMessage).toBe("latest user line");
+    expect(ctx.voicePrompt?.fullConversation).toContain("Caller: first user line");
+    expect(ctx.voicePrompt?.fullConversation).toContain("You: first agent line");
+    expect(ctx.voicePrompt?.fullConversation).toContain("Caller: latest user line");
+    expect(am.providerFor).not.toHaveBeenCalled();
   });
 
   it("KPR-313: codex-tagged mapping-only row (no handle) ⇒ full transcript, no resume", async () => {
@@ -586,7 +768,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     expect(ctx.sessionId).toBe("resume-sid-match");
     expect(ctx.sessionProvider).toBe("claude");
     expect(ctx.workItem.text).toBe("latest user line");
-    expect(am.providerFor).toHaveBeenCalledWith("mokie");
+    expect(am.providerFor).not.toHaveBeenCalled();
   });
 });
 
@@ -705,5 +887,211 @@ describe("VoiceAdapter.handleRequest agent resolution", () => {
 
     expect(res.statusCode).toBe(401);
     expect(am.spawnTurn).not.toHaveBeenCalled();
+  });
+});
+
+describe("E1 bridge auth (KPR-322)", () => {
+  const BRIDGE = "tok-bridge-1";
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("1. valid bearer + worker-shaped body → 200, spawn runs", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am, undefined, { bridgeToken: BRIDGE });
+    const res = await invokeHandleRequest(adapter, {
+      headers: { authorization: `Bearer ${BRIDGE}` },
+      body: workerBody(),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(am.spawnTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("2. non-matching bearer + Vapi-shaped body → falls through and succeeds", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am, undefined, { bridgeToken: BRIDGE });
+    const res = await invokeHandleRequest(adapter, {
+      headers: { authorization: "Bearer no-credentials-provided" },
+      body: vapiBody(),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(am.spawnTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("3. neither token nor Vapi shape → 401", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am, undefined, { bridgeToken: BRIDGE });
+    const res = await invokeHandleRequest(adapter, {
+      headers: { authorization: "Bearer wrong" },
+      body: {
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+        call: { id: "call-abc" },
+      },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(res.written.join("")).toBe(JSON.stringify({ error: "Unauthorized" }));
+    expect(am.spawnTurn).not.toHaveBeenCalled();
+  });
+
+  it("4. serverSecret unset + valid bridge → 200; unset + Vapi-shaped, no token → 403", async () => {
+    const amOk = makeAgentManager();
+    const adapterOk = makeVoiceAdapter(amOk, undefined, { serverSecret: "", bridgeToken: BRIDGE });
+    const resOk = await invokeHandleRequest(adapterOk, {
+      headers: { authorization: `Bearer ${BRIDGE}` },
+      body: workerBody(),
+    });
+    expect(resOk.statusCode).toBe(200);
+    expect(amOk.spawnTurn).toHaveBeenCalledTimes(1);
+
+    const amDeny = makeAgentManager();
+    const adapterDeny = makeVoiceAdapter(amDeny, undefined, { serverSecret: "", bridgeToken: BRIDGE });
+    const resDeny = await invokeHandleRequest(adapterDeny, {
+      headers: { authorization: "Bearer no-credentials-provided" },
+      body: vapiBody(),
+    });
+    expect(resDeny.statusCode).toBe(403);
+    expect(resDeny.written.join("")).toBe(JSON.stringify({ error: "Server secret not configured" }));
+    expect(amDeny.spawnTurn).not.toHaveBeenCalled();
+  });
+
+  it("5. bridge token configured but no resolvable hive_agent_id → 400", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am, undefined, { bridgeToken: BRIDGE });
+    const res = await invokeHandleRequest(adapter, {
+      headers: { authorization: `Bearer ${BRIDGE}` },
+      body: {
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+        call: { id: "call-abc" },
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.written.join("")).toBe(JSON.stringify({ error: "call.metadata.hive_agent_id required" }));
+    expect(am.spawnTurn).not.toHaveBeenCalled();
+  });
+
+  it("6. empty bridgeToken → Vapi requests match pre-E1 behavior", async () => {
+    const amOk = makeAgentManager();
+    const adapterOk = makeVoiceAdapter(amOk); // bridgeToken defaults to ""
+    const resOk = await invokeHandleRequest(adapterOk, {
+      headers: { authorization: "Bearer no-credentials-provided" },
+      body: vapiBody(),
+    });
+    expect(resOk.statusCode).toBe(200);
+    expect(amOk.spawnTurn).toHaveBeenCalledTimes(1);
+
+    const amDeny = makeAgentManager();
+    const adapterDeny = makeVoiceAdapter(amDeny);
+    const resDeny = await invokeHandleRequest(adapterDeny, {
+      headers: { authorization: "Bearer no-credentials-provided" },
+      body: {
+        model: "x",
+        messages: [{ role: "user", content: "hi" }],
+        assistant: {},
+        call: {},
+      },
+    });
+    expect(resDeny.statusCode).toBe(401);
+    expect(resDeny.written.join("")).toBe(JSON.stringify({ error: "Unauthorized" }));
+    expect(amDeny.spawnTurn).not.toHaveBeenCalled();
+  });
+
+  it("8. valid bridge token + Vapi-shaped body → 200 via the token path", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am, undefined, { bridgeToken: BRIDGE });
+    const res = await invokeHandleRequest(adapter, {
+      headers: { authorization: `Bearer ${BRIDGE}` },
+      body: vapiBody(),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(am.spawnTurn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("E2 abort-on-disconnect (KPR-322)", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("suppresses outer retry when the client is gone", async () => {
+    const am = makeAgentManager();
+    am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "stale-sid", provider: "claude" });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+      am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
+      res.emit("close");
+      return {
+        finalMessage: "",
+        newSessionId: "",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          contextWindow: 0,
+          costUsd: 0,
+          durationMs: 0,
+        },
+        errors: ["resume failed: bad session id"],
+      };
+    });
+
+    const req = makeRequest({
+      stream: false,
+      messages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: "ack" },
+        { role: "user", content: "now retry me" },
+      ],
+    });
+
+    await callHandle(adapter, req, res);
+
+    expect(am.abortThread).toHaveBeenCalledWith("mokie", "voice:call-abc-123");
+    expect(am.spawnTurn).toHaveBeenCalledTimes(1);
+    expect(res.written).toEqual([]);
+    expect(res.writableEnded).toBe(false);
+  });
+
+  it("does not write after premature close (no throw, no write after end)", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    const req = makeRequest({ stream: true });
+
+    am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+      am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
+      onStream!("before ");
+      res.emit("close");
+      onStream!("after ");
+      return {
+        finalMessage: "before after",
+        newSessionId: "s1",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          contextWindow: 0,
+          costUsd: 0,
+          durationMs: 0,
+        },
+        errors: [],
+      };
+    });
+
+    await expect(callHandle(adapter, req, res)).resolves.toBeUndefined();
+
+    expect(am.abortThread).toHaveBeenCalledWith("mokie", "voice:call-abc-123");
+    const joined = res.written.join("");
+    expect(joined).toContain('"content":"before "');
+    expect(joined).not.toContain("after");
+    expect(joined).not.toContain("[DONE]");
+    expect(res.writableEnded).toBe(false);
   });
 });

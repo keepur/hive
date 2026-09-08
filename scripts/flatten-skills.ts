@@ -16,9 +16,18 @@
  *   npx tsx scripts/flatten-skills.ts seeds/chief-of-staff
  *   npx tsx scripts/flatten-skills.ts seeds/chief-of-staff plugins --dry
  */
-import { existsSync, mkdtempSync, readdirSync, renameSync, rmdirSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmdirSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 export interface PlannedMove {
   from: string;
@@ -300,8 +309,21 @@ export function flattenRoot(root: string, opts: FlattenOptions = {}): FlattenPla
 // ---------------------------------------------------------------------------
 
 function isMain(): boolean {
-  // tsx-compatible main detection.
-  return import.meta.url === `file://${process.argv[1]}`;
+  // tsx-compatible main detection. `pathToFileURL`, not a raw `file://${...}`
+  // template: argv[1] is a filesystem path, so any component needing
+  // percent-encoding (a space, `#`, `?`, non-ASCII) makes the raw string differ
+  // from `import.meta.url` and the CLI silently no-ops (KPR-323 child-PR round
+  // 1, issue 1 — same idiom, same fix).
+  // The realpath fallback covers a symlinked invocation path (node resolves
+  // `import.meta.url` through symlinks, argv[1] stays as typed).
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  if (import.meta.url === pathToFileURL(entry).href) return true;
+  try {
+    return fileURLToPath(import.meta.url) === realpathSync(entry);
+  } catch {
+    return false;
+  }
 }
 
 if (isMain()) {

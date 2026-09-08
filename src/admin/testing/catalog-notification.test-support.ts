@@ -139,6 +139,7 @@ export function makeCatalogTurnResult(text = "I will bring any proposal to the o
     toolMs: 0,
     toolCalls: 0,
     toolSummary: null,
+    toolAckInjected: 0,
     streamed: false,
     compactions: 0,
   };
