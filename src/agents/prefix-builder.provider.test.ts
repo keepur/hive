@@ -7,7 +7,7 @@
  *
  * Standalone: its own local scaffolding, NOT imported from the golden file.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { AgentConfig } from "../types/agent-config.js";
 
 vi.mock("../logging/logger.js", () => ({
@@ -34,8 +34,6 @@ import {
   MEMORY_TURN_HEADER,
   type ProviderInstructionsInput,
 } from "./prefix-builder.js";
-import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
-import type { ArchetypeDefinition } from "../archetypes/registry.js";
 import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.js";
 import type { ProviderSkillIndexEntry } from "./provider-adapters/turn-assembly.js";
 import { BUILTIN_TOOL_DEFINITIONS } from "./provider-adapters/builtin-executor.js";
@@ -59,7 +57,7 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     delegateServers: [],
     soul: "",
     systemPrompt: "GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.",
-    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    autonomy: { externalComms: true, codeAccess: false },
     ...overrides,
   };
 }
@@ -167,29 +165,12 @@ function makeInput(overrides: Partial<ProviderInstructionsInput> = {}): Provider
   };
 }
 
-const GOLDEN_ARCHETYPE: ArchetypeDefinition = {
-  id: "golden-archetype",
-  validateConfig: (c) => c,
-  systemPromptCard: () => "GOLDEN-ARCHETYPE-CARD: fixture discipline card.",
-  preToolUseHooks: () => [],
-  memoryScopes: () => [],
-  sessionOptions: () => ({}),
-};
-
-beforeEach(() => {
-  __resetRegistryForTests();
-  registerArchetype(GOLDEN_ARCHETYPE);
-});
-afterEach(() => __resetRegistryForTests());
-
 // ── Composition / order ─────────────────────────────────────────────
 
 describe("buildProviderInstructions — composition / order", () => {
   function richInput(toolsExecutable: boolean): { cfg: AgentConfig; input: ProviderInstructionsInput } {
     const cfg = makeAgentConfig({
       soul: "GOLDEN-SOUL: warm, precise.",
-      archetype: "golden-archetype",
-      archetypeConfig: { k: "v" },
     });
     const input = makeInput({
       toolInventory: [makeEntry({ name: "memory" }), engineEntry("slack"), builtinEntry()],
@@ -212,7 +193,6 @@ describe("buildProviderInstructions — composition / order", () => {
 
     const order = [
       "GOLDEN-SOUL",
-      "GOLDEN-ARCHETYPE-CARD",
       "GOLDEN-SYSTEM-PROMPT",
       "GOLDEN-CONSTITUTION",
       "GOLDEN-TEAM",
@@ -232,10 +212,10 @@ describe("buildProviderInstructions — composition / order", () => {
   it("sections are joined by \\n\\n---\\n\\n (joiners = sections − 1)", async () => {
     const { cfg, input } = richInput(true);
     const { instructions } = await buildProviderInstructions(cfg, input);
-    // 10 sections: soul, card, systemPrompt, constitution, team, toolkit,
-    // follow-through, file-tier, skills, memory → 9 joiners (datetime left the instructions in KPR-432).
+    // 9 sections: soul, systemPrompt, constitution, team, toolkit,
+    // follow-through, file-tier, skills, memory → 8 joiners (datetime left the instructions in KPR-432).
     const joinerCount = instructions.split(SECTION_JOINER).length - 1;
-    expect(joinerCount).toBe(9);
+    expect(joinerCount).toBe(8);
   });
 
   it("instructions placement: hot tier folded in ONCE, and memoryBlock/memoryDigest returned too (rendered once either way)", async () => {
@@ -260,8 +240,8 @@ describe("buildProviderInstructions — composition / order", () => {
     expect(result.memoryBlock).toContain("mcp__structured-memory__memory_recall"); // Lane B bridged name inside the block
     expect(result.hotTierPrompt).toBe(result.memoryBlock);
     expect(result.memoryDigest).toBe(memoryDigest(result.memoryBlock!));
-    // 9 sections (memory left) ⇒ 8 joiners
-    expect(result.instructions.split(SECTION_JOINER).length - 1).toBe(8);
+    // 8 sections (memory left) ⇒ 7 joiners
+    expect(result.instructions.split(SECTION_JOINER).length - 1).toBe(7);
   });
 
   it("turn-input placement, legacy fallback: memory.md + listing leave the instructions and ride memoryBlock", async () => {

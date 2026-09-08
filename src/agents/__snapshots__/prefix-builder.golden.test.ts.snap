@@ -46,67 +46,6 @@ You have access to the following tools this session. Try them; don't guess at av
 - TodoWrite — track multi-step tasks within this session"
 `;
 
-exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G3: archetype card rendered (archetypeConfig present) 1`] = `
-"GOLDEN-ARCHETYPE-CARD: fixture discipline card.
-
----
-
-GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
-
----
-
-## Your toolkit
-
-You have access to the following tools this session. Try them; don't guess at availability.
-
-### Built-in (always available)
-- Bash — run shell commands
-- Read / Write / Edit — file I/O
-- Glob / Grep — file/content search
-- WebFetch / WebSearch — web access
-- NotebookEdit — Jupyter notebook editing
-- Task — delegate to a subagent (see Delegated capability MCPs below)
-- TodoWrite — track multi-step tasks within this session"
-`;
-
-exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G4: archetype card throws → omitted, rest of prefix intact 1`] = `
-"GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
-
----
-
-## Your toolkit
-
-You have access to the following tools this session. Try them; don't guess at availability.
-
-### Built-in (always available)
-- Bash — run shell commands
-- Read / Write / Edit — file I/O
-- Glob / Grep — file/content search
-- WebFetch / WebSearch — web access
-- NotebookEdit — Jupyter notebook editing
-- Task — delegate to a subagent (see Delegated capability MCPs below)
-- TodoWrite — track multi-step tasks within this session"
-`;
-
-exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G5: archetype id resolves but archetypeConfig absent → card skipped (prefix-builder.ts:75 conjunction) 1`] = `
-"GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
-
----
-
-## Your toolkit
-
-You have access to the following tools this session. Try them; don't guess at availability.
-
-### Built-in (always available)
-- Bash — run shell commands
-- Read / Write / Edit — file I/O
-- Glob / Grep — file/content search
-- WebFetch / WebSearch — web access
-- NotebookEdit — Jupyter notebook editing
-- Task — delegate to a subagent (see Delegated capability MCPs below)
-- TodoWrite — track multi-step tasks within this session"
-`;
-
 exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G6: team summary present 1`] = `
 "GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.
 
@@ -247,10 +186,6 @@ You have access to the following tools this session. Try them; don't guess at av
 
 exports[`buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first) > G12: kitchen sink — every layer at once 1`] = `
 "GOLDEN-SOUL: warm, precise.
-
----
-
-GOLDEN-ARCHETYPE-CARD: fixture discipline card.
 
 ---
 

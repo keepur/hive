@@ -59,7 +59,7 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     delegateServers: [],
     soul: "",
     systemPrompt: "You are a test agent.",
-    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    autonomy: { externalComms: true, codeAccess: false },
     ...overrides,
   };
 }
