@@ -55,7 +55,6 @@ const expectedMcp = [
   "background-task",
   "recall",
   "task",
-  "code-task",
   "voice",
   "voice-livekit",
   "slack",

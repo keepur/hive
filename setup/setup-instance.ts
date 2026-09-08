@@ -62,7 +62,6 @@ function detectCurrentPorts(): Record<string, number> | null {
         const offset = port % 100;
         if (offset === 0 && !detected.background) detected.background = port;
         else if (offset === 1 && !detected.recall) detected.recall = port;
-        else if (offset === 2 && !detected.codeTask) detected.codeTask = port;
         else if (!detected.ws) detected.ws = port;
       }
     } catch {
@@ -91,9 +90,7 @@ async function main() {
   if (currentId) {
     console.log(`Current instance: ${currentId}`);
     if (currentPorts) {
-      console.log(
-        `  Ports: bg=${currentPorts.background}, recall=${currentPorts.recall}, code-task=${currentPorts.codeTask}, ws=${currentPorts.ws}`,
-      );
+      console.log(`  Ports: bg=${currentPorts.background}, recall=${currentPorts.recall}, ws=${currentPorts.ws}`);
     } else if (currentPortBase) {
       console.log(`  Port base: ${currentPortBase}`);
     }
@@ -133,7 +130,6 @@ async function main() {
     ports = {
       background: currentPortBase,
       recall: currentPortBase + 1,
-      codeTask: currentPortBase + 2,
       ws: currentPortBase + 3,
     };
     console.log(`\nDerived ports from portBase ${currentPortBase}.`);
@@ -155,7 +151,6 @@ async function main() {
         ports = {
           background: availableBlock,
           recall: availableBlock + 1,
-          codeTask: availableBlock + 2,
           ws: availableBlock + 3,
         };
       }
@@ -170,7 +165,7 @@ async function main() {
         process.exit(1);
       }
 
-      ports = { background: portBase, recall: portBase + 1, codeTask: portBase + 2, ws: portBase + 3 };
+      ports = { background: portBase, recall: portBase + 1, ws: portBase + 3 };
     }
   }
 
@@ -182,10 +177,8 @@ async function main() {
     `  Constitution: ${instanceType === "personal" ? "lightweight (trust-based)" : "full (team governance)"}`,
   );
   console.log(`  Database:    hive_${instanceId}`);
-  console.log(
-    `  Ports:       bg=${ports.background}, recall=${ports.recall}, code-task=${ports.codeTask}, ws=${ports.ws}`,
-  );
-  console.log(`  Tmp dirs:    /tmp/${instanceId}-code-tasks, /tmp/${instanceId}-bg-tasks`);
+  console.log(`  Ports:       bg=${ports.background}, recall=${ports.recall}, ws=${ports.ws}`);
+  console.log(`  Tmp dirs:    /tmp/${instanceId}-bg-tasks`);
   console.log(`  Deploy dir:  ~/services/${instanceId}`);
   console.log(`  LaunchAgent: com.hive.${instanceId}.agent`);
 

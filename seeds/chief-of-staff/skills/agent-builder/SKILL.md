@@ -53,15 +53,7 @@ Using common sense and memory, determine what the agent needs:
 - Actions (send emails, create tasks, update records, etc.)
 - Scheduled work (daily reports, sweeps)
 
-**Then: discipline vs role-shape detection.** Call `list_archetypes`. For each returned archetype, compare the owner's described role against its `whenToUse`. If there's a clear match, plan to set `archetype` + `title` on the agent. Otherwise, create a plain agent (no archetype). Most agents are plain — they're defined by their soul and system prompt. A few roles are disciplines with shared infrastructure (e.g. `software-engineer` owns codebases and ships code through PRs, not free-text Edit).
-
-Let `list_archetypes` drive the decision — don't hardcode assumptions about which archetypes exist. Compare the owner's described role against each returned `whenToUse` independently.
-
-**SE archetype branch** — if `archetype: "software-engineer"`, ask one extra question:
-
-> *"What's your engineering root directory? That's where the engineer will prototype and where codebases live. Default: `~/dev`."*
-
-Expand `~` to an absolute path (e.g. `~/dev` → `/Users/<owner>/dev`). Then call `verify_path` with the absolute path — the tool returns `{ exists, isDirectory, resolved }`. If `exists` is false or `isDirectory` is false, tell the owner the path wasn't found and ask for a different one (or for them to create it first). Only proceed with creation once `verify_path` returns `exists: true` and `isDirectory: true`. Pass as `archetypeConfig: { workshop: "/absolute/path", workspaces: [] }`. **Do NOT ask about `workspaces`** — workspace registration is a separate future admin flow; it stays empty at creation.
+Every agent is defined by its soul and system prompt — there's no further branching here.
 
 ### 4. CHECK — what's configured
 
@@ -87,7 +79,7 @@ Present the agent as a person, not a config:
 >
 > *Sound right, or would you change anything?"*
 
-**Never surface:** MCP, server, autonomy, tool, system prompt, model tier, Haiku, Sonnet, Opus, coreServers, archetype, configSchema. The owner sees a person.
+**Never surface:** MCP, server, autonomy, tool, system prompt, model tier, Haiku, Sonnet, Opus, coreServers. The owner sees a person.
 
 ### 7. CONFIRM — approve or tweak
 
@@ -124,13 +116,11 @@ Call `agent_create` with these top-level fields:
 - `aliases` — array from above (omit if owner skipped)
 - `homeBase` — `agent-<id>` (you will tell the owner to create this Slack channel in step 9)
 - `soul` — the draft from step 2
-- `systemPrompt` — concise role + guardrails; instance-specific flavor. For archetype agents, keep it short — the archetype card layers framing underneath.
-- `archetype` — set only when step 3's detection matched. Omit for plain agents.
-- `title` — customer-facing title paired with archetype (e.g. "VP Engineering"). Omit for plain agents.
+- `systemPrompt` — concise role + guardrails; instance-specific flavor.
+- `title` — customer-facing title (e.g. "VP Engineering"). Omit if not needed.
 - `fields` — everything else:
   - `channels` — if the owner named specific channels beyond homeBase
   - `schedule` — cron tasks if applicable
-  - `archetypeConfig` — for SE: `{ workshop, workspaces: [] }`
   - **`autonomy: { externalComms: false }`** — ALWAYS pass this explicitly unless the owner approved outbound comms (email/SMS) in the conversation. The system default is `true`; you must opt out.
 
 Example shape:
@@ -180,7 +170,7 @@ Tell the owner:
 1. **One job, not a job description.** Single most important thing. Everything else is later.
 2. **Start minimal.** Fewest servers, simplest schedule, tightest scope. Easier to add than remove.
 3. **Don't offer what wasn't asked.** Owner didn't mention email → don't suggest email capabilities.
-4. **No jargon.** Never expose: MCP, server, autonomy, tool, system prompt, model tier, Haiku/Sonnet/Opus, coreServers, archetype.
+4. **No jargon.** Never expose: MCP, server, autonomy, tool, system prompt, model tier, Haiku/Sonnet/Opus, coreServers.
 5. **When in doubt, leave it out.** An agent that does one thing well beats one that does five things poorly.
 6. **Name them like a person.** Not "Email Handler Bot" — a name you'd give a new hire.
 7. **Default to restrictive.** Haiku ceiling, low budget, limited servers, `externalComms: false`. Upgrade based on evidence.
