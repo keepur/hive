@@ -79,6 +79,7 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
 
   const spawnTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
     calls.push({ ctx, onStream });
+    ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
     if (throwError) throw new Error(throwError);
     return {
       finalMessage: "agent reply",
@@ -516,6 +517,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     // Simulate text-delta chunks while spawnTurn is awaited.
     am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       // No headers yet (no chunks emitted).
       expect(res.headersSent).toBe(false);
       onStream!("Hel");
@@ -574,6 +576,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     // First call errors (in errors[]), second succeeds.
     am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       return {
         finalMessage: "",
         newSessionId: "",
@@ -617,6 +620,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
 
     const failingTurn = async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       return {
         finalMessage: "",
         newSessionId: "",
@@ -652,6 +656,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     am.spawnTurn.mockReset();
     am.spawnTurn.mockImplementation(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       return {
         finalMessage: "fresh",
         newSessionId: "new-sid",
@@ -1017,6 +1022,7 @@ describe("E2 abort-on-disconnect (KPR-322)", () => {
     const res = new MockServerResponse();
     am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       res.emit("close");
       return {
         finalMessage: "",
@@ -1059,6 +1065,7 @@ describe("E2 abort-on-disconnect (KPR-322)", () => {
 
     am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       onStream!("before ");
       res.emit("close");
       onStream!("after ");

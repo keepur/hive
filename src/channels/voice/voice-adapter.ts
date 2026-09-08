@@ -375,12 +375,20 @@ export class VoiceAdapter {
       systemPromptOverride: systemPrompt,
     };
 
+    let hasAdmittedContinuity = false;
     const runOnce = async (
       spawnCtx: TurnContext,
     ): Promise<
       | { ok: true; result: TurnResult; bytesSent: boolean }
       | { ok: false; reason: string; circuitOpen?: boolean; bytesSent: boolean }
     > => {
+      hasAdmittedContinuity = false;
+      spawnCtx = {
+        ...spawnCtx,
+        onVoiceAdmission: (continuity) => {
+          hasAdmittedContinuity = continuity === "warm" || continuity === "resume";
+        },
+      };
       try {
         // KPR-223: route through dispatcher when wired (applies taskLedger +
         // audit log; dedup intentionally skipped — see Dispatcher.routeVoiceTurn).
@@ -410,9 +418,10 @@ export class VoiceAdapter {
     }
 
     let outcome = await runOnce(ctx);
+    const continuityAttempted = hasAdmittedContinuity;
     let outerRetryFired = false;
 
-    // Outer retry — resume failed before any bytes hit the wire. Restart with
+    // Outer retry — admitted lease/resume failed before any bytes hit the wire. Restart with
     // full transcript and no resume id. Mirrors voice-adapter.ts:320-329 from
     // the legacy path. Catches cases spawnTurn's inner auth-retry doesn't
     // cover (stale id without auth-error pattern, etc.).
@@ -423,7 +432,7 @@ export class VoiceAdapter {
     // caller has HEARD the ack, replaying the turn would double-speak it, so
     // an ack-only turn is correctly treated as "already on the wire" and is
     // not retried here.
-    if (!outcome.ok && !outcome.circuitOpen && effectiveResume && !outcome.bytesSent && !clientGone) {
+    if (!outcome.ok && !outcome.circuitOpen && hasAdmittedContinuity && !outcome.bytesSent && !clientGone) {
       log.warn("Voice spawnTurn resume failed, retrying as turn-1", {
         callId,
         reason: outcome.reason,
@@ -516,7 +525,9 @@ export class VoiceAdapter {
     }
 
     // Telemetry parity with KPR-207 baseline (voice-adapter.ts:370-379).
-    // sdkSessionResumed = "we attempted resume AND the spawn succeeded
+    // Admission, including an active lease without a store row, is the
+    // continuity source for both returned and thrown failures.
+    // sdkSessionResumed = "we attempted continuity AND the spawn succeeded
     // without the outer-retry kicking in" — NOT `newSessionId === effectiveResume`,
     // because the SDK rotates session ids post-compaction, which would
     // systematically under-count successful resumes versus the baseline.
@@ -536,8 +547,8 @@ export class VoiceAdapter {
       firstTokenMs,
       totalMs: Date.now() - startedAt,
       mode: isStreaming ? "streaming" : "non-streaming",
-      sdkSessionResumeAttempted: !!effectiveResume,
-      sdkSessionResumed: !!effectiveResume && outcome.ok && !outerRetryFired,
+      sdkSessionResumeAttempted: continuityAttempted,
+      sdkSessionResumed: continuityAttempted && outcome.ok && !outerRetryFired,
       routedVia: "agentManager",
       // KPR-323 C1: stage decomposition (adapter-side stamps + coordinator/
       // runner stamps carried on TurnResult). Log-only; all durations —

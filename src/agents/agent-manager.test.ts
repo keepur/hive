@@ -7041,6 +7041,7 @@ describe("AgentManager", () => {
     function installEchoStreamingRunner(
       opts: {
         failOnTurn?: number;
+        throwOnTurn?: number;
         hangOnTurn?: number;
         hangResultSubtype?: string;
         /**
@@ -7071,6 +7072,10 @@ describe("AgentManager", () => {
           for await (const m of input) {
             n++;
             pushed.push(String(m.message?.content ?? ""));
+            if (opts.throwOnTurn === n) {
+              out.push(new Error("streaming session failed"));
+              continue;
+            }
             if (opts.failOnTurn === n) {
               out.push({ type: "result", subtype: "error_during_execution", errors: ["boom"], session_id: `sess-warm-${n}`, total_cost_usd: 0, duration_ms: 1 });
               continue;
@@ -7101,7 +7106,11 @@ describe("AgentManager", () => {
           out.end();
         })();
         return {
-          next: () => it.next(),
+          next: async () => {
+            const message = await it.next();
+            if (message.value instanceof Error) throw message.value;
+            return message;
+          },
           interrupt,
           close: close.mockImplementation(() => out.end()),
           [Symbol.asyncIterator]() {
@@ -7231,7 +7240,7 @@ describe("AgentManager", () => {
       // Real adapter and manager; only the response transport and vendor runner
       // are fake. The dispatcher hook models a reload after adapter reads but
       // before manager admission, without mocking either side of the seam.
-      async function adapterTurn(latest: string, beforeAdmission?: () => void) {
+      async function adapterTurn(latest: string, beforeAdmission?: () => void, options: { status?: number; stream?: boolean } = {}) {
         const { VoiceAdapter } = await import("../channels/voice/voice-adapter.js");
         const { EventEmitter } = await import("node:events");
         const res = Object.assign(new EventEmitter(), {
@@ -7248,14 +7257,15 @@ describe("AgentManager", () => {
             return manager.spawnTurn(ctx, onStream);
           } } as any);
         await (adapter as any).handleChatCompletion({}, res, {
-          model: "voice", stream: false, call: { id: "call-1" },
+          model: "voice", stream: options.stream ?? false, call: { id: "call-1" },
           messages: [
             { role: "user", content: "original question" },
             { role: "assistant", content: "earlier answer" },
             { role: "user", content: latest },
           ],
         }, "agent-a", registry.get("agent-a"));
-        expect(res.writeHead).toHaveBeenCalledWith(200, expect.anything());
+        expect(res.writeHead).toHaveBeenCalledWith(options.status ?? 200, expect.anything());
+        return res;
       }
 
       it.each([false, true])("adapter preserves pinned-lease incremental prompts after reload (missing store row: %s)", async (missingRow) => {
@@ -7299,6 +7309,105 @@ describe("AgentManager", () => {
           expect(pushed[0]).toContain("You: earlier answer");
           expect(pushed[0]).toContain("Caller: question after reload");
         }
+      });
+
+      it.each(["returned", "thrown"] as const)("round2: missing-row active warm %s failure retries the full transcript once before bytes", async (failure) => {
+        const { pushed } = installEchoStreamingRunner(failure === "returned" ? { failOnTurn: 2 } : { throwOnTurn: 2 });
+        await adapterTurn("opening question");
+        sessionStore._sessions.delete(WARM_KEY);
+        const spawn = vi.spyOn(manager, "spawnTurn");
+        const res = await adapterTurn("recover this question", undefined, { stream: true });
+        expect(spawn).toHaveBeenCalledTimes(2);
+        expect(mockRunnerOpenStream).toHaveBeenCalledTimes(2);
+        expect(mockRunnerOpenStream.mock.calls[1]![0].sessionId).toBeUndefined();
+        expect(pushed).toHaveLength(3);
+        expect(pushed[1]).toMatch(/^recover this question\n/);
+        expect(pushed[2]).toContain("Caller: original question");
+        expect(pushed[2]).toContain("You: earlier answer");
+        expect(pushed[2]).toContain("Caller: recover this question");
+        expect(res.write.mock.calls.filter(([chunk]) => String(chunk).includes("reply-1"))).toHaveLength(1);
+      });
+
+      it.each([
+        ["claude", "returned"], ["claude", "thrown"],
+        ["openai", "returned"], ["openai", "thrown"],
+      ] as const)("round2: fresh admission after %s switch is not resume-retried on %s failure", async (from, failure) => {
+        installEchoStreamingRunner({ failOnTurn: 1 });
+        registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: from === "claude" ? "claude-sonnet-4-6" : "openai/gpt-5.4-mini" }));
+        sessionStore._sessions.set(WARM_KEY, { sessionId: "old-provider-session", provider: from });
+        if (failure === "thrown") {
+          mockRunnerOpenStream.mockRejectedValue(new Error("session open failed"));
+          mockOpenAIRunTurn.mockRejectedValue(new Error("session failed"));
+        } else {
+          mockOpenAIRunTurn.mockResolvedValue(makeRunResult({ error: "boom" }));
+        }
+        const spawn = vi.spyOn(manager, "spawnTurn");
+        await adapterTurn("fresh question", () => {
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: from === "claude" ? "openai/gpt-5.4-mini" : "claude-sonnet-4-6" }));
+        }, { status: 500, stream: true });
+        expect(spawn).toHaveBeenCalledTimes(1);
+        if (from === "claude") {
+          expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+          expect(mockOpenAIRunTurn.mock.calls[0]![0].sessionId).toBeUndefined();
+          expect(mockOpenAIRunTurn.mock.calls[0]![0].prompt).toContain("Caller: original question");
+        } else {
+          expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+          expect(mockRunnerOpenStream.mock.calls[0]![0].sessionId).toBeUndefined();
+        }
+      });
+
+      it.each([
+        ["claude", true], ["claude", false], ["openai", true], ["openai", false],
+      ] as const)("round2: post-lock session read pins %s admission across reload (compatible handle: %s)", async (provider, compatible) => {
+        appConfig.voice.warmPath.enabled = false;
+        const model = provider === "claude" ? "claude-sonnet-4-6" : "openai/gpt-5.4-mini";
+        const other = provider === "claude" ? "openai" : "claude";
+        const definition = makeAgentConfig({ id: "agent-a", model, timeoutMs: 900_000 });
+        registry._agents.set("agent-a", definition);
+        sessionStore._sessions.set(WARM_KEY, { sessionId: "stored-candidate", provider: compatible ? provider : other });
+        const originalGet = sessionStore.get.getMockImplementation()!;
+        let resumeRead!: () => void;
+        const pausedRead = new Promise<void>((resolve) => { resumeRead = resolve; });
+        let markReading!: () => void;
+        const reading = new Promise<void>((resolve) => { markReading = resolve; });
+        sessionStore.get.mockImplementationOnce(originalGet).mockImplementationOnce(async (...args: Parameters<typeof originalGet>) => {
+          markReading();
+          await pausedRead;
+          return originalGet(...args);
+        });
+        const acquire = vi.spyOn(manager.circuitBreakers, "acquire");
+        const record = vi.spyOn(manager.circuitBreakers, "record");
+        const spawn = vi.spyOn(manager, "spawnTurn");
+        const pending = adapterTurn("question after paused read");
+        await reading;
+        try {
+          expect(acquire).toHaveBeenCalledWith(provider, expect.objectContaining({ deadlineMs: 900_000 }));
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: other === "claude" ? "claude-haiku-4-5" : "openai/gpt-5.4", timeoutMs: 10 }));
+        } finally {
+          resumeRead();
+        }
+        await pending;
+        expect(spawn).toHaveBeenCalledTimes(1);
+        expect(provider === "claude" ? mockRunnerSend : mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+        const input = provider === "claude"
+          ? { prompt: mockRunnerSend.mock.calls[0]![0], sessionId: mockRunnerSend.mock.calls[0]![1] }
+          : mockOpenAIRunTurn.mock.calls[0]![0];
+        expect(input.sessionId).toBe(compatible ? "stored-candidate" : undefined);
+        if (compatible) {
+          expect(input.prompt).toBe("question after paused read");
+          expect(input.prompt).not.toContain("original question");
+        } else {
+          expect(input.prompt).toContain("Caller: original question");
+          expect(input.prompt).toContain("You: earlier answer");
+        }
+        expect(provider === "claude" ? mockOpenAIRunTurn : mockRunnerSend).not.toHaveBeenCalled();
+        expect(vi.mocked(AgentRunner).mock.calls.at(-1)![0]).toBe(definition);
+        expect(record).toHaveBeenCalledTimes(1);
+        expect(record.mock.calls[0]![0]).toBe(acquire.mock.results[0]!.value);
+        expect(turnTelemetryStore.record).toHaveBeenLastCalledWith(expect.objectContaining({ model }));
+        // Voice still bypasses the classifier and keeps its original limits path.
+        expect(routeModel).not.toHaveBeenCalled();
+        expect(mockRunnerOpenStream).not.toHaveBeenCalled();
       });
 
       it("keeps a long-running warm half-open probe valid under the opening watchdog after reload", async () => {
