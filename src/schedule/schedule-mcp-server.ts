@@ -9,6 +9,7 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { Db } from "mongodb";
 import type { WorkItemContextRef } from "../agents/agent-runner.js";
+import { type DeliveryCapability, deliveryInputSchema, discoveryInputSchema } from "../obligations/types.js";
 
 const MAX_SCHEDULES = 10;
 const MIN_INTERVAL_MINUTES = 15;
@@ -25,6 +26,7 @@ export interface ScheduleToolDeps {
   workItemContext?: WorkItemContextRef;
   db: Db;
   agentId: string;
+  obligations?: DeliveryCapability;
 }
 
 /**
@@ -269,9 +271,47 @@ export function buildScheduleTools(deps: ScheduleToolDeps) {
 }
 
 export function createScheduleMcpServer(deps: ScheduleToolDeps) {
-  return createSdkMcpServer({
+  const server = createSdkMcpServer({
     name: "schedule",
     version: "0.1.0",
     tools: buildScheduleTools(deps),
   });
+  const response = (value: unknown) => ({
+    content: [{ type: "text" as const, text: JSON.stringify(value) }],
+  });
+  // Register full strict Zod objects. Passing only .shape through the SDK
+  // tool() helper would silently strip unknown keys before our handler.
+  server.instance.registerTool(
+    "my_delivery_obligations",
+    {
+      description:
+        "List your registered delivery obligations and current keys. Use section overdue and nextCursor for older unresolved keys; sending/unknown/history entries are not invitations to retry.",
+      inputSchema: discoveryInputSchema,
+    },
+    async (input) => {
+      if (!deps.obligations)
+        return {
+          isError: true,
+          ...response({ state: "unavailable" }),
+        };
+      return response(await deps.obligations.discover(deps.agentId, input));
+    },
+  );
+  server.instance.registerTool(
+    "deliver_obligation",
+    {
+      description:
+        "Send one registered obligation occurrence as a complete Slack text deliverable (at most 3900 characters including attribution). Use its explicit dueAt key. An unknown outcome must not be reposted; no success flag or destination can be supplied.",
+      inputSchema: deliveryInputSchema,
+    },
+    async (input) => {
+      if (!deps.obligations)
+        return {
+          isError: true,
+          ...response({ state: "unavailable", retryAllowed: false }),
+        };
+      return response(await deps.obligations.deliver(deps.agentId, input));
+    },
+  );
+  return server;
 }

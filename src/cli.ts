@@ -137,6 +137,10 @@ Commands:
   credentials list           Show third-party API keys (Honeypot)
   credentials add <KEY>      Set or rotate a credential
   credentials remove <KEY>   Delete a credential
+  obligations register --file <json>    Register a recurring delivery expectation
+  obligations list [--json]             Inspect definitions and checker status
+  obligations show <id> [--json]        Inspect occurrence evidence and notices
+  obligations deactivate <id> --reason <text>
 
 Options:
   --config <path>   Path to hive.yaml
@@ -166,6 +170,17 @@ function resolveInstanceHome(instanceId: string): string | null {
 }
 
 switch (command) {
+  case "obligations": {
+    try {
+      const { runObligations } = await import("./cli/obligations.js");
+      await runObligations(process.argv.slice(2));
+    } catch (err) {
+      console.error(err instanceof Error && /^[a-z_]+$/.test(err.message) ? err.message : "obligations_command_failed");
+      process.exitCode = 1;
+    }
+    break;
+  }
+
   case "init": {
     const { runSetupWizard } = await import("./setup/init.js");
     await runSetupWizard(PKG_ROOT);

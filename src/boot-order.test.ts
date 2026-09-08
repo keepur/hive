@@ -130,3 +130,35 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     ).toEqual([]);
   });
 });
+
+describe("KPR-456 obligation readiness and drain order", () => {
+  const code = readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf8")
+    .split("\n")
+    .map((line) => line.replace(/\/\/.*$/, ""))
+    .join("\n");
+  function at(text: string): number {
+    const offset = code.indexOf(text);
+    expect(offset, "missing lifecycle anchor " + text).toBeGreaterThanOrEqual(0);
+    return offset;
+  }
+  it("initializes outside optional turn logging and wires every spawn before use", () => {
+    expect(at("await obligations.init()")).toBeLessThan(at("if (config.activity.enabled)"));
+    expect(at("await obligations.init()")).toBeLessThan(at("agentManager.setDeliveryObligations(obligations)"));
+    for (const surface of [
+      "await bgTaskManager.start()",
+      "await bgTaskManager.scanOrphans()",
+      "await codeTaskManager.start()",
+      "await slackAdapter.start(",
+      "scheduler.start()",
+    ])
+      expect(at("agentManager.setDeliveryObligations(obligations)")).toBeLessThan(at(surface));
+    expect(at("await obligations.start(")).toBeGreaterThan(at("await slackAdapter.start("));
+  });
+  it("drains obligations before closing Slack or Mongo", () => {
+    const shutdown = code.slice(at("const shutdown = async"));
+    const stop = shutdown.indexOf("await obligations.stop()");
+    expect(stop).toBeGreaterThanOrEqual(0);
+    expect(shutdown.indexOf("await slackAdapter.stop()")).toBeGreaterThan(stop);
+    expect(shutdown.indexOf("await mongoClient.close()")).toBeGreaterThan(stop);
+  });
+});

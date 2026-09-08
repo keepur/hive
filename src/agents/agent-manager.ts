@@ -1,3 +1,4 @@
+import type { DeliveryCapability } from "../obligations/types.js";
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig, AgentState, AgentStatus } from "../types/agent-config.js";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
@@ -657,6 +658,7 @@ export class AgentManager {
   readonly circuitBreakers: ProviderCircuitBreakerRegistry;
   /** KPR-390: meeting worker pool — wired post-dispatcher by index.ts. */
   private workerPool?: MeetingWorkerPool;
+  private deliveryObligations?: DeliveryCapability;
 
   constructor(
     registry: AgentRegistry,
@@ -699,6 +701,10 @@ export class AgentManager {
     declarePluginProviders(this.plugins, { hiveHome, distDir: DIST_DIR });
     this.seedDirs = discoverSeedDirs(seedsDir);
     this.skillIndex = loadSkillIndex(skillsDir, this.plugins, this.seedDirs, this.registry.listIds());
+  }
+
+  setDeliveryObligations(capability: DeliveryCapability): void {
+    this.deliveryObligations = capability;
   }
 
   /**
@@ -820,8 +826,12 @@ export class AgentManager {
     // with "worker-pool" in coreServers gets the in-process server; absent
     // pool ⇒ the runner never builds it (Day-1-OOB layer 2).
     const runnerOptions: AgentRunnerOptions | undefined =
-      laneAPassthrough || this.workerPool
-        ? { laneAPassthrough, workerPool: this.workerPool }
+      laneAPassthrough || this.workerPool || this.deliveryObligations
+        ? {
+            laneAPassthrough,
+            workerPool: this.workerPool,
+            obligations: this.deliveryObligations,
+          }
         : undefined;
     const runner = new AgentRunner(config, this.memoryManager, this.plugins, this.skillIndex, eventSubscribersJson, this.prefetcher, this.teamRoster, this.db, this.prefixCache, this.memoryLifecycle, runnerOptions);
     if (route.provider === "claude") {

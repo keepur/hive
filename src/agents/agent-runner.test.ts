@@ -78,7 +78,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   createSdkMcpServer: vi.fn((opts: { name: string }) => ({
     name: opts.name,
     type: "sdk",
-    instance: {},
+    instance: { registerTool: vi.fn() },
   })),
   tool: vi.fn((name: string, description: string, _schema: unknown, handler: any) => ({
     name,

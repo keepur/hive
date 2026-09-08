@@ -1,3 +1,6 @@
+import { harness, definition, DUE } from "../../obligations/testing/harness.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1086,5 +1089,291 @@ describe("KPR-354 T3 — Task synthesis (§D3)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("KPR-456 provider schedule capability", () => {
+  it("reports missing service as unavailable through the real schedule server", async () => {
+    const h = await harness();
+    const runner = new AgentRunner(
+      makeMemoryAgentConfig({ id: "demo-producer", coreServers: ["schedule"] }),
+      makeMemMgr() as never,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      h.db,
+    );
+    const server = runner.buildInProcessServers().schedule!;
+    const client = new Client({ name: "fixture", version: "1" });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await server.instance.connect(st);
+    await client.connect(ct);
+    try {
+      const result = await client.callTool({
+        name: "deliver_obligation",
+        arguments: {
+          obligationId: "demo",
+          dueAt: DUE.toISOString(),
+          text: "complete",
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result)).toContain("unavailable");
+      expect(h.submitted).toHaveLength(0);
+    } finally {
+      await client.close();
+      await server.instance.close();
+    }
+  });
+
+  it("rejects extra fields before capabilities run and keeps unknown outcomes non-retryable", async () => {
+    const h = await harness();
+    const capability = {
+      discover: vi.fn(async () => ({})),
+      deliver: vi.fn(async () => ({ state: "delivery_outcome_unknown", retryAllowed: false })),
+    };
+    const runner = new AgentRunner(
+      makeMemoryAgentConfig({ id: "demo-producer", coreServers: ["schedule"] }),
+      makeMemMgr() as never,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      h.db,
+      undefined,
+      undefined,
+      { obligations: capability },
+    );
+    const server = runner.buildInProcessServers().schedule!;
+    const client = new Client({ name: "fixture", version: "1" });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await server.instance.connect(st);
+    await client.connect(ct);
+    try {
+      const input = { obligationId: "demo", dueAt: DUE.toISOString(), text: "complete" };
+      const discovery = await client.callTool({
+        name: "my_delivery_obligations",
+        arguments: { producerAgentId: "other" },
+      });
+      expect(discovery.isError).toBe(true);
+      expect(capability.discover).not.toHaveBeenCalled();
+      for (const extra of [{ success: true }, { producerAgentId: "other" }, { destination: definition.destination }]) {
+        const rejected = await client.callTool({ name: "deliver_obligation", arguments: { ...input, ...extra } });
+        expect(rejected.isError).toBe(true);
+        expect(capability.deliver).not.toHaveBeenCalled();
+      }
+      const unknown = await client.callTool({ name: "deliver_obligation", arguments: input });
+      expect(unknown.isError).not.toBe(true);
+      expect(unknown.content).toEqual([
+        { type: "text", text: JSON.stringify({ state: "delivery_outcome_unknown", retryAllowed: false }) },
+      ]);
+      expect(capability.deliver).toHaveBeenCalledWith("demo-producer", input);
+      expect(h.submitted).toHaveLength(0);
+    } finally {
+      await client.close();
+      await server.instance.close();
+    }
+  });
+
+  it.each(["claude", "lane-b"] as const)(
+    "keeps two overlapping %s runners bound to their own producer",
+    async (lane) => {
+      const h = await harness(),
+        e = h.engine();
+      await h.fake.collection("agent_definitions").insertOne({ _id: "other-producer", schedule: [] });
+      await h.store.register(
+        {
+          ...definition,
+          _id: "other",
+          producerAgentId: "other-producer",
+          destination: { kind: "slack", channelId: "C00000003" },
+        },
+        h.clock(),
+      );
+      h.at("2026-09-07T07:00:00Z");
+      const calls: Array<{ producer: string; input: unknown }> = [];
+      const capability = {
+        discover: (id: string, input: unknown) => e.reader.discover(id, input),
+        deliver: (id: string, input: unknown) => {
+          calls.push({ producer: id, input });
+          return e.delivery.deliver(id, input);
+        },
+      };
+      const closers: Array<() => Promise<void>> = [];
+      async function open(id: string) {
+        const runner = new AgentRunner(
+          makeMemoryAgentConfig({ id, coreServers: ["schedule"] }),
+          makeMemMgr() as never,
+          [],
+          new Map(),
+          "{}",
+          undefined,
+          undefined,
+          h.db,
+          undefined,
+          undefined,
+          { obligations: capability },
+        );
+        const servers = runner.buildInProcessServers();
+        if (lane === "claude") {
+          const client = new Client({ name: id, version: "1" });
+          const [ct, st] = InMemoryTransport.createLinkedPair();
+          await servers.schedule!.instance.connect(st);
+          await client.connect(ct);
+          closers.push(async () => {
+            await client.close();
+            await servers.schedule!.instance.close();
+          });
+          return async (input: Record<string, unknown>) =>
+            JSON.stringify(await client.callTool({ name: "deliver_obligation", arguments: input }));
+        }
+        const bridge = new ToolBridge({
+          inventory: runner.buildToolTransportInventory().filter((entry) => entry.name === "schedule"),
+          inProcessServers: servers,
+          gate: async () => ({ behavior: "allow" }),
+          signal: new AbortController().signal,
+          agentId: id,
+          sessionCwd: tmpdir(),
+          skillIndex: [],
+        });
+        const tools = await bridge.connect();
+        closers.push(() => bridge.close());
+        return async (input: Record<string, unknown>) =>
+          tools.find((tool) => tool.name === "mcp__schedule__deliver_obligation")!.execute(input);
+      }
+      let release!: () => void, reached!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const bothEntered = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      let entered = 0;
+      try {
+        const a = await open("demo-producer"),
+          b = await open("other-producer");
+        const inputA = { obligationId: "demo", dueAt: DUE.toISOString(), text: "A" };
+        const inputB = { obligationId: "other", dueAt: DUE.toISOString(), text: "B" };
+        expect(await a(inputB)).not.toContain("confirmed_delivery");
+        expect(await b(inputA)).not.toContain("confirmed_delivery");
+        expect(h.submitted).toHaveLength(0);
+        calls.length = 0;
+        h.beforeResponse(async () => {
+          if (++entered === 2) reached();
+          await waiting;
+        });
+        const sendingA = a(inputA),
+          sendingB = b(inputB);
+        await bothEntered;
+        expect(h.submitted.map((post) => post.channel).sort()).toEqual(["C00000001", "C00000003"]);
+        expect(calls).toEqual(
+          expect.arrayContaining([
+            { producer: "demo-producer", input: inputA },
+            { producer: "other-producer", input: inputB },
+          ]),
+        );
+        release();
+        for (const result of await Promise.all([sendingA, sendingB])) expect(result).toContain("confirmed_delivery");
+        const rows = [...h.fake.collection("activity_log").rows.values()];
+        expect(rows).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              obligationId: "demo",
+              producerAgentId: "demo-producer",
+              destination: definition.destination,
+            }),
+            expect.objectContaining({
+              obligationId: "other",
+              producerAgentId: "other-producer",
+              destination: { kind: "slack", channelId: "C00000003" },
+            }),
+          ]),
+        );
+        expect(rows).toHaveLength(2);
+        expect(h.submitted).toHaveLength(2);
+      } finally {
+        release();
+        h.beforeResponse();
+        for (const close of closers) await close();
+      }
+    },
+  );
+  it.each(["claude", "lane-b"] as const)("round-trips the strict delivery tool through %s", async (lane) => {
+    const h = await harness(),
+      e = h.engine();
+    h.at("2026-09-07T07:00:00Z");
+    const capability = {
+      discover: (id: string, input: unknown) => e.reader.discover(id, input),
+      deliver: (id: string, input: unknown) => e.delivery.deliver(id, input),
+    };
+    const runner = new AgentRunner(
+      makeMemoryAgentConfig({ id: "demo-producer", coreServers: ["schedule"] }),
+      makeMemMgr() as never,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      h.db,
+      undefined,
+      undefined,
+      { obligations: capability },
+    );
+    const servers = runner.buildInProcessServers();
+    const input = { obligationId: "demo", dueAt: DUE.toISOString(), text: "Complete report" };
+    if (lane === "claude") {
+      const client = new Client({ name: "fixture", version: "1" });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await servers.schedule!.instance.connect(serverTransport);
+      await client.connect(clientTransport);
+      try {
+        const rejected = await client.callTool({ name: "deliver_obligation", arguments: { ...input, success: true } });
+        expect(rejected.isError).toBe(true);
+        expect(h.submitted).toHaveLength(0);
+        const sent = await client.callTool({ name: "deliver_obligation", arguments: input });
+        expect(JSON.stringify(sent)).toContain("confirmed_delivery");
+      } finally {
+        await client.close();
+        await servers.schedule!.instance.close();
+      }
+    } else {
+      const bridge = new ToolBridge({
+        inventory: runner.buildToolTransportInventory().filter((entry) => entry.name === "schedule"),
+        inProcessServers: servers,
+        gate: async () => ({ behavior: "allow" }),
+        signal: new AbortController().signal,
+        agentId: "demo-producer",
+        sessionCwd: tmpdir(),
+        skillIndex: [],
+      });
+      try {
+        const tools = await bridge.connect();
+        const send = tools.find((tool) => tool.name === "mcp__schedule__deliver_obligation")!;
+        expect(await send.execute({ ...input, producerAgentId: "other" })).not.toContain("confirmed_delivery");
+        expect(h.submitted).toHaveLength(0);
+        expect(await send.execute(input)).toContain("confirmed_delivery");
+        expect(await send.execute(input)).toContain("confirmed_delivery");
+      } finally {
+        await bridge.close();
+      }
+    }
+    expect(h.submitted).toHaveLength(1);
+    const worker = new AgentRunner(
+      makeMemoryAgentConfig({ id: "worker", coreServers: [] }),
+      makeMemMgr() as never,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      h.db,
+      undefined,
+      undefined,
+      { suppressAutoInjectedServers: true },
+    );
+    expect(worker.buildInProcessServers().schedule).toBeUndefined();
   });
 });
