@@ -32,11 +32,9 @@ import { createLogger } from "../logging/logger.js";
 import { config as appConfig } from "../config.js";
 import { envValue } from "../agents/provider-adapters/oauth-credentials.js";
 import { getCachedGeminiModels, setCachedGeminiModels } from "./model-catalog-cache.js";
+import { catalogStatus, catalogStatusNote, catalogUnavailableNote } from "./model-catalog-status.js";
 import { ModelCatalogStore } from "./model-catalog-store.js";
-import type {
-  CatalogDoc as AgentModelCatalogDoc,
-  CatalogProvider as CuratedCatalogProvider,
-} from "./model-catalog-types.js";
+import type { CatalogProvider as CuratedCatalogProvider } from "./model-catalog-types.js";
 import { diffText } from "./model-catalog-value.js";
 
 const log = createLogger("admin-mcp");
@@ -353,7 +351,6 @@ export function buildAdminTools(deps: AdminToolDeps) {
   const { db, agentId, instanceCapabilitiesJson } = deps;
   const agentDefs = db.collection<AgentDefinition>("agent_definitions");
   const agentVersions = db.collection<AgentDefinitionVersion>("agent_definition_versions");
-  const catalogDocs = db.collection<AgentModelCatalogDoc>("agent_model_catalog");
   const catalogStore = new ModelCatalogStore(db, { listPluginProviderIds: deps.listPluginProviderIds });
 
   // Lazy index creation — first call to a handler triggers it. Avoids hard
@@ -1093,7 +1090,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
     ),
     tool(
       "agent_model_catalog_list",
-      "List valid LLM model ids per provider for agent `model` assignment. Gemini is resolved live from the vendor (cached ~10 min); claude/grok/codex are read from persisted catalogs shared by subscription discovery and full manual replacement. Listing does not trigger built-in discovery. Plugin-registered providers are read from manually maintained persisted catalogs. Use before setting `model` on agent_create/agent_update. Returns a JSON entries array plus prose notes for any provider leg that is unseeded or unavailable.",
+      "List valid LLM model ids for agent model assignment. Claude/grok/codex use stored catalogs checked automatically every eight hours; notes report saved-list time, successful discovery, latest attempt and pending recovery. Plugins are manually maintained. Gemini is resolved live (cached ~10 min). Returns a JSON entries array followed by provider notes. Listing does not trigger built-in discovery.",
       {
         provider: z
           .string()
@@ -1102,7 +1099,6 @@ export function buildAdminTools(deps: AdminToolDeps) {
       },
       async ({ provider }) => {
         try {
-          await ensureIndexes();
           // KPR-394 (§4.11): plugin providers map onto the curated-collection
           // path (unseeded ⇒ the existing prose note); gemini stays live.
           const pluginIds = deps.listPluginProviderIds?.() ?? [];
@@ -1120,22 +1116,32 @@ export function buildAdminTools(deps: AdminToolDeps) {
           const entries: CatalogListEntry[] = [];
           const notes: string[] = [];
 
+          const statusNow = Date.now();
           for (const p of wantCurated) {
-            const doc = await catalogDocs.findOne({ _id: p });
-            if (!doc || (doc.models ?? []).length === 0) {
-              notes.push(`${p}: not yet seeded — call agent_model_catalog_refresh first.`);
-              continue;
-            }
-            const asOf = doc.updatedAt instanceof Date ? doc.updatedAt.toISOString() : String(doc.updatedAt);
-            for (const m of doc.models ?? []) {
-              entries.push({
-                provider: p,
-                id: m.id,
-                displayName: m.displayName,
-                ...(m.notes ? { notes: m.notes } : {}),
-                source: "curated",
-                asOf,
-              });
+            try {
+              const { snapshot: doc } = await catalogStore.readCatalogState(p);
+              notes.push(catalogStatusNote(catalogStatus(p, doc, statusNow)));
+              if (!doc || !Array.isArray(doc.models)) continue;
+              const asOf =
+                doc.updatedAt instanceof Date
+                  ? Number.isFinite(doc.updatedAt.getTime())
+                    ? doc.updatedAt.toISOString()
+                    : "unknown"
+                  : String(doc.updatedAt);
+              for (const m of doc.models) {
+                entries.push({
+                  provider: p,
+                  id: m.id,
+                  displayName: m.displayName,
+                  ...(m.notes ? { notes: m.notes } : {}),
+                  source: "curated",
+                  asOf,
+                });
+              }
+            } catch {
+              const text = catalogUnavailableNote(p);
+              if (provider === p) return { isError: true, content: [{ type: "text", text }] };
+              notes.push(text);
             }
           }
 
@@ -1195,17 +1201,17 @@ export function buildAdminTools(deps: AdminToolDeps) {
               ...notes.map((n) => ({ type: "text" as const, text: n })),
             ],
           };
-        } catch (err) {
+        } catch {
           return {
             isError: true,
-            content: [{ type: "text", text: `agent_model_catalog_list error: ${String(err)}` }],
+            content: [{ type: "text", text: "Model catalog storage unavailable." }],
           };
         }
       },
     ),
     tool(
       "agent_model_catalog_refresh",
-      "Fully replace the shared model catalog for claude/grok/codex or a registered plugin provider. Built-in catalogs are shared between subscription discovery and full manual replacement; plugin catalogs remain manual. This tool makes no vendor calls. Pass the FULL replacement list, not a delta. The next successful built-in discovery replaces membership, display names, and order while retaining notes for retained model ids. Gemini is always resolved live and cannot be refreshed.",
+      "Replace one stored catalog with the FULL list, not a delta. The manual write performs no vendor calls. The next successful built-in scan replaces membership, names and order while retaining notes for retained IDs; a manual edit does not postpone discovery. Plugin catalogs remain manual; Gemini remains live and cannot be refreshed.",
       {
         provider: z
           .string()

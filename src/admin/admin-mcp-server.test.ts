@@ -94,6 +94,8 @@ function makeFakeDb(catalogDb: any = catalogFake.db): any {
 
 import { buildAdminTools } from "./admin-mcp-server.js";
 import { invalidateGeminiModelCache } from "./model-catalog-cache.js";
+import { catalogStatus, catalogStatusNote } from "./model-catalog-status.js";
+import { ModelCatalogStore } from "./model-catalog-store.js";
 // Ensure the software-engineer archetype is registered in the registry.
 await import("../archetypes/software-engineer/index.js");
 
@@ -132,9 +134,9 @@ function makeBaseAgent(overrides: Record<string, any> = {}): any {
 }
 
 function makeTools(depsOverride: Record<string, any> = {}) {
-  const { catalogDb, ...deps } = depsOverride;
+  const { adminDb, catalogDb, ...deps } = depsOverride;
   return buildAdminTools({
-    db: makeFakeDb(catalogDb),
+    db: adminDb ?? makeFakeDb(catalogDb),
     agentId: "admin",
     instanceCapabilitiesJson: "{}",
     ...deps,
@@ -1197,6 +1199,10 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
 });
 
 describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
+  const statusNow = new Date("2026-09-07T12:00:00.000Z");
+  const hour = 60 * 60 * 1000;
+  const statusAt = (offsetMs: number) => new Date(statusNow.getTime() + offsetMs);
+  const statusModels = [{ id: "gpt-5.5", displayName: "GPT-5.5", addedAt: statusAt(-24 * hour) }];
   const geminiOkResponse = {
     ok: true,
     status: 200,
@@ -1240,6 +1246,7 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
   });
@@ -1259,11 +1266,11 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
 
   it("returns curated entries with source/asOf for a seeded provider", async () => {
     seedGrok();
+    vi.spyOn(Date, "now").mockReturnValue(statusNow.getTime());
     const handler = getHandler(makeTools(), "agent_model_catalog_list");
     const result = await handler({ provider: "grok" });
     expect(result.isError).toBeUndefined();
-    const parsed = JSON.parse(result.content[0].text);
-    expect(parsed).toEqual([
+    const expectedEntries = [
       {
         provider: "grok",
         id: "grok-4.6",
@@ -1279,7 +1286,15 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
         source: "curated",
         asOf: "2026-08-23T00:00:00.000Z",
       },
-    ]);
+    ];
+    expect(result.content[0].text).toBe(JSON.stringify(expectedEntries, null, 2));
+    expect(JSON.parse(result.content[0].text)).toEqual(expectedEntries);
+    expect(result.content).toHaveLength(2);
+    expect(result.content[1].text).toBe(
+      catalogStatusNote(
+        catalogStatus("grok", catalogFake.rows("agent_model_catalog").get("grok"), statusNow.getTime()),
+      ),
+    );
   });
 
   it("unseeded curated provider → empty entries array + prose note, not an error", async () => {
@@ -1287,7 +1302,318 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
     const result = await handler({ provider: "codex" });
     expect(result.isError).toBeUndefined();
     expect(JSON.parse(result.content[0].text)).toEqual([]);
-    expect(result.content[1].text).toMatch(/codex: not yet seeded — call agent_model_catalog_refresh first/);
+    expect(result.content[1].text).toBe(
+      "codex: not yet seeded — manual option: agent_model_catalog_refresh; last discovery success never; latest attempt never; next normal attempt unknown/clock-inconsistent; automatic checks every 8h; discovery timestamps describe checks, not later manual edits.",
+    );
+  });
+
+  it.each([
+    {
+      name: "legacy saved catalog",
+      snapshot: { models: statusModels, updatedAt: statusAt(-10 * hour) },
+      fragments: ["saved 2026-09-07T02:00:00.000Z (legacy/unknown)", "last discovery success never"],
+    },
+    {
+      name: "recent successful discovery",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-4 * hour),
+        scan: {
+          outcome: "succeeded",
+          startedAt: statusAt(-2 * hour),
+          finishedAt: statusAt(-1.5 * hour),
+          lastSucceededAt: statusAt(-hour),
+        },
+      },
+      fragments: ["last discovery success 2026-09-07T11:00:00.000Z (recent; age 3600s)", "latest attempt succeeded"],
+    },
+    {
+      name: "overdue successful discovery",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-9 * hour),
+        scan: {
+          outcome: "succeeded",
+          startedAt: statusAt(-9 * hour),
+          finishedAt: statusAt(-8.5 * hour),
+          lastSucceededAt: statusAt(-8 * hour),
+        },
+      },
+      fragments: ["last discovery success 2026-09-07T04:00:00.000Z (overdue; age 28800s)"],
+    },
+    {
+      name: "failed latest attempt with retained entries",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-24 * hour),
+        scan: {
+          outcome: "failed",
+          startedAt: statusAt(-hour),
+          finishedAt: statusAt(-0.5 * hour),
+          lastSucceededAt: statusAt(-9 * hour),
+          error: { code: "auth", httpStatus: 401, message: "test-secret", body: "test-secret" },
+        },
+      },
+      fragments: [
+        "last discovery success 2026-09-07T03:00:00.000Z (overdue",
+        "latest attempt failed",
+        "(auth HTTP 401)",
+      ],
+    },
+    {
+      name: "active running attempt",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-3 * hour),
+        scan: {
+          outcome: "running",
+          startedAt: statusAt(-hour),
+          leaseExpiresAt: statusAt(hour),
+          lastSucceededAt: statusAt(-2 * hour),
+        },
+      },
+      fragments: ["latest attempt running", "lease 2026-09-07T13:00:00.000Z"],
+    },
+    {
+      name: "expired unresolved attempt",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-3 * hour),
+        scan: {
+          outcome: "running",
+          startedAt: statusAt(-hour),
+          leaseExpiresAt: statusAt(-1),
+          lastSucceededAt: statusAt(-2 * hour),
+        },
+      },
+      fragments: ["latest attempt expired/unresolved", "lease 2026-09-07T11:59:59.999Z"],
+    },
+    {
+      name: "unfinished attempt with unknown lease",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-3 * hour),
+        scan: { outcome: "running", startedAt: statusAt(-hour), lastSucceededAt: statusAt(-2 * hour) },
+      },
+      fragments: ["latest attempt unfinished; lease unknown", "lease unknown/clock-inconsistent"],
+    },
+    {
+      name: "pending audit and change recovery",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-2 * hour),
+        scan: {
+          outcome: "succeeded",
+          startedAt: statusAt(-2 * hour),
+          finishedAt: statusAt(-hour),
+          lastSucceededAt: statusAt(-hour),
+        },
+        pendingExport: {},
+      },
+      fragments: ["latest attempt succeeded", "audit/change recovery pending"],
+    },
+    {
+      name: "manual edit after successful discovery",
+      snapshot: {
+        models: statusModels,
+        source: "manual",
+        updatedAt: statusAt(-5 * 60 * 1000),
+        scan: {
+          outcome: "succeeded",
+          startedAt: statusAt(-7.5 * hour),
+          finishedAt: statusAt(-7 * hour),
+          lastSucceededAt: statusAt(-7 * hour),
+        },
+      },
+      fragments: [
+        "saved 2026-09-07T11:55:00.000Z (manual)",
+        "last discovery success 2026-09-07T05:00:00.000Z (recent; age 25200s)",
+      ],
+    },
+    {
+      name: "unchanged success advances check freshness without saved time",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-24 * hour),
+        scan: {
+          outcome: "succeeded",
+          startedAt: statusAt(-2 * hour),
+          finishedAt: statusAt(-hour),
+          lastSucceededAt: statusAt(-hour),
+        },
+      },
+      fragments: [
+        "saved 2026-09-06T12:00:00.000Z (discovery)",
+        "last discovery success 2026-09-07T11:00:00.000Z (recent; age 3600s)",
+      ],
+    },
+    {
+      name: "future dates",
+      snapshot: {
+        models: statusModels,
+        source: "manual",
+        updatedAt: statusAt(hour),
+        scan: {
+          outcome: "succeeded",
+          startedAt: statusAt(hour),
+          finishedAt: statusAt(1.5 * hour),
+          lastSucceededAt: statusAt(2 * hour),
+        },
+      },
+      fragments: [
+        "saved unknown/clock-inconsistent (manual)",
+        "unknown/clock-inconsistent",
+        "scan timing unavailable/clock-inconsistent",
+      ],
+    },
+    {
+      name: "invalid date values",
+      snapshot: {
+        models: statusModels,
+        source: "manual",
+        updatedAt: "invalid-date",
+        scan: {
+          outcome: "succeeded",
+          startedAt: "invalid-date",
+          finishedAt: "invalid-date",
+          lastSucceededAt: "invalid-date",
+        },
+      },
+      fragments: [
+        "saved unknown/clock-inconsistent (manual)",
+        "unknown/clock-inconsistent",
+        "scan timing unavailable/clock-inconsistent",
+      ],
+    },
+  ])("renders durable status for $name", async ({ snapshot, fragments }) => {
+    const doc = { _id: "codex", provider: "codex", ...snapshot };
+    catalogFake.rows("agent_model_catalog").set("codex", doc);
+    const now = vi.spyOn(Date, "now").mockReturnValue(statusNow.getTime());
+
+    const result = await getHandler(makeTools(), "agent_model_catalog_list")({ provider: "codex" });
+
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toHaveLength(1);
+    expect(result.content[1].text).toBe(catalogStatusNote(catalogStatus("codex", doc, statusNow.getTime())));
+    for (const fragment of fragments) expect(result.content[1].text).toContain(fragment);
+    expect(result.content[1].text).not.toContain("test-secret");
+    expect(now).toHaveBeenCalledTimes(1);
+  });
+
+  it("is a read-only status path with one shared clock sample and no index, discovery, apply, or recovery work", async () => {
+    const operations: string[] = [];
+    const observedCatalogDb = faultDb(catalogFake.db, async (collection, method, _args, run) => {
+      operations.push(`${collection}.${method}`);
+      return run();
+    });
+    const adminDb = makeFakeDb(observedCatalogDb);
+    const agentIndex = adminDb.collection("agent_definition_versions").createIndex;
+    const storeIndex = vi.spyOn(ModelCatalogStore.prototype, "ensureIndexes");
+    const begin = vi.spyOn(ModelCatalogStore.prototype, "beginDiscoveryAttempt");
+    const apply = vi.spyOn(ModelCatalogStore.prototype, "applyDiscovery");
+    const fail = vi.spyOn(ModelCatalogStore.prototype, "failDiscoveryAttempt");
+    const recover = vi.spyOn(ModelCatalogStore.prototype, "recoverPendingExports");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const now = vi.spyOn(Date, "now").mockReturnValue(statusNow.getTime());
+
+    const result = await getHandler(makeTools({ adminDb }), "agent_model_catalog_list")({ provider: "codex" });
+
+    expect(result.isError).toBeUndefined();
+    expect(operations).toEqual(["agent_model_catalog.findOne"]);
+    expect(agentIndex).not.toHaveBeenCalled();
+    expect(storeIndex).not.toHaveBeenCalled();
+    expect(begin).not.toHaveBeenCalled();
+    expect(apply).not.toHaveBeenCalled();
+    expect(fail).not.toHaveBeenCalled();
+    expect(recover).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(now).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a safe hard error when the requested stored provider cannot be read", async () => {
+    const unavailable = faultDb(catalogFake.db, async (collection, method, args, run) => {
+      if (collection === "agent_model_catalog" && method === "findOne" && args[0]._id === "codex") {
+        throw new Error("mongodb://user:test-secret@example.invalid/catalog");
+      }
+      return run();
+    });
+
+    const result = await getHandler(
+      makeTools({ catalogDb: unavailable }),
+      "agent_model_catalog_list",
+    )({
+      provider: "codex",
+    });
+
+    expect(result).toEqual({
+      isError: true,
+      content: [{ type: "text", text: "codex: catalog storage unavailable." }],
+    });
+    expect(JSON.stringify(result)).not.toContain("test-secret");
+  });
+
+  it("keeps other provider rows available when one all-provider catalog read fails", async () => {
+    seedGrok();
+    mockConfig.gemini.apiKey = "";
+    const partlyUnavailable = faultDb(catalogFake.db, async (collection, method, args, run) => {
+      if (collection === "agent_model_catalog" && method === "findOne" && args[0]._id === "grok") {
+        throw new Error("test-secret raw storage failure");
+      }
+      return run();
+    });
+
+    const result = await getHandler(makeTools({ catalogDb: partlyUnavailable }), "agent_model_catalog_list")({});
+
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+    const notes = result.content.slice(1).map((item: { text: string }) => item.text);
+    expect(notes).toHaveLength(4);
+    expect(notes[0]).toMatch(/^claude: not yet seeded/);
+    expect(notes[1]).toBe("grok: catalog storage unavailable.");
+    expect(notes[1]).not.toContain("not yet seeded");
+    expect(notes[2]).toMatch(/^codex: not yet seeded/);
+    expect(notes[3]).toMatch(/^gemini: Gemini API key not configured/);
+    expect(notes.join("\n")).not.toContain("test-secret");
+  });
+
+  it("sanitizes failures outside the isolated provider reads", async () => {
+    const result = await getHandler(
+      makeTools({
+        listPluginProviderIds: () => {
+          throw new Error("test-secret plugin registry failure");
+        },
+      }),
+      "agent_model_catalog_list",
+    )({ provider: "codex" });
+
+    expect(result).toEqual({
+      isError: true,
+      content: [{ type: "text", text: "Model catalog storage unavailable." }],
+    });
+  });
+
+  it("retains provider validation order and the durable-list/manual-refresh descriptions", async () => {
+    const tools = makeTools({ listPluginProviderIds: () => ["sol"] });
+    const list = tools.find((tool: { name: string }) => tool.name === "agent_model_catalog_list")!;
+    const refresh = tools.find((tool: { name: string }) => tool.name === "agent_model_catalog_refresh")!;
+    const invalid = await list.handler({ provider: "unknown" });
+
+    expect(invalid.content[0].text).toBe("Unknown provider 'unknown'. Valid: claude, grok, codex, sol, gemini.");
+    expect(list.description).toBe(
+      "List valid LLM model ids for agent model assignment. Claude/grok/codex use stored catalogs checked automatically every eight hours; notes report saved-list time, successful discovery, latest attempt and pending recovery. Plugins are manually maintained. Gemini is resolved live (cached ~10 min). Returns a JSON entries array followed by provider notes. Listing does not trigger built-in discovery.",
+    );
+    expect(refresh.description).toBe(
+      "Replace one stored catalog with the FULL list, not a delta. The manual write performs no vendor calls. The next successful built-in scan replaces membership, names and order while retaining notes for retained IDs; a manual edit does not postpone discovery. Plugin catalogs remain manual; Gemini remains live and cannot be refreshed.",
+    );
   });
 
   it("gemini live lookup uses x-goog-api-key HEADER auth — key never in the URL", async () => {
@@ -1564,6 +1890,39 @@ describe("agent_model_catalog — plugin providers (KPR-394)", () => {
     expect(res.isError).toBeUndefined();
     const texts = res.content.map((c: any) => c.text).join("\n");
     expect(texts).toContain("sol: not yet seeded");
+    expect(texts).toContain("manually maintained");
+  });
+
+  it("renders a stored plugin catalog as manual without discovery claims", async () => {
+    catalogFake.rows("agent_model_catalog").set("sol", {
+      _id: "sol",
+      provider: "sol",
+      models: [{ id: "sol-large-2", displayName: "Sol Large 2", addedAt: new Date("2026-09-01T00:00:00Z") }],
+      updatedAt: new Date("2026-09-07T11:00:00Z"),
+      source: "manual",
+      pendingExport: {},
+    });
+
+    const res = await getHandler(
+      makeTools({ listPluginProviderIds: () => ["sol"] }),
+      "agent_model_catalog_list",
+    )({
+      provider: "sol",
+    });
+
+    expect(JSON.parse(res.content[0].text)).toEqual([
+      {
+        provider: "sol",
+        id: "sol-large-2",
+        displayName: "Sol Large 2",
+        source: "curated",
+        asOf: "2026-09-07T11:00:00.000Z",
+      },
+    ]);
+    expect(res.content[1].text).toContain("sol: saved 2026-09-07T11:00:00.000Z (manual), 1 models");
+    expect(res.content[1].text).toContain("manually maintained");
+    expect(res.content[1].text).toContain("audit/change recovery pending");
+    expect(res.content[1].text).not.toContain("discovery");
   });
 
   it("refresh records a plugin provider's actor, diff, and summary", async () => {

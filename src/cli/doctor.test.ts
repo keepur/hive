@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   renderCircuitBreakerSection,
+  renderModelCatalogsSection,
   renderOutageQueueSection,
   renderDatastoreIdentitySection,
   renderPrefixCacheSection,
@@ -14,6 +15,7 @@ import {
   resolveRequiredEnvVars,
 } from "./doctor.js";
 import type { DatastoreIdentityReport } from "./doctor-checks.js";
+import { catalogStatus, catalogStatusNote } from "../admin/model-catalog-status.js";
 
 describe("resolveRequiredEnvVars", () => {
   let dir: string;
@@ -420,6 +422,79 @@ describe("renderCircuitBreakerSection (KPR-306)", () => {
     // Renderer returns void — structurally incapable of flipping the exit
     // code (D4): only renderDatastoreIdentitySection returns a verdict.
     expect(renderCircuitBreakerSection([], () => {})).toBeUndefined();
+  });
+});
+
+describe("renderModelCatalogsSection (KPR-460, informational)", () => {
+  const capture = () => {
+    const lines: string[] = [];
+    return { lines, emit: (line: string) => lines.push(line) };
+  };
+
+  it("renders an explicit unavailable result without a failure verdict", () => {
+    const { lines, emit } = capture();
+
+    expect(renderModelCatalogsSection({ kind: "unavailable" }, emit)).toBeUndefined();
+    expect(lines).toEqual(["\nModel catalogs", "  catalog storage unavailable"]);
+  });
+
+  it("renders built-in and plugin rows with the shared durable-status notes", () => {
+    const now = new Date("2026-09-07T12:00:00.000Z").getTime();
+    const rows = [
+      catalogStatus("claude", undefined, now),
+      catalogStatus(
+        "codex",
+        {
+          models: [{ id: "gpt-5.5", displayName: "GPT-5.5", addedAt: new Date(now - 86_400_000) }],
+          source: "manual",
+          updatedAt: new Date(now - 60_000),
+          scan: {
+            outcome: "failed",
+            startedAt: new Date(now - 3_600_000),
+            finishedAt: new Date(now - 1_800_000),
+            lastSucceededAt: new Date(now - 32_400_000),
+            error: { code: "auth", message: "test-secret" },
+          },
+        },
+        now,
+      ),
+      catalogStatus(
+        "sol",
+        {
+          models: [{ id: "sol-2", displayName: "Sol 2", addedAt: new Date(now - 86_400_000) }],
+          source: "manual",
+          updatedAt: new Date(now - 7_200_000),
+        },
+        now,
+      ),
+    ];
+    const { lines, emit } = capture();
+
+    renderModelCatalogsSection({ kind: "available", rows }, emit);
+
+    expect(lines).toEqual(["\nModel catalogs", ...rows.map((row) => `  ${catalogStatusNote(row)}`)]);
+    expect(lines.join("\n")).toContain("claude: not yet seeded");
+    expect(lines.join("\n")).toContain("codex: saved");
+    expect(lines.join("\n")).toContain("latest attempt failed");
+    expect(lines.join("\n")).toContain("sol: saved");
+    expect(lines.join("\n")).toContain("manually maintained");
+    expect(lines.join("\n")).not.toContain("test-secret");
+  });
+
+  it("is wired as a standalone informational call immediately after circuit breakers", () => {
+    const src = readFileSync(join(import.meta.dirname, "doctor.ts"), "utf-8");
+    const breaker = src.indexOf("renderCircuitBreakerSection(breakerRows);");
+    const catalog = src.indexOf(
+      "renderModelCatalogsSection(await modelCatalogsForDoctor(config.mongo.uri, config.mongo.dbName));",
+    );
+    const outage = src.indexOf("const outageStats = await outageQueueStatsForDoctor", catalog);
+
+    expect(breaker).toBeGreaterThan(-1);
+    expect(catalog).toBeGreaterThan(breaker);
+    expect(outage).toBeGreaterThan(catalog);
+    expect(src.slice(breaker, outage)).not.toMatch(/allPassed\s*=/);
+    expect(src.slice(breaker, catalog)).not.toContain("renderModelCatalogsSection");
+    expect(src.slice(catalog, outage).match(/modelCatalogsForDoctor/g)).toHaveLength(1);
   });
 });
 

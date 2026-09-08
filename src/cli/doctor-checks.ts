@@ -8,6 +8,8 @@ import {
 } from "../plugins/provider-decl.js";
 import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { LANE_B_PROVIDER_ABI_VERSION } from "../agents/provider-adapters/provider-abi.js";
+import { catalogStatus, type CatalogStatus } from "../admin/model-catalog-status.js";
+import { BUILTIN_CATALOG_PROVIDERS } from "../admin/model-catalog-types.js";
 import {
   explainResourceLimits,
   inertTopLevelFields,
@@ -25,6 +27,37 @@ export interface Check {
   required: boolean;
   test: () => boolean | Promise<boolean>;
   remedy?: string;
+}
+
+export type ModelCatalogReport = { kind: "available"; rows: CatalogStatus[] } | { kind: "unavailable" };
+
+export async function modelCatalogsForDoctor(
+  uri: string,
+  dbName: string,
+  now = Date.now(),
+): Promise<ModelCatalogReport> {
+  let client: import("mongodb").MongoClient | undefined;
+  try {
+    const { MongoClient } = await import("mongodb");
+    client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+    await client.connect();
+    const docs = await client
+      .db(dbName)
+      .collection("agent_model_catalog")
+      .find({ _id: { $ne: "gemini" } } as never)
+      .toArray();
+    const byId = new Map(docs.filter((doc) => typeof doc._id === "string").map((doc) => [String(doc._id), doc]));
+    const builtinIds: readonly string[] = BUILTIN_CATALOG_PROVIDERS;
+    const plugins = [...byId.keys()].filter((id) => !builtinIds.includes(id) && id !== "gemini").sort();
+    return {
+      kind: "available",
+      rows: [...builtinIds, ...plugins].map((id) => catalogStatus(id, byId.get(id), now)),
+    };
+  } catch {
+    return { kind: "unavailable" };
+  } finally {
+    await client?.close().catch(() => {});
+  }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────
