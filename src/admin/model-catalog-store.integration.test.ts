@@ -219,6 +219,125 @@ describe("standalone model catalog", () => {
     },
   );
 
+  it.each(["history", "change", "clear"] as const)(
+    "recovers a lost acknowledgment after the real %s export exactly once",
+    async (fault) => {
+      let tripped = false;
+      const uncertain = faultDb(mongo.db, async (collection, method, args, run) => {
+        const targeted =
+          (!tripped &&
+            fault === "history" &&
+            collection === "agent_model_catalog_versions" &&
+            method === "insertOne") ||
+          (!tripped && fault === "change" && collection === "agent_model_catalog_changes" && method === "insertOne") ||
+          (!tripped &&
+            fault === "clear" &&
+            collection === "agent_model_catalog" &&
+            method === "updateOne" &&
+            args[1].$unset?.pendingExport === "");
+        if (targeted) {
+          tripped = true;
+          await run();
+          throw new Error(`test ${fault} acknowledgment lost`);
+        }
+        return run();
+      });
+      const result = await new ModelCatalogStore(uncertain).replaceManual({
+        ...input("model-a", "operator note"),
+        changeSummary: "post-write acknowledgment test",
+      });
+      expect(result).toMatchObject({ kind: "committed", revision: 1, recoveryPending: true });
+      expect(tripped).toBe(true);
+      if (result.kind !== "committed") throw new Error("replacement did not commit");
+
+      const afterLostAck = await mongo.db.collection("agent_model_catalog").findOne({ _id: "codex" });
+      expect(Boolean(afterLostAck?.pendingExport)).toBe(fault !== "clear");
+      expect(await mongo.db.collection("agent_model_catalog_versions").countDocuments()).toBe(1);
+
+      if (fault === "history") {
+        let held = false;
+        const keepEnvelope = faultDb(mongo.db, async (collection, method, args, run) => {
+          if (
+            !held &&
+            collection === "agent_model_catalog" &&
+            method === "updateOne" &&
+            args[1].$unset?.pendingExport === ""
+          ) {
+            held = true;
+            throw new Error("test recovery slot clear unavailable");
+          }
+          return run();
+        });
+        expect(await new ModelCatalogStore(keepEnvelope).recoverPendingExports("codex")).toMatchObject([
+          { provider: "codex", kind: "pending", error: { code: "storage" } },
+        ]);
+        expect(held).toBe(true);
+      }
+
+      const versionBefore = await mongo.db.collection("agent_model_catalog_versions").findOne({ _id: result.commitId });
+      const changeBefore = await mongo.db.collection("agent_model_catalog_changes").findOne({ _id: result.commitId });
+      if (!versionBefore || !changeBefore) throw new Error("immutable exports were not persisted");
+      expect(versionBefore).toMatchObject({
+        _id: result.commitId,
+        provider: "codex",
+        revision: result.revision,
+        snapshotId: result.snapshotId,
+        bootstrap: true,
+        added: ["model-a"],
+        removed: [],
+        source: "manual",
+        updatedBy: "test-operator",
+        modelCount: 1,
+        snapshot: [{ id: "model-a", displayName: "MODEL-A", notes: "operator note" }],
+        changeSummary: "post-write acknowledgment test",
+      });
+      expect(changeBefore).toMatchObject({
+        _id: result.commitId,
+        provider: "codex",
+        revision: result.revision,
+        snapshotId: result.snapshotId,
+        bootstrap: true,
+        added: ["model-a"],
+        removed: [],
+        source: "manual",
+        updatedBy: "test-operator",
+        modelCount: 1,
+      });
+
+      const immutableChange = { ...changeBefore };
+      delete immutableChange.delivery;
+      const delivery = {
+        state: "pending",
+        attempts: 7,
+        nextAttemptAt: new Date(0),
+        owner: `future-kpr461-${fault}`,
+      };
+      const deliveryMutation = await mongo.db
+        .collection("agent_model_catalog_changes")
+        .updateOne({ _id: result.commitId }, { $set: { delivery } });
+      expect(deliveryMutation.matchedCount).toBe(1);
+
+      const fresh = new ModelCatalogStore(mongo.db);
+      expect(await fresh.recoverPendingExports("codex")).toEqual([{ provider: "codex", kind: "recovered" }]);
+      expect(await fresh.recoverPendingExports("codex")).toEqual([{ provider: "codex", kind: "recovered" }]);
+      expect(await fresh.collections.versions.find({}).toArray()).toEqual([versionBefore]);
+      const changes = await mongo.db.collection("agent_model_catalog_changes").find({}).toArray();
+      expect(changes).toHaveLength(1);
+      const finalImmutableChange = { ...changes[0] };
+      delete finalImmutableChange.delivery;
+      expect(finalImmutableChange).toEqual(immutableChange);
+      expect(changes[0].delivery).toEqual(delivery);
+      const finalCatalog = (await fresh.readCatalogState("codex")).snapshot;
+      expect(finalCatalog).not.toHaveProperty("pendingExport");
+      expect(finalCatalog).toMatchObject({
+        revision: result.revision,
+        commitId: result.commitId,
+        snapshotId: result.snapshotId,
+        models: [{ id: "model-a", notes: "operator note" }],
+      });
+    },
+  );
+
   it("preserves mutated delivery while duplicate recovery validates immutable fields", async () => {
     let failClear = true;
     const broken = faultDb(mongo.db, async (collection, method, args, run) => {
@@ -252,22 +371,35 @@ describe("standalone model catalog", () => {
     });
   });
 
-  it("reports an immutable duplicate mismatch and keeps the envelope", async () => {
-    let failHistory = true;
-    const broken = faultDb(mongo.db, async (collection, method, _args, run) => {
-      if (failHistory && collection === "agent_model_catalog_versions" && method === "insertOne") {
-        failHistory = false;
-        throw new Error("test history unavailable");
-      }
-      return run();
-    });
-    const saved = await new ModelCatalogStore(broken).replaceManual(input("model-a"));
-    if (saved.kind !== "committed") throw new Error("seed did not commit");
-    await mongo.db.collection("agent_model_catalog_versions").insertOne({ _id: saved.commitId, provider: "wrong" });
-    const recovery = await new ModelCatalogStore(mongo.db).recoverPendingExports("codex");
-    expect(recovery).toMatchObject([{ provider: "codex", kind: "pending", error: { code: "storage" } }]);
-    expect((await new ModelCatalogStore(mongo.db).readCatalogState("codex")).recoveryPending).toBe(true);
-  });
+  it.each(["history", "change"] as const)(
+    "reports an immutable duplicate %s mismatch and keeps the envelope",
+    async (target) => {
+      let failTarget = true;
+      const collectionName = target === "history" ? "agent_model_catalog_versions" : "agent_model_catalog_changes";
+      const broken = faultDb(mongo.db, async (collection, method, _args, run) => {
+        if (failTarget && collection === collectionName && method === "insertOne") {
+          failTarget = false;
+          throw new Error(`test ${target} unavailable`);
+        }
+        return run();
+      });
+      const saved = await new ModelCatalogStore(broken).replaceManual(input("model-a"));
+      if (saved.kind !== "committed") throw new Error("seed did not commit");
+      await mongo.db.collection(collectionName).insertOne({
+        _id: saved.commitId,
+        provider: "wrong",
+        ...(target === "change" ? { delivery: { state: "pending", attempts: 9, nextAttemptAt: new Date(0) } } : {}),
+      });
+      const recovery = await new ModelCatalogStore(mongo.db).recoverPendingExports("codex");
+      expect(recovery).toMatchObject([{ provider: "codex", kind: "pending", error: { code: "storage" } }]);
+      expect((await new ModelCatalogStore(mongo.db).readCatalogState("codex")).recoveryPending).toBe(true);
+      expect(await mongo.db.collection(collectionName).countDocuments({ _id: saved.commitId })).toBe(1);
+      expect((await mongo.db.collection(collectionName).findOne({ _id: saved.commitId }))?.provider).toBe("wrong");
+      expect(
+        (await mongo.db.collection("agent_model_catalog").findOne({ _id: "codex" }))?.pendingExport?.version?._id,
+      ).toBe(saved.commitId);
+    },
+  );
 
   it("reconciles an acknowledgment thrown after a real commit without replay", async () => {
     let tripped = false;
@@ -309,8 +441,8 @@ describe("standalone model catalog", () => {
     expect(await fresh.collections.changes.countDocuments()).toBe(1);
   });
 
-  it("rejects stale missing, legacy, and expired-running observations after newer outcomes", async () => {
-    for (const fixture of ["missing", "legacy", "expired"] as const) {
+  it("rejects stale observations after changed, failed, and unchanged-success outcomes", async () => {
+    for (const fixture of ["missing", "legacy", "expired", "unchanged"] as const) {
       await clearDatabase();
       if (fixture === "legacy") {
         await mongo.db.collection("agent_model_catalog").insertOne({
@@ -333,6 +465,7 @@ describe("standalone model catalog", () => {
           },
         });
       }
+      if (fixture === "unchanged") await new ModelCatalogStore(mongo.db).replaceManual(input("model-a"));
       const a = new ModelCatalogStore(mongo.db);
       const dueA = await a.readCatalogState("codex");
       const dueB = await a.readCatalogState("codex");
@@ -365,6 +498,8 @@ describe("standalone model catalog", () => {
           ).toEqual({
             kind: "recorded",
           });
+        } else if (fixture === "unchanged") {
+          expect(await a.applyDiscovery(winner.attempt, discovered("model-a"))).toMatchObject({ kind: "unchanged" });
         } else {
           expect(
             await a.applyDiscovery(winner.attempt, discovered(fixture === "legacy" ? "model-b" : "model-a")),
@@ -373,6 +508,14 @@ describe("standalone model catalog", () => {
           });
         }
         const before = await completeState(a);
+        if (fixture === "unchanged") {
+          expect(before.catalog?.scan).toMatchObject({
+            attemptId: winner.attempt.attemptId,
+            outcome: "succeeded",
+          });
+          expect(before.versions).toHaveLength(1);
+          expect(before.changes).toHaveLength(1);
+        }
         gate.resolve();
         expect(await pending).toEqual({ kind: "busy" });
         expect(await completeState(a)).toEqual(before);
@@ -413,13 +556,40 @@ describe("standalone model catalog", () => {
       }),
     ).rejects.toMatchObject({ safe: { code: "malformed" } });
 
-    const behindClock = new ModelCatalogStore(mongo.db, { now: () => new Date(sample.getTime() - 60_000) });
+    await store.replaceManual(input("model-a"));
+    const beforeServerExpiredProposal = await completeState(store);
+    const serverSample = await serverNow();
+    const clientNow = new Date(serverSample.getTime() - 60_000);
+    const behindClock = new ModelCatalogStore(mongo.db, { now: () => clientNow });
+    const behindObserved = await behindClock.readCatalogState("codex");
+    const serverExpiredProposal = {
+      attemptId: randomUUID(),
+      startedAt: new Date(serverSample.getTime() - 2_000),
+      leaseExpiresAt: new Date(serverSample.getTime() - 1_000),
+      observed: behindObserved.observed,
+    };
+    expect(serverExpiredProposal.leaseExpiresAt.getTime()).toBeGreaterThan(clientNow.getTime());
+    expect((await serverNow()).getTime()).toBeGreaterThanOrEqual(serverExpiredProposal.leaseExpiresAt.getTime());
+    expect(await behindClock.beginDiscoveryAttempt("codex", serverExpiredProposal)).toEqual({ kind: "busy" });
+    expect(
+      await behindClock.applyDiscovery(
+        {
+          provider: "codex",
+          attemptId: serverExpiredProposal.attemptId,
+          startedAt: serverExpiredProposal.startedAt,
+          leaseExpiresAt: serverExpiredProposal.leaseExpiresAt,
+        },
+        discovered("model-server-expired"),
+      ),
+    ).toMatchObject({ kind: "commit-unknown", operationId: serverExpiredProposal.attemptId });
+    expect(await completeState(behindClock)).toEqual(beforeServerExpiredProposal);
+
     const observed = await behindClock.readCatalogState("codex");
     expect(
       await behindClock.beginDiscoveryAttempt("codex", {
         attemptId: randomUUID(),
-        startedAt: new Date(sample.getTime() - 500),
-        leaseExpiresAt: new Date(sample.getTime() + 30_000),
+        startedAt: new Date(serverSample.getTime() - 500),
+        leaseExpiresAt: new Date(serverSample.getTime() + 30_000),
         observed: observed.observed,
       }),
     ).toMatchObject({ kind: "started" });
