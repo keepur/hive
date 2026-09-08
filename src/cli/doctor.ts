@@ -11,6 +11,7 @@ import {
   type OutageQueueStats,
   type MemoryLifecycleRow,
   type DatastoreIdentityReport,
+  type ModelCatalogReport,
   type ResourceEnvelopeRow,
   brewServiceRunning,
   cacheHitRatesForDoctor,
@@ -36,9 +37,11 @@ import {
   memoryLifecycleStatsForDoctor,
   modelRouterModeLine,
   llmSidecarLine,
+  modelCatalogsForDoctor,
   providerPluginsForDoctor,
   renderProviderPluginsSection,
 } from "./doctor-checks.js";
+import { catalogStatusNote } from "../admin/model-catalog-status.js";
 import { describeLimitSource } from "../agents/resource-tiers.js";
 import { engineDir, hiveHome } from "../paths.js";
 
@@ -241,6 +244,18 @@ export function renderCircuitBreakerSection(
       emit(`    last fault: ${r.lastFaultMessage}`);
     }
   }
+}
+
+export function renderModelCatalogsSection(
+  report: ModelCatalogReport,
+  emit: (line: string) => void = console.log,
+): void {
+  emit("\nModel catalogs");
+  if (report.kind === "unavailable") {
+    emit("  catalog storage unavailable");
+    return;
+  }
+  for (const row of report.rows) emit(`  ${catalogStatusNote(row)}`);
 }
 
 /**
@@ -765,6 +780,7 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // NEVER contributes to allPassed (D4).
     const breakerRows = await circuitBreakerStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderCircuitBreakerSection(breakerRows);
+    renderModelCatalogsSection(await modelCatalogsForDoctor(config.mongo.uri, config.mongo.dbName));
     // KPR-307: outage queue (informational — D4). Reuses the breaker rows
     // already fetched above to derive the stuck-drain signal.
     const outageStats = await outageQueueStatsForDoctor(config.mongo.uri, config.mongo.dbName);
