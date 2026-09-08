@@ -1,6 +1,6 @@
 # KPR-456 delivery obligations implementation plan
 
-> **For agentic workers:** Use dodi-dev:implement to execute this plan, after the repository's /spec-and-implement prerequisite has been resolved and invoked. This document does not authorize bypassing that entry point.
+> **For agentic workers:** Execute this plan through dodi-dev:drive-epic and its implementation lane. The user explicitly authorized drive-epic as the replacement for the missing /spec-and-implement entry point; see the execution boundary below.
 
 **Goal:** Register recurring human delivery expectations independently of cron and issue one durable missed-delivery notice identity for each unsatisfied deadline.
 
@@ -8,9 +8,9 @@
 
 **Tech Stack:** Existing TypeScript/Node 24, MongoDB driver, Slack WebClient 8.1.1, Zod, Claude in-process SDK MCP server and Lane B ToolBridge, Vitest. No runtime dependency addition.
 
-**Approved input:** [KPR-456 design](kpr-456-design.md), spec-ready at dfe72cf; clean final spec review 2. Gate 1 delegates this engineering scope. No dependencies or merged decision-register canon. Unmerged sibling plans are not prerequisites.
+**Approved input:** [KPR-456 design](kpr-456-design.md), spec-ready at dfe72cf; clean final spec review 2. Gate 1 delegates this engineering scope. Current source baseline: 681ec6751be86542fde9fc5487511ad9371a620e, including merged KPR-453. The [merged decision-register canon](https://linear.app/keepur/issue/KPR-451#comment-617e55a6) requires retaining the schedule server's live runner-owned WorkItemContextRef, refreshed including absence. This adds no dependency on workItemId for obligation identity or persistence; unmerged sibling plans are not prerequisites.
 
-**Execution boundary:** AGENTS.md requires /spec-and-implement after plan approval for a non-trivial architectural change. Its entry point remains unresolved at drafting time. The driver must resolve that workflow before executing this plan; do not ask again for Gate 1 approval. This draft does not implement, commit, push, edit PM state, deploy, enroll an obligation, or modify production prompts.
+**Execution boundary:** The [user's recorded workflow override](https://linear.app/keepur/issue/KPR-451#comment-9ae7412e) replaces AGENTS.md's missing /spec-and-implement entry point with dodi-dev:drive-epic. That override and the merged baseline above supersede the design's historical workflow/canon status notes; its approved product contract remains unchanged. Continue through the driver's plan-review and dependency gates without another Gate 1 approval request. This revision changes and commits plan artifacts only; it does not implement, push, edit PM state, deploy, enroll an obligation, or modify production prompts.
 
 ## Review chunks and file structure
 

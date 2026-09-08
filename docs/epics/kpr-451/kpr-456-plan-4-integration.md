@@ -96,9 +96,10 @@ init() failure must propagate before wiring readiness. Discovery reads may be av
 **Modify:** src/schedule/schedule-mcp-server.ts: imports, ScheduleToolDeps, createScheduleMcpServer
 **Test:** src/schedule/schedule-mcp-server.test.ts, src/agents/provider-adapters/tool-bridge.test.ts
 
-- [ ] Add imports and the optional dependency:
+- [ ] Retain the existing WorkItemContextRef type-only import and add the obligations import and optional dependency. The resulting imports include:
 
 ~~~typescript
+import type { WorkItemContextRef } from "../agents/agent-runner.js";
 import {
   type DeliveryCapability, deliveryInputSchema, discoveryInputSchema,
 } from "../obligations/types.js";
@@ -106,6 +107,8 @@ import {
 
 ~~~typescript
 export interface ScheduleToolDeps {
+  /** Optional live runtime context; never copy it into a stored document. */
+  workItemContext?: WorkItemContextRef;
   db: Db;
   agentId: string;
   obligations?: DeliveryCapability;
@@ -152,7 +155,7 @@ Use the real MCP request transport to verify extra fields are rejected before th
 
 ## Task 11: Forward one capability through both existing provider paths
 
-**Modify:** src/agents/agent-runner.ts: AgentRunnerOptions, fields, constructor, existing schedule-server construction around baseline line 1526
+**Modify:** src/agents/agent-runner.ts: AgentRunnerOptions, fields, constructor, existing schedule-server construction around baseline line 1540
 **Modify:** src/agents/agent-manager.ts: fields/setter and normal createProviderAdapter around baseline line 822
 
 - [ ] Add the type-only import to both files:
@@ -177,17 +180,18 @@ private readonly obligations?: DeliveryCapability;
 this.obligations = runnerOptions?.obligations;
 ~~~
 
-- [ ] Replace only the existing createScheduleMcpServer argument at the already gated construction site:
+- [ ] Extend only the existing createScheduleMcpServer argument at the already gated construction site, preserving every existing dependency:
 
 ~~~typescript
 this.scheduleMcpServer = createScheduleMcpServer({
   db: this.db,
   agentId: this.agentConfig.id,
+  workItemContext: this.workItemContextRef,
   obligations: this.obligations,
 });
 ~~~
 
-Do not change shouldEnableInProcessServer, autoInjectedServerNames, filterCoreServers, or the worker denylist.
+Preserve buildInProcessServers(context)'s unconditional this.workItemContextRef.current = context refresh before cached-server lookup, including absent context. Pass the live reference itself, never a captured workItemId or context snapshot. Do not change shouldEnableInProcessServer, autoInjectedServerNames, filterCoreServers, or the worker denylist.
 
 - [ ] In AgentManager add:
 
@@ -213,6 +217,14 @@ const runnerOptions: AgentRunnerOptions | undefined =
 ~~~
 
 The same runner feeds Claude and assembleProviderTurn/ToolBridge for Lane B. No provider ABI extension is needed. The worker factory remains exactly { suppressAutoInjectedServers: true }; it must not receive obligations, even if a later containment mistake exposes a schedule server.
+
+- [ ] After the Task 22 SDK mock extension, retain and run the existing KPR-453 regression cases. In src/agents/agent-runner.test.ts, preserve "every enabled cached MCP gets live identity without cross-runner leakage", including its schedule factory reference, shared-reference identity, A/B/empty/absent-context refresh, cached-instance reuse and separate-runner assertions. Preserve the existing complete-context assembly and real ToolBridge round-trip/gate assertions. The standalone callers in chunks 6–7 may omit context; the runner still supplies its live reference with current=undefined, and obligation inputs/receipts gain no workItemId field.
+
+~~~bash
+npx vitest run src/agents/agent-runner.test.ts src/agents/provider-adapters/turn-assembly.test.ts src/agents/provider-adapters/tool-bridge.test.ts -t 'KPR-453'
+~~~
+
+Expected: exit 0 and all selected KPR-453 cases pass. This focused check supplements the full provider/containment regression command in the parent Testing Contract.
 
 ## Task 12: Initialize before spawns; enable after Slack; drain before shutdown
 
