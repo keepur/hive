@@ -520,12 +520,12 @@ HIVE_HOME="$KPR463_INSTANCE" HIVE_CONFIG="$KPR463_CONFIG" "$KPR463_NODE" "$KPR46
 
 The helper's first migration path reads the registered pilot snapshot and current verified hold record under this instance (an explicit `--legacy-hold` selects a registered record, never an arbitrary bypass); require explicit selected instance agreement and clean archive identity. No implicit old updater or BUILD_DIR fallback. Expected: candidate `.hive`, engine fresh boot then worker registration, all packaged checks pass, no message/call emitted. If any operation fails, retain primary/recovery evidence and leave acceptance pending.
 
-- [ ] **Step 4:** Run explicit read-only acceptance from the live packaged worker environment:
+- [ ] **Step 4:** Run explicit read-only acceptance from the live packaged worker environment. Populate the runbook's `KPR463_WORKER_ENV` shell array with literal `KEY=value` entries produced by Task 7's `buildServiceEnvironment` from the captured, validated live worker definition, including its HOME/PATH/selectors and supported overrides such as `VOICE_PORT`. Verify this map deep-equals the generated worker service environment and matches the selected instance/config before probing. Do not populate it from the ambient shell or use `eval`; `env -i` below prevents inherited shell values from changing config or secret selection.
 
 ```bash
-HIVE_HOME="$KPR463_INSTANCE" HIVE_CONFIG="$KPR463_CONFIG" "$KPR463_NODE" "$KPR463_INSTANCE/.hive/pkg/runtime-probe.min.js" bridge
-HIVE_HOME="$KPR463_INSTANCE" HIVE_CONFIG="$KPR463_CONFIG" "$KPR463_NODE" "$KPR463_INSTANCE/.hive/pkg/runtime-probe.min.js" worker
-HIVE_HOME="$KPR463_INSTANCE" HIVE_CONFIG="$KPR463_CONFIG" "$KPR463_NODE" "$KPR463_INSTANCE/.hive/pkg/runtime-probe.min.js" outbound
+env -i "${KPR463_WORKER_ENV[@]}" "$KPR463_NODE" "$KPR463_INSTANCE/.hive/pkg/runtime-probe.min.js" bridge
+env -i "${KPR463_WORKER_ENV[@]}" "$KPR463_NODE" "$KPR463_INSTANCE/.hive/pkg/runtime-probe.min.js" worker
+env -i "${KPR463_WORKER_ENV[@]}" "$KPR463_NODE" "$KPR463_INSTANCE/.hive/pkg/runtime-probe.min.js" outbound
 ```
 
 Expected: correct token's exact missing-agent rejection and both bad-token denials; SDK registration/current owner/identity/heartbeat pass; configured trunk/read-only auth/routing relationship verified. Report only sanitized classifications. Independent OS read-back must corroborate both process identities and installed paths; helper output alone is not enough.

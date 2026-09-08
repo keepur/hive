@@ -163,7 +163,7 @@ Expected: dependency install exits 0 and SDK version is exactly `1.6.4`; if pack
 
 ```typescript
 it("accept resolution leaves an accepted-but-unassigned job unresolved", async () => {
-  const gate = new AdmissionLedger({ pid: 100, bootId: "boot-a" });
+  const gate = new AdmissionLedger({ pid: 100, bootId: "boot-a" }, () => {});
   let assignmentResolved = false;
   let finishAssignment!: () => void;
   const assignment = new Promise<void>((resolve) => { finishAssignment = resolve; });
@@ -183,7 +183,7 @@ it("accept resolution leaves an accepted-but-unassigned job unresolved", async (
 });
 ```
 
-Imports are `it/expect` from Vitest, `JobRequest` from `@livekit/agents`, and `AdmissionLedger` from the new local module. No SDK private field is accessed or patched.
+Imports are `it/expect` from Vitest, `JobRequest` from `@livekit/agents`, and `AdmissionLedger` from the new local module. The explicit no-op persistence callback is only for this in-memory proof fixture; production callers must supply Task 4's required durable snapshot callback. No SDK private field is accessed or patched.
 
 - [ ] **Step 3:** Fork the actual installed SDK `dist/ipc/job_proc_lazy_main.js` with the compiled Hive test agent as argv[2]. Drive its existing IPC messages: send `initializeRequest` with `{ loggerOptions: { level: "error", pretty: false } }`; require `initializeResponse`; send `startJobRequest` with a dummy `RunningJobInfo`; require Hive entry acknowledgement; send `shutdownRequest`; require Hive completion acknowledgement, SDK `done`, and process exit. The fixture uses `withJobLifecycle` and `ctx.shutdown`, never `ctx.connect` or `runCallSession`.
 

@@ -485,6 +485,7 @@ Outbound lookup uses `livekit-server-sdk`'s installed `SipClient` and `listSipOu
 
 ```typescript
 import type { BootIdentity, Release } from "./release.js";
+import type { AdmissionSnapshot } from "../voice-worker/admission.js";
 export interface PackagedEvidence {
   installed: Release;
   engine: BootIdentity;
@@ -497,6 +498,8 @@ export interface PackagedEvidence {
   workerAlive: boolean;
   heartbeatFresh: boolean;
   heartbeatMatchesSupervisor: boolean;
+  admissionSnapshot: AdmissionSnapshot | null;
+  admissionFresh: boolean;
   sdkRootStatus: number | null;
   sdkAgentName: string | null;
   sdkSocketOwned: boolean;
@@ -514,6 +517,11 @@ export function packagedHealthy(e: PackagedEvidence): boolean {
       !e.configSelectorsMatch || !e.freshOrderedEngineMarkers || !e.dependenciesContained) return false;
   if (!e.voiceEnabled) return true;
   return e.worker !== null && sameRelease(e.installed, e.worker.release) && e.workerAlive &&
+    e.admissionSnapshot !== null && e.admissionFresh &&
+    e.admissionSnapshot.supervisor.pid === e.worker.pid &&
+    e.admissionSnapshot.supervisor.bootId === e.worker.bootId &&
+    e.admissionSnapshot.admission === "open" && e.admissionSnapshot.operationId === null &&
+    e.admissionSnapshot.persistenceFault === false &&
     e.heartbeatFresh && e.heartbeatMatchesSupervisor && e.sdkRootStatus === 200 &&
     e.sdkAgentName === "hive-voice" && e.sdkSocketOwned && e.bridgeAuthenticated &&
     e.bridgeMissingDenied && e.bridgeWrongDenied;
@@ -521,6 +529,8 @@ export function packagedHealthy(e: PackagedEvidence): boolean {
 ```
 
 Evidence constructors additionally verify protocol/schema, boot ID equality to the expected activation, process PID/start-time match, finite timestamps no more than five seconds in the future, current supervisor heartbeat no older than 60 seconds, and record created after the captured activation boundary. A fabricated structurally valid BootIdentity is not sufficient. Engine marker scanner reads only post-bootstrap bytes, handles truncation as uncertainty/failure, requires starting-before-running for the current PID/boot, and verifies that same PID remains live at the final check. Plain heartbeat timestamp `updatedAt` cannot satisfy a packaged heartbeat.
+
+For enabled-worker activation, gather `admissionSnapshot` through a new correlated Task 4 `status` request during the current health window. Set `admissionFresh` only after validating the fresh successful reply's protocol, request/correlation operation ID, timestamp at or after that request, supervisor PID/boot and independently corroborated live process identity; require open admission, null snapshot owner and no persistence fault. A saved snapshot, cached reply or heartbeat cannot substitute for this acknowledgement. Missing, stale, wrong-supervisor, maintenance-owned or persistence-fault evidence fails activation even when all SDK, bridge and process checks pass. Update every evidence constructor/caller and healthy fixture with these required fields; voice-disabled fixtures use `admissionSnapshot: null, admissionFresh: false`. This status check does not replace Task 4's terminal release acknowledgement when reconciling a prior barrier.
 
 Engine and worker receive independent bounded retries: 3 × 30-second windows, with 10 seconds between windows (maximum 110 seconds each). Start engine, await its fresh boot, start worker, await registration and paired evidence. Per-request/probe timeouts must fit within each absolute window; nested retries cannot extend the contract. A worker whose heartbeat is fresh but whose SDK root is 503 never passes.
 
@@ -536,4 +546,4 @@ The legacy probe runs from retained candidate tooling **with the captured pilot 
 npx vitest run src/deployment/ports.test.ts src/deployment/health.test.ts src/voice-worker/worker-config.test.ts src/voice-worker/telemetry.test.ts src/cli/doctor-checks.test.ts src/cli/doctor.test.ts src/channels/voice/voice-adapter.test.ts src/channels/voice/voice-adapter.integration.test.ts
 ```
 
-Expected: all pass. Require negative cases for stale prior logs, wrong PID/start time/boot/revision, foreign listener, missing/malformed heartbeat, future timestamp, `/worker` 200 with `/` 503, unknown active-call telemetry, valid token denied, arbitrary 400, disabled voice missing keys, explicit health-port collision, legacy-only fields missing, legacy recovery falsely labeled packaged. Commit the worker/evidence slice after review and passing tests; proceed to lifecycle chunk.
+Expected: all pass. Require negative cases for stale prior logs, wrong PID/start time/boot/revision, foreign listener, missing/malformed heartbeat, future timestamp, `/worker` 200 with `/` 503, unknown active-call telemetry, valid token denied, arbitrary 400, disabled voice missing keys, explicit health-port collision, legacy-only fields missing, legacy recovery falsely labeled packaged. With all other enabled-worker evidence healthy, require `packagedHealthy` to return false separately for a persistence-faulted closed gate with null owner, a maintenance-owned closed gate without a persistence fault, missing/stale admission evidence, and a mismatched snapshot supervisor PID/boot. Require true for a fresh corroborated open/null-owner/fault-free snapshot, without imposing an idle-job condition on normal activation. The transaction health fixture must propagate each closed-gate failure into failed activation/checked recovery, never a healthy result. Commit the worker/evidence slice after review and passing tests; proceed to lifecycle chunk.
