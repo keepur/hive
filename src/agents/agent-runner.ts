@@ -146,6 +146,8 @@ function buildCapabilitiesJson(plugins: LoadedPlugin[]): string {
 export type StreamCallback = (chunk: string) => void;
 
 export interface WorkItemContext {
+  /** Exact ID of the represented WorkItem. Engine-managed turns supply it; compatible callers and invocations without a WorkItem may omit it. */
+  workItemId?: string;
   adapterId: string;
   channelId: string;
   channelKind: string;
@@ -153,6 +155,11 @@ export interface WorkItemContext {
   threadId: string;
   slackTs: string;
   slackThreadTs: string;
+}
+
+/** Runner-owned runtime context for cached in-process MCP builders. */
+export interface WorkItemContextRef {
+  current: WorkItemContext | undefined;
 }
 
 export interface RunResult {
@@ -385,6 +392,7 @@ export class AgentRunner {
   private memoryMcpServer?: ReturnType<typeof createMemoryMcpServer>;
   private structuredMemoryMcpServer?: ReturnType<typeof createStructuredMemoryMcpServer>;
   private structuredMemoryContextRef: { current: StructuredMemoryTurnContext } = { current: {} };
+  private readonly workItemContextRef: WorkItemContextRef = { current: undefined };
   private eventBusMcpServer?: ReturnType<typeof createEventBusMcpServer>;
   private callbackMcpServer?: ReturnType<typeof createCallbackMcpServer>;
   private callbackContextRef: { current: CallbackTurnContext } = { current: {} };
@@ -1457,17 +1465,19 @@ export class AgentRunner {
    * unchanged.
    */
   buildInProcessServers(context?: WorkItemContext): Record<string, McpSdkServerConfigWithInstance> {
+    this.workItemContextRef.current = context;
     const servers: Record<string, McpSdkServerConfigWithInstance> = {};
     // team-roster is the codebase's first in-process MCP server (createSdkMcpServer
     // from the SDK). Unlike stdio entries, it isn't a process spawn — it's a
     // long-lived object holding tool handlers that close over the shared
     // teamRoster cache. Built once per AgentRunner and reused across send()
-    // invocations to avoid per-message allocation.
+    // invocations to avoid per-message allocation. Runtime context is refreshed
+    // through the runner-owned reference above.
     // KPR-390: worker-mode runners receive `teamRoster` from the manager's
     // construction inputs; the flag suppresses the wiring (auto-injection).
     if (this.teamRoster && !this.suppressAutoInjectedServers) {
       if (!this.teamRosterMcpServer) {
-        this.teamRosterMcpServer = createTeamRosterMcpServer(this.teamRoster);
+        this.teamRosterMcpServer = createTeamRosterMcpServer(this.teamRoster, this.workItemContextRef);
       }
       servers["team-roster"] = this.teamRosterMcpServer;
     }
@@ -1480,10 +1490,11 @@ export class AgentRunner {
     // path; tests without `db` skip) and (b) the agent's coreServers includes
     // "memory". The cached SDK server is safe to reuse across turns: the
     // resolved scope list depends only on constructor-time agent + archetype
-    // config.
+    // config. Runtime context is refreshed through the runner-owned reference.
     if (this.db && this.shouldEnableInProcessServer("memory")) {
       if (!this.memoryMcpServer) {
         this.memoryMcpServer = createMemoryMcpServer({
+          workItemContext: this.workItemContextRef,
           db: this.db,
           agentId: this.agentConfig.id,
           memoryScopes: this.resolveMemoryScopes(),
@@ -1500,10 +1511,12 @@ export class AgentRunner {
     }
 
     // KPR-122: event-bus MCP — in-process. Subscriber map is constructor-time
-    // stable on the runner so the cached server is safe to reuse across turns.
+    // stable on the runner so the cached server is safe to reuse across turns;
+    // runtime context is refreshed through the runner-owned reference.
     if (this.db && this.shouldEnableInProcessServer("event-bus")) {
       if (!this.eventBusMcpServer) {
         this.eventBusMcpServer = createEventBusMcpServer({
+          workItemContext: this.workItemContextRef,
           db: this.db,
           agentId: this.agentConfig.id,
           eventSubscribersJson: this.eventSubscribersJson,
@@ -1512,28 +1525,34 @@ export class AgentRunner {
       servers["event-bus"] = this.eventBusMcpServer;
     }
 
-    // KPR-122: contacts MCP — in-process. No per-turn context.
+    // KPR-122: contacts MCP — cached server with optional live runtime context.
     if (this.db && this.shouldEnableInProcessServer("contacts")) {
       if (!this.contactsMcpServer) {
-        this.contactsMcpServer = createContactsMcpServer({ db: this.db });
+        this.contactsMcpServer = createContactsMcpServer({ db: this.db, workItemContext: this.workItemContextRef });
       }
       servers["contacts"] = this.contactsMcpServer;
     }
 
     // KPR-122: schedule MCP — in-process. AgentId is constructor-stable.
+    // Runtime context is refreshed through the runner-owned reference.
     if (this.db && this.shouldEnableInProcessServer("schedule")) {
       if (!this.scheduleMcpServer) {
-        this.scheduleMcpServer = createScheduleMcpServer({ db: this.db, agentId: this.agentConfig.id });
+        this.scheduleMcpServer = createScheduleMcpServer({
+          db: this.db,
+          agentId: this.agentConfig.id,
+          workItemContext: this.workItemContextRef,
+        });
       }
       servers["schedule"] = this.scheduleMcpServer;
     }
 
     // KPR-122: team MCP — in-process. `getAgentIds` reads the live registry on
     // every call so a hot reload (SIGUSR1) is reflected without rebuilding the
-    // cached server.
+    // cached server. Runtime context is refreshed through the runner-owned reference.
     if (this.db && this.shouldEnableInProcessServer("team")) {
       if (!this.teamMcpServer) {
         this.teamMcpServer = createTeamMcpServer({
+          workItemContext: this.workItemContextRef,
           db: this.db,
           agentId: this.agentConfig.id,
           getAgentIds: () => AgentRunner.registryRef?.getAll().map((a) => a.id) ?? [],
@@ -1543,10 +1562,12 @@ export class AgentRunner {
     }
 
     // KPR-122: admin MCP — in-process. instanceCapabilities is plugin-derived
-    // and constructor-stable on the runner.
+    // and constructor-stable on the runner; runtime context is refreshed through
+    // the runner-owned reference.
     if (this.db && this.shouldEnableInProcessServer("admin")) {
       if (!this.adminMcpServer) {
         this.adminMcpServer = createAdminMcpServer({
+          workItemContext: this.workItemContextRef,
           db: this.db,
           agentId: this.agentConfig.id,
           instanceCapabilitiesJson: buildCapabilitiesJson(this.plugins),
@@ -1559,19 +1580,22 @@ export class AgentRunner {
 
     // KPR-122: code-search MCP — in-process. Qdrant/Ollama URLs read from
     // process.env at server-build time (same default values as the stdio path).
+    // Runtime context is refreshed through the runner-owned reference.
     if (this.db && this.shouldEnableInProcessServer("code-search")) {
       if (!this.codeSearchMcpServer) {
-        this.codeSearchMcpServer = createCodeSearchMcpServer({ db: this.db });
+        this.codeSearchMcpServer = createCodeSearchMcpServer({ db: this.db, workItemContext: this.workItemContextRef });
       }
       servers["code-search"] = this.codeSearchMcpServer;
     }
 
     // KPR-122: workflow MCP — in-process. Gated by config.workflow.enabled
     // (mirrors `effectiveCoreServerSet` which only adds it when the feature
-    // flag is on).
+    // flag is on). Subscriber configuration is constructor-stable; runtime
+    // context is refreshed through the runner-owned reference.
     if (this.db && config.workflow.enabled && this.shouldEnableInProcessServer("workflow")) {
       if (!this.workflowMcpServer) {
         this.workflowMcpServer = createWorkflowMcpServer({
+          workItemContext: this.workItemContextRef,
           db: this.db,
           agentId: this.agentConfig.id,
           eventSubscribersJson: this.eventSubscribersJson,
@@ -1585,6 +1609,7 @@ export class AgentRunner {
     // scheduled mid-thread captures the right channel/thread.
     if (this.db && this.shouldEnableInProcessServer("callback")) {
       this.callbackContextRef.current = {
+        workItemId: context?.workItemId,
         adapterId: context?.adapterId,
         channelId: context?.channelId,
         channelKind: context?.channelKind,
@@ -1612,6 +1637,7 @@ export class AgentRunner {
     // bridge like every other in-process server — no adapter changes.
     if (this.workerPool && this.shouldEnableInProcessServer("worker-pool")) {
       this.workerPoolContextRef.current = {
+        workItemId: context?.workItemId,
         adapterId: context?.adapterId,
         channelId: context?.channelId,
         channelKind: context?.channelKind,
@@ -1635,6 +1661,7 @@ export class AgentRunner {
     // cached SDK server sees the active values without rebuilding).
     if (this.db && this.shouldEnableInProcessServer("structured-memory")) {
       this.structuredMemoryContextRef.current = {
+        workItemId: context?.workItemId,
         channelId: context?.channelId,
         threadId: context?.threadId,
       };

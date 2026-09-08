@@ -10,6 +10,7 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { Db } from "mongodb";
+import type { WorkItemContextRef } from "../agents/agent-runner.js";
 import { statSync } from "node:fs";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 import type { AgentDefinition, AgentDefinitionVersion } from "../types/agent-definition.js";
@@ -357,6 +358,8 @@ const FALLBACK_CAPABILITIES: InstanceCapabilities = {
 };
 
 export interface AdminToolDeps {
+  /** Optional live runtime context; never copy it into a stored document. */
+  workItemContext?: WorkItemContextRef;
   db: Db;
   agentId: string;
   /** KPR-241: shared memory lifecycle instance for the consolidation tool. */

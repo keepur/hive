@@ -2,16 +2,20 @@
  * Event Bus MCP Server — emit structured events for cross-agent coordination.
  *
  * KPR-122 port: in-process via `createSdkMcpServer`. The handler closes over
- * the shared engine `Db` plus the runner-supplied subscriber map; no per-turn
- * context is needed (subscribers and AGENT_ID are constructor-stable).
+ * the shared engine `Db` plus the runner-supplied subscriber map; subscriber
+ * and agent configuration are constructor-stable; optional runtime identity
+ * arrives through the runner-owned context reference.
  */
 
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { Db } from "mongodb";
+import type { WorkItemContextRef } from "../agents/agent-runner.js";
 import { EVENT_SCHEMAS, eventDomain } from "./event-types.js";
 
 export interface EventBusToolDeps {
+  /** Optional live runtime context; never copy it into a stored document. */
+  workItemContext?: WorkItemContextRef;
   db: Db;
   agentId: string;
   /**

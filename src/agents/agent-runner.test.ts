@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { writeFile, unlink } from "node:fs/promises";
 import type { AgentConfig } from "../types/agent-config.js";
 import type { LoadedPlugin } from "../plugins/types.js";
+import type { WorkItemContext } from "./agent-runner.js";
 
 // ── node:fs mock ─────────────────────────────────────────────────────
 // vi.hoisted() runs before vi.mock factory, avoiding the TDZ error that
@@ -84,6 +85,12 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
     description,
     handler,
   })),
+}));
+
+vi.mock("@qdrant/js-client-rest", () => ({
+  QdrantClient: vi.fn().mockImplementation(function () {
+    return { query: vi.fn().mockResolvedValue({ points: [] }) };
+  }),
 }));
 
 // KPR-327: the memory server's stdio placeholder (and its MEMORY_SCOPES_JSON
@@ -295,6 +302,19 @@ function makeFakeInProcessDb(): any {
   return { collection: vi.fn(() => col) };
 }
 
+function identityContext(workItemId?: string): WorkItemContext {
+  return {
+    ...(workItemId === undefined ? {} : { workItemId }),
+    adapterId: "slack-main",
+    channelId: "C-identity",
+    channelKind: "slack",
+    channelLabel: "conf-identity",
+    threadId: "shared-thread",
+    slackTs: "100.2",
+    slackThreadTs: "100.1",
+  };
+}
+
 function makeGooglePlugin(): LoadedPlugin {
   return {
     name: "@keepur/hive-plugin-google",
@@ -323,6 +343,86 @@ function inventoryByName(runner: AgentRunner, name: string) {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
+it("KPR-453: every enabled cached MCP gets live identity without cross-runner leakage", async () => {
+  const modules = await Promise.all([
+    import("../team-roster/team-roster-mcp-server.js"),
+    import("../memory/memory-mcp-server.js"),
+    import("../events/event-bus-mcp-server.js"),
+    import("../contacts/contacts-mcp-server.js"),
+    import("../schedule/schedule-mcp-server.js"),
+    import("../team/team-mcp-server.js"),
+    import("../admin/admin-mcp-server.js"),
+    import("../code-index/code-search-mcp-server.js"),
+    import("../workflow/workflow-mcp-server.js"),
+    import("../callback/callback-mcp-server.js"),
+    import("../workers/worker-pool-mcp-server.js"),
+    import("../memory/structured-memory-mcp-server.js"),
+  ]);
+  const names = [
+    "team-roster", "memory", "event-bus", "contacts", "schedule", "team",
+    "admin", "code-search", "workflow", "callback", "worker-pool", "structured-memory",
+  ];
+  const exports = [
+    "createTeamRosterMcpServer", "createMemoryMcpServer", "createEventBusMcpServer",
+    "createContactsMcpServer", "createScheduleMcpServer", "createTeamMcpServer",
+    "createAdminMcpServer", "createCodeSearchMcpServer", "createWorkflowMcpServer",
+    "createCallbackMcpServer", "createWorkerPoolMcpServer", "createStructuredMemoryMcpServer",
+  ];
+  const spies = modules.map((module, i) => vi.spyOn(module as any, exports[i]));
+  const { config } = await import("../config.js");
+  const oldWorkflow = config.workflow.enabled;
+  const makeIdentityRunner = () => new AgentRunner(
+    makeAgentConfig({
+      coreServers: ["memory", "event-bus", "contacts", "admin", "code-search", "callback", "worker-pool"],
+      autonomy: { externalComms: true, codeTask: false, codeAccess: true },
+    }),
+    makeMockMemoryManager() as any,
+    [], new Map(), "{}", undefined,
+    { getTeam: vi.fn(), lookupHuman: vi.fn(), lookupAgent: vi.fn() } as any,
+    makeFakeInProcessDb(), undefined, undefined,
+    { workerPool: { dispatch: vi.fn(), status: vi.fn(), cancel: vi.fn() } as any },
+  );
+  const refAt = (index: number, call: number): any => {
+    const args = spies[index].mock.calls[call] as any[];
+    return index === 0 ? args[1] : index >= 9 ? args[0].context : args[0].workItemContext;
+  };
+  try {
+    config.workflow.enabled = true;
+    spies.forEach((spy) => spy.mockClear());
+    const first = makeIdentityRunner();
+    const second = makeIdentityRunner();
+    const a = identityContext(" work:A/Ω ");
+    const servers = first.buildInProcessServers(a);
+    expect(Object.keys(servers)).toEqual(names);
+    const refs = names.map((_, i) => refAt(i, 0));
+    for (const ref of refs) expect(ref.current.workItemId).toBe(a.workItemId);
+    for (const ref of refs.slice(0, 9)) expect(ref).toBe(refs[0]);
+    expect(refs[0].current).toBe(a);
+
+    second.buildInProcessServers(identityContext("other-runner"));
+    const otherRefs = names.map((_, i) => refAt(i, 1));
+    otherRefs.forEach((ref, i) => expect(ref).not.toBe(refs[i]));
+
+    for (const next of [identityContext("B"), identityContext(""), identityContext(), undefined]) {
+      const nextServers = first.buildInProcessServers(next);
+      expect(Object.keys(nextServers)).toEqual(names);
+      for (const name of names) expect(nextServers[name]).toBe(servers[name]);
+      refs.forEach((ref) => expect(ref.current?.workItemId).toBe(next?.workItemId));
+      otherRefs.forEach((ref) => expect(ref.current.workItemId).toBe("other-runner"));
+      spies.forEach((spy) => expect(spy).toHaveBeenCalledTimes(2));
+    }
+    expect(refs[0].current).toBeUndefined();
+    const empty = new AgentRunner(makeAgentConfig({ coreServers: [] }),
+      makeMockMemoryManager() as any, [], new Map(), "{}", undefined, undefined,
+      undefined, undefined, undefined, { suppressAutoInjectedServers: true });
+    expect(empty.buildInProcessServers(a)).toEqual({});
+    expect(empty.buildInProcessServers()).toEqual({});
+  } finally {
+    config.workflow.enabled = oldWorkflow;
+    spies.forEach((spy) => spy.mockRestore());
+  }
+});
+
 describe("AgentRunner.buildMcpServers (via send)", () => {
   let runner: AgentRunner;
   let memoryManager: ReturnType<typeof makeMockMemoryManager>;
@@ -3207,7 +3307,7 @@ describe("buildSystemPrompt — archetype card", () => {
   });
 
   it("KPR-222: buildHooks rebuilds with current WorkItemContext on every call (no stale context across spawns)", () => {
-    const captured: Array<unknown> = [];
+    const captured: Array<WorkItemContext | undefined> = [];
     registerArchetype({
       id: "context-capturing",
       validateConfig: (c) => c,
@@ -3225,11 +3325,20 @@ describe("buildSystemPrompt — archetype card", () => {
       archetype: "context-capturing",
       archetypeConfig: {},
     });
-    const ctxA = { channelId: "ch-a", threadId: "thr-a", source: "test" } as any;
-    const ctxB = { channelId: "ch-b", threadId: "thr-b", source: "test" } as any;
+    const ctxA = identityContext("hook-A");
+    const ctxB = identityContext("hook-B");
+    const legacyContext = identityContext();
     (runner as any).buildHooks(ctxA);
     (runner as any).buildHooks(ctxB);
-    expect(captured).toEqual([ctxA, ctxB]);
+    (runner as any).buildHooks(legacyContext);
+    (runner as any).buildHooks();
+    expect(captured).toEqual([ctxA, ctxB, legacyContext, undefined]);
+    expect(captured.map((context) => context?.workItemId)).toEqual([
+      "hook-A",
+      "hook-B",
+      undefined,
+      undefined,
+    ]);
   });
 
   it("omits card gracefully when archetype systemPromptCard throws", async () => {
@@ -4131,9 +4240,10 @@ describe("AgentRunner — KPR-390 worker-pool wiring", () => {
     );
   }
 
-  it("(a) pool wired + worker-pool in coreServers → in-process server built, context ref carries the seven and refreshes per turn", () => {
+  it("(a) pool wired + worker-pool in coreServers → in-process server built, context ref carries transport metadata and identity and refreshes per turn", () => {
     const runner = makeWorkerPoolRunner({ coreServers: ["worker-pool"], pool: makeFakePool() });
     const servers = runner.buildInProcessServers({
+      workItemId: "boss-A",
       adapterId: "slack",
       channelId: "C1",
       channelKind: "slack",
@@ -4146,6 +4256,7 @@ describe("AgentRunner — KPR-390 worker-pool wiring", () => {
     const ref = (runner as unknown as { workerPoolContextRef: { current: Record<string, unknown> } })
       .workerPoolContextRef;
     expect(ref.current).toEqual({
+      workItemId: "boss-A",
       adapterId: "slack",
       channelId: "C1",
       channelKind: "slack",
@@ -4159,6 +4270,7 @@ describe("AgentRunner — KPR-390 worker-pool wiring", () => {
     runner.buildInProcessServers({ channelLabel: "conf-other", threadId: "2.0" } as any);
     expect(ref.current).not.toBe(before);
     expect(ref.current.threadId).toBe("2.0");
+    expect(ref.current.workItemId).toBeUndefined();
   });
 
   it("(b) no pool option, or pool without coreServers membership → worker-pool absent", () => {

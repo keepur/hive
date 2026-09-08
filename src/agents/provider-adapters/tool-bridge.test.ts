@@ -10,7 +10,8 @@ import type { ToolBridgeOptions } from "./tool-bridge.js";
 import { BUILTIN_TOOL_DEFINITIONS } from "./builtin-executor.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import { classifyToolTransport } from "./tool-transport.js";
-import type { ProviderSkillIndexEntry } from "./turn-assembly.js";
+import type { DelegateTurnCall, ProviderSkillIndexEntry } from "./turn-assembly.js";
+import type { GuardrailToolCall } from "./types.js";
 // KPR-349 T5/T6: real round-trips through production code paths.
 import { AgentRunner } from "../agent-runner.js";
 import { buildProviderInstructions } from "../prefix-builder.js";
@@ -363,22 +364,42 @@ describe("T1 — dispatch containment", () => {
 // --- T6: in-process round-trip --------------------------------------------
 
 describe("T6 — in-process round-trip", () => {
-  it("reads a mutable *ContextRef set before connect()", async () => {
-    const contextRef = { current: { channel: "C-PLANTED", thread: "T-PLANTED" } };
-    const inProcess = makeInProcessServer((s) =>
-      s.registerTool("echo_context", { description: "", inputSchema: {} }, async () => ({
-        content: [{ type: "text", text: JSON.stringify(contextRef.current) }],
+  it("KPR-453: real MCP round trip and gate retain exact work identity", async () => {
+    const context = {
+      workItemId: "bridge-item/Ω",
+      adapterId: "slack",
+      channelId: "C1",
+      channelKind: "slack",
+      channelLabel: "general",
+      threadId: "shared-thread",
+      slackTs: "100.2",
+      slackThreadTs: "100.1",
+    };
+    const contextRef: { current: typeof context | undefined } = { current: context };
+    const gate = vi.fn(async (_call: GuardrailToolCall) => ({ behavior: "allow" as const }));
+    const inProcess = makeInProcessServer((server) =>
+      server.registerTool("echo_context", { description: "", inputSchema: {} }, async () => ({
+        content: [{ type: "text", text: contextRef.current?.workItemId ?? "unavailable" }],
       })),
     );
     const bridge = makeBridge({
       inventory: [makeEntry({ name: "ctx", transport: "sdk-in-process", serverConfig: undefined })],
       inProcessServers: { ctx: inProcess },
+      workItemContext: context,
+      gate,
     });
-    const tools = await bridge.connect();
-    const out = await tools[0].execute({});
-    expect(out).toContain("C-PLANTED");
-    expect(out).toContain("T-PLANTED");
-    await bridge.close();
+    try {
+      const tools = await bridge.connect();
+      expect(tools[0].inputSchema.properties).not.toHaveProperty("workItemId");
+      expect(await tools[0].execute({})).toBe("bridge-item/Ω");
+      expect(gate.mock.calls[0][0].workItemContext).toBe(context);
+      contextRef.current = { ...context, workItemId: "next-item" };
+      expect(await tools[0].execute({})).toBe("next-item");
+      contextRef.current = undefined;
+      expect(await tools[0].execute({})).toBe("unavailable");
+    } finally {
+      await bridge.close();
+    }
   });
 
   it("flows the fixture listTools schema into inputSchema", async () => {
@@ -838,6 +859,7 @@ describe("KPR-354 T3 — Task synthesis (§D3)", () => {
   }
 
   const workItemContext = {
+    workItemId: "inline-origin",
     adapterId: "test",
     channelId: "C1",
     channelKind: "slack",
@@ -914,7 +936,7 @@ describe("KPR-354 T3 — Task synthesis (§D3)", () => {
   });
 
   it("valid args → runner called once with the full DelegateTurnCall; resolves its text", async () => {
-    const runner = vi.fn(async () => "delegate says hi");
+    const runner = vi.fn(async (_call: DelegateTurnCall) => "delegate says hi");
     const entry = makeSubagentEntry("google", "Google MCP");
     const controller = new AbortController();
     const bridge = makeBridge({
@@ -935,6 +957,7 @@ describe("KPR-354 T3 — Task synthesis (§D3)", () => {
       signal: controller.signal,
       workItemContext,
     });
+    expect(runner.mock.calls[0][0].workItemContext).toBe(workItemContext);
     await bridge.close();
   });
 

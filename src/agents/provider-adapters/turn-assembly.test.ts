@@ -76,6 +76,19 @@ function makeRunner(
 beforeEach(() => vi.clearAllMocks());
 
 describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
+  it("KPR-453: assembly passes complete context into in-process construction", async () => {
+    const context = {
+      workItemId: "assembly-item",
+      adapterId: "sms", channelId: "line-1", channelKind: "sms",
+      channelLabel: "Identity", threadId: "same-thread", slackTs: "", slackThreadTs: "",
+    };
+    const runner = makeRunner([]);
+    await assembleProviderTurn({ runner, config: makeAgentConfig(), provider: "codex", workItemContext: context });
+    expect(runner.buildToolTransportInventory).toHaveBeenCalledWith(context);
+    expect(runner.buildInProcessServers).toHaveBeenCalledWith(context);
+    expect(runner.resolveTurnCwd).toHaveBeenCalledWith(context);
+  });
+
   it("KPR-349 inversion: instructions come from buildProviderPrompt; memory + skillIndex populated; inventory partitioned", async () => {
     const bridgeable = makeEntry();
     const omittedEntry = makeEntry({

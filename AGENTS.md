@@ -21,5 +21,6 @@
 ## Conventions
 
 - Use `createLogger("module-name")` for logging
-- MCP servers run as stdio subprocesses of agent sessions
+- MCP servers use in-process SDK servers for engine Mongo-backed tools; stdio remains for process-isolated and vendor integrations. `AgentRunner.buildInProcessServers(context)` refreshes runner-owned context references for both provider lanes.
+- **Work-item identity (KPR-453):** Manager-owned turns set `WorkItemContext.workItemId` to the exact `WorkItem.id` before provider assembly; hooks, ToolBridge, guardrails, and inline delegates retain it. The public field stays optional (provider ABI v1); older callers and detached worker/scribe executions without a `WorkItem` may omit it. Never derive an ID from a thread, session, claim, or boss turn. Every enabled in-process MCP builder receives a live runner-owned reference: callback, worker-pool, and structured-memory use their existing projections; the other nine share one `WorkItemContextRef` per runner. Refresh references on every invocation, including absence, and read `.current` at tool execution rather than capturing the first ID. This runtime-only plumbing adds no persistence or external MCP/model/tool payload fields; retries and outage replay may reuse an item ID.
 - Agent identity layers: `soul.md` (personality) + `system-prompt.md` (role) + `memory.md` (knowledge)

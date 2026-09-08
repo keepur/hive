@@ -51,7 +51,8 @@ vi.mock("./memory-embedder.js", () => ({
   }),
 }));
 
-import { buildStructuredMemoryTools } from "./structured-memory-mcp-server.js";
+import { buildStructuredMemoryMcpForTurn, buildStructuredMemoryTools } from "./structured-memory-mcp-server.js";
+import type { StructuredMemoryTurnContext } from "./structured-memory-mcp-server.js";
 
 function getHandler(tools: any[], name: string): any {
   const t = tools.find((x) => x.name === name);
@@ -71,7 +72,9 @@ describe("structured-memory-mcp-server (in-process)", () => {
   it("memory_save threads channel/thread from the mutable context ref", async () => {
     mockSave.mockClear();
     mockSearch.mockResolvedValue([]);
-    const ctx = { current: { channelId: "C1", threadId: "T1" } };
+    const ctx: { current: StructuredMemoryTurnContext } = {
+      current: { workItemId: "memory-origin", channelId: "C1", threadId: "T1" },
+    };
     const tools = buildStructuredMemoryTools({
       db: { collection: () => ({}) } as any,
       agentId: "alice",
@@ -93,6 +96,9 @@ describe("structured-memory-mcp-server (in-process)", () => {
       "C1",
       "T1",
     );
+    expect(mockSave.mock.calls[0]).toHaveLength(5);
+    expect(JSON.stringify(mockSave.mock.calls[0])).not.toContain("memory-origin");
+    expect(JSON.stringify(res)).not.toContain("memory-origin");
 
     // Now mutate the ref and confirm a second save sees the new context — proves
     // the cached server picks up per-turn updates without rebuilding.
@@ -105,6 +111,21 @@ describe("structured-memory-mcp-server (in-process)", () => {
       "C2",
       "T2",
     );
+  });
+
+  it("KPR-453: alternate structured-memory builder reads supplied runtime identity", () => {
+    const identity = vi.fn(() => "alternate-memory");
+    buildStructuredMemoryMcpForTurn({
+      db: { collection: () => ({}) } as any,
+      agentId: "alice",
+      get workItemId() {
+        return identity();
+      },
+    });
+    expect(identity).toHaveBeenCalledTimes(1);
+    expect(() =>
+      buildStructuredMemoryMcpForTurn({ db: { collection: () => ({}) } as any, agentId: "alice" }),
+    ).not.toThrow();
   });
 
   it("memory_recall returns 'no matching' when search yields nothing", async () => {

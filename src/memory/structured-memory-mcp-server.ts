@@ -15,6 +15,8 @@ import { describeError } from "../logging/describe-error.js";
 import type { MemoryType, MemoryImportance, MemoryTier, PurgeFilters } from "./memory-types.js";
 
 export interface StructuredMemoryTurnContext {
+  /** Identity of this runtime invocation, when it represents a WorkItem. */
+  workItemId?: string;
   channelId?: string;
   threadId?: string;
 }
@@ -542,6 +544,8 @@ export function createStructuredMemoryMcpServer(deps: StructuredMemoryToolDeps) 
 export interface StructuredMemoryTurnDeps {
   db: Db;
   agentId: string;
+  /** Identity of this runtime invocation, when it represents a WorkItem. */
+  workItemId?: string;
   channelId?: string;
   threadId?: string;
   qdrantUrl?: string;
@@ -551,7 +555,11 @@ export interface StructuredMemoryTurnDeps {
 
 export function buildStructuredMemoryMcpForTurn(deps: StructuredMemoryTurnDeps) {
   const contextRef: { current: StructuredMemoryTurnContext } = {
-    current: { channelId: deps.channelId, threadId: deps.threadId },
+    current: {
+      workItemId: deps.workItemId,
+      channelId: deps.channelId,
+      threadId: deps.threadId,
+    },
   };
   return createSdkMcpServer({
     name: "structured-memory",

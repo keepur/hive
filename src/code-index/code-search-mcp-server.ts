@@ -10,10 +10,13 @@ import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { type Collection, type Db } from "mongodb";
 import { QdrantClient } from "@qdrant/js-client-rest";
+import type { WorkItemContextRef } from "../agents/agent-runner.js";
 import { embedOllama } from "../search/embed-utils.js";
 import { CODE_INDEX_COLLECTION, type CodeIndexRecord, type CodeSearchResult } from "./code-index-types.js";
 
 export interface CodeSearchToolDeps {
+  /** Optional live runtime context; never copy it into a stored document. */
+  workItemContext?: WorkItemContextRef;
   db: Db;
   qdrantUrl?: string;
   ollamaUrl?: string;

@@ -364,7 +364,7 @@ describe("MeetingScribe — role params + prompt pins (T7)", () => {
     // Base is the live registry object, not a clone.
     expect(call.base).toBe(f.agents.boss);
 
-    // All seven workItemContext fields.
+    // Detached role transport metadata; no represented WorkItem.
     expect(call.workItemContext).toEqual({
       adapterId: "slack-main",
       channelId: "C123",
@@ -374,6 +374,7 @@ describe("MeetingScribe — role params + prompt pins (T7)", () => {
       slackTs: "1724680001.200",
       slackThreadTs: THREAD,
     });
+    expect(call.workItemContext).not.toHaveProperty("workItemId");
   });
 
   it("D2a: pins the first-run prompt byte-exact (no prior summary ⇒ sentinel)", async () => {

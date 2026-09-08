@@ -8,9 +8,9 @@
 
 **Tech Stack:** TypeScript 6, Node 24, Vitest 4, Claude Agent SDK in-process MCP servers, MCP SDK in-memory transport, existing fake Mongo and provider harnesses.
 
-**Authority and baseline:** Approved spec: `docs/epics/kpr-451/kpr-453-design.md`, clean at `622c7ba31f9bd822137481ecf1f1d6ff71dff42c`. KPR-453 has no child dependencies; no Decision Register — Canon exists. Gate 1 delegates routine engineering decisions. This is a draft for independent plan review, not an implementation-readiness ruling.
+**Authority and baseline:** Approved spec: `docs/epics/kpr-451/kpr-453-design.md`, clean at `622c7ba31f9bd822137481ecf1f1d6ff71dff42c`. KPR-453 has no child dependencies; no Decision Register — Canon existed at the planning baseline. Gate 1 delegates routine engineering decisions. The specification and plan were approved before child delivery.
 
-**Execution boundary:** The repository requires `/spec-and-implement` after plan approval. Its entrypoint remains unresolved with the dispatcher. Drafting/review may continue; the delivery lane must resolve that requirement before beginning implementation. No production deployment belongs to this ticket.
+**Execution boundary:** For KPR-451, the user explicitly selected `dodi-dev:drive-epic` in place of `/spec-and-implement`, recorded in epic comment `9ae7412e-daf5-42d4-b13d-9173e3a447bb`. That epic-specific instruction authorizes the approved plan's child delivery lane; it does not change the repository workflow for other epics. No production deployment belongs to this ticket.
 
 ## Testing Contract
 
@@ -694,4 +694,4 @@ it("KPR-453: role callers can supply identity without changing detached defaults
 - The optional public identity contract, runtime-only projection, and unavailable detached identity are approved spec decisions, not new product questions.
 - Existing mutable-runner reuse is sequential. This ticket does not add overlapping `send()` support on one runner; parallel spawns remain separate runners.
 - All in-process factories in approved spec D3 are covered. The shared reference is deliberately an internal type; downstream consumers must read `.current` at execution time.
-- Review the complete plan independently, then let the dispatcher apply readiness after dependency checks. Do not self-approve, label tickets, deploy, or open/merge PRs from the planning leaf.
+- Specification and plan approval are complete; child readiness and delivery remain dispatcher-owned. Planning leaves do not self-approve, label tickets, deploy, or open/merge PRs.

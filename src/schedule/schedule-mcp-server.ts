@@ -8,6 +8,7 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { Db } from "mongodb";
+import type { WorkItemContextRef } from "../agents/agent-runner.js";
 
 const MAX_SCHEDULES = 10;
 const MIN_INTERVAL_MINUTES = 15;
@@ -20,6 +21,8 @@ interface AgentDefDoc {
 }
 
 export interface ScheduleToolDeps {
+  /** Optional live runtime context; never copy it into a stored document. */
+  workItemContext?: WorkItemContextRef;
   db: Db;
   agentId: string;
 }
