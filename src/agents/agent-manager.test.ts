@@ -7041,6 +7041,7 @@ describe("AgentManager", () => {
     function installEchoStreamingRunner(
       opts: {
         failOnTurn?: number;
+        throwOnTurn?: number;
         hangOnTurn?: number;
         hangResultSubtype?: string;
         /**
@@ -7071,6 +7072,10 @@ describe("AgentManager", () => {
           for await (const m of input) {
             n++;
             pushed.push(String(m.message?.content ?? ""));
+            if (opts.throwOnTurn === n) {
+              out.push(new Error("streaming session failed"));
+              continue;
+            }
             if (opts.failOnTurn === n) {
               out.push({ type: "result", subtype: "error_during_execution", errors: ["boom"], session_id: `sess-warm-${n}`, total_cost_usd: 0, duration_ms: 1 });
               continue;
@@ -7101,7 +7106,11 @@ describe("AgentManager", () => {
           out.end();
         })();
         return {
-          next: () => it.next(),
+          next: async () => {
+            const message = await it.next();
+            if (message.value instanceof Error) throw message.value;
+            return message;
+          },
           interrupt,
           close: close.mockImplementation(() => out.end()),
           [Symbol.asyncIterator]() {
@@ -7225,6 +7234,366 @@ describe("AgentManager", () => {
       // 2nd positional arg to AgentRunner's constructor (index 10, matching
       // the cold-path laneAPassthrough pin at (6b) above).
       expect(vi.mocked(AgentRunner).mock.calls.at(-1)![10]).toEqual({ workerPool: pool });
+    });
+
+    describe("KPR-467 call-pinned reload routing", () => {
+      // Real adapter and manager; only the response transport and vendor runner
+      // are fake. The dispatcher hook models a reload after adapter reads but
+      // before manager admission, without mocking either side of the seam.
+      async function adapterTurn(latest: string, beforeAdmission?: () => void, options: { status?: number; stream?: boolean } = {}) {
+        const { VoiceAdapter } = await import("../channels/voice/voice-adapter.js");
+        const { EventEmitter } = await import("node:events");
+        const res = Object.assign(new EventEmitter(), {
+          destroyed: false,
+          writableEnded: false,
+          writeHead: vi.fn(),
+          write: vi.fn(),
+          end: vi.fn(),
+        });
+        const adapter = new VoiceAdapter(0, "", "", registry as any,
+          { ...memoryManager, getHotTierPrompt: vi.fn().mockResolvedValue("") } as any,
+          manager, { routeVoiceTurn: async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+            beforeAdmission?.();
+            return manager.spawnTurn(ctx, onStream);
+          } } as any);
+        await (adapter as any).handleChatCompletion({}, res, {
+          model: "voice", stream: options.stream ?? false, call: { id: "call-1" },
+          messages: [
+            { role: "user", content: "original question" },
+            { role: "assistant", content: "earlier answer" },
+            { role: "user", content: latest },
+          ],
+        }, "agent-a", registry.get("agent-a"));
+        expect(res.writeHead).toHaveBeenCalledWith(options.status ?? 200, expect.anything());
+        return res;
+      }
+
+      it.each([false, true])("adapter preserves pinned-lease incremental prompts after reload (missing store row: %s)", async (missingRow) => {
+        const { pushed } = installEchoStreamingRunner();
+        await adapterTurn("opening question");
+        expect(pushed[0]).toContain("Caller: original question");
+        registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "openai/gpt-5.4-mini" }));
+        if (missingRow) sessionStore._sessions.delete(WARM_KEY);
+        await adapterTurn("follow-up question");
+        expect(pushed[1]).toMatch(/^follow-up question\n\n\*\*Current date\/time\*\*: /);
+        expect(pushed[1]).not.toContain("original question");
+        expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+        expect(mockOpenAIRunTurn).not.toHaveBeenCalled();
+        warmLeases(manager).get(WARM_KEY)!.close("call-ended");
+        await adapterTurn("fresh route question");
+        const freshInput = mockOpenAIRunTurn.mock.calls.at(-1)![0];
+        expect(freshInput.sessionId).toBeUndefined();
+        expect(freshInput.prompt).toContain("Caller: original question");
+        expect(freshInput.prompt).toContain("You: earlier answer");
+        expect(freshInput.prompt).not.toContain("session continuity was reset");
+      });
+
+      it.each(["claude", "openai"])("adapter retains the full transcript when admission switches away from %s", async (from) => {
+        const { pushed } = installEchoStreamingRunner();
+        registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: from === "claude" ? "claude-sonnet-4-6" : "openai/gpt-5.4-mini" }));
+        sessionStore._sessions.set(WARM_KEY, { sessionId: "stored-before-reload", provider: from });
+        await adapterTurn("question after reload", () => {
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: from === "claude" ? "openai/gpt-5.4-mini" : "claude-sonnet-4-6" }));
+        });
+        if (from === "claude") {
+          const input = mockOpenAIRunTurn.mock.calls[0]![0];
+          expect(input.sessionId).toBeUndefined();
+          expect(input.prompt).toContain("Caller: original question");
+          expect(input.prompt).toContain("You: earlier answer");
+          expect(input.prompt).toContain("Caller: question after reload");
+        } else {
+          expect(mockRunnerOpenStream.mock.calls[0]![0].sessionId).toBeUndefined();
+          const lease = warmLeases(manager).get(WARM_KEY)!;
+          expect(lease.turns).toBe(1);
+          expect(pushed[0]).toContain("Caller: original question");
+          expect(pushed[0]).toContain("You: earlier answer");
+          expect(pushed[0]).toContain("Caller: question after reload");
+        }
+      });
+
+      it.each(["returned", "thrown"] as const)("round2: missing-row active warm %s failure retries the full transcript once before bytes", async (failure) => {
+        const { pushed } = installEchoStreamingRunner(failure === "returned" ? { failOnTurn: 2 } : { throwOnTurn: 2 });
+        await adapterTurn("opening question");
+        sessionStore._sessions.delete(WARM_KEY);
+        const spawn = vi.spyOn(manager, "spawnTurn");
+        const res = await adapterTurn("recover this question", undefined, { stream: true });
+        expect(spawn).toHaveBeenCalledTimes(2);
+        expect(mockRunnerOpenStream).toHaveBeenCalledTimes(2);
+        expect(mockRunnerOpenStream.mock.calls[1]![0].sessionId).toBeUndefined();
+        expect(pushed).toHaveLength(3);
+        expect(pushed[1]).toMatch(/^recover this question\n/);
+        expect(pushed[2]).toContain("Caller: original question");
+        expect(pushed[2]).toContain("You: earlier answer");
+        expect(pushed[2]).toContain("Caller: recover this question");
+        expect(res.write.mock.calls.filter(([chunk]) => String(chunk).includes("reply-1"))).toHaveLength(1);
+      });
+
+      it.each([
+        ["claude", "returned"], ["claude", "thrown"],
+        ["openai", "returned"], ["openai", "thrown"],
+      ] as const)("round2: fresh admission after %s switch is not resume-retried on %s failure", async (from, failure) => {
+        installEchoStreamingRunner({ failOnTurn: 1 });
+        registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: from === "claude" ? "claude-sonnet-4-6" : "openai/gpt-5.4-mini" }));
+        sessionStore._sessions.set(WARM_KEY, { sessionId: "old-provider-session", provider: from });
+        if (failure === "thrown") {
+          mockRunnerOpenStream.mockRejectedValue(new Error("session open failed"));
+          mockOpenAIRunTurn.mockRejectedValue(new Error("session failed"));
+        } else {
+          mockOpenAIRunTurn.mockResolvedValue(makeRunResult({ error: "boom" }));
+        }
+        const spawn = vi.spyOn(manager, "spawnTurn");
+        await adapterTurn("fresh question", () => {
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: from === "claude" ? "openai/gpt-5.4-mini" : "claude-sonnet-4-6" }));
+        }, { status: 500, stream: true });
+        expect(spawn).toHaveBeenCalledTimes(1);
+        if (from === "claude") {
+          expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+          expect(mockOpenAIRunTurn.mock.calls[0]![0].sessionId).toBeUndefined();
+          expect(mockOpenAIRunTurn.mock.calls[0]![0].prompt).toContain("Caller: original question");
+        } else {
+          expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+          expect(mockRunnerOpenStream.mock.calls[0]![0].sessionId).toBeUndefined();
+        }
+      });
+
+      it.each([
+        ["claude", true], ["claude", false], ["openai", true], ["openai", false],
+      ] as const)("round2: post-lock session read pins %s admission across reload (compatible handle: %s)", async (provider, compatible) => {
+        appConfig.voice.warmPath.enabled = false;
+        const model = provider === "claude" ? "claude-sonnet-4-6" : "openai/gpt-5.4-mini";
+        const other = provider === "claude" ? "openai" : "claude";
+        const definition = makeAgentConfig({ id: "agent-a", model, timeoutMs: 900_000 });
+        registry._agents.set("agent-a", definition);
+        sessionStore._sessions.set(WARM_KEY, { sessionId: "stored-candidate", provider: compatible ? provider : other });
+        const originalGet = sessionStore.get.getMockImplementation()!;
+        let resumeRead!: () => void;
+        const pausedRead = new Promise<void>((resolve) => { resumeRead = resolve; });
+        let markReading!: () => void;
+        const reading = new Promise<void>((resolve) => { markReading = resolve; });
+        sessionStore.get.mockImplementationOnce(originalGet).mockImplementationOnce(async (...args: Parameters<typeof originalGet>) => {
+          markReading();
+          await pausedRead;
+          return originalGet(...args);
+        });
+        const acquire = vi.spyOn(manager.circuitBreakers, "acquire");
+        const record = vi.spyOn(manager.circuitBreakers, "record");
+        const spawn = vi.spyOn(manager, "spawnTurn");
+        const pending = adapterTurn("question after paused read");
+        await reading;
+        try {
+          expect(acquire).toHaveBeenCalledWith(provider, expect.objectContaining({ deadlineMs: 900_000 }));
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: other === "claude" ? "claude-haiku-4-5" : "openai/gpt-5.4", timeoutMs: 10 }));
+        } finally {
+          resumeRead();
+        }
+        await pending;
+        expect(spawn).toHaveBeenCalledTimes(1);
+        expect(provider === "claude" ? mockRunnerSend : mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+        const input = provider === "claude"
+          ? { prompt: mockRunnerSend.mock.calls[0]![0], sessionId: mockRunnerSend.mock.calls[0]![1] }
+          : mockOpenAIRunTurn.mock.calls[0]![0];
+        expect(input.sessionId).toBe(compatible ? "stored-candidate" : undefined);
+        if (compatible) {
+          expect(input.prompt).toBe("question after paused read");
+          expect(input.prompt).not.toContain("original question");
+        } else {
+          expect(input.prompt).toContain("Caller: original question");
+          expect(input.prompt).toContain("You: earlier answer");
+        }
+        expect(provider === "claude" ? mockOpenAIRunTurn : mockRunnerSend).not.toHaveBeenCalled();
+        expect(vi.mocked(AgentRunner).mock.calls.at(-1)![0]).toBe(definition);
+        expect(record).toHaveBeenCalledTimes(1);
+        expect(record.mock.calls[0]![0]).toBe(acquire.mock.results[0]!.value);
+        expect(turnTelemetryStore.record).toHaveBeenLastCalledWith(expect.objectContaining({ model }));
+        // Voice still bypasses the classifier and keeps its original limits path.
+        expect(routeModel).not.toHaveBeenCalled();
+        expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+      });
+
+      it("keeps a long-running warm half-open probe valid under the opening watchdog after reload", async () => {
+        let now = 0;
+        (manager as any).circuitBreakers = new ProviderCircuitBreakerRegistry(undefined, () => now);
+        registry._agents.get("agent-a")!.timeoutMs = 900_000;
+        const { pushed, releaseHang } = installEchoStreamingRunner({ hangOnTurn: 2 });
+        await manager.spawnTurn(makeVoiceCtx());
+        for (let i = 0; i < 3; i++) {
+          const permit = manager.circuitBreakers.acquire("claude");
+          manager.circuitBreakers.record(permit, { outcome: "fault", kind: "connect-fail", message: "fetch failed" }, 0);
+        }
+        registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "openai/gpt-5.4-mini", timeoutMs: 10 }));
+        now = 15_000;
+        const probe = manager.spawnTurn(makeVoiceCtx());
+        try {
+          await vi.waitFor(() => expect(pushed).toHaveLength(2));
+          now += 361_000; // past the metadata-less 360s stale bound, before the pinned 900s deadline
+          expect(() => manager.circuitBreakers.acquire("claude")).toThrow(ProviderCircuitOpenError);
+          expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("half-open");
+          releaseHang();
+          expect((await probe).errors).toEqual([]);
+          expect(manager.circuitBreakers.stateFor("claude")!.state).toBe("closed");
+        } finally {
+          releaseHang();
+          await probe;
+        }
+      });
+
+      it("reuses the opening Claude lease after a cross-provider reload; the next call uses OpenAI", async () => {
+        vi.useFakeTimers();
+        const { pushed } = installEchoStreamingRunner();
+        let nextTurn: Promise<unknown> | undefined;
+        try {
+          await manager.spawnTurn(makeVoiceCtx());
+          const acquire = vi.spyOn(manager.circuitBreakers, "acquire");
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "openai/gpt-5.4-mini" }));
+          let completed = false;
+          nextTurn = manager.spawnTurn(makeVoiceCtx()).then((result) => {
+            completed = true;
+            return result;
+          });
+          // A retained lease completes without waiting for its own 120s idle release.
+          await vi.advanceTimersByTimeAsync(25);
+          expect(completed).toBe(true);
+          expect(await nextTurn).toMatchObject({ warmPath: true, warmTurnSeq: 2, finalMessage: "reply-2" });
+          expect(acquire).toHaveBeenLastCalledWith("claude", expect.anything());
+          expect(pushed).toHaveLength(2);
+          expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+          expect(turnTelemetryStore.record).toHaveBeenLastCalledWith(expect.objectContaining({ model: "claude-haiku-4-5" }));
+          expect(sessionStore.set).toHaveBeenLastCalledWith("agent-a", "voice:call-1", "sess-warm-2", "claude", expect.anything(), null);
+
+          warmLeases(manager).get(WARM_KEY)!.close("call-ended");
+          await vi.advanceTimersByTimeAsync(25);
+          const fresh = await manager.spawnTurn(makeVoiceCtx());
+          expect(fresh.warmPath).toBeUndefined();
+          expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+          expect(turnTelemetryStore.record).toHaveBeenLastCalledWith(expect.objectContaining({ model: "openai/gpt-5.4-mini" }));
+        } finally {
+          manager.stopAgent("agent-a");
+          const settled = nextTurn?.catch(() => {});
+          await vi.advanceTimersByTimeAsync(25);
+          await settled;
+          vi.useRealTimers();
+        }
+      });
+
+      it("pins model and watchdog across a same-provider reload, then opens with the latest definition", async () => {
+        vi.useFakeTimers();
+        const { interrupt } = installEchoStreamingRunner({ hangOnTurn: 2 });
+        registry._agents.get("agent-a")!.timeoutMs = 100;
+        const activityLogger = { record: vi.fn() };
+        manager = new AgentManager(
+          registry as any, memoryManager as any, sessionStore as any,
+          undefined as any, turnTelemetryStore as any, activityLogger as any,
+        );
+        try {
+          await manager.spawnTurn(makeVoiceCtx());
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "claude-sonnet-4-6", timeoutMs: 10 }));
+          const second = manager.spawnTurn(makeVoiceCtx());
+          await vi.advanceTimersByTimeAsync(10);
+          expect(interrupt).not.toHaveBeenCalled();
+          await vi.advanceTimersByTimeAsync(90);
+          expect(await second).toMatchObject({ warmTurnSeq: 2, timedOut: true });
+          expect(interrupt).toHaveBeenCalledTimes(1);
+          expect(turnTelemetryStore.record).toHaveBeenLastCalledWith(expect.objectContaining({ model: "claude-haiku-4-5" }));
+          expect(activityLogger.record).toHaveBeenLastCalledWith(expect.objectContaining({ model: "claude-haiku-4-5", modelTier: "haiku" }));
+          warmLeases(manager).get(WARM_KEY)!.close("call-ended");
+          await vi.advanceTimersByTimeAsync(25);
+
+          const freshRunner = installEchoStreamingRunner({ hangOnTurn: 2 });
+          await manager.spawnTurn(makeVoiceCtx());
+          expect(vi.mocked(AgentRunner).mock.calls.at(-1)![0]).toMatchObject({ model: "claude-sonnet-4-6", timeoutMs: 10 });
+          expect(turnTelemetryStore.record).toHaveBeenLastCalledWith(expect.objectContaining({ model: "claude-sonnet-4-6" }));
+          const freshSecond = manager.spawnTurn(makeVoiceCtx());
+          await vi.advanceTimersByTimeAsync(10);
+          expect(await freshSecond).toMatchObject({ warmTurnSeq: 2, timedOut: true });
+          expect(freshRunner.interrupt).toHaveBeenCalledTimes(1);
+        } finally {
+          manager.stopAgent("agent-a");
+          await vi.advanceTimersByTimeAsync(25);
+          vi.useRealTimers();
+        }
+      });
+
+      it.each(["reflection", "nonvoice", "flag-off"] as const)("keeps %s traffic off the active lease after reload", async (kind) => {
+        vi.useFakeTimers();
+        const { pushed } = installEchoStreamingRunner();
+        let pending: Promise<unknown> | undefined;
+        try {
+          await manager.spawnTurn(makeVoiceCtx());
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "claude-sonnet-4-6" }));
+          const ctx = kind === "reflection"
+            ? { ...makeVoiceCtx(), kind: "reflection" as const }
+            : kind === "nonvoice"
+              ? makeSmsCtx({ threadId: "voice:call-1" })
+              : makeVoiceCtx();
+          if (kind === "flag-off") appConfig.voice.warmPath.enabled = false;
+          let completed = false;
+          pending = manager.spawnTurn(ctx).then((result) => {
+            completed = true;
+            return result;
+          });
+          await vi.advanceTimersByTimeAsync(25);
+          expect(completed).toBe(false);
+          expect(pushed).toHaveLength(1);
+          warmLeases(manager).get(WARM_KEY)!.close("call-ended");
+          await vi.advanceTimersByTimeAsync(25);
+          expect(await pending).not.toHaveProperty("warmPath");
+          expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+        } finally {
+          manager.stopAgent("agent-a");
+          const settled = pending?.catch(() => {});
+          await vi.advanceTimersByTimeAsync(25);
+          await settled;
+          vi.useRealTimers();
+        }
+      });
+
+      it.each(["stop", "disable", "removal"] as const)("preserves %s lifecycle rejection after reload", async (action) => {
+        const { close, pushed } = installEchoStreamingRunner();
+        await manager.spawnTurn(makeVoiceCtx());
+        registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "openai/gpt-5.4-mini" }));
+        // The registry excludes disabled/removed agents; index.ts then stops
+        // their active tickets. Exercise that same sequence at the manager seam.
+        if (action !== "stop") {
+          registry._agents.delete("agent-a");
+          await expect(manager.spawnTurn(makeVoiceCtx())).rejects.toThrow("Unknown agent");
+        }
+        manager.stopAgent("agent-a");
+        await expect(manager.spawnTurn(makeVoiceCtx())).rejects.toThrow(action === "stop" ? /stopped/ : /Unknown agent/);
+        await Promise.resolve();
+        expect(close).toHaveBeenCalledTimes(1);
+        expect(warmLeases(manager).size).toBe(0);
+        expect(pushed).toHaveLength(1);
+        expect(mockOpenAIRunTurn).not.toHaveBeenCalled();
+        expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0);
+      });
+
+      it("rechecks opening eligibility after waiting for an existing cold turn's lock", async () => {
+        vi.useFakeTimers();
+        installEchoStreamingRunner();
+        let finishCold!: () => void;
+        mockRunnerSend.mockImplementationOnce(() => new Promise((resolve) => {
+          finishCold = () => resolve(makeRunResult());
+        }));
+        try {
+          const cold = manager.spawnTurn({ ...makeVoiceCtx(), kind: "reflection" });
+          await vi.advanceTimersByTimeAsync(0);
+          const queued = manager.spawnTurn(makeVoiceCtx());
+          registry._agents.set("agent-a", makeAgentConfig({ id: "agent-a", model: "openai/gpt-5.4-mini" }));
+          finishCold();
+          await cold;
+          await vi.advanceTimersByTimeAsync(25);
+          const result = await queued;
+          expect(result.warmPath).toBeUndefined();
+          expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+          expect(mockOpenAIRunTurn).toHaveBeenCalledTimes(1);
+          expect(warmLeases(manager).size).toBe(0);
+          expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0);
+        } finally {
+          manager.stopAgent("agent-a");
+          await vi.advanceTimersByTimeAsync(25);
+          vi.useRealTimers();
+        }
+      });
     });
 
     // ---- assertion 5 -----------------------------------------------------

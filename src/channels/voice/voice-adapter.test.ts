@@ -79,6 +79,7 @@ function makeAgentManager(turnResult: Partial<TurnResult> = {}, throwError?: str
 
   const spawnTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
     calls.push({ ctx, onStream });
+    ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
     if (throwError) throw new Error(throwError);
     return {
       finalMessage: "agent reply",
@@ -516,6 +517,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     // Simulate text-delta chunks while spawnTurn is awaited.
     am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       // No headers yet (no chunks emitted).
       expect(res.headersSent).toBe(false);
       onStream!("Hel");
@@ -574,6 +576,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     // First call errors (in errors[]), second succeeds.
     am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       return {
         finalMessage: "",
         newSessionId: "",
@@ -617,6 +620,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
 
     const failingTurn = async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       return {
         finalMessage: "",
         newSessionId: "",
@@ -652,6 +656,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     am.spawnTurn.mockReset();
     am.spawnTurn.mockImplementation(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       return {
         finalMessage: "fresh",
         newSessionId: "new-sid",
@@ -697,7 +702,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     expect(body.error).toBe("Voice unavailable");
   });
 
-  it("KPR-313: provider mismatch at the read ⇒ no resume, no tag, FULL-transcript prompt (voice's native handoff), no annotation", async () => {
+  it("KPR-467: forwards the stored candidate and both prompt forms for authoritative admission", async () => {
     const am = makeAgentManager();
     am.sessionStoreGet.mockResolvedValueOnce({ sessionId: "resp_openai_123", provider: "openai" });
     const adapter = makeVoiceAdapter(am);
@@ -714,16 +719,13 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     await callHandle(adapter, req, res);
 
     const ctx = am.calls[0]!.ctx;
-    expect(ctx.sessionId).toBeUndefined(); // mismatched handle never attempted
-    expect(ctx.sessionProvider).toBeUndefined(); // spawnTurn guard has nothing to trip on
-    // FULL transcript, not latest-message-only — pre-313 the doomed resume
-    // failed HARD and the outer retry re-sent the transcript; a naive
-    // guard-strip downstream would have silently sent only the last line.
-    expect(ctx.workItem.text).toContain("Caller: first user line");
-    expect(ctx.workItem.text).toContain("You: first agent line");
-    expect(ctx.workItem.text).toContain("Caller: latest user line");
-    // Voice carve-out: annotation-free (the transcript IS the handoff).
-    expect(ctx.workItem.text).not.toContain("session continuity was reset");
+    expect(ctx.sessionId).toBe("resp_openai_123");
+    expect(ctx.sessionProvider).toBe("openai");
+    expect(ctx.voicePrompt?.latestUserMessage).toBe("latest user line");
+    expect(ctx.voicePrompt?.fullConversation).toContain("Caller: first user line");
+    expect(ctx.voicePrompt?.fullConversation).toContain("You: first agent line");
+    expect(ctx.voicePrompt?.fullConversation).toContain("Caller: latest user line");
+    expect(am.providerFor).not.toHaveBeenCalled();
   });
 
   it("KPR-313: codex-tagged mapping-only row (no handle) ⇒ full transcript, no resume", async () => {
@@ -766,7 +768,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     expect(ctx.sessionId).toBe("resume-sid-match");
     expect(ctx.sessionProvider).toBe("claude");
     expect(ctx.workItem.text).toBe("latest user line");
-    expect(am.providerFor).toHaveBeenCalledWith("mokie");
+    expect(am.providerFor).not.toHaveBeenCalled();
   });
 });
 
@@ -1020,6 +1022,7 @@ describe("E2 abort-on-disconnect (KPR-322)", () => {
     const res = new MockServerResponse();
     am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       res.emit("close");
       return {
         finalMessage: "",
@@ -1062,6 +1065,7 @@ describe("E2 abort-on-disconnect (KPR-322)", () => {
 
     am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
       am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
       onStream!("before ");
       res.emit("close");
       onStream!("after ");

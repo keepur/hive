@@ -119,13 +119,20 @@ export interface TurnContext {
   /**
    * KPR-313: provider tag of the stored session — set wherever sessionId is
    * resolved from the session store (runWorkItemTurn, reflection reads,
-   * voice's eligibility-filtered read). Consumed by spawnTurn's
+   * voice's candidate read). Consumed by spawnTurn's
    * session-identity guard. undefined ⇒ nothing known about the row's
    * producer (first turn, or a caller that resolved no session).
    */
   // R2 (KPR-394): widened from AgentProviderId — StoredSessionRef.provider is
   // now a string (plugin provider ids are arbitrary registered strings).
   sessionProvider?: string;
+  /** KPR-467: voice renders both forms; admission selects against the
+   * actual lease/resume. Never log this transcript-bearing payload. */
+  voicePrompt?: { latestUserMessage: string; fullConversation: string };
+  /** KPR-467: report admitted continuity before execution, including paths
+   * that throw. The voice adapter uses this for its pre-bytes outer retry;
+   * a candidate store handle is not evidence that admission resumed it. */
+  onVoiceAdmission?: (continuity: "warm" | "resume" | "fresh") => void;
   /**
    * KPR-313: set ONLY by spawnTurn's session-identity guard when this turn
    * starts fresh due to a provider change; prepareSpawn prepends the handoff
@@ -344,6 +351,15 @@ interface ProviderModelRoute {
 
 const REASONING_EFFORTS = new Set<CodexReasoningEffort>(["minimal", "none", "low", "medium", "high", "xhigh"]);
 
+/** KPR-467: initialized before publication; every turn describes the Query opened for this call. */
+type WarmVoiceLease = WarmVoiceSession & {
+  readonly opening: {
+    readonly model: string;
+    readonly route: ProviderModelRoute;
+    readonly timeoutMs: number;
+  };
+};
+
 function resolveProviderModel(model: string): ProviderModelRoute {
   const normalized = model.trim();
   const slash = normalized.indexOf("/");
@@ -392,6 +408,12 @@ function splitProviderModel(providerModel: string): { model: string; reasoningEf
   return { model: providerModel.slice(0, colon), reasoningEffort: suffix as CodexReasoningEffort };
 }
 
+interface VoiceAdmissionSnapshot {
+  config: AgentConfig | undefined;
+  route: ProviderModelRoute;
+  eventSubscribersJson: string;
+}
+
 /**
  * KPR-311 → KPR-338: per-turn spawn shaping — shaped prompt plus the agent's
  * static route. Post-KPR-338 the route IS the static route on every path
@@ -403,6 +425,9 @@ function splitProviderModel(providerModel: string): { model: string; reasoningEf
  * per-turn routing stays parked (kpr-311-spec §5 → KPR-337).
  */
 interface SpawnShaping {
+  /** Real cold voice turns carry the post-lock admission snapshot through
+   * shaping and every spawn attempt; nonvoice/reflection retain their path. */
+  voiceAdmission?: VoiceAdmissionSnapshot;
   prompt: string;
   /** The agent's static route — consumed by createProviderAdapter. */
   route: ProviderModelRoute;
@@ -652,7 +677,7 @@ export class AgentManager {
   // ticket acquisition; removed by lease.close() via onClosed (identity-
   // checked). The lease's ticket lives in activeTickets like any spawn, so
   // stopAgent/stopAll/sweep and the snapshot see it without special-casing.
-  private warmLeases = new Map<string, WarmVoiceSession>();
+  private warmLeases = new Map<string, WarmVoiceLease>();
   // KPR-220 Phase 6: per-(agentId,threadId) reflection coordinator state.
   private reflectionStates = new Map<string, ReflectionState>();
   private reflectionDebounceMs: number;
@@ -824,8 +849,8 @@ export class AgentManager {
    * snapshot they read BEFORE that await, so a SIGUSR1 reload landing inside
    * the await window cannot swap the runner's config out from under them —
    * this restores the pre-extraction read ordering in `createProviderAdapter`
-   * and removes its double registry read. Callers with no such gap
-   * (`openWarmLease`) omit it and let this method read.
+   * and removes its double registry read. Warm leases also pass the exact
+   * opening definition so the Query and its pinned telemetry agree.
    */
   private createRunner(
     agentId: string,
@@ -852,14 +877,20 @@ export class AgentManager {
     agentId: string,
     route: ProviderModelRoute,
     workItemContext?: WorkItemContext,
+    voiceAdmission?: VoiceAdmissionSnapshot,
   ): Promise<AgentProviderAdapter> {
-    const config = this.registry.get(agentId);
+    // Preserve the live removal fence, but never replace the admitted route's
+    // definition with a reloaded one after session I/O.
+    const currentConfig = this.registry.get(agentId);
+    if (!currentConfig) throw new Error(`Unknown agent: ${agentId}`);
+    const config = voiceAdmission ? voiceAdmission.config : currentConfig;
     if (!config) throw new Error(`Unknown agent: ${agentId}`);
-    // Read the subscriber snapshot HERE, beside the definition read and
+    // Reuse voice admission's subscriber snapshot; other turns read it
+    // HERE, beside the definition read and
     // before the Lane A await below (review round 4, issue 5): both are
     // handed to createRunner so a SIGUSR1 reload landing inside the
     // credential-resolve window cannot half-swap the runner's inputs.
-    const eventSubscribersJson = JSON.stringify(this.registry.getSubscriberMap());
+    const eventSubscribersJson = voiceAdmission?.eventSubscribersJson ?? JSON.stringify(this.registry.getSubscriberMap());
 
     // KPR-346 (§D3/§D4): Lane A passthrough — credential + model resolved
     // per spawn, BEFORE runner construction. A missing credential throws
@@ -1329,13 +1360,14 @@ export class AgentManager {
     // the outer retry, all error rows, and the 322 bridge contract are
     // untouched (spec §5). Flag off / non-eligible → the code below this
     // block is byte-identical to pre-323.
-    if (this.isWarmPathEligible(ctx)) {
+    if (this.isWarmVoiceTurn(ctx)) {
       const threadKey = `${ctx.agentId}:${ctx.threadId}`;
       const lease = this.warmLeases.get(threadKey);
       if (lease && !lease.isClosed) {
-        return this.runWarmTurn(lease, ctx, onStream);
+        ctx.onVoiceAdmission?.("warm");
+        return this.runWarmTurn(lease, this.shapeVoicePrompt(ctx, true), onStream);
       }
-      return this.openWarmLease(ctx, onStream);
+      if (this.isWarmPathEligible(ctx)) return this.openWarmLease(ctx, onStream);
     }
 
     return this.withSpawnTicket(ctx, async (ticket) => {
@@ -1348,6 +1380,10 @@ export class AgentManager {
       // held for microseconds during a fast-fail — no I/O precedes the throw.
       const acquireAgentConfig = this.registry.get(ctx.agentId);
       const route = resolveProviderModel(acquireAgentConfig?.model ?? "");
+      const voiceAdmission: VoiceAdmissionSnapshot | undefined =
+        ctx.channel === "voice" && ctx.kind !== "reflection"
+          ? { config: acquireAgentConfig, route, eventSubscribersJson: JSON.stringify(this.registry.getSubscriberMap()) }
+          : undefined;
       const permit = this.circuitBreakers.acquire(route.provider, {
         agentId: ctx.agentId,
         threadId: ctx.threadId,
@@ -1463,6 +1499,8 @@ export class AgentManager {
         }
       }
 
+      effectiveCtx = this.shapeVoicePrompt(effectiveCtx, !!effectiveCtx.sessionId);
+      if (voiceAdmission) effectiveCtx.onVoiceAdmission?.(effectiveCtx.sessionId ? "resume" : "fresh");
       if (!effectiveCtx.sessionId) this.recordSpawn(effectiveCtx.workItem.source.id);
 
       // KPR-224 + KPR-226: shape prompt + resolve model router once at the
@@ -1472,7 +1510,7 @@ export class AgentManager {
       // throw in shaping (e.g., formatFilesForPrompt on malformed file
       // metadata) cannot leak the per-thread lock or budget slot — KPR-226
       // regression prevention.
-      const shaping = await this.prepareSpawn(effectiveCtx);
+      const shaping = await this.prepareSpawn(effectiveCtx, voiceAdmission);
 
       let dispatchAt: number | undefined; // KPR-323 C1: T3 anchor (adapter.runTurn)
       const markDispatch = () => {
@@ -1643,7 +1681,7 @@ export class AgentManager {
           initToFirstTokenMs: finalResult.initToFirstTokenMs,
         };
       }
-      this.recordSpawnObservability(effectiveCtx, shaping, finalResult, !!finalAttemptSessionId);
+      this.recordSpawnObservability(effectiveCtx, shaping, finalResult, !!finalAttemptSessionId, voiceAdmission?.config?.model);
 
       // KPR-220 Phase 6: post-quiescence reflection scheduling. Reflection
       // turns themselves don't reschedule (kind="reflection" guard).
@@ -1677,7 +1715,7 @@ export class AgentManager {
    *    cold path's runnerOptions — but that addition is orthogonal to this
    *    laneAPassthrough omission decision and does not reopen the gap.)
    */
-  private isWarmPathEligible(ctx: TurnContext): boolean {
+  private isWarmVoiceTurn(ctx: TurnContext): boolean {
     if (ctx.channel !== "voice" || ctx.kind === "reflection") return false;
     // Optional chaining keeps test config mocks without a `voice` key working
     // — the gate simply stays cold.
@@ -1691,7 +1729,23 @@ export class AgentManager {
     // makes a future regression degrade HONESTLY to the cold path (which
     // passes systemPromptOverride: undefined and builds the real prompt)
     // instead of silently running a whole call without identity/guardrails.
-    if (!ctx.systemPromptOverride) return false;
+    return !!ctx.systemPromptOverride;
+  }
+
+  /** Select only after admission has resolved continuity. A cleared resume
+   * stays cleared: retries must never recover a handle from the store. */
+  private shapeVoicePrompt(ctx: TurnContext, hasContinuity: boolean): TurnContext {
+    if (ctx.channel !== "voice" || ctx.kind === "reflection" || !ctx.voicePrompt) return ctx;
+    const latest = hasContinuity && ctx.voicePrompt.latestUserMessage;
+    return {
+      ...ctx,
+      ...(!latest ? { sessionId: undefined, sessionProvider: undefined, memoryDigestSeen: undefined } : {}),
+      workItem: { ...ctx.workItem, text: latest || ctx.voicePrompt.fullConversation },
+    };
+  }
+
+  private isWarmPathEligible(ctx: TurnContext): boolean {
+    if (!this.isWarmVoiceTurn(ctx)) return false;
     const def = this.registry.get(ctx.agentId);
     if (!def) return false;
     return resolveProviderModel(def.model).provider === "claude";
@@ -1787,6 +1841,36 @@ export class AgentManager {
     // "Lease ready" gate: acquisition errors propagate synchronously.
     await Promise.race([ready, coordinator]);
 
+    // KPR-467: admission may have waited behind a cold turn while the
+    // registry changed. Re-evaluate before opening a Claude-only Query;
+    // release our ticket before routing through the current definition.
+    if (!this.isWarmPathEligible(ctx)) {
+      lease.close("opening-ineligible");
+      await coordinator;
+      return this.spawnTurn(ctx, onStream);
+    }
+
+    // No await between this read and runner construction. Pin scalar policy
+    // separately from the registry object, and publish only the complete
+    // metadata so a turn arriving during session open never sees unset fields.
+    const definition = this.registry.get(ctx.agentId)!;
+    const pinnedLease: WarmVoiceLease = Object.assign(lease, {
+      opening: {
+        model: definition.model,
+        route: resolveProviderModel(definition.model),
+        timeoutMs: definition.timeoutMs ?? 300_000,
+      },
+    });
+
+    // The supplied handle is a candidate, never a new store read. A reload
+    // while admission waited may have changed its eligibility. An explicit
+    // retry with no handle remains fresh even if Mongo still has the old id.
+    if (ctx.sessionProvider && ctx.sessionProvider !== pinnedLease.opening.route.provider) {
+      ctx = { ...ctx, sessionId: undefined, sessionProvider: undefined };
+    }
+    ctx = this.shapeVoicePrompt(ctx, !!ctx.sessionId);
+    ctx.onVoiceAdmission?.(ctx.sessionId ? "resume" : "fresh");
+
     // Published BEFORE start() deliberately (review round 1, issue 4): the
     // registry entry is what makes a second turn arriving mid-open reuse this
     // lease. Deferring the publish until after start() would send that turn
@@ -1817,11 +1901,11 @@ export class AgentManager {
     //
     // Known edge case, documented not fixed: if a turn DID land in this
     // window and got closed as collateral, turn 1 specifically has no
-    // effectiveResume, so the adapter's outer retry (which requires a resume
-    // attempt) would NOT fire — the caller would get a hard failure on the
+    // admitted continuity, so the adapter's outer continuity retry
+    // would NOT fire — the caller would get a hard failure on the
     // very first exchange of the call rather than a graceful cold retry.
     // Acceptable given the window is a microtask.
-    this.warmLeases.set(threadKey, lease);
+    this.warmLeases.set(threadKey, pinnedLease);
 
     try {
       if (!ctx.sessionId) this.recordSpawn(ctx.workItem.source.id);
@@ -1836,10 +1920,9 @@ export class AgentManager {
       // already-degraded state — while the opened lease keeps half-open
       // probes warm mid-call (spec §5 breaker row).
       // Build the runner once; open the streaming session with resume =
-      // ctx.sessionId EXACTLY as passed (§4.2 resume-source rule — the
-      // adapter stays the single authority on resume-vs-full-prompt; the
-      // retry-shaped ctx {sessionId: undefined, full transcript} therefore
-      // opens a FRESH session and never resumes the one a retry escaped).
+      // the admitted ctx.sessionId (§4.2, amended by KPR-467): a compatible
+      // adapter candidate or undefined, never a store re-read. The retry's
+      // cleared handle therefore always opens a FRESH session.
       // KPR-390 parity with the cold path's runnerOptions (createProviderAdapter):
       // an agent with "worker-pool" in coreServers must get the in-process
       // server on a warm turn too, not just a cold one — laneAPassthrough
@@ -1849,6 +1932,7 @@ export class AgentManager {
       const runner = this.createRunner(
         ctx.agentId,
         this.workerPool ? { workerPool: this.workerPool } : undefined,
+        { config: definition, eventSubscribersJson: JSON.stringify(this.registry.getSubscriberMap()) },
       );
       const q = await runner.openVoiceStreamingSession({
         input: lease.inputQueue,
@@ -1878,7 +1962,7 @@ export class AgentManager {
     // Turn 1 runs through the same per-turn path as turns 2..N. Turn 1's
     // text is the adapter's full-transcript or greet-branch render,
     // unchanged from conversation-prompt.ts (§4.2).
-    return this.runWarmTurn(lease, ctx, onStream);
+    return this.runWarmTurn(pinnedLease, ctx, onStream);
   }
 
   /**
@@ -1915,17 +1999,16 @@ export class AgentManager {
    * reflection. One reflection per call is credited at release.
    */
   private async runWarmTurn(
-    lease: WarmVoiceSession,
+    lease: WarmVoiceLease,
     ctx: TurnContext,
     onStream?: SpawnTurnStreamCallback,
   ): Promise<TurnResult> {
-    const route = resolveProviderModel(this.registry.get(ctx.agentId)?.model ?? "");
+    const { route, model, timeoutMs } = lease.opening;
     const permit = this.circuitBreakers.acquire(route.provider, {
       agentId: ctx.agentId,
       threadId: ctx.threadId,
+      deadlineMs: timeoutMs,
     });
-
-    const timeoutMs = this.registry.get(ctx.agentId)?.timeoutMs ?? 300_000;
 
     let runResult: RunResult;
     try {
@@ -1971,7 +2054,7 @@ export class AgentManager {
       resourceLimits: undefined,
       routerCostUsd: 0,
       effortOverride: undefined,
-    }, runResult, resumedSession);
+    }, runResult, resumedSession, model);
     lease.lastTurn = { ctx, result: turnResult };
 
     if (runResult.error) {
@@ -2397,7 +2480,7 @@ export class AgentManager {
     ticket.attachAbort(() => {
       abortedEarly = true;
     });
-    const adapter = await this.createProviderAdapter(ctx.agentId, shaping.route, bgContext);
+    const adapter = await this.createProviderAdapter(ctx.agentId, shaping.route, bgContext, shaping.voiceAdmission);
     ticket.attachAbort(() => adapter.abort());
 
     // KPR-347 §D5: an abort that landed while the async assembly above was in
@@ -2629,10 +2712,12 @@ export class AgentManager {
    * (KPR-219) and explicitly bypasses prepending + model router. Returns
    * raw text + the static route for `ctx.channel === "voice"`.
    */
-  private async prepareSpawn(ctx: TurnContext): Promise<SpawnShaping> {
+  private async prepareSpawn(ctx: TurnContext, voiceAdmission?: VoiceAdmissionSnapshot): Promise<SpawnShaping> {
     const item = ctx.workItem;
 
-    // Static route — resolved ONCE per turn, here; createProviderAdapter
+    // Real voice uses the authoritative post-lock snapshot; other turns
+    // retain the existing shaping-time lookup below.
+    // Static route — resolved here; createProviderAdapter
     // consumes it (KPR-311). The `?.model ?? ""` guard mirrors the breaker
     // acquire site (KPR-306): SIGUSR1 hot-reload can remove the agent
     // between spawnTurn's registry pre-check and this point, and an
@@ -2643,8 +2728,8 @@ export class AgentManager {
     // flows on instead; the turn then fails INSIDE the recorded try via
     // createProviderAdapter's `Unknown agent` throw (classifyThrown →
     // non-provider → never trips).
-    const agentConfig = this.registry.get(ctx.agentId);
-    const staticRoute = resolveProviderModel(agentConfig?.model ?? "");
+    const agentConfig = voiceAdmission ? voiceAdmission.config : this.registry.get(ctx.agentId);
+    const staticRoute = voiceAdmission?.route ?? resolveProviderModel(agentConfig?.model ?? "");
     // KPR-338: static tier — guarded like staticRoute (KPR-306 wedged-permit
     // hazard; see the comment above). Only meaningful on the claude-static
     // router-on path below.
@@ -2654,7 +2739,7 @@ export class AgentManager {
     // explicitly bypasses prepending + model router. Pin via this branch so
     // future prepareSpawn edits cannot accidentally re-shape voice prompts.
     if (ctx.channel === "voice") {
-      return { prompt: item.text, route: staticRoute, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined };
+      return { prompt: item.text, route: staticRoute, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined, ...(voiceAdmission ? { voiceAdmission } : {}) };
     }
 
     const senderLabel = item.senderName ?? item.sender;
@@ -2916,6 +3001,7 @@ export class AgentManager {
     shaping: SpawnShaping,
     result: RunResult,
     resumedSession: boolean,
+    model = this.registry.get(ctx.agentId)?.model,
   ): void {
     const item = ctx.workItem;
     // KPR-389 D6: turn-kind discriminators from the dispatcher's conference meta.
@@ -2939,7 +3025,7 @@ export class AgentManager {
           agentId: ctx.agentId,
           threadId: ctx.threadId,
           sessionId: result.sessionId,
-          model: this.registry.get(ctx.agentId)?.model,
+          model,
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
           cacheReadTokens: result.cacheReadTokens,
@@ -3003,7 +3089,7 @@ export class AgentManager {
     if (intentTrailer) {
       log.info("Intent trailer detected", {
         agentId: ctx.agentId,
-        model: this.registry.get(ctx.agentId)?.model ?? "unknown",
+        model: model ?? "unknown",
         toolCalls: result.toolCalls,
       });
     }
@@ -3015,7 +3101,7 @@ export class AgentManager {
       senderName: item.senderName,
       channel: item.source.label,
       channelKind: item.source.kind,
-      model: this.registry.get(ctx.agentId)?.model ?? "unknown",
+      model: model ?? "unknown",
       // KPR-338 D4: tier is a static per-agent fact — audited on every
       // claude-static turn (R-311.7's observability feed, now static).
       // Pilots carry no tier: modelToTier is a Claude-id substring heuristic,
@@ -3182,7 +3268,8 @@ export class AgentManager {
       // an older `pkg/types/` RunResult and can legitimately omit the field
       // at runtime, where `undefined` would flow into a required-number
       // TurnResult slot and log as `undefined` on C5d. Every in-engine
-      // construction site still declares it explicitly (C5a is required).
+      // construction site declares it by convention and guard tests; the
+      // exported RunResult ABI keeps the field optional for older plugins.
       toolAckInjected: result.toolAckInjected ?? 0,
       streamed: result.streamed,
       compactions: result.compactions,
