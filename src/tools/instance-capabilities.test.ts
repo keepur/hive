@@ -93,10 +93,6 @@ describe("buildInstanceCapabilities", () => {
     expect(result.servers.unconfigured).toContain("tasks");
   });
 
-  it("always classifies code-task as configured", () => {
-    expect(result.servers.configured).toContain("code-task");
-  });
-
   it("does not include servers in both configured and unconfigured", () => {
     const overlap = result.servers.configured.filter((s) => result.servers.unconfigured.includes(s));
     expect(overlap).toEqual([]);
@@ -120,7 +116,6 @@ describe("SERVER_CREDENTIAL_CHECKS invariant", () => {
       "github-issues",
       "quo",
       "recall",
-      "code-task",
       "code-search",
       "browser",
       "tasks",

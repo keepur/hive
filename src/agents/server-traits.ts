@@ -8,7 +8,6 @@
 export const TURN_CONTEXT_DEPENDENT_SERVERS = new Set<string>([
   "callback",
   "background",
-  "code-task",
   "recall",
   "structured-memory",
   // KPR-390: worker-pool reads per-turn channel/thread metadata from a mutable

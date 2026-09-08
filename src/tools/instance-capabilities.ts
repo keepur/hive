@@ -50,7 +50,6 @@ const SERVER_CREDENTIAL_CHECKS: Record<string, () => boolean> = {
   "github-issues": () => !!config.github?.repo,
   quo: () => !!config.quo?.apiKey,
   recall: () => !!config.recall?.apiKey,
-  "code-task": () => true,
   "code-search": () => !!config.codeIndex?.enabled,
   browser: () => !!config.browser?.cdpEndpoint,
   tasks: () => (config.taskLedger?.apiUrl ?? "") !== "http://localhost:3002",
