@@ -1914,7 +1914,7 @@ export class AgentRunner {
     return getSkillsForAgent(this.skillIndex, this.agentConfig.id);
   }
 
-  private buildHooks(context?: WorkItemContext): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+  private buildHooks(_context?: WorkItemContext): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
     return {
       PreCompact: this.buildPreCompactMatcher(),
     };
