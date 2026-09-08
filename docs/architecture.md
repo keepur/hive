@@ -76,7 +76,6 @@ Each agent gets a subset of MCP servers — listed in its `coreServers` and `del
 - `tasks/task-mcp-server.ts` — generic task store.
 - `background/background-task-mcp-server.ts` — spawn detached long-running commands.
 - `code-index/code-search-mcp-server.ts` — semantic code search over indexed files.
-- `code-task/code-task-mcp-server.ts` — delegate coding to Claude Code CLI sessions.
 - `search/conversation-search-mcp-server.ts` — semantic search over past conversations.
 - `admin/admin-mcp-server.ts` — agent CRUD + version history, agent model catalog (model-id discovery/lookup, KPR-381) (admin-scoped).
 - `workers/worker-pool-mcp-server.ts` — dispatch/monitor/cancel detached meeting fetch-workers with a claim ledger (KPR-390).
@@ -97,7 +96,7 @@ Hive supports three distinct cross-agent coordination patterns. They do not over
 
 ### In-session sub-agent
 
-Synchronous, ephemeral, returns into the caller's turn. Driven by the SDK's `agents:` field, populated from `delegateServers` on the calling agent. The sub-agent is spawned for one focused task, returns its result, and is gone — it has no thread, no session, no inbox. Use when the calling agent needs a focused tool call done **right now** to finish the current turn (e.g. Jessica spawns a CRM-search specialist mid-turn). Built in `src/agents/agent-runner.ts:buildServerSubAgents`. Context-dependent servers (`callback`, `background`, `code-task`, `recall`, `structured-memory`) cannot be sub-agents because they need channel/thread context that does not exist in a sub-agent spawn. `memory` is also delegate-unsafe, but for a different reason: it is Hive-runtime-backed rather than turn-context-dependent.
+Synchronous, ephemeral, returns into the caller's turn. Driven by the SDK's `agents:` field, populated from `delegateServers` on the calling agent. The sub-agent is spawned for one focused task, returns its result, and is gone — it has no thread, no session, no inbox. Use when the calling agent needs a focused tool call done **right now** to finish the current turn (e.g. Jessica spawns a CRM-search specialist mid-turn). Built in `src/agents/agent-runner.ts:buildServerSubAgents`. Context-dependent servers (`callback`, `background`, `recall`, `structured-memory`) cannot be sub-agents because they need channel/thread context that does not exist in a sub-agent spawn. `memory` is also delegate-unsafe, but for a different reason: it is Hive-runtime-backed rather than turn-context-dependent.
 
 ### Direct messaging (Team MCP)
 

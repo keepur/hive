@@ -1,7 +1,7 @@
 import { FsMemoryStore } from "./fs-memory-store.js";
 
 export interface ScopeDecl {
-  id: string; // "self" | "workshop" | "workspace:<name>" | archetype-defined
+  id: string; // "self" | "workshop" | "workspace:<name>" | caller-defined
   backing: "mongo" | "filesystem";
   dir?: string; // absolute, required when backing === "filesystem"
 }

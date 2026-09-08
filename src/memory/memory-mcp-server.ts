@@ -31,9 +31,9 @@ export interface MemoryToolDeps {
   db: Db;
   agentId: string;
   /**
-   * Filesystem-backed scopes (the engine's archetype layer adds these); the
-   * always-present "self" Mongo scope is implicit and does not need to appear
-   * in this list.
+   * Filesystem-backed scopes, supplied by the caller (no in-tree producer
+   * today — KPR-435); the always-present "self" Mongo scope is implicit and
+   * does not need to appear in this list.
    */
   memoryScopes: ScopeList;
   /**

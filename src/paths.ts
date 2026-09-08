@@ -92,7 +92,7 @@ export function agentsDir(home: string = hiveHome): string {
 }
 
 /**
- * Default session cwd for an agent with no archetype-provided cwd.
+ * Default session cwd for an agent.
  * Business agents (Milo, River, Jessica, etc.) land here.
  */
 export function agentScratchDir(agentId: string, home: string = hiveHome): string {

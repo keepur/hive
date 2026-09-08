@@ -168,7 +168,7 @@ export type GuardrailDecision =
 
 /**
  * KPR-347 (consumed by KPR-348's dispatch loop): fail-closed pre-execution
- * gate — the Lane B analog of the archetype PreToolUse hooks. The bridge
+ * gate — the Lane B analog of the Claude lane's PreToolUse hooks. The bridge
  * MUST call it before every tool execution and MUST treat a gate throw as
  * deny (contained per the epic §D4 exception-containment invariant: a gate
  * throw becomes a structured error result, classifies non-provider, and

@@ -165,7 +165,7 @@ export class LLMRegistry {
   }
 }
 
-// ── Singleton (PR #194's accessor shape; reset seam per archetypes/registry.ts precedent) ──
+// ── Singleton (PR #194's accessor shape; module-global with an explicit reset seam for tests) ──
 let registry: LLMRegistry | null = null;
 
 export function getLLMRegistry(): LLMRegistry {
