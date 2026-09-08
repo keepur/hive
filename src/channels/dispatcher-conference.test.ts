@@ -166,6 +166,7 @@ function makeMockAgentManager() {
       toolMs: 0,
       toolCalls: 0,
       toolSummary: null,
+      toolAckInjected: 0,
       streamed: false,
       compactions: 0,
     }),
@@ -304,6 +305,7 @@ Meeting rules:
       toolMs: 0,
       toolCalls: 0,
       toolSummary: null,
+      toolAckInjected: 0,
       streamed: false,
       compactions: 0,
       ...overrides,
@@ -2430,6 +2432,7 @@ Meeting rules:
         toolMs: 0,
         toolCalls: 0,
         toolSummary: null,
+        toolAckInjected: 0,
         streamed: false,
         compactions: 0,
       });
@@ -2478,6 +2481,7 @@ Meeting rules:
         toolMs: 0,
         toolCalls: 0,
         toolSummary: null,
+        toolAckInjected: 0,
         streamed: false,
         compactions: 0,
       };
@@ -2547,6 +2551,7 @@ Meeting rules:
         toolMs: 0,
         toolCalls: 0,
         toolSummary: null,
+        toolAckInjected: 0,
         streamed: false,
         compactions: 0,
       });
@@ -2587,6 +2592,7 @@ Meeting rules:
         toolMs: 0,
         toolCalls: 0,
         toolSummary: null,
+        toolAckInjected: 0,
         streamed: false,
         compactions: 0,
         resumedSession: false, // stale-handle self-heal / auth-rebuild ran the turn fresh
@@ -2877,6 +2883,7 @@ Meeting rules:
         toolMs: 0,
         toolCalls: 0,
         toolSummary: null,
+        toolAckInjected: 0,
         streamed: false,
         compactions: 0,
         resumedSession: false, // would clear on a DELTA turn — full mode must still set
@@ -3153,6 +3160,7 @@ Meeting rules:
         toolMs: 0,
         toolCalls: 0,
         toolSummary: null,
+        toolAckInjected: 0,
         streamed: false,
         compactions: 0,
         resumedSession: false, // would clear on a DELTA turn — summary mode must still set

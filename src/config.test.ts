@@ -5,6 +5,9 @@ import {
   resolveCircuitBreakerConfig,
   resolveOutageQueueConfig,
   resolveToolSearchConfig,
+  resolveVoiceLivekitConfig,
+  resolveVoiceWarmPathConfig,
+  resolveVoiceToolAckConfig,
   resolveMeetingWorkersConfig,
   DEFAULT_TOOL_SEARCH_CONFIG,
 } from "./config.js";
@@ -340,5 +343,71 @@ describe("resolveToolSearchConfig (KPR-329)", () => {
       mode: "on",
       source: "hive.yaml",
     });
+  });
+});
+
+describe("resolveVoiceLivekitConfig (KPR-322 E3)", () => {
+  it("defaults on absent/garbage input", () => {
+    for (const input of [undefined, null, 42, "x", []]) {
+      const c = resolveVoiceLivekitConfig(input);
+      expect(c.enabled).toBe(false);
+      expect(c.url).toBe("");
+      expect(c.sipTrunkId).toBe("");
+      expect(c.inboundAgents).toEqual({});
+      expect(c.agentVoices).toEqual({});
+      expect(c.defaultStt).toBe("deepgram/flux-general-en");
+      expect(c.defaultTts).toBe("cartesia/sonic-3");
+    }
+  });
+  it("parses a full section and filters junk inboundAgents and agentVoices entries", () => {
+    const c = resolveVoiceLivekitConfig({
+      enabled: true,
+      url: " wss://p.livekit.cloud ",
+      sipTrunkId: "ST_1",
+      inboundAgents: { "+15551230000": "nora", "+15551231111": 7, "+15551232222": " " },
+      agentVoices: { mokie: " 00000000-0000-4000-8000-000000000001 ", nora: 7, sige: " " },
+      defaultStt: "deepgram/nova-3",
+      defaultTts: "elevenlabs/eleven_flash_v2_5",
+      unknownKey: "ignored",
+    });
+    expect(c.enabled).toBe(true);
+    expect(c.url).toBe("wss://p.livekit.cloud");
+    expect(c.inboundAgents).toEqual({ "+15551230000": "nora" });
+    expect(c.agentVoices).toEqual({ mokie: "00000000-0000-4000-8000-000000000001" });
+    expect(c.defaultStt).toBe("deepgram/nova-3");
+  });
+  it("enabled must be literal true", () => {
+    expect(resolveVoiceLivekitConfig({ enabled: "true" }).enabled).toBe(false);
+  });
+});
+
+describe("resolveVoiceWarmPathConfig (KPR-323 C4)", () => {
+  it("defaults to disabled on absent/garbage input", () => {
+    for (const input of [undefined, null, 42, "x", [], { enabled: "true" }, { enabled: 1 }]) {
+      expect(resolveVoiceWarmPathConfig(input).enabled).toBe(false);
+    }
+  });
+  it("enables on literal true only", () => {
+    expect(resolveVoiceWarmPathConfig({ enabled: true }).enabled).toBe(true);
+  });
+  it("ignores unknown keys", () => {
+    expect(resolveVoiceWarmPathConfig({ enabled: true, idleMs: 5 }).enabled).toBe(true);
+  });
+});
+
+describe("resolveVoiceToolAckConfig (KPR-324 C6)", () => {
+  it("defaults to enabled on absent/garbage input (spec §12.1 #7)", () => {
+    for (const input of [undefined, null, 42, "x", [], {}, { enabled: "false" }, { enabled: 0 }, { enabled: "no" }]) {
+      expect(resolveVoiceToolAckConfig(input).enabled).toBe(true);
+    }
+  });
+  it("disables on { enabled: false }", () => {
+    expect(resolveVoiceToolAckConfig({ enabled: false }).enabled).toBe(false);
+  });
+  it("disables on the bare scalar false (child-PR/1 finding: the operator shorthand)", () => {
+    expect(resolveVoiceToolAckConfig(false).enabled).toBe(false);
+  });
+  it("enables on literal true; ignores unknown keys", () => {
+    expect(resolveVoiceToolAckConfig({ enabled: true, phrases: ["x"] }).enabled).toBe(true);
   });
 });

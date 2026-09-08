@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, timingSafeEqual, randomUUID } from "node:crypto";
 import { createLogger } from "../../logging/logger.js";
 import { buildVoiceSystemPrompt } from "../../agents/prompt-builder.js";
 import { renderConversationPrompt, extractLatestUserMessage } from "./conversation-prompt.js";
@@ -28,6 +28,17 @@ export function isAuthError(err: unknown): boolean {
   );
 }
 
+/**
+ * KPR-322 E1: constant-time bearer comparison. sha256 normalizes lengths so
+ * timingSafeEqual never throws on length mismatch. Exported for unit tests.
+ */
+export function timingSafeTokenEqual(provided: string, expected: string): boolean {
+  if (!provided || !expected) return false;
+  const a = createHash("sha256").update(provided).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
+}
+
 interface CallSession {
   callId: string;
   agentId: string;
@@ -45,6 +56,8 @@ export class VoiceAdapter {
   constructor(
     private port: number,
     private serverSecret: string,
+    /** KPR-322 E1: shared bridge secret (HIVE_VOICE_BRIDGE_TOKEN). "" = LiveKit bridge disabled. */
+    private bridgeToken: string,
     private registry: AgentRegistry,
     private memoryManager: MemoryManager,
     /**
@@ -61,6 +74,8 @@ export class VoiceAdapter {
      * that doesn't need the full dispatcher.
      */
     private dispatcher?: Dispatcher,
+    /** KPR-322 E1: loopback default — both callers are local. */
+    private bindHost: string = "127.0.0.1",
   ) {
     if (!agentManager) {
       throw new Error("VoiceAdapter requires AgentManager (KPR-220 Phase 8 retired the direct-query fallback)");
@@ -79,13 +94,13 @@ export class VoiceAdapter {
     });
 
     await new Promise<void>((resolve) => {
-      this.httpServer!.listen(this.port, () => resolve());
+      this.httpServer!.listen(this.port, this.bindHost, () => resolve());
     });
 
     // Sweep stale sessions every 30 minutes
     this.sweepTimer = setInterval(() => this.sweepStaleSessions(), 30 * 60 * 1000);
 
-    log.info("Voice adapter started", { port: this.port });
+    log.info("Voice adapter started", { port: this.port, bindHost: this.bindHost });
   }
 
   stop(): void {
@@ -109,23 +124,37 @@ export class VoiceAdapter {
   }
 
   private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (!this.serverSecret) {
+    const authHeader = (req.headers["authorization"] as string) ?? "";
+    const bearerSecret = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7) : "";
+    // KPR-322 E1: a matching bridge bearer authenticates the request as the
+    // LiveKit worker, regardless of body shape. A present-but-NON-matching
+    // bearer is NOT an immediate 401 — Vapi sends `Authorization: Bearer
+    // no-credentials-provided` by default, so non-matching bearers fall
+    // through to the Vapi shape check below.
+    const isBridgeAuthed = this.bridgeToken !== "" && timingSafeTokenEqual(bearerSecret, this.bridgeToken);
+
+    // Pre-E1 dead-endpoint gate, with the bridge carved out: a LiveKit-only
+    // instance (no VAPI_SERVER_SECRET) must still serve bridge-authed turns.
+    if (!this.serverSecret && !isBridgeAuthed) {
       log.error("Voice endpoint called but VAPI_SERVER_SECRET not configured — rejecting");
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Server secret not configured" }));
       return;
     }
 
-    const authHeader = (req.headers["authorization"] as string) ?? "";
-    const bearerSecret = authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7) : "";
     const providedSecret =
       (req.headers["x-vapi-secret"] as string) ?? (req.headers["server-secret"] as string) ?? bearerSecret ?? "";
     const hasValidSecret = providedSecret === this.serverSecret;
 
-    // Custom LLM endpoint: Vapi sends `Authorization: Bearer no-credentials-provided`
-    // by default; their schema has no per-assistant API-key field. Auth this path by
-    // verifying the body's assistant.id maps to a configured agent — the UUID is
-    // the bearer token. Other paths still require the shared secret.
+    // Custom LLM endpoint. Two authenticated shapes:
+    //  (a) bridge: `Authorization: Bearer <HIVE_VOICE_BRIDGE_TOKEN>` — no
+    //      `assistant` object; agent resolves via call.metadata.hive_agent_id.
+    //  (b) Vapi: no/non-matching bearer, but Vapi-shaped — an `assistant`
+    //      object present, resolving through the existing three-priority
+    //      chain (assistant.metadata → voice.assistants map → call.metadata;
+    //      the MCP-initiated flow legitimately uses call.metadata).
+    // Anything neither token-bearing nor Vapi-shaped → 401. The worker sends
+    // no `assistant`, so a wrong/missing token gets 401, never a spawn.
     if (req.method === "POST" && req.url === "/v1/chat/completions") {
       const body = await readBody(req);
       let request: OpenAIChatRequest;
@@ -137,8 +166,24 @@ export class VoiceAdapter {
         return;
       }
 
+      if (!isBridgeAuthed && !request.assistant) {
+        log.warn("Voice request rejected — no bridge token and not Vapi-shaped", {
+          hasBearer: !!bearerSecret,
+        });
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+
       const agentId = this.resolveAgentId(request);
       if (!agentId) {
+        if (isBridgeAuthed) {
+          // Authenticated bridge but malformed body — a request error, not auth.
+          log.warn("Bridge request missing resolvable agent", { hasCallMeta: !!request.call?.metadata });
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "call.metadata.hive_agent_id required" }));
+          return;
+        }
         log.warn("Voice request rejected — could not resolve agent from request body", {
           assistantId: request.assistant?.id,
           hasMetadata: !!request.assistant?.metadata,
@@ -159,7 +204,7 @@ export class VoiceAdapter {
       return this.handleChatCompletion(req, res, request, agentId, agentConfig);
     }
 
-    // All other paths require the shared secret.
+    // All other paths require the shared secret (unchanged).
     if (!hasValidSecret) {
       log.warn("Voice request rejected — invalid server secret", {
         url: req.url,
@@ -237,37 +282,53 @@ export class VoiceAdapter {
     const callMeta = request.call?.metadata as Record<string, string> | undefined;
     const model = agentConfig.model;
 
+    // KPR-322 E2: abort the in-flight spawn when the client disconnects
+    // pre-completion (LiveKit barge-in cancels the bridge's HTTP request;
+    // a Vapi hang-up benefits identically). Registered BEFORE any await —
+    // `close` is not replayed for late listeners, and the prompt-build /
+    // session-store lookups below are real suspension points. `close` also
+    // fires after a normal `end()` — `writableEnded` distinguishes premature
+    // closes. All later response writes are suppressed via `clientGone`.
+    let clientGone = res.destroyed === true;
+    res.on("close", () => {
+      if (res.writableEnded) return;
+      clientGone = true;
+      try {
+        const abortedInFlight = agentManager.abortThread(agentId, threadId);
+        log.info("Voice client disconnected mid-turn", { callId, agentId, abortedInFlight });
+      } catch (err) {
+        // Throw-safety (review round 1 B2): a synchronous throw in an HTTP
+        // event listener is an uncaughtException — index.ts registers only
+        // an unhandledRejection handler (:878) — and would crash the engine
+        // mid-Vapi-coexistence. Log and swallow; the socket is gone anyway.
+        log.error("abort-on-disconnect failed", { callId, agentId, error: String(err) });
+      }
+    });
+
     // Voice-specific system prompt — omits tool summaries / delegate
     // descriptions, adds call goal/context. AgentRunner consumes via
     // TurnContext.systemPromptOverride.
+    const promptBuildStartedAt = Date.now(); // KPR-323 C1: T0→T1
     const systemPrompt = await buildVoiceSystemPrompt(agentConfig, this.memoryManager, {
       goal: callMeta?.goal,
       context: callMeta?.context,
     });
+    const promptBuildMs = Date.now() - promptBuildStartedAt;
 
     const sessionStore = agentManager.getSessionStore();
+    const sessionLookupStartedAt = Date.now(); // KPR-323 C1: T0→T1
     const storedRef = await sessionStore.get(agentId, threadId);
+    const sessionLookupMs = Date.now() - sessionLookupStartedAt;
 
-    // KPR-313 §3.5: provider eligibility applied at voice's OWN read — not
-    // left to the spawnTurn guard. Voice chooses its prompt SHAPE from
-    // resume-presence; if a mismatched-provider id flowed through and the
-    // guard stripped it downstream, the turn would succeed fresh with only
-    // the latest user message — a silent mid-call context loss the pre-313
-    // hard failure never caused. On mismatch we treat the thread as
-    // no-resume, so renderConversationPrompt fires and the full in-call
-    // transcript IS voice's handoff. providerFor is the KPR-307 static-route
-    // read (same resolveProviderModel as the breaker wrap); null (agent
-    // vanished mid-call, SIGUSR1) degrades to no-resume — fail-soft.
-    const staticProvider = agentManager.providerFor(agentId);
-    const resumableId =
-      storedRef && staticProvider && storedRef.provider === staticProvider ? storedRef.sessionId : undefined;
-
-    // Choose prompt based on resume-presence (mirrors current voice behavior).
-    const turnPrompt = resumableId
-      ? extractLatestUserMessage(request.messages)
-      : renderConversationPrompt(request.messages);
-    const safePrompt = resumableId && !turnPrompt ? renderConversationPrompt(request.messages) : turnPrompt;
-    const effectiveResume = resumableId && turnPrompt ? resumableId : undefined;
+    // KPR-467: carry both prompt forms and the stored resume candidate to
+    // admission. Only the manager knows whether this turn uses a pinned
+    // lease, a compatible resume, or a fresh route after a registry reload.
+    const voicePrompt = {
+      latestUserMessage: extractLatestUserMessage(request.messages),
+      fullConversation: renderConversationPrompt(request.messages),
+    };
+    const effectiveResume = voicePrompt.latestUserMessage ? storedRef?.sessionId : undefined;
+    const safePrompt = effectiveResume ? voicePrompt.latestUserMessage : voicePrompt.fullConversation;
 
     // Synthesize a WorkItem. ChannelKind="voice" was added in Step 1 of this
     // ticket so this compiles.
@@ -288,7 +349,7 @@ export class VoiceAdapter {
           // chunk is the pre-extracted text-delta string (StreamCallback shape
           // = `(chunk: string) => void`). Defensive empty-skip mirrors the
           // legacy inline loop's behavior.
-          if (!chunk) return;
+          if (!chunk || clientGone) return;
           if (!headersSent) {
             res.writeHead(200, {
               "Content-Type": "text/event-stream",
@@ -305,11 +366,8 @@ export class VoiceAdapter {
     const ctx: TurnContext = {
       agentId,
       sessionId: effectiveResume,
-      // KPR-313: tag travels only when a resume is actually attempted; on a
-      // provider mismatch BOTH stay unset — the full transcript above is
-      // voice's handoff, and the spawnTurn guard then has nothing to trip on
-      // (the voice carve-out stays annotation-free).
-      sessionProvider: effectiveResume ? (staticProvider ?? undefined) : undefined,
+      sessionProvider: effectiveResume ? storedRef?.provider : undefined,
+      voicePrompt,
       channelId: callId,
       threadId,
       workItem,
@@ -317,12 +375,20 @@ export class VoiceAdapter {
       systemPromptOverride: systemPrompt,
     };
 
+    let hasAdmittedContinuity = false;
     const runOnce = async (
       spawnCtx: TurnContext,
     ): Promise<
       | { ok: true; result: TurnResult; bytesSent: boolean }
       | { ok: false; reason: string; circuitOpen?: boolean; bytesSent: boolean }
     > => {
+      hasAdmittedContinuity = false;
+      spawnCtx = {
+        ...spawnCtx,
+        onVoiceAdmission: (continuity) => {
+          hasAdmittedContinuity = continuity === "warm" || continuity === "resume";
+        },
+      };
       try {
         // KPR-223: route through dispatcher when wired (applies taskLedger +
         // audit log; dedup intentionally skipped — see Dispatcher.routeVoiceTurn).
@@ -346,14 +412,27 @@ export class VoiceAdapter {
       }
     };
 
+    if (clientGone) {
+      log.info("Voice turn skipped — client disconnected before spawn", { callId, agentId });
+      return;
+    }
+
     let outcome = await runOnce(ctx);
+    const continuityAttempted = hasAdmittedContinuity;
     let outerRetryFired = false;
 
-    // Outer retry — resume failed before any bytes hit the wire. Restart with
+    // Outer retry — admitted lease/resume failed before any bytes hit the wire. Restart with
     // full transcript and no resume id. Mirrors voice-adapter.ts:320-329 from
     // the legacy path. Catches cases spawnTurn's inner auth-retry doesn't
     // cover (stale id without auth-error pattern, etc.).
-    if (!outcome.ok && !outcome.circuitOpen && effectiveResume && !outcome.bytesSent) {
+    //
+    // KPR-324 semantics note: `bytesSent` (= headersSent) now flips true on a
+    // hive-injected tool-start ack too, not just model text — the ack goes
+    // through this same `onStream`/SSE path. That is intentional: once the
+    // caller has HEARD the ack, replaying the turn would double-speak it, so
+    // an ack-only turn is correctly treated as "already on the wire" and is
+    // not retried here.
+    if (!outcome.ok && !outcome.circuitOpen && hasAdmittedContinuity && !outcome.bytesSent && !clientGone) {
       log.warn("Voice spawnTurn resume failed, retrying as turn-1", {
         callId,
         reason: outcome.reason,
@@ -364,9 +443,23 @@ export class VoiceAdapter {
       const retryCtx: TurnContext = {
         ...ctx,
         sessionId: undefined,
+        sessionProvider: undefined,
         workItem: retryWorkItem,
       };
       outcome = await runOnce(retryCtx);
+    }
+
+    // E2: never write into a dead socket — the turn (aborted or completed)
+    // ends silently; next turn's resume either works or trips the outer
+    // full-transcript retry (recoverable by construction, spec §7).
+    if (clientGone) {
+      log.info("Voice turn ended after client disconnect — response suppressed", {
+        callId,
+        agentId,
+        ok: outcome.ok,
+        aborted: outcome.ok ? (outcome.result.aborted ?? false) : undefined,
+      });
+      return;
     }
 
     if (!outcome.ok) {
@@ -432,7 +525,9 @@ export class VoiceAdapter {
     }
 
     // Telemetry parity with KPR-207 baseline (voice-adapter.ts:370-379).
-    // sdkSessionResumed = "we attempted resume AND the spawn succeeded
+    // Admission, including an active lease without a store row, is the
+    // continuity source for both returned and thrown failures.
+    // sdkSessionResumed = "we attempted continuity AND the spawn succeeded
     // without the outer-retry kicking in" — NOT `newSessionId === effectiveResume`,
     // because the SDK rotates session ids post-compaction, which would
     // systematically under-count successful resumes versus the baseline.
@@ -442,12 +537,36 @@ export class VoiceAdapter {
     log.info("Voice turn complete", {
       callId,
       agentId,
+      // KPR-324: on an ack turn, firstTokenMs now measures time-to-FIRST-
+      // AUDIO (model text OR a hive-injected ack, whichever the caller hears
+      // first via onStream) — not necessarily time-to-model-text anymore.
+      // stageTimings.initToFirstTokenMs (below) is a separate, SDK-side stamp
+      // that still measures time-to-first-model-text specifically and
+      // includes toolMs; the two intentionally diverge on ack turns. Read
+      // both, not just one, when interpreting a T-gate row.
       firstTokenMs,
       totalMs: Date.now() - startedAt,
       mode: isStreaming ? "streaming" : "non-streaming",
-      sdkSessionResumeAttempted: !!effectiveResume,
-      sdkSessionResumed: !!effectiveResume && outcome.ok && !outerRetryFired,
+      sdkSessionResumeAttempted: continuityAttempted,
+      sdkSessionResumed: continuityAttempted && outcome.ok && !outerRetryFired,
       routedVia: "agentManager",
+      // KPR-323 C1: stage decomposition (adapter-side stamps + coordinator/
+      // runner stamps carried on TurnResult). Log-only; all durations —
+      // no content, no numbers-of-humans (repo redaction posture).
+      promptBuildMs,
+      sessionLookupMs,
+      ...(result.stageTimings ?? {}),
+      // KPR-324 C5d/S4: tool observability for T-gates and 325 pause
+      // attribution. Counts + durations + server-name summary only — the
+      // existing redaction posture (tool NAMES, never args, never content,
+      // never the ack phrase text).
+      toolCalls: result.toolCalls,
+      toolMs: result.toolMs,
+      toolSummary: result.toolSummary ?? "none",
+      toolAckInjected: result.toolAckInjected,
+      // KPR-323 C2: warm-lease markers (false/absent until Task 5 lands).
+      warmPath: result.warmPath ?? false,
+      ...(result.warmTurnSeq !== undefined ? { warmTurnSeq: result.warmTurnSeq } : {}),
     });
   }
 

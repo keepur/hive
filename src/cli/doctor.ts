@@ -7,6 +7,7 @@ import {
   type PromptCacheRow,
   type PrefixCacheStatsRow,
   type SpawnCoordinatorRow,
+  type VoiceWorkerStatsRow,
   type CircuitBreakerRow,
   type OutageQueueStats,
   type MemoryLifecycleRow,
@@ -32,6 +33,7 @@ import {
   resolveServicePath,
   slackAuthOk,
   spawnCoordinatorStatsForDoctor,
+  voiceWorkerStatsForDoctor,
   resourceEnvelopesForDoctor,
   memoryLifecycleStatsForDoctor,
   modelRouterModeLine,
@@ -146,11 +148,54 @@ export function renderSpawnCoordinatorSection(
     const lastSat =
       r.lastSaturationAt === null ? "never" : `${Math.round((Date.now() - r.lastSaturationAt) / 1000)}s ago`;
     emit(
-      `  ${r.agentId}: active=${r.activeSpawns} budget=${r.budget} (source=${r.budgetSource}) saturations=${r.saturationCount} (last ${lastSat})${flagStr} (heartbeat ${stale})`,
+      `  ${r.agentId}: active=${r.activeSpawns} warm-voice=${r.warmVoiceSessions} budget=${r.budget} (source=${r.budgetSource}) saturations=${r.saturationCount} (last ${lastSat})${flagStr} (heartbeat ${stale})`,
     );
     if (r.lastError) {
       emit(`    last error: ${r.lastError}`);
     }
+  }
+}
+
+/**
+ * KPR-322: render the LiveKit voice-worker heartbeat section. Reads the
+ * engine's `telemetry.voice_worker_stats` doc (written every 30s).
+ * Informational — does not affect exit code. Staleness threshold is 90s
+ * (tighter than the 120s engine-heartbeat siblings: the worker is a
+ * separate launchd process).
+ */
+export function renderVoiceWorkerSection(
+  row: VoiceWorkerStatsRow | null,
+  emit: (line: string) => void = console.log,
+  instanceId = "<id>",
+  sipTrunkId?: string,
+): void {
+  emit("\nVoice worker (LiveKit)");
+  // Epic-integration review round 1 (mechanical): warn when livekit is
+  // enabled but no outbound SIP trunk id is configured — outbound calls
+  // will fail at dispatch. Informational only, never affects allPassed
+  // (same D4 posture as the rest of this section).
+  if (sipTrunkId !== undefined && !sipTrunkId.trim()) {
+    emit("  ⚠ voice.livekit.sipTrunkId is not set — outbound calls will fail");
+  }
+  if (!row) {
+    emit("  ○ no heartbeat yet — worker never started?");
+    return;
+  }
+  const stale = row.staleSeconds === null ? "?" : `${row.staleSeconds}s ago`;
+  const defaults =
+    row.cellDefaults === null
+      ? "none"
+      : `stt=${row.cellDefaults.defaultStt ?? "?"} tts=${row.cellDefaults.defaultTts ?? "?"}`;
+  emit(
+    `  active=${row.activeCalls} started=${row.callsStarted} completed=${row.callsCompleted} cell-defaults=${defaults} (heartbeat ${stale})`,
+  );
+  if (row.lastError) {
+    emit(`    last error: ${row.lastError}`);
+  }
+  if (row.staleSeconds !== null && row.staleSeconds > 90) {
+    emit(
+      `  ⚠ heartbeat stale — worker down or wedged (launchctl kickstart -k gui/$(id -u)/com.hive.${instanceId}.voice-worker)`,
+    );
   }
 }
 
@@ -751,6 +796,13 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // KPR-220 Phase 11: spawn-coordinator per-agent stats.
     const coordinatorRows = await spawnCoordinatorStatsForDoctor(config.mongo.uri, config.mongo.dbName);
     renderSpawnCoordinatorSection(coordinatorRows);
+    // KPR-322: LiveKit voice-worker heartbeat. Informational — NEVER
+    // contributes to allPassed. Omitted entirely when livekit is disabled
+    // (the worker isn't expected to run).
+    if (config.voice.livekit.enabled) {
+      const voiceWorkerStats = await voiceWorkerStatsForDoctor(config.mongo.uri, config.mongo.dbName);
+      renderVoiceWorkerSection(voiceWorkerStats, console.log, config.instance.id, config.voice.livekit.sipTrunkId);
+    }
     // KPR-433 D5 (N1 review fix): effective Claude-lane envelopes —
     // informational only, NEVER contributes to allPassed (KPR-296 canon).
     // Only fetch when the router is on: under router-off the renderer prints

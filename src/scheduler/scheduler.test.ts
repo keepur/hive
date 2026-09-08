@@ -103,6 +103,7 @@ function makeAgentManager() {
       toolMs: 0,
       toolCalls: 0,
       toolSummary: null,
+      toolAckInjected: 0,
       streamed: false,
       compactions: 0,
     }),
@@ -252,6 +253,7 @@ describe("Scheduler.checkCronJobs — homeBase dispatch channel selection", () =
       toolMs: 0,
       toolCalls: 0,
       toolSummary: null,
+      toolAckInjected: 0,
       streamed: false,
       compactions: 0,
     });

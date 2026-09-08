@@ -18,6 +18,14 @@ export interface ServerCatalogEntry {
  * Plugin servers define their own metadata in plugin.yaml manifests.
  */
 export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
+  // KPR-324 C8: there is deliberately NO `orders` key here. The read-only
+  // purchase-order MCP contract (`orders_lookup` / `orders_get`) is defined
+  // in docs/epics/kpr-320/kpr-324-spec.md §6 and is implemented by W1B
+  // (KPR-300), which inserts the key WITH the live server. Do not add a
+  // blurb-only key: buildInstanceCapabilities treats a catalog key with no
+  // SERVER_CREDENTIAL_CHECKS entry as `configured`, so it would render as a
+  // live capability that does not exist. The same rule covers the KPR-324
+  // `voice-fixture` test double — in-process-wired only, never cataloged.
   clickup: {
     description: "Task management — tasks, lists, spaces, comments, custom fields",
     usage: "Creating and managing project tasks",
@@ -70,6 +78,11 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
   voice: {
     description: "Make outbound phone calls via Vapi",
     usage: "Calling customers, scheduling appointments, following up by phone",
+  },
+  "voice-livekit": {
+    description: "Make outbound phone calls via the LiveKit voice pipeline",
+    usage: "Calling someone by phone when a live voice conversation is what's needed",
+    notFor: "Vapi-based calling — use voice instead; that server key is separate and unrelated",
   },
   tasks: {
     description: "Task management — create, update, and track agent tasks",

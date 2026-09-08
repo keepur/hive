@@ -1,4 +1,4 @@
-import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type McpSdkServerConfigWithInstance, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions, type EffortLevel } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUserMessage, type EffortLevel, type McpServerConfig, type McpSdkServerConfigWithInstance, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions } from "@anthropic-ai/claude-agent-sdk";
 import { resolve } from "node:path";
 import { existsSync, mkdirSync, symlinkSync, lstatSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -51,7 +51,11 @@ import {
   DELEGATE_UNSAFE_SERVERS as DELEGATE_UNSAFE_SERVER_NAMES,
   TURN_CONTEXT_DEPENDENT_SERVERS,
 } from "./server-traits.js";
-import { IN_PROCESS_PORTED_SERVERS } from "./in-process-servers.js";
+import {
+  IN_PROCESS_PORTED_SERVERS,
+  VOICE_FIXTURE_SERVER_NAME,
+  VOICE_FIXTURE_ALLOWED_AGENT_ID,
+} from "./in-process-servers.js";
 
 import type { ResourceLimits } from "./resource-tiers.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
@@ -74,6 +78,7 @@ import { createAdminMcpServer } from "../admin/admin-mcp-server.js";
 import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.js";
 import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
 import { createWorkerPoolMcpServer } from "../workers/worker-pool-mcp-server.js";
+import { createVoiceFixtureMcpServer } from "../voice/voice-fixture-mcp-server.js";
 import type { MeetingWorkerPool, WorkerPoolTurnContext } from "../workers/meeting-worker-pool.js";
 import type { MemoryLifecycle } from "../memory/memory-lifecycle.js";
 import type { Db } from "mongodb";
@@ -81,6 +86,8 @@ import type { TurnEffort } from "./provider-adapters/types.js";
 import { isAgentEffort, type AgentEffort } from "./agent-effort.js";
 // KPR-394 (§4.11): plugin provider ids widen the admin model-catalog tools.
 import { listPluginProviderIds } from "./provider-adapters/provider-registry.js";
+// KPR-324 C2: voice tool-start acknowledgment (cold spawn loop).
+import { shouldInjectToolAck, nextAckPhrase, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
 
 // KPR-430: compile-time pin — AgentEffort ≡ SDK EffortLevel in BOTH
 // directions. If the SDK adds or removes a level, this fails typecheck
@@ -164,6 +171,29 @@ export interface RunResult {
   toolMs: number;
   toolCalls: number;
   toolSummary: string;
+  /**
+   * KPR-324 C5a/S4: count of hive-injected tool-start acknowledgment phrases
+   * spoken on this turn (voice channel only — 0 on every other channel, when
+   * voice.toolAck.enabled is false, or when the model spoke before each
+   * tool_use).
+   *
+   * Optional here — not compiler-enforced — specifically because `RunResult`
+   * is re-exported as frozen plugin-facing ABI via
+   * `src/agents/provider-adapters/provider-abi.ts` (`@keepur/hive/provider-abi`):
+   * a required field would be source-breaking for a plugin author's
+   * `runTurn(): Promise<RunResult>` implementation compiled against an older
+   * `pkg/types/` (epic-integration review round 1, `2edb14e`, ratified by
+   * May). `TurnResult` (agent-manager.ts) is NOT re-exported via
+   * provider-abi.ts and stays required.
+   *
+   * Every in-engine construction site MUST still declare it explicitly, by
+   * convention — this is no longer compiler-enforced, so a new construction
+   * site can silently omit it. What makes an omission runtime-safe
+   * regardless is the `?? 0` belt at the `finalizeSpawnResult` copy site
+   * (agent-manager.ts) — see also the guard test in agent-runner.test.ts
+   * pinning that the `send()` return path yields a defined number.
+   */
+  toolAckInjected?: number;
   streamed: boolean;
   inputTokens: number;
   outputTokens: number;
@@ -177,6 +207,18 @@ export interface RunResult {
   error?: string;
   aborted?: boolean;
   timedOut?: boolean; // KPR-306: deadline fired; distinguishes timeout-abort from operator abort
+  /**
+   * KPR-323 C1: turn dispatch → system/init. Spans query-envelope assembly
+   * (server configs, in-process MCP construction, sub-agent + skill-projection
+   * build, session cwd mkdir) PLUS the CLI boot, session load and MCP
+   * handshake — i.e. everything between the manager's T3 dispatch anchor and
+   * the SDK's init message, not just the raw query() boot. Stamped before
+   * buildQueryEnvelope so no time falls between spawnPrepMs and this field.
+   * Voice decomposition; log-only.
+   */
+  bootToInitMs?: number;
+  /** KPR-323 C1: system/init → first streamed text_delta (≈ model TTFT). On warm turns (KPR-323 C2): push → first delta. */
+  initToFirstTokenMs?: number;
   /** KPR-388: populated ONLY by the dispatcher's convertTurnResult mapping (TurnResult passthrough); runner/adapters never set it. */
   resumedSession?: boolean;
   /** KPR-434: digest of the memory block this turn's input carried; absent ⇒ no block was injected. */
@@ -292,6 +334,7 @@ const MCP_BUNDLE_MAP: Record<string, string> = {
   "google/google-mcp-server.js": "google.min.js",
   "quo/quo-mcp-server.js": "quo.min.js",
   "voice/voice-mcp-server.js": "voice.min.js",
+  "voice/livekit-voice-mcp-server.js": "voice-livekit.min.js",
   "tasks/task-mcp-server.js": "task.min.js",
   "resend/resend-mcp-server.js": "resend.min.js",
   "linear/linear-mcp-server.js": "linear.min.js",
@@ -391,6 +434,8 @@ export class AgentRunner {
   private workerPoolMcpServer?: ReturnType<typeof createWorkerPoolMcpServer>;
   private workerPoolContextRef: { current: WorkerPoolTurnContext } = { current: {} };
   private workerPool?: MeetingWorkerPool;
+  // KPR-324 C7: voice-pilot-only test fixture (no db dependency — canned data).
+  private voiceFixtureMcpServer?: ReturnType<typeof createVoiceFixtureMcpServer>;
   private readonly suppressAutoInjectedServers: boolean;
   private contactsMcpServer?: ReturnType<typeof createContactsMcpServer>;
   private scheduleMcpServer?: ReturnType<typeof createScheduleMcpServer>;
@@ -650,6 +695,29 @@ export class AgentRunner {
           VAPI_API_KEY: config.voice.apiKey,
           VAPI_PHONE_NUMBER_ID: config.voice.phoneNumberId,
           VAPI_ASSISTANT_ID: vapiAssistantId,
+          AGENT_ID: this.agentConfig.id,
+          AGENT_NAME: this.agentConfig.name,
+        },
+      };
+    }
+
+    // LiveKit voice MCP server (KPR-322 E4) — outbound calls via the
+    // hive-voice worker. Gated on the livekit section + API pair; server
+    // key name "voice-livekit" so agents can carry either/both.
+    if (
+      config.voice.livekit?.enabled &&
+      config.voice.livekitApiKey &&
+      config.voice.livekitApiSecret &&
+      config.voice.livekit?.url
+    ) {
+      servers["voice-livekit"] = {
+        type: "stdio",
+        command: "node",
+        args: [mcpPath("voice/livekit-voice-mcp-server.js")],
+        env: {
+          LIVEKIT_URL: config.voice.livekit.url,
+          LIVEKIT_API_KEY: config.voice.livekitApiKey,
+          LIVEKIT_API_SECRET: config.voice.livekitApiSecret,
           AGENT_ID: this.agentConfig.id,
           AGENT_NAME: this.agentConfig.name,
         },
@@ -1392,6 +1460,30 @@ export class AgentRunner {
       });
     }
 
+    // KPR-324 C7 + KPR-327 pattern: voice-fixture is in-process-only with no
+    // stdio placeholder — surface its descriptor explicitly so the Lane B
+    // partition sees it honestly (bridged, not silently absent). Gate
+    // mirrors the runtime wiring in buildInProcessServers, including the
+    // voice-pilot-only belt. (Standing obligation, CLAUDE.md "Adding an
+    // in-process MCP server".)
+    if (
+      this.agentConfig.id === VOICE_FIXTURE_ALLOWED_AGENT_ID &&
+      this.shouldEnableInProcessServer(VOICE_FIXTURE_SERVER_NAME) &&
+      !mcpServers[VOICE_FIXTURE_SERVER_NAME]
+    ) {
+      inventory.push({
+        ...classifyToolTransport({
+          name: VOICE_FIXTURE_SERVER_NAME,
+          transport: "sdk-in-process",
+          source: "core",
+          requiresTurnContext: false,
+          requiresHiveRuntime: true,
+          inProcess: true,
+        }),
+        schemas: { kind: "connect-time" },
+      });
+    }
+
     if (this.teamRoster && !this.suppressAutoInjectedServers) {
       inventory.push({
         ...classifyToolTransport({
@@ -1628,6 +1720,21 @@ export class AgentRunner {
         });
       }
       servers["worker-pool"] = this.workerPoolMcpServer;
+    }
+
+    // KPR-324 C7: voice-fixture — in-process test double, voice-pilot ONLY.
+    // Double gate: registry load already strips it from other defs; this
+    // agent-id check is the belt so a bypassed registry (direct DB write +
+    // SIGUSR1 race) still cannot arm the fixture on a production agent.
+    // No db dependency — canned data. No SERVER_CATALOG key (C8 trap).
+    if (
+      this.agentConfig.id === VOICE_FIXTURE_ALLOWED_AGENT_ID &&
+      this.shouldEnableInProcessServer(VOICE_FIXTURE_SERVER_NAME)
+    ) {
+      if (!this.voiceFixtureMcpServer) {
+        this.voiceFixtureMcpServer = createVoiceFixtureMcpServer();
+      }
+      servers[VOICE_FIXTURE_SERVER_NAME] = this.voiceFixtureMcpServer;
     }
 
     // KPR-122: structured-memory MCP — in-process, paired with memory.
@@ -1988,21 +2095,28 @@ export class AgentRunner {
       }];
   }
 
-  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: TurnEffort, memoryDigestSeen?: string): Promise<RunResult> {
+  /**
+   * KPR-323: shared `query()` options assembly for the per-turn send() path
+   * and the warm voice streaming session (openVoiceStreamingSession).
+   * Mechanical extraction of send()'s pre-query body — server configs,
+   * in-process MCP wiring, system prompt, archetype/cwd/toolSearch/env,
+   * options literal. Identical behavior for send() callers; `streaming`
+   * replaces the `!!onStream` test for includePartialMessages.
+   */
+  private async buildQueryEnvelope(params: {
+    sessionId?: string;
+    context?: WorkItemContext;
+    resourceLimits?: ResourceLimits;
+    systemPromptOverride?: string;
+    effort?: TurnEffort;
+    streaming: boolean;
+  }): Promise<SdkQueryOptions> {
     // KPR-346 (§D5): Lane A passthrough — the CLI model is the FOREIGN id;
     // agentConfig.model keeps the prefixed string (kimi/…) so telemetry and
     // the activity log attribute the provider via the model string untouched.
     const passthrough = this.laneAPassthrough;
     const effectiveModel = passthrough?.model ?? this.agentConfig.model;
-
-    log.info("Sending prompt to agent", {
-      agent: this.agentConfig.id,
-      model: effectiveModel,
-      resumeSession: sessionId ?? "new",
-      promptLength: prompt.length,
-      streaming: !!onStream,
-      ...(passthrough ? { passthroughProvider: passthrough.provider } : {}),
-    });
+    const { context, sessionId, resourceLimits, systemPromptOverride, effort } = params;
 
     const allServerConfigs = this.buildAllServerConfigs(context);
     const mcpServers = this.filterCoreServers(allServerConfigs);
@@ -2082,6 +2196,126 @@ export class AgentRunner {
       toolSearchEnvValue = toolSearch.mode === "on" ? "true" : toolSearch.mode === "off" ? "false" : "auto";
     }
 
+    const options: SdkQueryOptions = {
+      model: effectiveModel,
+      systemPrompt,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+
+      maxTurns: resourceLimits?.maxTurns ?? this.agentConfig.maxTurns,
+      maxBudgetUsd: resourceLimits?.budgetUsd ?? this.agentConfig.budgetUsd,
+      // KPR-430: deliver SDK-supported effort, including xhigh/max.
+      // Keep thinking configuration stable to preserve the prompt cache.
+      ...(isAgentEffort(effort) ? { effort } : {}),
+      // Only allowlisted archetype keys are merged. The archetype's sessionOptions()
+      // may return arbitrary SDK options, but we explicitly pick only the safe ones
+      // so a rogue archetype can't override security invariants (permissionMode,
+      // maxTurns, etc.) or runtime wiring (mcpServers, hooks, env, etc.).
+      cwd: effectiveCwd,
+      // Default to SDK isolation mode (no user/project settings, no user-installed plugins).
+      // Archetypes may opt in to specific sources (e.g. ["project"] for CLAUDE.md access).
+      settingSources: archetypeExtra.settingSources ?? [],
+      includePartialMessages: params.streaming,
+      ...(sessionId ? { resume: sessionId } : {}),
+      ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
+      ...(Object.keys(serverSubAgents).length > 0 ? { agents: serverSubAgents } : {}),
+      ...(sdkPlugins.length > 0 ? { plugins: sdkPlugins } : {}),
+      hooks: this.buildHooks(context),
+      // Cast: AgentConfig stores string[] but SDK expects SdkBeta[] — intentional for forward compat
+      ...(this.agentConfig.betas?.length ? { betas: this.agentConfig.betas as any } : {}),
+      env: {
+        ...process.env,
+        ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
+        CLAUDE_AGENT_SDK_CLIENT_APP: "hive/0.1.0",
+        CLAUDECODE: undefined,
+        // KPR-329: always pinned — overrides any ambient ENABLE_TOOL_SEARCH.
+        ENABLE_TOOL_SEARCH: toolSearchEnvValue,
+          // KPR-438: always pinned — SDK 0.3.26x (Claude Code 2.1.26x) runs the
+          // `Agent` tool's subagents in the BACKGROUND by default and completes
+          // them with a `<task-notification>` user message that wakes the
+          // session. After that wake-up every in-process SDK MCP tool call
+          // (createSdkMcpServer servers: memory, structured-memory, team,
+          // team-roster, callback, schedule, admin, contacts, event-bus,
+          // conversation-search, code-search, workflow, worker-pool) fails
+          // instantly with "The tool call was interrupted before a result was
+          // received"; stdio servers and builtins are unaffected. Hive's
+          // `delegateServers` subagents ARE `Agent` calls, so any turn that
+          // delegates loses memory/team tools for the rest of the session.
+          // Disabling background tasks runs subagents inline and the failure
+          // disappears (the CLI reads `backgroundTasksDisabled ||
+          // CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`). Hive already awaits every
+          // delegate result, so inline execution costs no throughput here.
+          // KEEP THIS PIN. The removal gate is NOT a repro: a minimal harness
+          // does not reproduce the failure (three variants pass unpinned on
+          // both 0.3.258 and the fleet-resolved 0.3.261 — `^0.3.258` floats,
+          // so deployed instances run higher than this repo's lockfile). The
+          // gate is `npx tsx scripts/repro-bg-subagent-mcp.ts --audit
+          // --since=<deploy date>`, which measures the real before/after-
+          // notification interruption rate out of the CLI transcripts; drop
+          // the pin only after a hive has run a day of delegating traffic
+          // WITHOUT it and that rate stays at the ~0.06% baseline. Unfixed as
+          // of SDK 0.3.263.
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
+
+        // KPR-346 (§D5): Lane A pins — base URL, vendor token, foreign-model
+        // pins (incl. subagents), ANTHROPIC_API_KEY scrub, tool search off.
+        ...(passthrough ? buildPassthroughEnv(passthrough) : {}),
+      },
+      // Pass --strict-mcp-config to the spawned claude CLI so it ignores all
+      // MCP sources except the engine-supplied `mcpServers` above (which the
+      // SDK feeds in via --mcp-config). Without this, user-level enabled
+      // plugins and claude.ai connectors (e.g. hosted Linear OAuth'd to a
+      // personal account) leak into agent sessions regardless of
+      // settingSources: []. Auth and session storage stay on the default
+      // ~/.claude/ — only MCP discovery is sandboxed.
+      extraArgs: { "strict-mcp-config": null },
+    };
+    return options;
+  }
+
+  async send(prompt: string, sessionId?: string, onStream?: StreamCallback, context?: WorkItemContext, resourceLimits?: ResourceLimits, systemPromptOverride?: string, effort?: TurnEffort, memoryDigestSeen?: string): Promise<RunResult> {
+    // KPR-346 (§D5): Lane A passthrough — the CLI model is the FOREIGN id;
+    // agentConfig.model keeps the prefixed string (kimi/…) so telemetry and
+    // the activity log attribute the provider via the model string untouched.
+    const passthrough = this.laneAPassthrough;
+    const effectiveModel = passthrough?.model ?? this.agentConfig.model;
+
+    log.info("Sending prompt to agent", {
+      agent: this.agentConfig.id,
+      model: effectiveModel,
+      resumeSession: sessionId ?? "new",
+      promptLength: prompt.length,
+      streaming: !!onStream,
+      ...(passthrough ? { passthroughProvider: passthrough.provider } : {}),
+    });
+
+    // KPR-323 C1: cold-turn stage anchors (spec §2 T3→T5, T5→T6). Log-only.
+    // The T3 anchor is stamped BEFORE envelope assembly, not after: the
+    // manager fires its onDispatch T3 callback immediately before
+    // adapter.runTurn (agent-manager.ts), and ClaudeAgentAdapter.runTurn is a
+    // bare passthrough to send(). Anchoring after buildQueryEnvelope would
+    // leave envelope assembly (server configs, in-process MCP construction,
+    // sub-agents, skill projections, session cwd mkdir) attributed to NEITHER
+    // spawnPrepMs nor bootToInitMs — an unattributed gap that understates the
+    // decomposition against firstTokenMs and biases Task 11's W1 falsification
+    // rule toward a false demotion. Spec §2's stage table is annotated to
+    // match: in-process MCP server construction and the rest of envelope
+    // assembly are measured inside bootToInitMs, not spawnPrepMs.
+    const queryStartedAt = Date.now();
+
+    const options = await this.buildQueryEnvelope({
+      sessionId,
+      context,
+      resourceLimits,
+      systemPromptOverride,
+      effort,
+      streaming: !!onStream,
+    });
+
+    let initAt: number | undefined;
+    let bootToInitMs: number | undefined;
+    let initToFirstTokenMs: number | undefined;
+
     // KPR-434: memory rides the turn input under the digest gate; overrides
     // (voice, worker, scribe) are total replacements and never get it — a
     // contained worker must never see the boss's hot tier. FAIL-SOFT: a render
@@ -2115,90 +2349,7 @@ export class AgentRunner {
     // the time it actually ran and the memory the session has not yet seen.
     const turnPrompt = composeTurnInput({ prompt, memoryBlock: injectMemory ? rendered!.block : undefined });
 
-    const q = query({
-      prompt: turnPrompt,
-      options: {
-        model: effectiveModel,
-        systemPrompt,
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-
-        maxTurns: resourceLimits?.maxTurns ?? this.agentConfig.maxTurns,
-        maxBudgetUsd: resourceLimits?.budgetUsd ?? this.agentConfig.budgetUsd,
-        // KPR-312 → KPR-430: per-turn reasoning effort. The channel carries
-        // TurnEffort (= ReasoningEffort | "max"); the SDK accepts exactly
-        // AgentEffort (= EffortLevel, pinned equal at the top of this file),
-        // so `minimal`/`none` are dropped and everything else — including the
-        // static field's `xhigh`/`max` — is delivered. The runner is a pure
-        // narrowing: precedence and deliverability gating live in
-        // prepareSpawn. Deliberately NO `thinking` key: toggling thinking
-        // config turn-to-turn invalidates the messages-tier prompt cache —
-        // the exact cost class KPR-312 avoids (a per-agent constant effort
-        // has no such cost).
-        ...(isAgentEffort(effort) ? { effort } : {}),
-        // Only allowlisted archetype keys are merged. The archetype's sessionOptions()
-        // may return arbitrary SDK options, but we explicitly pick only the safe ones
-        // so a rogue archetype can't override security invariants (permissionMode,
-        // maxTurns, etc.) or runtime wiring (mcpServers, hooks, env, etc.).
-        cwd: effectiveCwd,
-        // Default to SDK isolation mode (no user/project settings, no user-installed plugins).
-        // Archetypes may opt in to specific sources (e.g. ["project"] for CLAUDE.md access).
-        settingSources: archetypeExtra.settingSources ?? [],
-        includePartialMessages: !!onStream,
-        ...(sessionId ? { resume: sessionId } : {}),
-        ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
-        ...(Object.keys(serverSubAgents).length > 0 ? { agents: serverSubAgents } : {}),
-        ...(sdkPlugins.length > 0 ? { plugins: sdkPlugins } : {}),
-        hooks: this.buildHooks(context),
-        // Cast: AgentConfig stores string[] but SDK expects SdkBeta[] — intentional for forward compat
-        ...(this.agentConfig.betas?.length ? { betas: this.agentConfig.betas as any } : {}),
-        env: {
-          ...process.env,
-          ...(config.anthropic.apiKey ? { ANTHROPIC_API_KEY: config.anthropic.apiKey } : {}),
-          CLAUDE_AGENT_SDK_CLIENT_APP: "hive/0.1.0",
-          CLAUDECODE: undefined,
-          // KPR-329: always pinned — overrides any ambient ENABLE_TOOL_SEARCH.
-          ENABLE_TOOL_SEARCH: toolSearchEnvValue,
-          // KPR-438: always pinned — SDK 0.3.26x (Claude Code 2.1.26x) runs the
-          // `Agent` tool's subagents in the BACKGROUND by default and completes
-          // them with a `<task-notification>` user message that wakes the
-          // session. After that wake-up every in-process SDK MCP tool call
-          // (createSdkMcpServer servers: memory, structured-memory, team,
-          // team-roster, callback, schedule, admin, contacts, event-bus,
-          // conversation-search, code-search, workflow, worker-pool) fails
-          // instantly with "The tool call was interrupted before a result was
-          // received"; stdio servers and builtins are unaffected. Hive's
-          // `delegateServers` subagents ARE `Agent` calls, so any turn that
-          // delegates loses memory/team tools for the rest of the session.
-          // Disabling background tasks runs subagents inline and the failure
-          // disappears (the CLI reads `backgroundTasksDisabled ||
-          // CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`). Hive already awaits every
-          // delegate result, so inline execution costs no throughput here.
-          // KEEP THIS PIN. The removal gate is NOT a repro: a minimal harness
-          // does not reproduce the failure (three variants pass unpinned on
-          // both 0.3.258 and the fleet-resolved 0.3.261 — `^0.3.258` floats,
-          // so deployed instances run higher than this repo's lockfile). The
-          // gate is `npx tsx scripts/repro-bg-subagent-mcp.ts --audit
-          // --since=<deploy date>`, which measures the real before/after-
-          // notification interruption rate out of the CLI transcripts; drop
-          // the pin only after a hive has run a day of delegating traffic
-          // WITHOUT it and that rate stays at the ~0.06% baseline. Unfixed as
-          // of SDK 0.3.263.
-          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
-          // KPR-346 (§D5): Lane A pins — base URL, vendor token, foreign-model
-          // pins (incl. subagents), ANTHROPIC_API_KEY scrub, tool search off.
-          ...(passthrough ? buildPassthroughEnv(passthrough) : {}),
-        },
-        // Pass --strict-mcp-config to the spawned claude CLI so it ignores all
-        // MCP sources except the engine-supplied `mcpServers` above (which the
-        // SDK feeds in via --mcp-config). Without this, user-level enabled
-        // plugins and claude.ai connectors (e.g. hosted Linear OAuth'd to a
-        // personal account) leak into agent sessions regardless of
-        // settingSources: []. Auth and session storage stay on the default
-        // ~/.claude/ — only MCP discovery is sandboxed.
-        extraArgs: { "strict-mcp-config": null },
-      },
-    });
+    const q = query({ prompt: turnPrompt, options });
 
     this.activeQuery = q;
 
@@ -2236,6 +2387,13 @@ export class AgentRunner {
     const toolCalls: { tool: string; startMs: number; endMs?: number }[] = [];
     let activeToolName: string | null = null;
 
+    // KPR-324 C2/S2: tool-start acknowledgment state (spec §4.1 segment
+    // rule). Per-turn locals — rotation is caller-owned so concurrent calls
+    // never share a counter (spec §4.2).
+    let streamedThisSegment = false;
+    let toolAckInjected = 0;
+    let ackRotation = { index: 0 };
+
     const timeoutMs = resourceLimits?.timeoutMs ?? this.agentConfig.timeoutMs ?? 300_000; // 5 min default
     // KPR-306: stamp timedOut ONLY when the deadline actually cancels an
     // active query — mirrors abort()'s own null guard. The gap this closes:
@@ -2266,6 +2424,8 @@ export class AgentRunner {
 
         if (msg.type === "system" && msg.subtype === "init") {
           resultSessionId = msg.session_id;
+          initAt = Date.now();
+          bootToInitMs = initAt - queryStartedAt; // KPR-323 C1
           log.debug("Session initialized", { sessionId: resultSessionId });
         }
 
@@ -2294,8 +2454,12 @@ export class AgentRunner {
         if (msg.type === "stream_event" && onStream) {
           const event = (msg as any).event;
           if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
+            if (initToFirstTokenMs === undefined) {
+              initToFirstTokenMs = Date.now() - (initAt ?? queryStartedAt); // KPR-323 C1
+            }
             onStream(event.delta.text);
             streamed = true;
+            streamedThisSegment = true; // KPR-324 §4.1: the model spoke in this segment
           }
         }
 
@@ -2328,12 +2492,72 @@ export class AgentRunner {
             cacheReadTokens += messageUsage.cache_read_input_tokens ?? 0;
             cacheCreationTokens += messageUsage.cache_creation_input_tokens ?? 0;
           }
+          // KPR-324 pre-PR R1/R3: subagent/delegate-nested messages are excluded
+          // from the ack decision AND from every segment-state mutation. The SDK
+          // forwards subagent tool_use / tool_result blocks by default
+          // (parent_tool_use_id != null), so a single Task delegation would
+          // otherwise speak one canned hold line per NESTED tool call — several
+          // "One moment." lines for what the caller experiences as one silent
+          // gap. `streamedThisSegment` models what the LIVE CALLER has heard in
+          // the current segment, so machinery the caller never hears must not
+          // move it in either direction: nested text must not mark the segment
+          // "spoken" (would suppress a genuinely-silent top-level ack), and a
+          // nested tool_use must not reset it to false (would mis-frame the next
+          // top-level segment). Usage accounting above and the tool-timing/
+          // logging below deliberately keep processing these messages (KPR-401)
+          // — this guard touches ack + segment state alone, and only on THIS
+          // (assistant-message) branch. The text_delta branch above sets
+          // streamedThisSegment unconditionally on every delta, nesting or not
+          // — that is correct as-is, not an oversight: the SDK does not forward
+          // subagent text by default (forwardSubagentText unset), so any delta
+          // reaching that branch really was spoken to the live caller.
+          const subagentNested =
+            (msg as { parent_tool_use_id?: string | null }).parent_tool_use_id != null;
           const content = assistantMessage?.content;
           if (Array.isArray(content)) {
+            // KPR-324 §4.1: text blocks are processed BEFORE tool blocks so a
+            // "let me check that" + tool_use in ONE assistant message counts
+            // as streamed (no double-speak — spec §4.1 same-message rule).
+            if (
+              !subagentNested &&
+              content.some(
+                (b: { type?: string; text?: string }) =>
+                  b.type === "text" && typeof b.text === "string" && b.text.length > 0,
+              )
+            ) {
+              streamedThisSegment = true;
+            }
             for (const block of content) {
               if (block.type === "text") {
                 resultText = block.text;
               } else if (block.type === "tool_use") {
+                // KPR-324 C2/S2: speak a canned hold line iff this segment was
+                // silent and this is a streaming VOICE turn. SSE-only — the
+                // phrase never enters the SDK transcript or resultText, and
+                // does not set `streamed` (not model text). tool_use is
+                // observed BEFORE the handler runs (⚠ registry #2, Task 0),
+                // so the ack reaches TTS while the tool executes. Nested
+                // (subagent/delegate) tool calls never ack — see above.
+                if (
+                  !subagentNested &&
+                  shouldInjectToolAck({
+                    enabled: config.voice.toolAck.enabled,
+                    streamedThisSegment,
+                    hasOnStream: !!onStream,
+                    channel: context?.channelKind ?? "",
+                  })
+                ) {
+                  const next = nextAckPhrase(ackRotation);
+                  ackRotation = { index: next.index };
+                  onStream!(next.phrase + VOICE_TOOL_ACK_SEPARATOR);
+                  toolAckInjected += 1;
+                }
+                // §4.1: the tool-run gap starts now. Nested (subagent) tool
+                // calls open no gap the caller perceives — they must not reset
+                // the top-level segment's spoken state (R3).
+                if (!subagentNested) {
+                  streamedThisSegment = false;
+                }
                 // Close previous tool timing if any
                 if (activeToolName && toolCalls.length > 0) {
                   toolCalls[toolCalls.length - 1]!.endMs = Date.now();
@@ -2530,15 +2754,80 @@ export class AgentRunner {
     return {
       text: resultText, sessionId: resultSessionId, costUsd, durationMs,
       llmMs, toolMs: totalToolMs, toolCalls: toolCalls.length,
-      toolSummary: toolSummary || "none", streamed,
+      toolSummary: toolSummary || "none", toolAckInjected, streamed,
       inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
       ephemeral5mTokens, ephemeral1hTokens,
       contextWindow, compactions, preCompactTokens,
       error, aborted: this._aborted,
       ...(timedOut ? { timedOut: true } : {}),
+      bootToInitMs, initToFirstTokenMs,
       ...(injectMemory ? { memoryDigestInjected: rendered!.digest } : {}),
       ...(memoryRenderFailed ? { memoryRenderFailed: true as const } : {}),
     };
+  }
+
+  /**
+   * KPR-323 C2: open a long-lived streaming-input query for a warm voice
+   * call session (spec §4.2). Reuses the exact options assembly as send()
+   * via buildQueryEnvelope — same MCP wiring, hooks, cwd, env — with
+   * includePartialMessages always true (voice streams) and `resume` = the
+   * sessionId the adapter resolved for turn 1, EXACTLY as passed (spec §4.2
+   * resume-source rule: never re-read the session store here — after a
+   * warm-turn failure the adapter's outer retry lands cold with
+   * sessionId undefined + full transcript; a store re-read would resume the
+   * very session the retry just escaped and double-inject the transcript).
+   *
+   * WorkItemContext is call-stable on voice (channelId = callId, threadId
+   * fixed), so constructor-time context capture — the KPR-122 pattern — is
+   * correct for the whole call; the per-turn contextRef update degenerates
+   * to a no-op.
+   *
+   * Returns the raw Query. The caller (WarmVoiceSession) owns the input
+   * queue, per-turn output consumption, watchdog, interrupt, and close.
+   * This method does NOT consume the output stream and does NOT arm the
+   * per-turn deadline (the lease's watchdog owns turn deadlines).
+   */
+  async openVoiceStreamingSession(params: {
+    input: AsyncIterable<SDKUserMessage>;
+    sessionId: string | undefined;
+    context: WorkItemContext;
+    systemPromptOverride: string;
+  }): Promise<Query> {
+    log.info("Opening warm voice streaming session", {
+      agent: this.agentConfig.id,
+      resumeSession: params.sessionId ?? "new",
+    });
+
+    const options = await this.buildQueryEnvelope({
+      sessionId: params.sessionId,
+      context: params.context,
+      systemPromptOverride: params.systemPromptOverride,
+      streaming: true,
+    });
+
+    // KPR-323 Task 0 ⚠#5 (DECIDED): strip maxTurns / maxBudgetUsd from the
+    // warm envelope. Both are PER-TURN bounds on the cold path — one query()
+    // per turn — but a lease is ONE query() for the WHOLE call, so the SDK
+    // would apply them CUMULATIVELY across every turn of the conversation.
+    // With the shipped defaults a long call would trip the cumulative limit
+    // mid-conversation, error the turn out, close the lease, and silently
+    // degrade to cold for the rest of the call. Per-turn shaping is not
+    // available on the streaming-input path; the lease's per-turn watchdog
+    // (WarmVoiceSession) is what bounds an individual warm turn.
+    delete options.maxTurns;
+    delete options.maxBudgetUsd;
+
+    const q = query({ prompt: params.input, options });
+    // Bookkeeping parity with send(), NOT a safety net (final round, issue
+    // 4). What actually terminates a warm session is the lease's own close()
+    // → Query.close(). runner.abort() is unreachable on this path: the
+    // manager's openWarmLease builds this runner as a local binding, hands
+    // the Query to the WarmVoiceSession, and never retains the runner — so
+    // nothing external can call .abort()/read .wasAborted on it. The
+    // assignment is kept only so this instance's own state stays consistent
+    // with the cold path's invariants.
+    this.activeQuery = q;
+    return q;
   }
 
   private _aborted = false;

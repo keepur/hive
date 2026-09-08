@@ -108,6 +108,7 @@ await build({
     "mcp/task": "dist/tasks/task-mcp-server.js",
     "mcp/code-task": "dist/code-task/code-task-mcp-server.js",
     "mcp/voice": "dist/voice/voice-mcp-server.js",
+    "mcp/voice-livekit": "dist/voice/livekit-voice-mcp-server.js",
     "mcp/slack": "dist/slack/slack-mcp-server.js",
     "mcp/skill-author": "dist/skill-author/skill-author-mcp-server.js",
   },

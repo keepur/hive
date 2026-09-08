@@ -20,6 +20,10 @@
  * (which imports `createAdminMcpServer` from `admin-mcp-server`) and
  * `admin-mcp-server` (which uses this constant).
  */
+/** KPR-324 C7: test-only voice fixture — allowed on ONE agent (spec §7). */
+export const VOICE_FIXTURE_SERVER_NAME = "voice-fixture";
+export const VOICE_FIXTURE_ALLOWED_AGENT_ID = "voice-pilot";
+
 export const IN_PROCESS_PORTED_SERVERS = new Set<string>([
   "memory",
   "structured-memory",
@@ -33,4 +37,6 @@ export const IN_PROCESS_PORTED_SERVERS = new Set<string>([
   "workflow",
   // KPR-390: meeting worker pool — in-process only (no per-server bundle).
   "worker-pool",
+  // KPR-324 C7: voice-pilot test fixture — in-process only, never delegable.
+  "voice-fixture",
 ]);

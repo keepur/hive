@@ -24,6 +24,11 @@ describe("SERVER_CATALOG", () => {
     }
   });
 
+  it("KPR-324 C8: has no orders key and no voice-fixture key until W1B ships the live server", () => {
+    expect(SERVER_CATALOG).not.toHaveProperty("orders");
+    expect(SERVER_CATALOG).not.toHaveProperty("voice-fixture");
+  });
+
   it("every entry has a non-empty description", () => {
     for (const [name, entry] of Object.entries(SERVER_CATALOG)) {
       expect(entry.description, `${name} missing description`).toBeTruthy();

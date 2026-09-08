@@ -31,11 +31,26 @@ export async function buildVoiceSystemPrompt(
   }
 
   // Voice-specific instructions
+  // KPR-324 C4/S8: the tools paragraph is complementary to the engine's
+  // code-shaped tool-start ack (S2), not a substitute — models skip
+  // prompt-only wait lines. Static text: sits with the rest of Voice Call
+  // Mode, before goal/context/memory/datetime (prefix-cache friendly).
+  // Deliberately still NO toolkit dump / delegate catalog here — the SDK
+  // attaches MCP schemas, so the model can call tools without the KPR-87
+  // section (spec §5).
   parts.push(
     `## Voice Call Mode\n\n` +
     `You are currently on a live phone call. Keep responses conversational and concise — ` +
     `you are speaking out loud, not writing text. Avoid markdown, bullet points, or long lists. ` +
-    `Speak naturally as a human would on the phone. Identify yourself at the start of the call.`,
+    `Speak naturally as a human would on the phone. Identify yourself at the start of the call.\n\n` +
+    `You have your normal tools on this call; the caller cannot see tool names or output. ` +
+    `If you need to look something up, a brief spoken acknowledgment first is good — ` +
+    `the system may also speak a short hold line if you go straight to a tool; do not apologize for it or repeat it. ` +
+    `Speak results the way a person would on the phone: no markdown, no bullet dumps, no raw JSON. ` +
+    `Confirm a PO or reference number back only when the caller cares about the digits. ` +
+    `Do not start long-running work while the caller is waiting — no browser automation, code tasks, ` +
+    `background jobs, or skill authoring on a live call. Prefer a single lookup; if you cannot find it, ` +
+    `say so and offer to follow up after the call. Never initiate another voice_call from a live call.`,
   );
 
   // Call-specific goal/context (injected from voice_call tool)
