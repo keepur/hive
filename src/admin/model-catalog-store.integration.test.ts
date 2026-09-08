@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { randomUUID } from "node:crypto";
-import { ObjectId, type CommandStartedEvent } from "mongodb";
+import { Binary, Long, ObjectId, type CommandStartedEvent } from "mongodb";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { guardDb, WriteGuard } from "../db/write-guard.js";
 import type { AcquisitionObservation, CatalogProvider } from "./model-catalog-types.js";
@@ -52,6 +52,14 @@ async function completeState(store: ModelCatalogStore, provider = "codex") {
     versions: await store.collections.versions.find({ provider }).sort({ revision: 1 }).toArray(),
     changes: await store.collections.changes.find({ provider }).sort({ revision: 1 }).toArray(),
   };
+}
+async function waitForLeaseExpiry(leaseExpiresAt: Date): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    if ((await serverNow()) >= leaseExpiresAt && new Date() >= leaseExpiresAt) return;
+    if (Date.now() >= deadline) throw new Error("Test lease did not expire");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 async function clearDatabase(): Promise<void> {
   expect(mongo.db.databaseName).toMatch(/^hive_kpr459_test_/);
@@ -144,21 +152,103 @@ describe("standalone model catalog", () => {
     ]);
   });
 
-  it("advances only scan freshness for unchanged discovery after a manual revision race", async () => {
-    const store = new ModelCatalogStore(mongo.db);
-    await store.replaceManual(input("model-a", "one"));
-    const started = await begin(store);
+  it("fences a delegated unchanged completion and rebases on the manual membership winner", async () => {
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    let firstStatusResult: { matchedCount: number } | undefined;
+    let hold = true;
+    const db = faultDb(mongo.db, async (collection, method, args, run) => {
+      if (
+        hold &&
+        collection === "agent_model_catalog" &&
+        method === "updateOne" &&
+        args[1].$set?.["scan.outcome"] === "succeeded" &&
+        !args[1].$set?.pendingExport
+      ) {
+        hold = false;
+        entered.resolve();
+        await release.promise;
+        const result = await run();
+        firstStatusResult = result;
+        return result;
+      }
+      return run();
+    });
+    const discovery = new ModelCatalogStore(db);
+    await discovery.replaceManual(input("model-a", "seed note"));
+    const started = await begin(discovery);
     if (started.kind !== "started") throw new Error("attempt did not start");
-    await new ModelCatalogStore(mongo.db).replaceManual(input("model-a", "two"));
-    const before = await completeState(store);
-    const result = await store.applyDiscovery(started.attempt, discovered("model-a"));
-    expect(result.kind).toBe("unchanged");
-    const after = await completeState(store);
-    expect(after.catalog?.revision).toBe(2);
-    expect(after.catalog?.scan).toMatchObject({ attemptId: started.attempt.attemptId, outcome: "succeeded" });
-    expect(after.versions).toHaveLength(before.versions.length);
-    expect(after.changes).toHaveLength(before.changes.length);
-    expect(after.catalog?.models?.[0].notes).toBe("two");
+    const pending = discovery.applyDiscovery(started.attempt, discovered("model-a"));
+    try {
+      await entered.promise;
+      const manual = await new ModelCatalogStore(mongo.db).replaceManual({
+        provider: "codex",
+        updatedBy: "manual-winner",
+        models: [
+          { id: "model-a", displayName: "Manual A", notes: "winner note" },
+          { id: "model-b", displayName: "Manual B", notes: "manual only" },
+        ],
+      });
+      expect(manual).toMatchObject({ kind: "committed", revision: 2, added: ["model-b"], removed: [] });
+      const winner = await completeState(new ModelCatalogStore(mongo.db));
+      expect(winner.catalog).toMatchObject({
+        revision: 2,
+        updatedBy: "manual-winner",
+        models: [
+          { id: "model-a", notes: "winner note" },
+          { id: "model-b", notes: "manual only" },
+        ],
+        scan: { attemptId: started.attempt.attemptId, outcome: "running" },
+      });
+
+      release.resolve();
+      expect(await pending).toMatchObject({
+        kind: "committed",
+        commitId: started.attempt.attemptId,
+        revision: 3,
+        added: [],
+        removed: ["model-b"],
+      });
+      expect(firstStatusResult?.matchedCount).toBe(0);
+
+      const final = await completeState(new ModelCatalogStore(mongo.db));
+      expect(final.versions.slice(0, 2)).toEqual(winner.versions);
+      expect(final.changes.slice(0, 2)).toEqual(winner.changes);
+      expect(final.catalog).toMatchObject({
+        revision: 3,
+        commitId: started.attempt.attemptId,
+        source: "discovery",
+        updatedBy: "system:model-catalog-scanner",
+        models: [{ id: "model-a", displayName: "MODEL-A", notes: "winner note" }],
+        scan: {
+          attemptId: started.attempt.attemptId,
+          outcome: "succeeded",
+          finishedAt: expect.any(Date),
+          lastSucceededAt: expect.any(Date),
+        },
+      });
+      expect(final.catalog).not.toHaveProperty("pendingExport");
+      expect(final.catalog?.scan).not.toHaveProperty("leaseExpiresAt");
+      expect(final.versions).toHaveLength(3);
+      expect(final.versions[2]).toMatchObject({
+        _id: started.attempt.attemptId,
+        revision: 3,
+        added: [],
+        removed: ["model-b"],
+        snapshot: [{ id: "model-a", displayName: "MODEL-A", notes: "winner note" }],
+      });
+      expect(final.changes).toHaveLength(3);
+      expect(final.changes[2]).toMatchObject({
+        _id: started.attempt.attemptId,
+        revision: 3,
+        added: [],
+        removed: ["model-b"],
+        delivery: { state: "pending", attempts: 0, nextAttemptAt: expect.any(Date) },
+      });
+    } finally {
+      release.resolve();
+      await pending.catch(() => undefined);
+    }
   });
 
   it("records failure without changing saved content, successful freshness, or audit rows", async () => {
@@ -544,6 +634,218 @@ describe("standalone model catalog", () => {
     expect(accepted.kind).toBe("started");
   });
 
+  it("matches the exact BSON observation through the production literal filter", async () => {
+    const diagnostic = {
+      objectId: new ObjectId(),
+      long: Long.fromString("922337203685477580"),
+      binary: new Binary(Buffer.from([1, 2, 3, 4])),
+      fieldString: "$scan",
+      variableString: "$$NOW",
+      operatorDocument: { $gt: ["$scan.leaseExpiresAt", "$$NOW"] },
+      operatorArray: ["$scan", { $lte: [1, 2] }],
+    };
+    const predecessorScan = {
+      attemptId: randomUUID(),
+      startedAt: new Date(0),
+      outcome: "failed",
+      finishedAt: new Date(1),
+      diagnostic,
+    };
+    await mongo.db.collection("agent_model_catalog").insertOne({
+      _id: "codex",
+      provider: "codex",
+      models: [],
+      scan: predecessorScan,
+    });
+    const store = new ModelCatalogStore(mongo.db);
+    const due = await store.readCatalogState("codex");
+    (due.snapshot!.scan as any).diagnostic.fieldString = "mutated after observation";
+    const proposed = proposal(due.observed, await serverNow());
+    expect(await store.beginDiscoveryAttempt("codex", proposed)).toMatchObject({
+      kind: "started",
+      attempt: { attemptId: proposed.attemptId },
+    });
+
+    const claim = [...commands]
+      .reverse()
+      .find(
+        ({ commandName, command }) =>
+          commandName === "update" &&
+          command.update === "agent_model_catalog" &&
+          command.updates?.[0]?.u?.$set?.["scan.attemptId"] === proposed.attemptId,
+      );
+    expect(claim?.command.updates[0].q.$expr.$and[0].$eq[1].$literal).toEqual(predecessorScan);
+    const persisted = await completeState(store);
+    expect(persisted.catalog).toEqual({
+      _id: "codex",
+      provider: "codex",
+      models: [],
+      scan: {
+        attemptId: proposed.attemptId,
+        startedAt: proposed.startedAt,
+        leaseExpiresAt: proposed.leaseExpiresAt,
+        outcome: "running",
+        diagnostic,
+      },
+    });
+    expect(persisted.versions).toEqual([]);
+    expect(persisted.changes).toEqual([]);
+  });
+
+  it("distinguishes scan field presence and ordered embedded BSON in the production predicate", async () => {
+    const nestedScan = {
+      attemptId: randomUUID(),
+      startedAt: new Date(0),
+      outcome: "failed",
+      diagnostic: { first: 1, second: 2 },
+    };
+    const fixtures: Array<{
+      name: string;
+      initial: Record<string, unknown>;
+      mutate: () => Promise<unknown>;
+    }> = [
+      {
+        name: "absent scan observed before explicit null",
+        initial: {},
+        mutate: () => mongo.db.collection("agent_model_catalog").updateOne({ _id: "codex" }, { $set: { scan: null } }),
+      },
+      {
+        name: "explicit null observed before scan becomes absent",
+        initial: { scan: null },
+        mutate: () => mongo.db.collection("agent_model_catalog").updateOne({ _id: "codex" }, { $unset: { scan: "" } }),
+      },
+      {
+        name: "nested field absent before explicit null",
+        initial: { scan: nestedScan },
+        mutate: () =>
+          mongo.db
+            .collection("agent_model_catalog")
+            .updateOne({ _id: "codex" }, { $set: { "scan.diagnostic.detail": null } }),
+      },
+      {
+        name: "ordered embedded fields are reordered",
+        initial: { scan: nestedScan },
+        mutate: () =>
+          mongo.db.collection("agent_model_catalog").updateOne(
+            { _id: "codex" },
+            {
+              $set: {
+                scan: {
+                  attemptId: nestedScan.attemptId,
+                  startedAt: nestedScan.startedAt,
+                  outcome: nestedScan.outcome,
+                  diagnostic: { second: 2, first: 1 },
+                },
+              },
+            },
+          ),
+      },
+    ];
+
+    for (const fixture of fixtures) {
+      await clearDatabase();
+      await mongo.db.collection("agent_model_catalog").insertOne({
+        _id: "codex",
+        provider: "codex",
+        ...fixture.initial,
+      });
+      const store = new ModelCatalogStore(mongo.db);
+      const due = await store.readCatalogState("codex");
+      await fixture.mutate();
+      const before = await completeState(store);
+      expect(await store.beginDiscoveryAttempt("codex", proposal(due.observed, await serverNow()))).toEqual({
+        kind: "busy",
+      });
+      expect(await completeState(store), fixture.name).toEqual(before);
+    }
+
+    await clearDatabase();
+    await mongo.db.collection("agent_model_catalog").insertOne({ _id: "codex", provider: "codex", scan: null });
+    const nullStore = new ModelCatalogStore(mongo.db);
+    const nullDue = await nullStore.readCatalogState("codex");
+    const nullBefore = await completeState(nullStore);
+    await expect(
+      nullStore.beginDiscoveryAttempt("codex", proposal(nullDue.observed, await serverNow())),
+    ).rejects.toMatchObject({ safe: { code: "storage" } });
+    expect(await completeState(nullStore)).toEqual(nullBefore);
+  });
+
+  it("applies the seeded-bit expression safely to every stored models representation", async () => {
+    const unseeded: Array<{ name: string; models?: unknown }> = [
+      { name: "absent" },
+      { name: "null", models: null },
+      { name: "string", models: "not-an-array" },
+      { name: "empty array", models: [] },
+    ];
+    for (const fixture of unseeded) {
+      await clearDatabase();
+      await mongo.db.collection("agent_model_catalog").insertOne({
+        _id: "codex",
+        provider: "codex",
+        ...(Object.hasOwn(fixture, "models") ? { models: fixture.models } : {}),
+      });
+      const store = new ModelCatalogStore(mongo.db);
+      const due = await store.readCatalogState("codex");
+      const proposed = proposal(due.observed, await serverNow());
+      expect(await store.beginDiscoveryAttempt("codex", proposed), fixture.name).toMatchObject({ kind: "started" });
+      const state = await completeState(store);
+      expect(state.catalog).toMatchObject({
+        _id: "codex",
+        provider: "codex",
+        scan: { attemptId: proposed.attemptId, outcome: "running" },
+      });
+      if (Object.hasOwn(fixture, "models")) expect((state.catalog as any).models).toEqual(fixture.models);
+      else expect(state.catalog).not.toHaveProperty("models");
+      expect(state.versions).toEqual([]);
+      expect(state.changes).toEqual([]);
+    }
+
+    await clearDatabase();
+    await mongo.db.collection("agent_model_catalog").insertOne({
+      _id: "codex",
+      provider: "codex",
+      models: [
+        { id: "model-a", displayName: "A", addedAt: new Date(0) },
+        { id: "model-b", displayName: "B", addedAt: new Date(0) },
+      ],
+    });
+    const seededStore = new ModelCatalogStore(mongo.db);
+    const seededDue = await seededStore.readCatalogState("codex");
+    await mongo.db.collection("agent_model_catalog").updateOne(
+      { _id: "codex" },
+      {
+        $set: {
+          models: [
+            { id: "model-b", displayName: "Renamed B", notes: "latest", addedAt: new Date(0) },
+            { id: "model-a", displayName: "Renamed A", addedAt: new Date(0) },
+          ],
+        },
+      },
+    );
+    const seededProposal = proposal(seededDue.observed, await serverNow());
+    expect(await seededStore.beginDiscoveryAttempt("codex", seededProposal)).toMatchObject({ kind: "started" });
+    expect((await completeState(seededStore)).catalog).toMatchObject({
+      models: [
+        { id: "model-b", displayName: "Renamed B", notes: "latest" },
+        { id: "model-a", displayName: "Renamed A" },
+      ],
+      scan: { attemptId: seededProposal.attemptId, outcome: "running" },
+    });
+
+    await clearDatabase();
+    await mongo.db.collection("agent_model_catalog").insertOne({ _id: "codex", provider: "codex", models: [] });
+    const changedBit = new ModelCatalogStore(mongo.db);
+    const unseededDue = await changedBit.readCatalogState("codex");
+    await mongo.db
+      .collection("agent_model_catalog")
+      .updateOne({ _id: "codex" }, { $set: { models: [{ id: "model-a", displayName: "A", addedAt: new Date(0) }] } });
+    const beforeBusy = await completeState(changedBit);
+    expect(await changedBit.beginDiscoveryAttempt("codex", proposal(unseededDue.observed, await serverNow()))).toEqual({
+      kind: "busy",
+    });
+    expect(await completeState(changedBit)).toEqual(beforeBusy);
+  });
+
   it("uses actual server time for expired/future proposals and strict timestamp equality", async () => {
     const store = new ModelCatalogStore(mongo.db);
     const due = await store.readCatalogState("codex");
@@ -601,7 +903,7 @@ describe("standalone model catalog", () => {
   });
 
   it("refuses malformed BSON lease values through the production claim predicate", async () => {
-    const malformed: unknown[] = ["tomorrow", null, 42, { date: new Date(0) }];
+    const malformed: unknown[] = [new Date(0).toISOString(), null, 42, [new Date(0)], { date: new Date(0) }];
     for (const leaseExpiresAt of malformed) {
       await clearDatabase();
       await mongo.db.collection("agent_model_catalog").insertOne({
@@ -617,6 +919,83 @@ describe("standalone model catalog", () => {
       expect((await store.readCatalogState("codex")).snapshot?.scan?.leaseExpiresAt).toEqual(leaseExpiresAt);
     }
   });
+
+  it.each(["shell", "claim"] as const)(
+    "refuses an expired proposal after the real %s operation is delayed before delegation",
+    async (delayedStage) => {
+      const entered = deferred<void>();
+      const release = deferred<void>();
+      let attemptId = "";
+      let shellCalls = 0;
+      let claimCalls = 0;
+      let claimResult: { matchedCount: number } | undefined;
+      const db = faultDb(mongo.db, async (collection, method, args, run) => {
+        const shell = collection === "agent_model_catalog" && method === "insertOne" && !args[0].pendingExport;
+        const claim =
+          collection === "agent_model_catalog" &&
+          method === "updateOne" &&
+          args[1].$set?.["scan.attemptId"] === attemptId;
+        if (shell) {
+          shellCalls++;
+          if (delayedStage === "shell") {
+            entered.resolve();
+            await release.promise;
+          }
+        }
+        if (claim) {
+          claimCalls++;
+          if (delayedStage === "claim") {
+            entered.resolve();
+            await release.promise;
+          }
+        }
+        const result = await run();
+        if (claim) claimResult = result;
+        return result;
+      });
+      const store = new ModelCatalogStore(db);
+      await store.ensureIndexes();
+      const due = await store.readCatalogState("codex");
+      const now = await serverNow();
+      const proposed = proposal(due.observed, now, 1_200);
+      attemptId = proposed.attemptId;
+      const pending = store.beginDiscoveryAttempt("codex", proposed);
+      try {
+        await entered.promise;
+        await waitForLeaseExpiry(proposed.leaseExpiresAt);
+        release.resolve();
+        expect(await pending).toEqual({ kind: "busy" });
+        expect(shellCalls).toBe(1);
+        expect(claimCalls).toBe(1);
+        expect(claimResult?.matchedCount).toBe(0);
+        expect(await completeState(store)).toEqual({
+          catalog: { _id: "codex", provider: "codex" },
+          versions: [],
+          changes: [],
+        });
+        expect(
+          await store.applyDiscovery(
+            {
+              provider: "codex",
+              attemptId: proposed.attemptId,
+              startedAt: proposed.startedAt,
+              leaseExpiresAt: proposed.leaseExpiresAt,
+            },
+            discovered("model-a"),
+          ),
+        ).toMatchObject({ kind: "commit-unknown", operationId: proposed.attemptId });
+        expect(await completeState(store)).toEqual({
+          catalog: { _id: "codex", provider: "codex" },
+          versions: [],
+          changes: [],
+        });
+      } finally {
+        release.resolve();
+        await pending.catch(() => undefined);
+      }
+    },
+    30_000,
+  );
 
   it("holds a real matched acknowledgment past expiry without granting submission proof", async () => {
     const gate = deferred<void>();
@@ -672,39 +1051,214 @@ describe("standalone model catalog", () => {
     }
   }, 30_000);
 
-  it("keeps an uncertain unchanged completion fenced until its delayed mutation becomes positive evidence", async () => {
-    let delayed: (() => Promise<any>) | undefined;
-    const uncertain = new ModelCatalogStore(
-      faultDb(mongo.db, async (collection, method, args, run) => {
+  it.each(["replacement", "unchanged"] as const)(
+    "keeps an unresolved %s UUID on reconciliation while guard and index writes are unavailable",
+    async (kind) => {
+      let delayed: (() => Promise<any>) | undefined;
+      let submissions = 0;
+      const original = new ModelCatalogStore(
+        faultDb(mongo.db, async (collection, method, args, run) => {
+          const target =
+            collection === "agent_model_catalog" &&
+            method === "updateOne" &&
+            (kind === "replacement"
+              ? args[1].$set?.pendingExport
+              : args[1].$set?.["scan.outcome"] === "succeeded" && !args[1].$set?.pendingExport);
+          if (target) {
+            submissions++;
+            if (!delayed) {
+              delayed = run;
+              throw new Error(`test delayed ${kind}`);
+            }
+          }
+          return run();
+        }),
+      );
+      await original.replaceManual(input("model-a", "seed note"));
+      const started = await begin(original);
+      if (started.kind !== "started") throw new Error("attempt did not start");
+      const rows = discovered(kind === "replacement" ? "model-b" : "model-a");
+      expect(await original.applyDiscovery(started.attempt, rows)).toMatchObject({
+        kind: "commit-unknown",
+        operationId: started.attempt.attemptId,
+      });
+      expect(submissions).toBe(1);
+      const beforeRelease = await completeState(new ModelCatalogStore(mongo.db));
+      expect(beforeRelease.catalog).toMatchObject({
+        revision: 1,
+        models: [{ id: "model-a", notes: "seed note" }],
+        scan: { attemptId: started.attempt.attemptId, outcome: "running" },
+      });
+
+      const guard = new WriteGuard({ instanceId: "test", dbName: mongo.db.databaseName });
+      guard.engage("private post-submission identity mismatch");
+      let indexCalls = 0;
+      let delegatedWrites = 0;
+      const unavailable = faultDb(guardDb(mongo.db, guard), async (collection, method, _args, run) => {
+        if (method === "createIndex") indexCalls++;
         if (
-          !delayed &&
-          collection === "agent_model_catalog" &&
-          method === "updateOne" &&
-          args[1].$set?.["scan.outcome"] === "succeeded" &&
-          !args[1].$set?.pendingExport
+          ["agent_model_catalog", "agent_model_catalog_versions", "agent_model_catalog_changes"].includes(collection) &&
+          ["insertOne", "updateOne"].includes(method)
         ) {
-          delayed = run;
-          throw new Error("test delayed unchanged completion");
+          delegatedWrites++;
         }
         return run();
-      }),
-    );
-    await uncertain.replaceManual(input("model-a"));
-    const started = await begin(uncertain);
-    if (started.kind !== "started") throw new Error("attempt did not start");
-    const unknown = await uncertain.applyDiscovery(started.attempt, discovered("model-a"));
-    expect(unknown).toMatchObject({ kind: "commit-unknown", operationId: started.attempt.attemptId });
-    expect((await uncertain.readCatalogState("codex")).snapshot?.scan?.outcome).toBe("running");
-    expect((await delayed!()).matchedCount).toBe(1);
-    const resolved = await new ModelCatalogStore(mongo.db).applyDiscovery(started.attempt, discovered("model-a"));
-    expect(resolved).toMatchObject({ kind: "commit-unknown", operationId: started.attempt.attemptId });
-    expect((await uncertain.readCatalogState("codex")).snapshot?.scan).toMatchObject({
-      attemptId: started.attempt.attemptId,
-      outcome: "succeeded",
-    });
-    expect(await uncertain.collections.versions.countDocuments()).toBe(1);
-    expect(await uncertain.collections.changes.countDocuments()).toBe(1);
-  });
+      });
+      expect(
+        await new ModelCatalogStore(unavailable).applyDiscovery(started.attempt, [{ invalid: true }]),
+      ).toMatchObject({
+        kind: "commit-unknown",
+        operationId: started.attempt.attemptId,
+      });
+      expect(indexCalls).toBe(0);
+      expect(delegatedWrites).toBe(0);
+      expect(guard.refusedWriteCount).toBe(0);
+      expect(submissions).toBe(1);
+      expect(await completeState(new ModelCatalogStore(mongo.db))).toEqual(beforeRelease);
+
+      const delegatedResult = await delayed!();
+      expect(delegatedResult.matchedCount).toBe(1);
+      guard.disengage();
+      const raw = new ModelCatalogStore(mongo.db);
+      const resolved = await raw.applyDiscovery(started.attempt, rows);
+      if (kind === "replacement") {
+        expect(resolved).toMatchObject({
+          kind: "committed",
+          commitId: started.attempt.attemptId,
+          revision: 2,
+          added: ["model-b"],
+          removed: ["model-a"],
+        });
+      } else {
+        expect(resolved).toMatchObject({ kind: "commit-unknown", operationId: started.attempt.attemptId });
+      }
+      const final = await completeState(raw);
+      expect(final.catalog).toMatchObject({
+        revision: kind === "replacement" ? 2 : 1,
+        models: [{ id: kind === "replacement" ? "model-b" : "model-a" }],
+        scan: { attemptId: started.attempt.attemptId, outcome: "succeeded", lastSucceededAt: expect.any(Date) },
+      });
+      expect(final.catalog).not.toHaveProperty("pendingExport");
+      expect(final.versions.slice(0, 1)).toEqual(beforeRelease.versions);
+      expect(final.changes.slice(0, 1)).toEqual(beforeRelease.changes);
+      expect(final.versions).toHaveLength(kind === "replacement" ? 2 : 1);
+      expect(final.changes).toHaveLength(kind === "replacement" ? 2 : 1);
+      if (kind === "replacement") {
+        expect(final.versions[1]).toMatchObject({
+          _id: started.attempt.attemptId,
+          revision: 2,
+          snapshot: [{ id: "model-b", displayName: "MODEL-B" }],
+        });
+        expect(final.changes[1]).toMatchObject({
+          _id: started.attempt.attemptId,
+          revision: 2,
+          delivery: { state: "pending", attempts: 0 },
+        });
+      }
+    },
+  );
+
+  it.each(["original", "fresh"] as const)(
+    "keeps an unresolved UUID unknown through a failed recovery read on the %s store",
+    async (reentryKind) => {
+      await new ModelCatalogStore(mongo.db).replaceManual(input("model-a", "seed note"));
+      let delayed: (() => Promise<any>) | undefined;
+      let captureReplacement = false;
+      let faultReentry = false;
+      let submissions = 0;
+      let catalogReads = 0;
+      let historyReads = 0;
+      let indexCalls = 0;
+      let delegatedWrites = 0;
+      const db = faultDb(mongo.db, async (collection, method, args, run) => {
+        if (
+          captureReplacement &&
+          collection === "agent_model_catalog" &&
+          method === "updateOne" &&
+          args[1].$set?.pendingExport
+        ) {
+          submissions++;
+          if (!delayed) {
+            delayed = run;
+            throw new Error("test deferred replacement");
+          }
+        }
+        if (faultReentry) {
+          if (method === "createIndex") indexCalls++;
+          if (collection === "agent_model_catalog" && method === "findOne") {
+            catalogReads++;
+            if (catalogReads === 2) throw new Error("test provider recovery read unavailable");
+          }
+          if (collection === "agent_model_catalog_versions" && method === "findOne") historyReads++;
+          if (
+            ["agent_model_catalog", "agent_model_catalog_versions", "agent_model_catalog_changes"].includes(
+              collection,
+            ) &&
+            ["insertOne", "updateOne"].includes(method)
+          ) {
+            delegatedWrites++;
+          }
+        }
+        return run();
+      });
+      const original = new ModelCatalogStore(db);
+      const started = await begin(original);
+      if (started.kind !== "started") throw new Error("attempt did not start");
+      captureReplacement = true;
+      expect(await original.applyDiscovery(started.attempt, discovered("model-b"))).toMatchObject({
+        kind: "commit-unknown",
+        operationId: started.attempt.attemptId,
+      });
+      expect(submissions).toBe(1);
+      const beforeRelease = await completeState(new ModelCatalogStore(mongo.db));
+
+      faultReentry = true;
+      const reentry = reentryKind === "original" ? original : new ModelCatalogStore(db);
+      expect(await reentry.applyDiscovery(started.attempt, [{ malformed: true }])).toMatchObject({
+        kind: "commit-unknown",
+        operationId: started.attempt.attemptId,
+      });
+      expect(catalogReads).toBe(3);
+      expect(historyReads).toBe(2);
+      expect(indexCalls).toBe(0);
+      expect(delegatedWrites).toBe(0);
+      expect(submissions).toBe(1);
+      expect(await completeState(new ModelCatalogStore(mongo.db))).toEqual(beforeRelease);
+
+      faultReentry = false;
+      const delegatedResult = await delayed!();
+      expect(delegatedResult.matchedCount).toBe(1);
+      const resolved = await new ModelCatalogStore(mongo.db).applyDiscovery(started.attempt, discovered("model-b"));
+      expect(resolved).toMatchObject({
+        kind: "committed",
+        commitId: started.attempt.attemptId,
+        revision: 2,
+        added: ["model-b"],
+        removed: ["model-a"],
+        recoveryPending: false,
+      });
+      const final = await completeState(new ModelCatalogStore(mongo.db));
+      expect(final.catalog).toMatchObject({
+        revision: 2,
+        commitId: started.attempt.attemptId,
+        models: [{ id: "model-b", displayName: "MODEL-B" }],
+        scan: { attemptId: started.attempt.attemptId, outcome: "succeeded" },
+      });
+      expect(final.catalog).not.toHaveProperty("pendingExport");
+      expect(final.versions).toHaveLength(2);
+      expect(final.versions[1]).toMatchObject({
+        _id: started.attempt.attemptId,
+        revision: 2,
+        snapshot: [{ id: "model-b", displayName: "MODEL-B" }],
+      });
+      expect(final.changes).toHaveLength(2);
+      expect(final.changes[1]).toMatchObject({
+        _id: started.attempt.attemptId,
+        revision: 2,
+        delivery: { state: "pending", attempts: 0 },
+      });
+    },
+  );
 
   it("does not let a delayed old completion overwrite a manual winner", async () => {
     let delayed: (() => Promise<any>) | undefined;
@@ -796,91 +1350,160 @@ describe("standalone model catalog", () => {
     expect(await begin(retry)).toMatchObject({ kind: "started" });
   });
 
-  it("lets a successor take over an expired lease and ignores the late old matched acknowledgment", async () => {
-    let oldId = "";
-    const entered = deferred<void>();
-    const release = deferred<void>();
-    const db = faultDb(mongo.db, async (collection, method, args, run) => {
-      const result = await run();
-      if (
-        collection === "agent_model_catalog" &&
-        method === "updateOne" &&
-        args[1].$set?.["scan.attemptId"] === oldId
-      ) {
-        expect(result.matchedCount).toBe(1);
-        entered.resolve();
-        await release.promise;
-      }
-      return result;
-    });
-    const store = new ModelCatalogStore(db);
-    await store.ensureIndexes();
-    const due = await store.readCatalogState("codex");
-    const now = await serverNow();
-    oldId = randomUUID();
-    const oldLease = new Date(now.getTime() + 1_200);
-    const oldPending = store.beginDiscoveryAttempt("codex", {
-      attemptId: oldId,
-      startedAt: now,
-      leaseExpiresAt: oldLease,
-      observed: due.observed,
-    });
-    try {
-      await entered.promise;
-      const deadline = Date.now() + 5_000;
-      while ((await serverNow()) < oldLease) {
-        if (Date.now() > deadline) throw new Error("Old test lease did not expire");
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-      const successorDue = await store.readCatalogState("codex");
-      const successorNow = await serverNow();
-      const successor = await store.beginDiscoveryAttempt("codex", proposal(successorDue.observed, successorNow));
-      expect(successor.kind).toBe("started");
-      if (successor.kind !== "started") throw new Error("successor did not acquire");
-      release.resolve();
-      expect((await oldPending).kind).toBe("started");
-      expect(await store.applyDiscovery(successor.attempt, discovered("model-a"))).toMatchObject({
-        kind: "committed",
-        commitId: successor.attempt.attemptId,
+  it.each(["ready", "uncertain"] as const)(
+    "does not let a late old claim acknowledgment replace a %s successor proof",
+    async (successorState) => {
+      let oldId = "";
+      let successorId = "";
+      let oldClaimResult: { matchedCount: number } | undefined;
+      let successorRun: (() => Promise<any>) | undefined;
+      let successorSubmissions = 0;
+      const entered = deferred<void>();
+      const release = deferred<void>();
+      const db = faultDb(mongo.db, async (collection, method, args, run) => {
+        if (
+          collection === "agent_model_catalog" &&
+          method === "updateOne" &&
+          args[1].$set?.["scan.attemptId"] === oldId
+        ) {
+          const result = await run();
+          oldClaimResult = result;
+          entered.resolve();
+          await release.promise;
+          return result;
+        }
+        if (
+          collection === "agent_model_catalog" &&
+          method === "updateOne" &&
+          args[1].$set?.pendingExport?.version?._id === successorId
+        ) {
+          successorSubmissions++;
+          if (successorState === "uncertain" && !successorRun) {
+            successorRun = run;
+            throw new Error("test uncertain successor");
+          }
+        }
+        return run();
       });
-      expect(
-        await store.failDiscoveryAttempt(
-          { provider: "codex", attemptId: oldId, startedAt: now, leaseExpiresAt: oldLease },
-          { code: "timeout", message: "ignored" },
-          new Date(),
-        ),
-      ).toEqual({
-        kind: "superseded",
+      const store = new ModelCatalogStore(db);
+      await store.ensureIndexes();
+      const due = await store.readCatalogState("codex");
+      const now = await serverNow();
+      oldId = randomUUID();
+      const oldLease = new Date(now.getTime() + 1_200);
+      const oldPending = store.beginDiscoveryAttempt("codex", {
+        attemptId: oldId,
+        startedAt: now,
+        leaseExpiresAt: oldLease,
+        observed: due.observed,
       });
-      expect((await store.readCatalogState("codex")).snapshot?.scan?.attemptId).toBe(successor.attempt.attemptId);
-    } finally {
-      release.resolve();
-      await oldPending.catch(() => undefined);
-    }
-  }, 30_000);
+      try {
+        await entered.promise;
+        await waitForLeaseExpiry(oldLease);
+        const successorDue = await store.readCatalogState("codex");
+        const successorNow = await serverNow();
+        const successor = await store.beginDiscoveryAttempt("codex", proposal(successorDue.observed, successorNow));
+        expect(successor.kind).toBe("started");
+        if (successor.kind !== "started") throw new Error("successor did not acquire");
+        successorId = successor.attempt.attemptId;
+        if (successorState === "uncertain") {
+          expect(await store.applyDiscovery(successor.attempt, discovered("model-a"))).toMatchObject({
+            kind: "commit-unknown",
+            operationId: successorId,
+          });
+          expect(successorSubmissions).toBe(1);
+        }
 
-  it("settles committed UUID evidence before failed index initialization and never replays", async () => {
-    let blockHistory = true;
+        release.resolve();
+        expect((await oldPending).kind).toBe("started");
+        expect(oldClaimResult?.matchedCount).toBe(1);
+        if (successorState === "uncertain") {
+          expect(await store.applyDiscovery(successor.attempt, discovered("model-a"))).toMatchObject({
+            kind: "commit-unknown",
+            operationId: successorId,
+          });
+          expect(successorSubmissions).toBe(1);
+          expect((await successorRun!()).matchedCount).toBe(1);
+          expect(
+            await new ModelCatalogStore(mongo.db).applyDiscovery(successor.attempt, discovered("model-a")),
+          ).toMatchObject({
+            kind: "committed",
+            commitId: successorId,
+            revision: 1,
+          });
+        } else {
+          expect(await store.applyDiscovery(successor.attempt, discovered("model-a"))).toMatchObject({
+            kind: "committed",
+            commitId: successorId,
+            revision: 1,
+          });
+          expect(successorSubmissions).toBe(1);
+        }
+        expect(
+          await store.failDiscoveryAttempt(
+            { provider: "codex", attemptId: oldId, startedAt: now, leaseExpiresAt: oldLease },
+            { code: "timeout", message: "ignored" },
+            new Date(),
+          ),
+        ).toEqual({ kind: "superseded" });
+        const final = await completeState(new ModelCatalogStore(mongo.db));
+        expect(final.catalog).toMatchObject({
+          revision: 1,
+          commitId: successorId,
+          models: [{ id: "model-a", displayName: "MODEL-A" }],
+          scan: { attemptId: successorId, outcome: "succeeded" },
+        });
+        expect(final.catalog).not.toHaveProperty("pendingExport");
+        expect(final.versions).toHaveLength(1);
+        expect(final.versions[0]).toMatchObject({ _id: successorId, revision: 1, snapshot: [{ id: "model-a" }] });
+        expect(final.changes).toHaveLength(1);
+        expect(final.changes[0]).toMatchObject({
+          _id: successorId,
+          revision: 1,
+          delivery: { state: "pending", attempts: 0 },
+        });
+      } finally {
+        release.resolve();
+        await oldPending.catch(() => undefined);
+      }
+    },
+    30_000,
+  );
+
+  it("preserves a delayed UUID across explicit failed index initialization and never replays", async () => {
+    await new ModelCatalogStore(mongo.db).replaceManual(input("model-a"));
+    let delayed: (() => Promise<any>) | undefined;
+    let submissions = 0;
     const original = new ModelCatalogStore(
-      faultDb(mongo.db, async (collection, method, _args, run) => {
-        if (blockHistory && collection === "agent_model_catalog_versions" && method === "insertOne") {
-          throw new Error("test projection unavailable");
+      faultDb(mongo.db, async (collection, method, args, run) => {
+        if (collection === "agent_model_catalog" && method === "updateOne" && args[1].$set?.pendingExport) {
+          submissions++;
+          if (!delayed) {
+            delayed = run;
+            throw new Error("test delayed discovery commit");
+          }
         }
         return run();
       }),
     );
     const started = await begin(original);
     if (started.kind !== "started") throw new Error("attempt did not start");
-    expect(await original.applyDiscovery(started.attempt, discovered("model-a"))).toMatchObject({
-      kind: "committed",
-      commitId: started.attempt.attemptId,
-      recoveryPending: true,
+    expect(await original.applyDiscovery(started.attempt, discovered("model-b"))).toMatchObject({
+      kind: "commit-unknown",
+      operationId: started.attempt.attemptId,
     });
+    expect(submissions).toBe(1);
 
     let indexCalls = 0;
+    let released = false;
+    let delegatedResult: Promise<any> | undefined;
     const unavailable = faultDb(mongo.db, async (collection, method, _args, run) => {
       if (method === "createIndex") {
         indexCalls++;
+        if (!released) {
+          released = true;
+          delegatedResult = delayed!();
+        }
         throw new Error("test index unavailable");
       }
       if (collection === "agent_model_catalog_versions" && method === "insertOne") {
@@ -888,83 +1511,159 @@ describe("standalone model catalog", () => {
       }
       return run();
     });
-    expect(
-      await new ModelCatalogStore(unavailable).applyDiscovery(started.attempt, [{ malformed: true }]),
-    ).toMatchObject({
+    const fresh = new ModelCatalogStore(unavailable);
+    await expect(fresh.ensureIndexes()).rejects.toThrow("test index unavailable");
+    expect((await delegatedResult!).matchedCount).toBe(1);
+    const afterDelayedCommit = await completeState(new ModelCatalogStore(mongo.db));
+    expect(afterDelayedCommit.catalog).toMatchObject({
+      revision: 2,
+      commitId: started.attempt.attemptId,
+      models: [{ id: "model-b" }],
+      scan: { attemptId: started.attempt.attemptId, outcome: "succeeded" },
+      pendingExport: { version: { _id: started.attempt.attemptId, revision: 2 } },
+    });
+    expect(afterDelayedCommit.versions).toHaveLength(1);
+    expect(afterDelayedCommit.changes).toHaveLength(1);
+
+    const failedIndexCalls = indexCalls;
+    expect(await fresh.applyDiscovery(started.attempt, [{ malformed: true }])).toMatchObject({
       kind: "committed",
       commitId: started.attempt.attemptId,
+      revision: 2,
       recoveryPending: true,
     });
-    expect(indexCalls).toBe(0);
-    expect(await mongo.db.collection("agent_model_catalog").countDocuments()).toBe(1);
-    expect(await mongo.db.collection("agent_model_catalog_versions").countDocuments()).toBe(0);
-    blockHistory = false;
-    expect(await new ModelCatalogStore(mongo.db).recoverPendingExports("codex")).toEqual([
-      { provider: "codex", kind: "recovered" },
-    ]);
-    expect(await mongo.db.collection("agent_model_catalog_versions").countDocuments()).toBe(1);
-    expect(await mongo.db.collection("agent_model_catalog_changes").countDocuments()).toBe(1);
+    expect(indexCalls).toBe(failedIndexCalls);
+    expect(submissions).toBe(1);
+    expect(await completeState(new ModelCatalogStore(mongo.db))).toEqual(afterDelayedCommit);
+
+    const raw = new ModelCatalogStore(mongo.db);
+    expect(await raw.recoverPendingExports("codex")).toEqual([{ provider: "codex", kind: "recovered" }]);
+    const final = await completeState(raw);
+    expect(final.catalog).not.toHaveProperty("pendingExport");
+    expect(final.versions).toHaveLength(2);
+    expect(final.versions[1]).toMatchObject({ _id: started.attempt.attemptId, revision: 2 });
+    expect(final.changes).toHaveLength(2);
+    expect(final.changes[1]).toMatchObject({
+      _id: started.attempt.attemptId,
+      revision: 2,
+      delivery: { state: "pending", attempts: 0 },
+    });
   });
 
-  it("keeps an unresolved UUID unknown when evidence is unavailable and a later guard cannot license replay", async () => {
-    let delayed: (() => Promise<any>) | undefined;
-    const original = new ModelCatalogStore(
-      faultDb(mongo.db, async (collection, method, args, run) => {
-        if (!delayed && collection === "agent_model_catalog" && method === "updateOne" && args[1].$set?.pendingExport) {
-          delayed = run;
-          throw new Error("test deferred initial commit");
+  it.each(["ready", "uncertain"] as const)(
+    "does not let an older proven guard refusal erase a %s successor proof",
+    async (successorState) => {
+      await new ModelCatalogStore(mongo.db).replaceManual(input("model-a"));
+      const guard = new WriteGuard({ instanceId: "test", dbName: mongo.db.databaseName });
+      const aEntered = deferred<void>();
+      const releaseA = deferred<void>();
+      let aId = "";
+      let bId = "";
+      let aSubmissions = 0;
+      let bSubmissions = 0;
+      let bRun: (() => Promise<any>) | undefined;
+      const db = faultDb(guardDb(mongo.db, guard), async (collection, method, args, run) => {
+        const operationId = args[1]?.$set?.pendingExport?.version?._id;
+        if (collection === "agent_model_catalog" && method === "updateOne" && operationId === aId) {
+          aSubmissions++;
+          aEntered.resolve();
+          await releaseA.promise;
+          return run();
+        }
+        if (collection === "agent_model_catalog" && method === "updateOne" && operationId === bId) {
+          bSubmissions++;
+          if (successorState === "uncertain" && !bRun) {
+            bRun = run;
+            throw new Error("test successor write uncertain");
+          }
         }
         return run();
-      }),
-    );
-    const started = await begin(original);
-    if (started.kind !== "started") throw new Error("attempt did not start");
-    expect(await original.applyDiscovery(started.attempt, discovered("model-a"))).toMatchObject({
-      kind: "commit-unknown",
-      operationId: started.attempt.attemptId,
-    });
+      });
+      const store = new ModelCatalogStore(db);
+      await store.ensureIndexes();
+      const a = await begin(store, "codex", 1_200);
+      if (a.kind !== "started") throw new Error("A did not start");
+      aId = a.attempt.attemptId;
+      const pendingA = store.applyDiscovery(a.attempt, discovered("model-b"));
+      try {
+        await aEntered.promise;
+        await waitForLeaseExpiry(a.attempt.leaseExpiresAt);
+        const bDue = await store.readCatalogState("codex");
+        const b = await store.beginDiscoveryAttempt("codex", proposal(bDue.observed, await serverNow()));
+        if (b.kind !== "started") throw new Error("B did not start");
+        bId = b.attempt.attemptId;
+        if (successorState === "uncertain") {
+          expect(await store.applyDiscovery(b.attempt, discovered("model-c"))).toMatchObject({
+            kind: "commit-unknown",
+            operationId: bId,
+          });
+          expect(bSubmissions).toBe(1);
+        }
+        const beforeARefusal = await completeState(new ModelCatalogStore(mongo.db));
+        expect(beforeARefusal.catalog).toMatchObject({
+          revision: 1,
+          models: [{ id: "model-a" }],
+          scan: { attemptId: bId, outcome: "running" },
+        });
 
-    let indexCalls = 0;
-    let mutationCalls = 0;
-    const unavailable = faultDb(mongo.db, async (collection, method, _args, run) => {
-      if (
-        (collection === "agent_model_catalog" || collection === "agent_model_catalog_versions") &&
-        method === "findOne"
-      ) {
-        throw new Error("test all evidence unavailable");
+        guard.engage("test refuses the already delegated A mutation");
+        releaseA.resolve();
+        expect(await pendingA).toMatchObject({
+          kind: "not-committed",
+          retriable: true,
+          error: { code: "storage" },
+        });
+        expect(aSubmissions).toBe(1);
+        expect(guard.refusedWriteCount).toBe(1);
+        expect(await completeState(new ModelCatalogStore(mongo.db))).toEqual(beforeARefusal);
+
+        if (successorState === "uncertain") {
+          expect(await store.applyDiscovery(b.attempt, discovered("model-c"))).toMatchObject({
+            kind: "commit-unknown",
+            operationId: bId,
+          });
+          expect(bSubmissions).toBe(1);
+          expect(guard.refusedWriteCount).toBe(1);
+          guard.disengage();
+          expect((await bRun!()).matchedCount).toBe(1);
+          expect(await new ModelCatalogStore(mongo.db).applyDiscovery(b.attempt, discovered("model-c"))).toMatchObject({
+            kind: "committed",
+            commitId: bId,
+            revision: 2,
+          });
+        } else {
+          guard.disengage();
+          expect(await store.applyDiscovery(b.attempt, discovered("model-c"))).toMatchObject({
+            kind: "committed",
+            commitId: bId,
+            revision: 2,
+          });
+          expect(bSubmissions).toBe(1);
+        }
+        const final = await completeState(new ModelCatalogStore(mongo.db));
+        expect(final.catalog).toMatchObject({
+          revision: 2,
+          commitId: bId,
+          models: [{ id: "model-c", displayName: "MODEL-C" }],
+          scan: { attemptId: bId, outcome: "succeeded" },
+        });
+        expect(final.catalog).not.toHaveProperty("pendingExport");
+        expect(final.versions).toHaveLength(2);
+        expect(final.versions[1]).toMatchObject({ _id: bId, revision: 2, snapshot: [{ id: "model-c" }] });
+        expect(final.changes).toHaveLength(2);
+        expect(final.changes[1]).toMatchObject({
+          _id: bId,
+          revision: 2,
+          delivery: { state: "pending", attempts: 0 },
+        });
+      } finally {
+        guard.disengage();
+        releaseA.resolve();
+        await pendingA.catch(() => undefined);
       }
-      if (method === "createIndex") indexCalls++;
-      if (collection === "agent_model_catalog" && ["insertOne", "updateOne"].includes(method)) mutationCalls++;
-      return run();
-    });
-    expect(await new ModelCatalogStore(unavailable).applyDiscovery(started.attempt, [{ invalid: true }])).toMatchObject(
-      {
-        kind: "commit-unknown",
-        operationId: started.attempt.attemptId,
-      },
-    );
-    expect(indexCalls).toBe(0);
-    expect(mutationCalls).toBe(0);
-
-    expect((await delayed!()).acknowledged).toBe(true);
-    const guard = new WriteGuard({ instanceId: "test", dbName: mongo.db.databaseName });
-    guard.engage("private post-submission identity mismatch");
-    expect(
-      await new ModelCatalogStore(guardDb(mongo.db, guard)).applyDiscovery(started.attempt, [{ invalid: true }]),
-    ).toMatchObject({
-      kind: "committed",
-      commitId: started.attempt.attemptId,
-      recoveryPending: true,
-    });
-    expect(guard.refusedWriteCount).toBeGreaterThanOrEqual(1);
-    expect(await mongo.db.collection("agent_model_catalog").countDocuments()).toBe(1);
-    expect(await mongo.db.collection("agent_model_catalog_versions").countDocuments()).toBe(0);
-    expect(await mongo.db.collection("agent_model_catalog_changes").countDocuments()).toBe(0);
-    guard.disengage();
-    expect(await new ModelCatalogStore(mongo.db).recoverPendingExports("codex")).toEqual([
-      { provider: "codex", kind: "recovered" },
-    ]);
-  });
+    },
+    30_000,
+  );
 
   it("sanitizes an initial acquisition read refusal without installing scan state", async () => {
     const base = new ModelCatalogStore(mongo.db);
