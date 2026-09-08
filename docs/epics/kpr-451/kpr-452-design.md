@@ -30,7 +30,7 @@ KPR-452 has no dependency on any sibling and must not acquire one. Relevant cano
 
 ### What runs today
 
-`postAuditLog` (`src/channels/dispatcher.ts:2458-2508`) formats a turn as `:incoming_envelope: *Agent* handled <kind> from <sender>: > <300-char summary> ($cost · Ns)` and delivers it. Its destination is `this.auditChannelIds.get(agentConfig.homeBase) ?? this.fallbackAuditChannelId` (`:2464`) — the agent's **own** `#agent-<id>` channel, with `config.slack.auditChannel` used only when homeBase cannot be resolved. `setAuditChannel` (`:268-272`) is the wiring; the three fields are `:193-195`. `index.ts:642-668` paginates `conversations.list` once at boot to build the name→id map and resolves the fallback id.
+`postAuditLog` (`src/channels/dispatcher.ts:2458-2507`) formats a turn as `:incoming_envelope: *Agent* handled <kind> from <sender>: > <300-char summary> ($cost · Ns)` and delivers it. Its destination is `this.auditChannelIds.get(agentConfig.homeBase) ?? this.fallbackAuditChannelId` (`:2464`) — the agent's **own** `#agent-<id>` channel, with `config.slack.auditChannel` used only when homeBase cannot be resolved. `setAuditChannel` (`:268-272`) is the wiring; the three fields are `:193-195`. `index.ts:642-669` paginates `conversations.list` once at boot to build the name→id map and resolves the fallback id.
 
 There are **three** call sites, not the two named on the ticket, each gated identically on `item.source.kind !== this.auditAdapter.kind`:
 
