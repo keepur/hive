@@ -94,6 +94,7 @@ function makeFakeDb(catalogDb: any = catalogFake.db): any {
 
 import { buildAdminTools } from "./admin-mcp-server.js";
 import { invalidateGeminiModelCache } from "./model-catalog-cache.js";
+import { notificationNote, emptyNotificationStatus } from "./model-catalog-notification-status.js";
 import { catalogStatus, catalogStatusNote } from "./model-catalog-status.js";
 import { ModelCatalogStore } from "./model-catalog-store.js";
 // Ensure the software-engineer archetype is registered in the registry.
@@ -1289,12 +1290,13 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
     ];
     expect(result.content[0].text).toBe(JSON.stringify(expectedEntries, null, 2));
     expect(JSON.parse(result.content[0].text)).toEqual(expectedEntries);
-    expect(result.content).toHaveLength(2);
+    expect(result.content).toHaveLength(3);
     expect(result.content[1].text).toBe(
       catalogStatusNote(
         catalogStatus("grok", catalogFake.rows("agent_model_catalog").get("grok"), statusNow.getTime()),
       ),
     );
+    expect(result.content[2].text).toBe(notificationNote(emptyNotificationStatus("grok"), statusNow.getTime()));
   });
 
   it("unseeded curated provider → empty entries array + prose note, not an error", async () => {
@@ -1305,6 +1307,7 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
     expect(result.content[1].text).toBe(
       "codex: not yet seeded — manual option: agent_model_catalog_refresh; last discovery success never; latest attempt never; next normal attempt unknown/clock-inconsistent; automatic checks every 8h; discovery timestamps describe checks, not later manual edits.",
     );
+    expect(result.content[2].text).toBe(notificationNote(emptyNotificationStatus("codex"), statusNow.getTime()));
   });
 
   it.each([
@@ -1528,7 +1531,7 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
     const result = await getHandler(makeTools({ adminDb }), "agent_model_catalog_list")({ provider: "codex" });
 
     expect(result.isError).toBeUndefined();
-    expect(operations).toEqual(["agent_model_catalog.findOne"]);
+    expect(operations).toEqual(["agent_model_catalog.findOne", "agent_model_catalog_changes.find"]);
     expect(agentIndex).not.toHaveBeenCalled();
     expect(storeIndex).not.toHaveBeenCalled();
     expect(begin).not.toHaveBeenCalled();
@@ -1537,6 +1540,118 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
     expect(recover).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
     expect(now).toHaveBeenCalledTimes(1);
+  });
+
+  it("appends projected notification timing without changing the catalog JSON or freshness note", async () => {
+    const catalogDoc = {
+      _id: "codex",
+      provider: "codex",
+      models: statusModels,
+      source: "manual",
+      updatedAt: statusAt(-hour),
+    };
+    catalogFake.rows("agent_model_catalog").set("codex", catalogDoc);
+    catalogFake.rows("agent_model_catalog_changes").set("future-intent", {
+      _id: "future-intent",
+      provider: "codex",
+      createdAt: statusAt(-hour),
+      delivery: {
+        state: "claimed",
+        attempts: 1,
+        version: 2,
+        nextAttemptAt: statusAt(-hour),
+        lastAttemptAt: statusAt(-30 * 60 * 1000),
+        preparation: {
+          id: "preparation-1",
+          binding: {
+            agentId: "chief",
+            homeBase: "catalog-alerts",
+            adapterId: "slack",
+            channelId: "C123ABC",
+          },
+          processedAt: statusAt(-20 * 60 * 1000),
+          text: "must not be projected",
+        },
+        claim: {
+          token: "claim-1",
+          owner: "notifier-1",
+          startedAt: statusAt(-30 * 60 * 1000),
+          leaseExpiresAt: statusAt(hour),
+          stage: "sending",
+          sendIntent: {
+            preparationId: "preparation-1",
+            startedAt: statusAt(hour / 2),
+            previouslyUncertain: false,
+          },
+        },
+      },
+    });
+    vi.spyOn(Date, "now").mockReturnValue(statusNow.getTime());
+
+    const result = await getHandler(makeTools(), "agent_model_catalog_list")({ provider: "codex" });
+
+    expect(JSON.parse(result.content[0].text)).toEqual([
+      {
+        provider: "codex",
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        source: "curated",
+        asOf: "2026-09-07T11:00:00.000Z",
+      },
+    ]);
+    expect(result.content[1].text).toBe(catalogStatusNote(catalogStatus("codex", catalogDoc, statusNow.getTime())));
+    expect(result.content[2].text).toContain("in progress 1, prepared 1, possibly repeated 1");
+    expect(result.content[2].text).toContain("timing unavailable/clock-inconsistent");
+    expect(result.content[2].text).not.toContain("must not be projected");
+  });
+
+  it("includes outbox-only manual plugin status on all-provider reads and excludes Gemini outbox rows", async () => {
+    mockConfig.gemini.apiKey = "";
+    catalogFake.rows("agent_model_catalog_changes").set("sol-change", {
+      _id: "sol-change",
+      provider: "sol",
+      createdAt: statusAt(-hour),
+      source: "manual",
+      delivery: { state: "pending", attempts: 0, nextAttemptAt: statusAt(-1) },
+    });
+    catalogFake.rows("agent_model_catalog_changes").set("gemini-change", {
+      _id: "gemini-change",
+      provider: "gemini",
+      createdAt: statusAt(-hour),
+      delivery: { state: "pending", attempts: 0, nextAttemptAt: statusAt(-1) },
+    });
+    vi.spyOn(Date, "now").mockReturnValue(statusNow.getTime());
+
+    const result = await getHandler(makeTools(), "agent_model_catalog_list")({});
+    const notes = result.content.slice(1).map((item: { text: string }) => item.text);
+
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+    expect(notes.filter((note: string) => note.startsWith('"sol": notifications'))).toEqual([
+      expect.stringContaining("notifications pending 1"),
+    ]);
+    expect(notes.some((note: string) => note.startsWith('"gemini": notifications'))).toBe(false);
+    expect(notes.at(-1)).toMatch(/^gemini: Gemini API key not configured/);
+  });
+
+  it("keeps catalog facts available and reports a failed outbox cursor separately", async () => {
+    const unavailableOutbox = faultDb(catalogFake.db, async (collection, method, _args, run) => {
+      if (collection === "agent_model_catalog_changes" && method === "find") {
+        throw new Error("test-secret outbox failure");
+      }
+      return run();
+    });
+    vi.spyOn(Date, "now").mockReturnValue(statusNow.getTime());
+
+    const result = await getHandler(
+      makeTools({ catalogDb: unavailableOutbox }),
+      "agent_model_catalog_list",
+    )({ provider: "codex" });
+
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+    expect(result.content[1].text).toMatch(/^codex: not yet seeded/);
+    expect(result.content[2].text).toBe("Notifications unavailable.");
+    expect(JSON.stringify(result)).not.toContain("test-secret");
   });
 
   it("returns a safe hard error when the requested stored provider cannot be read", async () => {
@@ -1576,12 +1691,15 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
     expect(result.isError).toBeUndefined();
     expect(JSON.parse(result.content[0].text)).toEqual([]);
     const notes = result.content.slice(1).map((item: { text: string }) => item.text);
-    expect(notes).toHaveLength(4);
+    expect(notes).toHaveLength(7);
     expect(notes[0]).toMatch(/^claude: not yet seeded/);
     expect(notes[1]).toBe("grok: catalog storage unavailable.");
     expect(notes[1]).not.toContain("not yet seeded");
     expect(notes[2]).toMatch(/^codex: not yet seeded/);
-    expect(notes[3]).toMatch(/^gemini: Gemini API key not configured/);
+    expect(notes.slice(3, 6)).toEqual(
+      ["claude", "grok", "codex"].map((id) => notificationNote(emptyNotificationStatus(id), statusNow.getTime())),
+    );
+    expect(notes[6]).toMatch(/^gemini: Gemini API key not configured/);
     expect(notes.join("\n")).not.toContain("test-secret");
   });
 
@@ -1609,7 +1727,7 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
 
     expect(invalid.content[0].text).toBe("Unknown provider 'unknown'. Valid: claude, grok, codex, sol, gemini.");
     expect(list.description).toBe(
-      "List valid LLM model ids for agent model assignment. Claude/grok/codex use stored catalogs checked automatically every eight hours; notes report saved-list time, successful discovery, latest attempt and pending recovery. Plugins are manually maintained. Gemini is resolved live (cached ~10 min). Returns a JSON entries array followed by provider notes. Listing does not trigger built-in discovery.",
+      "List valid LLM model ids for agent model assignment. Claude/grok/codex use stored catalogs checked automatically every eight hours; notes report saved-list time, successful discovery, latest attempt, pending recovery, notification retry status, and acknowledged CoS processing/Slack acceptance. Plugins are manually maintained. Gemini is resolved live (cached ~10 min). Returns a JSON entries array followed by provider notes. Listing does not trigger built-in discovery.",
     );
     expect(refresh.description).toBe(
       "Replace one stored catalog with the FULL list, not a delta. The manual write performs no vendor calls. The next successful built-in scan replaces membership, names and order while retaining notes for retained IDs; a manual edit does not postpone discovery. Plugin catalogs remain manual; Gemini remains live and cannot be refreshed.",

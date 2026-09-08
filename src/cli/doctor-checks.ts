@@ -8,6 +8,7 @@ import {
 } from "../plugins/provider-decl.js";
 import { resolvePluginServerPath } from "../plugins/plugin-loader.js";
 import { LANE_B_PROVIDER_ABI_VERSION } from "../agents/provider-adapters/provider-abi.js";
+import { readNotificationStatus, type NotificationReport } from "../admin/model-catalog-notification-status.js";
 import { catalogStatus, type CatalogStatus } from "../admin/model-catalog-status.js";
 import { BUILTIN_CATALOG_PROVIDERS } from "../admin/model-catalog-types.js";
 import {
@@ -29,7 +30,8 @@ export interface Check {
   remedy?: string;
 }
 
-export type ModelCatalogReport = { kind: "available"; rows: CatalogStatus[] } | { kind: "unavailable" };
+export type ModelCatalogReport =
+  { kind: "available"; rows: CatalogStatus[]; notifications: NotificationReport } | { kind: "unavailable" };
 
 export async function modelCatalogsForDoctor(
   uri: string,
@@ -41,8 +43,8 @@ export async function modelCatalogsForDoctor(
     const { MongoClient } = await import("mongodb");
     client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
     await client.connect();
-    const docs = await client
-      .db(dbName)
+    const db = client.db(dbName);
+    const docs = await db
       .collection("agent_model_catalog")
       .find({ _id: { $ne: "gemini" } } as never)
       .toArray();
@@ -52,6 +54,7 @@ export async function modelCatalogsForDoctor(
     return {
       kind: "available",
       rows: [...builtinIds, ...plugins].map((id) => catalogStatus(id, byId.get(id), now)),
+      notifications: await readNotificationStatus(db, now),
     };
   } catch {
     return { kind: "unavailable" };

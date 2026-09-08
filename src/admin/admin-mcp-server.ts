@@ -32,6 +32,11 @@ import { createLogger } from "../logging/logger.js";
 import { config as appConfig } from "../config.js";
 import { envValue } from "../agents/provider-adapters/oauth-credentials.js";
 import { getCachedGeminiModels, setCachedGeminiModels } from "./model-catalog-cache.js";
+import {
+  emptyNotificationStatus,
+  notificationNote,
+  readNotificationStatus,
+} from "./model-catalog-notification-status.js";
 import { catalogStatus, catalogStatusNote, catalogUnavailableNote } from "./model-catalog-status.js";
 import { ModelCatalogStore } from "./model-catalog-store.js";
 import type { CatalogProvider as CuratedCatalogProvider } from "./model-catalog-types.js";
@@ -1090,7 +1095,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
     ),
     tool(
       "agent_model_catalog_list",
-      "List valid LLM model ids for agent model assignment. Claude/grok/codex use stored catalogs checked automatically every eight hours; notes report saved-list time, successful discovery, latest attempt and pending recovery. Plugins are manually maintained. Gemini is resolved live (cached ~10 min). Returns a JSON entries array followed by provider notes. Listing does not trigger built-in discovery.",
+      "List valid LLM model ids for agent model assignment. Claude/grok/codex use stored catalogs checked automatically every eight hours; notes report saved-list time, successful discovery, latest attempt, pending recovery, notification retry status, and acknowledged CoS processing/Slack acceptance. Plugins are manually maintained. Gemini is resolved live (cached ~10 min). Returns a JSON entries array followed by provider notes. Listing does not trigger built-in discovery.",
       {
         provider: z
           .string()
@@ -1142,6 +1147,23 @@ export function buildAdminTools(deps: AdminToolDeps) {
               const text = catalogUnavailableNote(p);
               if (provider === p) return { isError: true, content: [{ type: "text", text }] };
               notes.push(text);
+            }
+          }
+
+          const notificationReport = await readNotificationStatus(db, statusNow);
+          if (wantCurated.length > 0) {
+            if (notificationReport.kind === "unavailable") {
+              notes.push("Notifications unavailable.");
+            } else {
+              const notificationByProvider = new Map(notificationReport.rows.map((row) => [row.provider, row]));
+              const outboxOnly = notificationReport.rows
+                .map((row) => row.provider)
+                .filter((id) => id !== "gemini" && !wantCurated.includes(id))
+                .sort();
+              const notificationProviders = provider === undefined ? [...wantCurated, ...outboxOnly] : wantCurated;
+              for (const id of notificationProviders) {
+                notes.push(notificationNote(notificationByProvider.get(id) ?? emptyNotificationStatus(id), statusNow));
+              }
             }
           }
 
