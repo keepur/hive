@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, afterEach, vi } from "vitest";
 import { toAgentConfig, AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 import type { AgentDefinition } from "../types/agent-definition.js";
 import type { Collection } from "mongodb";
@@ -10,10 +10,7 @@ process.env.MONGODB_URI ??= "mongodb://localhost:27017";
 process.env.OPENPHONE_API_KEY ??= "test";
 
 type AgentRegistryModule = typeof import("./agent-registry.js");
-type ArchetypesRegistryModule = typeof import("../archetypes/registry.js");
 let AgentRegistry: AgentRegistryModule["AgentRegistry"];
-let registerArchetype: ArchetypesRegistryModule["registerArchetype"];
-let __resetRegistryForTests: ArchetypesRegistryModule["__resetRegistryForTests"];
 
 function makeDefinition(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
   return {
@@ -139,20 +136,18 @@ describe("toAgentConfig autonomy resolution", () => {
     const def = makeDefinition({
       autonomy: { externalComms: false },
     });
-    const instanceCeiling = { externalComms: true, codeTask: true, codeAccess: false };
+    const instanceCeiling = { externalComms: true, codeAccess: false };
     const config = toAgentConfig(def, instanceCeiling);
 
     expect(config.autonomy.externalComms).toBe(false); // agent restricted
-    expect(config.autonomy.codeTask).toBe(true);       // inherits ceiling
     expect(config.autonomy.codeAccess).toBe(false);    // ceiling is false
   });
 
   it("uses hardcoded defaults when no autonomy overrides", () => {
     const def = makeDefinition();
     const config = toAgentConfig(def, {});
-    // AUTONOMY_DEFAULTS: externalComms=true, codeTask=false, codeAccess=false
+    // AUTONOMY_DEFAULTS: externalComms=true, codeAccess=false
     expect(config.autonomy.externalComms).toBe(true);
-    expect(config.autonomy.codeTask).toBe(false);
     expect(config.autonomy.codeAccess).toBe(false);
   });
 });
@@ -199,108 +194,169 @@ function makeFakeCollection(docs: AgentDefinition[]): Collection<AgentDefinition
   } as unknown as Collection<AgentDefinition>;
 }
 
-describe("AgentRegistry archetype validation on load", () => {
+describe("KPR-435 — AgentRegistry fail-soft strips retired code-task/archetype (never evicts)", () => {
   beforeAll(async () => {
-    const archetypes = await import("../archetypes/registry.js");
-    registerArchetype = archetypes.registerArchetype;
-    __resetRegistryForTests = archetypes.__resetRegistryForTests;
     const registryModule = await import("./agent-registry.js");
     AgentRegistry = registryModule.AgentRegistry;
   });
 
-  beforeEach(() => {
-    __resetRegistryForTests();
-    registerArchetype({
-      id: "test-arch",
-      validateConfig: (c: unknown) => {
-        const cfg = (c ?? {}) as { workshop?: string };
-        if (typeof cfg.workshop !== "string") {
-          throw new Error("missing workshop");
-        }
-        return cfg;
-      },
-      systemPromptCard: () => "",
-      preToolUseHooks: () => [],
-      memoryScopes: () => [],
-      sessionOptions: () => ({}),
+  /**
+   * log.error writes one JSON line per call to process.stderr (logging/logger.ts),
+   * so one captured chunk containing `"level":"error"` == one log.error call.
+   */
+  function captureStderr(): { lines: string[]; restore: () => void } {
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array): boolean => {
+      lines.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
     });
-  });
+    return { lines, restore: () => spy.mockRestore() };
+  }
 
-  it("loads agent with valid archetypeConfig and reflects validator return value", async () => {
+  const errorLines = (lines: string[]): string[] => lines.filter((l) => l.includes(`"level":"error"`));
+
+  it("strips code-task from coreServers, logs once, and keeps the agent loaded", async () => {
     const def = makeDefinition({
-      _id: "valid-agent",
-      archetype: "test-arch",
-      archetypeConfig: { workshop: "/tmp/workshop" },
+      _id: "core-code-task",
+      coreServers: ["memory", "code-task"],
     });
     const registry = new AgentRegistry(makeFakeCollection([def]));
-    const result = await registry.load();
+    const cap = captureStderr();
+    let result: Awaited<ReturnType<typeof registry.load>>;
+    try {
+      result = await registry.load();
+    } finally {
+      cap.restore();
+    }
 
-    expect(result.added).toContain("valid-agent");
-    const loaded = registry.get("valid-agent");
-    expect(loaded).toBeDefined();
-    expect(loaded?.archetype).toBe("test-arch");
-    expect(loaded?.archetypeConfig).toEqual({ workshop: "/tmp/workshop" });
+    // Not evicted — this is the live `alexandria` shape the ticket must not break.
+    expect(result.added).toContain("core-code-task");
+    expect(registry.get("core-code-task")).toBeDefined();
+    expect(registry.get("core-code-task")?.coreServers).toEqual(["memory"]);
+    expect(errorLines(cap.lines)).toHaveLength(1);
+    expect(cap.lines.some((l) => l.includes("Invalid coreServers") && l.includes("core-code-task"))).toBe(true);
   });
 
-  it("fails closed on invalid archetypeConfig (agent not added to active map)", async () => {
+  it("strips code-task from delegateServers, logs once, and keeps the agent loaded", async () => {
     const def = makeDefinition({
-      _id: "invalid-agent",
-      archetype: "test-arch",
-      archetypeConfig: {},
+      _id: "delegate-code-task",
+      delegateServers: ["code-task"],
     });
     const registry = new AgentRegistry(makeFakeCollection([def]));
-    const result = await registry.load();
+    const cap = captureStderr();
+    let result: Awaited<ReturnType<typeof registry.load>>;
+    try {
+      result = await registry.load();
+    } finally {
+      cap.restore();
+    }
 
-    expect(result.added).not.toContain("invalid-agent");
-    expect(registry.get("invalid-agent")).toBeUndefined();
-    expect(registry.getAll().map((a) => a.id)).not.toContain("invalid-agent");
+    // Pre-KPR-435 this evicted: code-task was in CONTEXT_DEPENDENT_SERVERS.
+    expect(result.added).toContain("delegate-code-task");
+    expect(registry.get("delegate-code-task")).toBeDefined();
+    expect(registry.get("delegate-code-task")?.delegateServers).toEqual([]);
+    expect(errorLines(cap.lines)).toHaveLength(1);
+    expect(cap.lines.some((l) => l.includes("Invalid delegateServers") && l.includes("delegate-code-task"))).toBe(true);
   });
 
-  it("evicts a previously-loaded agent when its archetypeConfig becomes invalid on reload", async () => {
-    // Round 1: doc is valid, agent loads.
-    const validDef = makeDefinition({
-      _id: "evicted-agent",
-      archetype: "test-arch",
-      archetypeConfig: { workshop: "/tmp/workshop" },
-    });
-    const docs: AgentDefinition[] = [validDef];
-    const collection = {
-      find: () => ({ toArray: async () => docs }),
-    } as unknown as Collection<AgentDefinition>;
-
-    const registry = new AgentRegistry(collection);
-    await registry.load();
-    expect(registry.get("evicted-agent")).toBeDefined();
-
-    // Round 2: same id, but archetypeConfig is now invalid (simulates DB corruption
-    // or a relay edit gone wrong). The previously-loaded valid version must
-    // NOT keep serving requests.
-    docs[0] = makeDefinition({
-      _id: "evicted-agent",
-      archetype: "test-arch",
-      archetypeConfig: {}, // missing workshop — validateConfig throws
-    });
-    const result = await registry.load();
-
-    expect(result.removed).toContain("evicted-agent");
-    expect(registry.get("evicted-agent")).toBeUndefined();
-    expect(registry.getAll().map((a) => a.id)).not.toContain("evicted-agent");
-  });
-
-  it("degrades gracefully on unknown archetype id", async () => {
+  it("strips code-task BEFORE the KPR-221 hard-reject, so a mixed doc evicts only for the real violation", async () => {
+    // Ordering invariant: sanitizeRemovedServers must run ahead of
+    // validateDelegateServersOrThrow. `recall` is still context-dependent, so
+    // this doc legitimately evicts — but the eviction message must name only
+    // `recall`, never the retired `code-task`, and the strip must have logged.
+    // Negative-verify: move the sanitizeRemovedServers calls below the
+    // validate block in agent-registry.ts → the "code-task" absence assertion
+    // on the eviction line fails.
     const def = makeDefinition({
-      _id: "unknown-arch-agent",
-      archetype: "missing",
-      archetypeConfig: { workshop: "/tmp/x" },
+      _id: "mixed-retired-and-context",
+      delegateServers: ["code-task", "recall"],
     });
     const registry = new AgentRegistry(makeFakeCollection([def]));
-    const result = await registry.load();
+    const cap = captureStderr();
+    let result: Awaited<ReturnType<typeof registry.load>>;
+    try {
+      result = await registry.load();
+    } finally {
+      cap.restore();
+    }
 
-    expect(result.added).toContain("unknown-arch-agent");
-    const loaded = registry.get("unknown-arch-agent");
-    expect(loaded).toBeDefined();
-    expect(loaded?.archetype).toBeUndefined();
-    expect(loaded?.archetypeConfig).toBeUndefined();
+    expect(result.added).not.toContain("mixed-retired-and-context");
+    expect(registry.get("mixed-retired-and-context")).toBeUndefined();
+
+    const strip = cap.lines.filter((l) => l.includes("Invalid delegateServers"));
+    expect(strip).toHaveLength(1);
+    const evict = cap.lines.filter((l) => l.includes("Context-dependent server in delegateServers"));
+    expect(evict).toHaveLength(1);
+    expect(evict[0]).toContain("recall");
+    // The eviction reason must not mention the retired server — it was already
+    // stripped, so validateDelegateServersOrThrow never saw it.
+    expect(evict[0]).not.toContain("code-task");
+  });
+
+  it("logs exactly three errors for coreServers + delegateServers + archetype, and still loads", async () => {
+    // The live hive_keepur `alexandria` shape, plus a stray delegateServers entry:
+    // one log.error per sanitizeRemovedServers call that found something, plus one
+    // for the retired archetype field. Cardinality is three, not one.
+    const def = {
+      ...makeDefinition({
+        _id: "combo-agent",
+        coreServers: ["memory", "code-task"],
+        delegateServers: ["code-task"],
+      }),
+      archetype: "software-engineer",
+      archetypeConfig: { workshop: "/tmp/ws" },
+    } as unknown as AgentDefinition;
+
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const cap = captureStderr();
+    let result: Awaited<ReturnType<typeof registry.load>>;
+    try {
+      result = await registry.load();
+    } finally {
+      cap.restore();
+    }
+
+    expect(result.added).toContain("combo-agent");
+    expect(registry.get("combo-agent")).toBeDefined();
+    expect(registry.get("combo-agent")?.coreServers).toEqual(["memory"]);
+    expect(registry.get("combo-agent")?.delegateServers).toEqual([]);
+    expect(errorLines(cap.lines)).toHaveLength(3);
+    expect(cap.lines.some((l) => l.includes("Invalid coreServers"))).toBe(true);
+    expect(cap.lines.some((l) => l.includes("Invalid delegateServers"))).toBe(true);
+    expect(cap.lines.some((l) => l.includes("retired archetype/archetypeConfig fields"))).toBe(true);
+  });
+
+  it("logs the retired-archetype error for a doc carrying only archetypeConfig", async () => {
+    const def = {
+      ...makeDefinition({ _id: "arch-config-only" }),
+      archetypeConfig: { workshop: "/tmp/ws" },
+    } as unknown as AgentDefinition;
+
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const cap = captureStderr();
+    try {
+      await registry.load();
+    } finally {
+      cap.restore();
+    }
+
+    expect(registry.get("arch-config-only")).toBeDefined();
+    expect(errorLines(cap.lines)).toHaveLength(1);
+    expect(cap.lines.some((l) => l.includes("retired archetype/archetypeConfig fields"))).toBe(true);
+  });
+
+  it("logs nothing for a clean doc", async () => {
+    const def = makeDefinition({ _id: "clean-agent", coreServers: ["memory"], delegateServers: ["google"] });
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const cap = captureStderr();
+    try {
+      await registry.load();
+    } finally {
+      cap.restore();
+    }
+
+    expect(registry.get("clean-agent")).toBeDefined();
+    expect(errorLines(cap.lines)).toHaveLength(0);
   });
 });
 
@@ -764,7 +820,7 @@ describe("KPR-221 — AgentRegistry hard-rejects context-dependent servers in de
   // by KPR-221's hard-reject. The overlap cases (callback, memory,
   // structured-memory) are stripped by KPR-184's sanitizer and don't reach
   // the hard-reject path — covered by the separate "stripped" test.
-  const CONTEXT_DEPENDENT_NEW = ["background", "code-task", "recall"];
+  const CONTEXT_DEPENDENT_NEW = ["background", "recall"];
 
   it.each(CONTEXT_DEPENDENT_NEW)("rejects agent with '%s' in delegateServers", async (server) => {
     const def = makeDefinition({
@@ -870,7 +926,7 @@ describe("KPR-221 — AgentRegistry hard-rejects context-dependent servers in de
     // memory, structured-memory, and callback) before KPR-221 validation
     // runs, so these load with empty delegateServers rather than getting
     // evicted. The hard-reject path applies only to context-dependent
-    // servers that aren't also in-process (background, code-task, recall).
+    // servers that aren't also in-process (background, recall).
     const def = makeDefinition({
       _id: "in-process-stripped",
       delegateServers: ["memory", "structured-memory", "callback"],
@@ -1095,32 +1151,15 @@ describe("KPR-295 — empty-roster reload guard", () => {
   });
 
   it("5b. validation-evicts-all stays unguarded", async () => {
+    // KPR-435 rebase: archetype validation is now fail-soft (strip + log, never
+    // evict), so it can no longer serve as this test's eviction lever. The
+    // surviving fail-closed lever is validateDelegateServersOrThrow — `recall`
+    // stays context-dependent. Round-1 docs must load CLEANLY (the setup
+    // assertions below depend on it), so only the round-2 docs carry it.
     const validDocs = [
-      makeDefinition({
-        _id: "arch-agent-1",
-        archetype: "kpr295-test-arch",
-        archetypeConfig: { workshop: "/tmp/a" },
-      }),
-      makeDefinition({
-        _id: "arch-agent-2",
-        archetype: "kpr295-test-arch",
-        archetypeConfig: { workshop: "/tmp/b" },
-      }),
+      makeDefinition({ _id: "arch-agent-1" }),
+      makeDefinition({ _id: "arch-agent-2" }),
     ];
-
-    const archetypes = await import("../archetypes/registry.js");
-    archetypes.registerArchetype({
-      id: "kpr295-test-arch",
-      validateConfig: (c: unknown) => {
-        const cfg = (c ?? {}) as { workshop?: string };
-        if (typeof cfg.workshop !== "string") throw new Error("missing workshop");
-        return cfg;
-      },
-      systemPromptCard: () => "",
-      preToolUseHooks: () => [],
-      memoryScopes: () => [],
-      sessionOptions: () => ({}),
-    });
 
     const { collection, setDocs } = makeMutableCollection(validDocs);
     const registry = new RosterAgentRegistry(collection);
@@ -1128,11 +1167,11 @@ describe("KPR-295 — empty-roster reload guard", () => {
     expect(registry.get("arch-agent-1")).toBeDefined();
     expect(registry.get("arch-agent-2")).toBeDefined();
 
-    // All docs now fail archetype validation — docs.length is still > 0, so
-    // this must NOT be treated as an empty-roster read.
+    // All docs now fail delegateServers validation — docs.length is still > 0,
+    // so this must NOT be treated as an empty-roster read.
     const invalidDocs = [
-      makeDefinition({ _id: "arch-agent-1", archetype: "kpr295-test-arch", archetypeConfig: {} }),
-      makeDefinition({ _id: "arch-agent-2", archetype: "kpr295-test-arch", archetypeConfig: {} }),
+      makeDefinition({ _id: "arch-agent-1", delegateServers: ["recall"] }),
+      makeDefinition({ _id: "arch-agent-2", delegateServers: ["recall"] }),
     ];
     setDocs(invalidDocs);
     const { lines, restore } = captureLogs();
@@ -1302,13 +1341,12 @@ describe("KPR-221 — validateDelegateServersOrThrow", () => {
   it("error message names the offending server and the agent id", async () => {
     const mod = await import("./agent-registry.js");
     try {
-      mod.validateDelegateServersOrThrow("rae", ["recall", "code-task"]);
+      mod.validateDelegateServersOrThrow("rae", ["recall"]);
       throw new Error("expected throw");
     } catch (err) {
       const msg = String(err);
       expect(msg).toContain("rae");
       expect(msg).toContain("recall");
-      expect(msg).toContain("code-task");
     }
   });
 });
