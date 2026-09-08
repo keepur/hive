@@ -2,7 +2,6 @@ import { query, type Query, type SDKMessage, type SDKResultMessage, type SDKUser
 import { resolve } from "node:path";
 import { existsSync, mkdirSync, symlinkSync, lstatSync } from "node:fs";
 import { createRequire } from "node:module";
-import { getArchetype, type ArchetypeDefinition } from "../archetypes/registry.js";
 import { readFile } from "node:fs/promises";
 import { createLogger } from "../logging/logger.js";
 import type { AgentConfig } from "../types/agent-config.js";
@@ -117,17 +116,14 @@ void _agentEffortIsSdkEffort;
  *
  * **Per-spawn entry point**: {@link AgentRunner.send}. It assembles the SDK
  * `query()` options — model, system prompt (cache-friendly prefix), MCP
- * servers, hooks, `resume: sessionId` (when present), and per-archetype
- * settings — and yields one inference cycle.
+ * servers, hooks, and `resume: sessionId` (when present) — and yields one
+ * inference cycle.
  *
- * **Hooks** ({@link AgentRunner.buildHooks}): rebuild on every `send()` call
- * with the current `WorkItemContext`. No stale context survives across turns.
- * The `PreCompact` matcher closes over the agent's `prefetcher` reference
- * (constructed once at boot in `index.ts`, owned by `AgentManager`), so the
- * closure captures fresh per spawn because the runner itself is fresh per
- * spawn. `PreToolUse` matchers come from the archetype's `preToolUseHooks`
- * factory — fail-closed if it throws (deny-all is installed rather than
- * silently dropping enforcement).
+ * **Hooks** ({@link AgentRunner.buildHooks}): rebuild on every `send()` call.
+ * No stale context survives across turns. The `PreCompact` matcher closes over
+ * the agent's `prefetcher` reference (constructed once at boot in `index.ts`,
+ * owned by `AgentManager`), so the closure captures fresh per spawn because
+ * the runner itself is fresh per spawn.
  *
  * **Cross-agent coordination** is handled by three distinct primitives —
  * see [docs/architecture.md](../../docs/architecture.md) "Coordination
@@ -342,7 +338,6 @@ const MCP_BUNDLE_MAP: Record<string, string> = {
   "clickup/clickup-mcp-server.js": "clickup.min.js",
   "recall/recall-mcp-server.js": "recall.min.js",
   "background/background-task-mcp-server.js": "background-task.min.js",
-  "code-task/code-task-mcp-server.js": "code-task.min.js",
   "search/conversation-search-mcp-server.js": "search-conversation.min.js",
   "slack/slack-mcp-server.js": "slack.min.js",
   "skill-author/skill-author-mcp-server.js": "skill-author.min.js",
@@ -444,7 +439,6 @@ export class AgentRunner {
   private memoryLifecycle?: MemoryLifecycle;
   private codeSearchMcpServer?: ReturnType<typeof createCodeSearchMcpServer>;
   private workflowMcpServer?: ReturnType<typeof createWorkflowMcpServer>;
-  private _archetypeDef: ArchetypeDefinition | null | undefined = undefined;
   // KPR-213: optional shared prefix cache. Production wires this in via
   // index.ts; tests that don't pass one fall through to a direct buildPrefix
   // call (no cache) so per-test isolation isn't a concern.
@@ -529,9 +523,6 @@ export class AgentRunner {
       coreSet.delete("resend");
       coreSet.delete("quo");
     }
-    if (!this.agentConfig.autonomy.codeTask) {
-      coreSet.delete("code-task");
-    }
     if (!this.agentConfig.autonomy.codeAccess) {
       coreSet.delete("code-search");
     }
@@ -543,32 +534,12 @@ export class AgentRunner {
   }
 
   /**
-   * Resolve the memory scope list for this agent. "self" (Mongo) is always
-   * present; archetype-provided scopes are appended. KPR-122: extracted from
-   * `buildAllServerConfigs` so the in-process memory MCP factory can access
-   * the same list.
+   * Resolve the memory scope list for this agent. "self" (Mongo) is the only
+   * scope. Extracted from `buildAllServerConfigs` so the in-process memory MCP
+   * factory can access the same list.
    */
   private resolveMemoryScopes(): ScopeDecl[] {
-    const memoryScopes: ScopeDecl[] = [{ id: "self", backing: "mongo" }];
-    const archetypeDef = this.getArchetypeDef();
-    if (archetypeDef && this.agentConfig.archetypeConfig) {
-      try {
-        const extra = archetypeDef.memoryScopes({
-          agentConfig: this.agentConfig,
-          archetypeConfig: this.agentConfig.archetypeConfig,
-        });
-        for (const s of extra) {
-          if (s.id !== "self") memoryScopes.push(s);
-        }
-      } catch (err) {
-        log.error("Archetype memoryScopes threw — using self-only", {
-          agent: this.agentConfig.id,
-          archetype: this.agentConfig.archetype,
-          error: String(err),
-        });
-      }
-    }
-    return memoryScopes;
+    return [{ id: "self", backing: "mongo" }];
   }
 
   /**
@@ -917,25 +888,6 @@ export class AgentRunner {
       },
     };
 
-    // Code task server — agents can spawn Claude Code CLI sessions
-    servers["code-task"] = {
-      type: "stdio",
-      command: "node",
-      args: [mcpPath("code-task/code-task-mcp-server.js")],
-      env: {
-        CT_TASK_API: `http://127.0.0.1:${config.codeTask.port}`,
-        CT_AUTH_TOKEN: config.codeTask.authToken,
-        CT_AGENT_ID: this.agentConfig.id,
-        CT_ADAPTER_ID: context?.adapterId ?? "",
-        CT_CHANNEL_ID: context?.channelId ?? "",
-        CT_CHANNEL_KIND: context?.channelKind ?? "internal",
-        CT_CHANNEL_LABEL: context?.channelLabel ?? "",
-        CT_THREAD_ID: context?.threadId ?? "",
-        CT_SLACK_TS: context?.slackTs ?? "",
-        CT_SLACK_THREAD_TS: context?.slackThreadTs ?? "",
-      },
-    };
-
     // ── Conversation Search ──────────────────────────────────────
     // Core search server — semantic search over past agent conversations (Qdrant only)
     const searchEnv: Record<string, string> = {
@@ -1244,12 +1196,6 @@ export class AgentRunner {
         }
       }
     }
-    if (!this.agentConfig.autonomy.codeTask) {
-      if (servers["code-task"]) {
-        log.debug("Autonomy: codeTask disabled — removing server", { server: "code-task", agent: this.agentConfig.id });
-        delete servers["code-task"];
-      }
-    }
     if (!this.agentConfig.autonomy.codeAccess) {
       if (servers["code-search"]) {
         log.debug("Autonomy: codeAccess disabled — removing server", { server: "code-search", agent: this.agentConfig.id });
@@ -1367,9 +1313,6 @@ export class AgentRunner {
     if (!this.agentConfig.autonomy.externalComms) {
       blockedDelegates.add("resend");
       blockedDelegates.add("quo");
-    }
-    if (!this.agentConfig.autonomy.codeTask) {
-      blockedDelegates.add("code-task");
     }
     if (!this.agentConfig.autonomy.codeAccess) {
       blockedDelegates.add("code-search");
@@ -1571,8 +1514,7 @@ export class AgentRunner {
     // the in-process SDK server when (a) the runner has a shared `db` (runtime
     // path; tests without `db` skip) and (b) the agent's coreServers includes
     // "memory". The cached SDK server is safe to reuse across turns: the
-    // resolved scope list depends only on constructor-time agent + archetype
-    // config.
+    // resolved scope list depends only on constructor-time agent config.
     if (this.db && this.shouldEnableInProcessServer("memory")) {
       if (!this.memoryMcpServer) {
         this.memoryMcpServer = createMemoryMcpServer({
@@ -1766,29 +1708,11 @@ export class AgentRunner {
 
   /**
    * KPR-348 (spec §D5-cwd): resolve the session cwd for a Lane B spawn —
-   * exactly the Claude-lane rule. Archetype sessionOptions().cwd wins (with
-   * the shared fail-loud stat check → the assembly's TurnAssemblyError try
-   * classifies it non-provider); otherwise the agent scratch dir.
+   * exactly the Claude-lane rule (the per-agent scratch dir; the per-config
+   * cwd override was removed in KPR-435).
    */
-  resolveTurnCwd(context?: WorkItemContext): string {
-    let archetypeCwd: unknown;
-    const archetypeDef = this.getArchetypeDef();
-    if (archetypeDef && this.agentConfig.archetypeConfig) {
-      try {
-        archetypeCwd = archetypeDef.sessionOptions({
-          agentConfig: this.agentConfig,
-          archetypeConfig: this.agentConfig.archetypeConfig,
-          workItemContext: context,
-        }).cwd;
-      } catch (err) {
-        log.error("Archetype sessionOptions threw — ignoring", {
-          agent: this.agentConfig.id,
-          archetype: this.agentConfig.archetype,
-          error: String(err),
-        });
-      }
-    }
-    return resolveSessionCwd({ archetypeCwd, agentId: this.agentConfig.id });
+  resolveTurnCwd(_context?: WorkItemContext): string {
+    return resolveSessionCwd(this.agentConfig.id);
   }
 
   /**
@@ -1867,9 +1791,6 @@ export class AgentRunner {
     if (!this.agentConfig.autonomy.externalComms) {
       blockedDelegates.add("resend");
       blockedDelegates.add("quo");
-    }
-    if (!this.agentConfig.autonomy.codeTask) {
-      blockedDelegates.add("code-task");
     }
     if (!this.agentConfig.autonomy.codeAccess) {
       blockedDelegates.add("code-search");
@@ -1993,59 +1914,10 @@ export class AgentRunner {
     return getSkillsForAgent(this.skillIndex, this.agentConfig.id);
   }
 
-  private getArchetypeDef(): ArchetypeDefinition | null {
-    if (this._archetypeDef === undefined) {
-      this._archetypeDef = this.agentConfig.archetype
-        ? getArchetype(this.agentConfig.archetype) ?? null
-        : null;
-      if (this.agentConfig.archetype && !this._archetypeDef) {
-        log.warn("Archetype referenced by agent not registered — running unstructured", {
-          agent: this.agentConfig.id,
-          archetype: this.agentConfig.archetype,
-        });
-      }
-    }
-    return this._archetypeDef;
-  }
-
   private buildHooks(context?: WorkItemContext): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
-    const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {
+    return {
       PreCompact: this.buildPreCompactMatcher(),
     };
-
-    const archetypeDef = this.getArchetypeDef();
-    if (archetypeDef && this.agentConfig.archetypeConfig) {
-      try {
-        const pre = archetypeDef.preToolUseHooks({
-          agentConfig: this.agentConfig,
-          archetypeConfig: this.agentConfig.archetypeConfig,
-          workItemContext: context,
-        });
-        if (pre.length > 0) {
-          hooks.PreToolUse = pre;
-        }
-      } catch (err) {
-        // Fail-closed: if the archetype can't produce its hooks, install a
-        // deny-all PreToolUse hook rather than running without enforcement.
-        // A missing hook set would silently disable archetype tool policy.
-        log.error("Archetype preToolUseHooks threw — installing deny-all PreToolUse hook", {
-          agent: this.agentConfig.id,
-          archetype: this.agentConfig.archetype,
-          error: String(err),
-        });
-        hooks.PreToolUse = [{
-          hooks: [async () => ({
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse",
-              permissionDecision: "deny",
-              permissionDecisionReason: `Archetype hook initialization failed (${String(err)}). All tool calls blocked until the archetype is fixed.`,
-            },
-          })],
-        }];
-      }
-    }
-
-    return hooks;
   }
 
   private buildPreCompactMatcher(): HookCallbackMatcher[] {
@@ -2099,7 +1971,7 @@ export class AgentRunner {
    * KPR-323: shared `query()` options assembly for the per-turn send() path
    * and the warm voice streaming session (openVoiceStreamingSession).
    * Mechanical extraction of send()'s pre-query body — server configs,
-   * in-process MCP wiring, system prompt, archetype/cwd/toolSearch/env,
+   * in-process MCP wiring, system prompt, cwd/toolSearch/env,
    * options literal. Identical behavior for send() callers; `streaming`
    * replaces the `!!onStream` test for includePartialMessages.
    */
@@ -2138,33 +2010,11 @@ export class AgentRunner {
       });
     }
 
-    // Archetype session options (cwd, settingSources, etc.)
-    let archetypeExtra: Partial<SdkQueryOptions> = {};
-    const archetypeDefForSession = this.getArchetypeDef();
-    if (archetypeDefForSession && this.agentConfig.archetypeConfig) {
-      try {
-        archetypeExtra = archetypeDefForSession.sessionOptions({
-          agentConfig: this.agentConfig,
-          archetypeConfig: this.agentConfig.archetypeConfig,
-          workItemContext: context,
-        });
-      } catch (err) {
-        log.error("Archetype sessionOptions threw — ignoring", {
-          agent: this.agentConfig.id,
-          archetype: this.agentConfig.archetype,
-          error: String(err),
-        });
-      }
-    }
-
-    // Resolve the session cwd. Archetype-provided wins; otherwise every agent
-    // gets a per-agent scratch dir so Bash/Write with relative paths lands in
-    // the agent's namespace instead of HIVE_HOME. See KPR-51 design spec.
+    // Resolve the session cwd. Every agent gets a per-agent scratch dir so
+    // Bash/Write with relative paths lands in the agent's namespace instead of
+    // HIVE_HOME. See KPR-51 design spec.
     // KPR-348: shared with the Lane B builtin executor via resolveSessionCwd.
-    const effectiveCwd = resolveSessionCwd({
-      archetypeCwd: archetypeExtra.cwd,
-      agentId: this.agentConfig.id,
-    });
+    const effectiveCwd = resolveSessionCwd(this.agentConfig.id);
 
     // KPR-329: resolve tool-search mode for this spawn. The env value is
     // always pinned (see env block below) so hive owns the policy — the CLI's
@@ -2207,14 +2057,9 @@ export class AgentRunner {
       // KPR-430: deliver SDK-supported effort, including xhigh/max.
       // Keep thinking configuration stable to preserve the prompt cache.
       ...(isAgentEffort(effort) ? { effort } : {}),
-      // Only allowlisted archetype keys are merged. The archetype's sessionOptions()
-      // may return arbitrary SDK options, but we explicitly pick only the safe ones
-      // so a rogue archetype can't override security invariants (permissionMode,
-      // maxTurns, etc.) or runtime wiring (mcpServers, hooks, env, etc.).
       cwd: effectiveCwd,
-      // Default to SDK isolation mode (no user/project settings, no user-installed plugins).
-      // Archetypes may opt in to specific sources (e.g. ["project"] for CLAUDE.md access).
-      settingSources: archetypeExtra.settingSources ?? [],
+      // SDK isolation mode — no user/project settings, no user-installed plugins.
+      settingSources: [],
       includePartialMessages: params.streaming,
       ...(sessionId ? { resume: sessionId } : {}),
       ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),

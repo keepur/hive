@@ -99,12 +99,12 @@ describe("filterCoreServers always-on injection", () => {
 
     // Build a minimal-but-valid AgentConfig. Field set must match what
     // filterCoreServers reads: coreServers (string[]), autonomy.{externalComms,
-    // codeTask, codeAccess}.
+    // codeAccess}.
     const agentConfig = {
       id: "river",
       coreServers: [], // empty allowlist — only implicit servers should survive
       delegateServers: [],
-      autonomy: { externalComms: false, codeTask: false, codeAccess: false },
+      autonomy: { externalComms: false, codeAccess: false },
     };
     const runner = Object.create(AgentRunner.prototype) as { agentConfig: typeof agentConfig };
     runner.agentConfig = agentConfig;

@@ -31,7 +31,7 @@ const { mockExistsSync, mockStatSync, mockMkdirSync, mockSymlinkSync, mockLstatS
     // KPR-326: config.ts's discoverPluginDirs() also runs at module load —
     // with mockExistsSync defaulting true, it falls into readdirSync(). Empty
     // list = no auto-discovered plugin dirs, matching prior synthetic-mock
-    // behavior (config.codeTask wasn't exercised by this file's tests).
+    // behavior.
     mockReaddirSync: vi.fn().mockReturnValue([]),
   }));
 vi.mock("node:fs", () => ({
@@ -187,10 +187,9 @@ vi.mock("../config.js", async (importOriginal) => {
         webhookSecret: "test-webhook-secret",
       },
       background: { port: 3200, authToken: "test-bg-token" },
-      codeTask: { port: 3202, authToken: "test-ct-token", pluginDir: "/tmp/fake-plugins" },
       anthropic: { apiKey: "test-key" },
       defaultAgent: "chief-of-staff",
-      autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+      autonomy: { externalComms: true, codeAccess: false },
       browser: { cdpEndpoint: "" },
       memory: { hotBudgetTokens: 3000 },
       workflow: { enabled: false },
@@ -240,7 +239,7 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     delegateServers: [],
     soul: "",
     systemPrompt: "You are a test agent.",
-    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    autonomy: { externalComms: true, codeAccess: false },
     ...overrides,
   };
 }
@@ -270,7 +269,6 @@ import {
   memoryDigest,
   MEMORY_TURN_HEADER,
 } from "./prefix-builder.js";
-import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
 import { fromKeychain } from "../keychain/from-keychain.js";
 import { config } from "../config.js";
 // Round-2 finding B: cross-file KPR-401 accounting parity (see the describe
@@ -512,7 +510,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     runner = new AgentRunner(
       makeAgentConfig({
         coreServers: ["memory", "keychain", "resend", "quo"],
-        autonomy: { externalComms: false, codeTask: false, codeAccess: false },
+        autonomy: { externalComms: false, codeAccess: false },
       }),
       memoryManager as any,
     );
@@ -525,37 +523,11 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     (config.quo as any).apiKey = origQuoKey;
   });
 
-  it("removes code-task when codeTask autonomy flag is false", async () => {
-    runner = new AgentRunner(
-      makeAgentConfig({
-        coreServers: ["memory", "code-task"],
-        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
-      }),
-      memoryManager as any,
-    );
-    await runner.send("hello");
-    const servers = getCapturedServers();
-    expect(servers).not.toHaveProperty("code-task");
-  });
-
-  it("keeps code-task when codeTask autonomy flag is true", async () => {
-    runner = new AgentRunner(
-      makeAgentConfig({
-        coreServers: ["memory", "code-task"],
-        autonomy: { externalComms: true, codeTask: true, codeAccess: false },
-      }),
-      memoryManager as any,
-    );
-    await runner.send("hello");
-    const servers = getCapturedServers();
-    expect(servers).toHaveProperty("code-task");
-  });
-
   it("removes code-search when codeAccess autonomy flag is false", async () => {
     runner = new AgentRunner(
       makeAgentConfig({
         coreServers: ["memory", "code-search"],
-        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+        autonomy: { externalComms: true, codeAccess: false },
       }),
       memoryManager as any,
     );
@@ -568,7 +540,7 @@ describe("AgentRunner.buildMcpServers (via send)", () => {
     runner = new AgentRunner(
       makeAgentConfig({
         coreServers: ["memory", "code-search"],
-        autonomy: { externalComms: true, codeTask: false, codeAccess: true },
+        autonomy: { externalComms: true, codeAccess: true },
       }),
       memoryManager as any,
     );
@@ -1433,7 +1405,7 @@ describe("AgentRunner.buildToolTransportInventory", () => {
     const runner = new AgentRunner(
       makeAgentConfig({
         coreServers: ["background"],
-        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+        autonomy: { externalComms: true, codeAccess: false },
       }),
       memoryManager as any,
     );
@@ -1613,18 +1585,17 @@ describe("AgentRunner.buildToolTransportInventory", () => {
     }
   });
 
-  it("applies autonomy gates consistently to inventory", () => {
+  it("applies the codeAccess autonomy gate to inventory", () => {
     const runner = new AgentRunner(
       makeAgentConfig({
-        coreServers: ["code-task", "code-search"],
-        delegateServers: ["code-task", "code-search"],
-        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+        coreServers: ["code-search"],
+        delegateServers: ["code-search"],
+        autonomy: { externalComms: true, codeAccess: false },
       }),
       memoryManager as any,
     );
 
     const names = runner.buildToolTransportInventory().map((entry) => entry.name);
-    expect(names).not.toContain("code-task");
     expect(names).not.toContain("code-search");
   });
 
@@ -1871,7 +1842,7 @@ describe("AgentRunner server sub-agents (via send)", () => {
       makeAgentConfig({
         coreServers: ["memory"],
         delegateServers: ["google", "resend"],
-        autonomy: { externalComms: false, codeTask: false, codeAccess: false },
+        autonomy: { externalComms: false, codeAccess: false },
       }),
       memoryManager as any,
     );
@@ -1882,22 +1853,6 @@ describe("AgentRunner server sub-agents (via send)", () => {
     expect(options.agents).not.toHaveProperty("resend");
 
     (config.resend as any).apiKey = origResendKey;
-  });
-
-  it("excludes code-task from delegates when codeTask autonomy flag is false", async () => {
-    const runner = new AgentRunner(
-      makeAgentConfig({
-        coreServers: ["memory"],
-        delegateServers: ["google", "code-task"],
-        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
-      }),
-      memoryManager as any,
-    );
-    await runner.send("hello");
-    const options = getCapturedOptions();
-
-    expect(options.agents).toHaveProperty("google");
-    expect(options.agents).not.toHaveProperty("code-task");
   });
 
   it("KPR-221: skips context-dependent servers if they slip through (defense-in-depth)", async () => {
@@ -1924,7 +1879,7 @@ describe("AgentRunner server sub-agents (via send)", () => {
       makeAgentConfig({
         coreServers: ["memory"],
         delegateServers: ["google", "code-search"],
-        autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+        autonomy: { externalComms: true, codeAccess: false },
       }),
       memoryManager as any,
     );
@@ -3162,43 +3117,10 @@ describe("AgentRunner Lane A passthrough env substitution (via send) (KPR-346)",
   });
 });
 
-// ── Archetype card injection ─────────────────────────────────────
-describe("buildSystemPrompt — archetype card", () => {
+// ── System prompt assembly ───────────────────────────────────────
+describe("buildSystemPrompt", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    __resetRegistryForTests();
-  });
-
-  it("injects card between soul and systemPrompt", async () => {
-    registerArchetype({
-      id: "stub",
-      validateConfig: (c) => c,
-      systemPromptCard: () => "ARCH_CARD_MARKER",
-      preToolUseHooks: () => [],
-      memoryScopes: () => [],
-      sessionOptions: () => ({}),
-    });
-    const runner = makeRunner({
-      soul: "SOUL_MARKER",
-      systemPrompt: "SYSPROMPT_MARKER",
-      archetype: "stub",
-      archetypeConfig: {},
-    });
-    const prompt = await (runner as any).buildSystemPrompt([], []);
-    const soulIdx = prompt.indexOf("SOUL_MARKER");
-    const cardIdx = prompt.indexOf("ARCH_CARD_MARKER");
-    const sysIdx = prompt.indexOf("SYSPROMPT_MARKER");
-    expect(soulIdx).toBeGreaterThanOrEqual(0);
-    expect(cardIdx).toBeGreaterThan(soulIdx);
-    expect(sysIdx).toBeGreaterThan(cardIdx);
-  });
-
-  it("no card when archetype unset", async () => {
-    const runner = makeRunner({ soul: "SOUL_MARKER", systemPrompt: "SYSPROMPT_MARKER" });
-    const prompt = await (runner as any).buildSystemPrompt([], []);
-    expect(prompt).not.toContain("ARCH_CARD_MARKER");
-    expect(prompt).toContain("SOUL_MARKER");
-    expect(prompt).toContain("SYSPROMPT_MARKER");
   });
 
   it("KPR-139: injects team summary when teamRoster is provided", async () => {
@@ -3236,181 +3158,27 @@ describe("buildSystemPrompt — archetype card", () => {
     expect(hooks.PreToolUse).toBeUndefined();
   });
 
-  it("buildHooks merges archetype PreToolUse hooks", () => {
-    registerArchetype({
-      id: "hooked",
-      validateConfig: (c) => c,
-      systemPromptCard: () => "",
-      preToolUseHooks: () => [
-        { matcher: "Edit", hooks: [async () => ({ continue: true })] },
-      ],
-      memoryScopes: () => [],
-      sessionOptions: () => ({}),
-    });
-    const runner = makeRunner({
-      soul: "",
-      systemPrompt: "",
-      archetype: "hooked",
-      archetypeConfig: {},
-    });
-    const hooks = (runner as any).buildHooks();
-    expect(hooks.PreCompact).toBeDefined();
-    expect(hooks.PreToolUse).toHaveLength(1);
-    expect(hooks.PreToolUse[0].matcher).toBe("Edit");
-  });
-
-  it("buildHooks installs deny-all when preToolUseHooks throws (fail-closed)", () => {
-    registerArchetype({
-      id: "hook-throws",
-      validateConfig: (c) => c,
-      systemPromptCard: () => "",
-      preToolUseHooks: () => {
-        throw new Error("hook init boom");
-      },
-      memoryScopes: () => [],
-      sessionOptions: () => ({}),
-    });
-    const runner = makeRunner({
-      soul: "",
-      systemPrompt: "",
-      archetype: "hook-throws",
-      archetypeConfig: {},
-    });
-    const hooks = (runner as any).buildHooks();
-    expect(hooks.PreCompact).toBeDefined();
-    // Should have a deny-all hook, not undefined (fail-open)
-    expect(hooks.PreToolUse).toBeDefined();
-    expect(hooks.PreToolUse).toHaveLength(1);
-    // No matcher = matches all tools
-    expect(hooks.PreToolUse[0].matcher).toBeUndefined();
-  });
-
-  it("KPR-222: buildHooks rebuilds with current WorkItemContext on every call (no stale context across spawns)", () => {
-    const captured: Array<unknown> = [];
-    registerArchetype({
-      id: "context-capturing",
-      validateConfig: (c) => c,
-      systemPromptCard: () => "",
-      preToolUseHooks: (args) => {
-        captured.push(args.workItemContext);
-        return [];
-      },
-      memoryScopes: () => [],
-      sessionOptions: () => ({}),
-    });
-    const runner = makeRunner({
-      soul: "",
-      systemPrompt: "",
-      archetype: "context-capturing",
-      archetypeConfig: {},
-    });
-    const ctxA = { channelId: "ch-a", threadId: "thr-a", source: "test" } as any;
-    const ctxB = { channelId: "ch-b", threadId: "thr-b", source: "test" } as any;
-    (runner as any).buildHooks(ctxA);
-    (runner as any).buildHooks(ctxB);
-    expect(captured).toEqual([ctxA, ctxB]);
-  });
-
-  it("omits card gracefully when archetype systemPromptCard throws", async () => {
-    registerArchetype({
-      id: "throws",
-      validateConfig: (c) => c,
-      systemPromptCard: () => {
-        throw new Error("boom");
-      },
-      preToolUseHooks: () => [],
-      memoryScopes: () => [],
-      sessionOptions: () => ({}),
-    });
-    const runner = makeRunner({
-      soul: "SOUL_MARKER",
-      systemPrompt: "SYSPROMPT_MARKER",
-      archetype: "throws",
-      archetypeConfig: {},
-    });
-    const prompt = await (runner as any).buildSystemPrompt([], []);
-    expect(prompt).toContain("SOUL_MARKER");
-    expect(prompt).toContain("SYSPROMPT_MARKER");
-    expect(prompt).not.toContain("ARCH_CARD_MARKER");
-  });
 });
 
-// ── Archetype sessionOptions + cwd validation ───────────────────
-describe("AgentRunner — archetype sessionOptions + cwd guard", () => {
+// ── Session cwd resolution ──────────────────────────────────────
+describe("AgentRunner — session cwd", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    __resetRegistryForTests();
     mockStatSync.mockReset();
     mockStatSync.mockReturnValue({ isDirectory: () => true });
   });
 
   afterEach(() => {
-    __resetRegistryForTests();
     mockStatSync.mockReset();
     mockStatSync.mockReturnValue({ isDirectory: () => true });
   });
 
-  it("merges archetype sessionOptions (cwd + settingSources) into SDK query options", async () => {
-    registerArchetype({
-      id: "with-session",
-      validateConfig: (c) => c,
-      systemPromptCard: () => "",
-      preToolUseHooks: () => [],
-      memoryScopes: () => [],
-      sessionOptions: () => ({ cwd: "/tmp/exists", settingSources: ["project"] }),
-    });
-    const runner = makeRunner({
-      archetype: "with-session",
-      archetypeConfig: {},
-    });
-    await runner.send("hello");
-    const options = getCapturedOptions();
-    expect(options.cwd).toBe("/tmp/exists");
-    expect(options.settingSources).toEqual(["project"]);
-  });
-
-  it("throws when statSync errors on the archetype cwd", async () => {
-    mockStatSync.mockImplementation(() => {
-      throw new Error("ENOENT");
-    });
-    registerArchetype({
-      id: "missing-cwd",
-      validateConfig: (c) => c,
-      systemPromptCard: () => "",
-      preToolUseHooks: () => [],
-      memoryScopes: () => [],
-      sessionOptions: () => ({ cwd: "/tmp/missing" }),
-    });
-    const runner = makeRunner({
-      archetype: "missing-cwd",
-      archetypeConfig: {},
-    });
-    await expect(runner.send("hello")).rejects.toThrow(/\/tmp\/missing/);
-  });
-
-  it("throws when archetype cwd exists but is not a directory", async () => {
-    mockStatSync.mockReturnValue({ isDirectory: () => false });
-    registerArchetype({
-      id: "file-cwd",
-      validateConfig: (c) => c,
-      systemPromptCard: () => "",
-      preToolUseHooks: () => [],
-      memoryScopes: () => [],
-      sessionOptions: () => ({ cwd: "/tmp/file" }),
-    });
-    const runner = makeRunner({
-      archetype: "file-cwd",
-      archetypeConfig: {},
-    });
-    await expect(runner.send("hello")).rejects.toThrow(/not a directory/);
-  });
-
-  it("falls back to per-agent scratch dir when no archetype is configured", async () => {
+  it("resolves to the per-agent scratch dir", async () => {
     mockStatSync.mockClear();
     mockMkdirSync.mockClear();
     const runner = makeRunner({ id: "milo" });
     await runner.send("hello");
-    // Default path: mkdir the scratch dir, no archetype stat.
+    // Only path: mkdir the scratch dir, no stat.
     expect(mockStatSync.mock.calls.length).toBe(0);
     expect(mockMkdirSync).toHaveBeenCalledWith(
       expect.stringMatching(/\/agents\/milo\/scratch$/),
@@ -3418,31 +3186,6 @@ describe("AgentRunner — archetype sessionOptions + cwd guard", () => {
     );
     const options = getCapturedOptions();
     expect(options.cwd).toMatch(/\/agents\/milo\/scratch$/);
-  });
-
-  it("archetype-provided cwd still wins over default scratch dir", async () => {
-    mockMkdirSync.mockClear();
-    registerArchetype({
-      id: "overrides",
-      validateConfig: (c) => c,
-      systemPromptCard: () => "",
-      preToolUseHooks: () => [],
-      memoryScopes: () => [],
-      sessionOptions: () => ({ cwd: "/tmp/exists" }),
-    });
-    const runner = makeRunner({
-      id: "jasper",
-      archetype: "overrides",
-      archetypeConfig: {},
-    });
-    await runner.send("hello");
-    const options = getCapturedOptions();
-    expect(options.cwd).toBe("/tmp/exists");
-    // Archetype branch must not mkdir (operator-configured path must already exist).
-    const jasperScratchCalls = mockMkdirSync.mock.calls.filter((c) =>
-      /\/agents\/jasper\/scratch$/.test(String(c[0])),
-    );
-    expect(jasperScratchCalls.length).toBe(0);
   });
 
   it("propagates mkdir failure when scratch dir can't be created", async () => {
@@ -3630,7 +3373,7 @@ describe("AgentRunner — KPR-122 in-process MCP wiring", () => {
     const runner = new AgentRunner(
       makeAgentConfig({
         coreServers: ["code-search"],
-        autonomy: { externalComms: true, codeTask: false, codeAccess: true },
+        autonomy: { externalComms: true, codeAccess: true },
       }),
       memoryManager as any,
       [],
@@ -3665,78 +3408,10 @@ describe("AgentRunner — memoryScopes wiring into createMemoryMcpServer (KPR-32
     vi.clearAllMocks();
     mockMessages = null;
     memoryDepsCapture.deps.length = 0; // plain array — clearAllMocks does not reset it
-    __resetRegistryForTests();
   });
-  afterEach(() => __resetRegistryForTests());
 
-  it("defaults to self-mongo only when no archetype is set", async () => {
+  it("wires self-mongo as the only scope", async () => {
     const runner = makeScopesRunner();
-    await runner.send("hello");
-    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
-    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
-    expect(scopes).toEqual([{ id: "self", backing: "mongo" }]);
-  });
-
-  it("leads with self-mongo and appends archetype scopes", async () => {
-    registerArchetype({
-      id: "scoped",
-      validateConfig: (c) => c,
-      systemPromptCard: () => "",
-      preToolUseHooks: () => [],
-      memoryScopes: () => [
-        { id: "workshop", backing: "filesystem", dir: "/tmp/workshop" },
-        { id: "workspace:dodi_v2", backing: "filesystem", dir: "/tmp/dodi" },
-      ],
-      sessionOptions: () => ({}),
-    });
-    const runner = makeScopesRunner({ archetype: "scoped", archetypeConfig: {} });
-    await runner.send("hello");
-    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
-    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
-    expect(scopes[0]).toEqual({ id: "self", backing: "mongo" });
-    expect(scopes).toHaveLength(3);
-    expect(scopes.find((s: { id: string }) => s.id === "workshop")).toEqual({
-      id: "workshop",
-      backing: "filesystem",
-      dir: "/tmp/workshop",
-    });
-    expect(scopes.find((s: { id: string }) => s.id === "workspace:dodi_v2")).toBeDefined();
-  });
-
-  it("dedupes self when an archetype incorrectly returns its own self entry", async () => {
-    registerArchetype({
-      id: "with-self",
-      validateConfig: (c) => c,
-      systemPromptCard: () => "",
-      preToolUseHooks: () => [],
-      memoryScopes: () => [
-        { id: "self", backing: "filesystem", dir: "/tmp/should-be-filtered" },
-        { id: "workshop", backing: "filesystem", dir: "/tmp/workshop" },
-      ],
-      sessionOptions: () => ({}),
-    });
-    const runner = makeScopesRunner({ archetype: "with-self", archetypeConfig: {} });
-    await runner.send("hello");
-    expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
-    const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
-    const selfEntries = scopes.filter((s: { id: string }) => s.id === "self");
-    expect(selfEntries).toHaveLength(1);
-    expect(selfEntries[0]).toEqual({ id: "self", backing: "mongo" });
-    expect(scopes[0]).toEqual({ id: "self", backing: "mongo" });
-  });
-
-  it("falls back to self-mongo only when memoryScopes throws", async () => {
-    registerArchetype({
-      id: "throwing",
-      validateConfig: (c) => c,
-      systemPromptCard: () => "",
-      preToolUseHooks: () => [],
-      memoryScopes: () => {
-        throw new Error("intentional");
-      },
-      sessionOptions: () => ({}),
-    });
-    const runner = makeScopesRunner({ archetype: "throwing", archetypeConfig: {} });
     await runner.send("hello");
     expect(memoryDepsCapture.deps).toHaveLength(1); // wiring broke if the factory was never (or repeatedly) called
     const scopes = memoryDepsCapture.deps.at(-1)!.memoryScopes;
