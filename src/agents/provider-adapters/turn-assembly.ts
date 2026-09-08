@@ -8,11 +8,9 @@
  */
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../../logging/logger.js";
-import { getArchetype } from "../../archetypes/registry.js";
 import type { AgentConfig } from "../../types/agent-config.js";
 import type { AgentRunner, WorkItemContext } from "../agent-runner.js";
 import type { GuardrailGate } from "./types.js";
-import { buildArchetypeGuardrailGate } from "./archetype-gate.js";
 import {
   classifyToolTransport,
   partitionInventoryForProvider,
@@ -97,8 +95,8 @@ export interface ProviderTurnAssembly {
   /**
    * Assembled system instructions — the full Lane B prompt from the shared
    * section helpers (buildProviderInstructions via runner.buildProviderPrompt):
-   * soul → archetype card → systemPrompt → constitution → team summary →
-   * memory (no datetime — KPR-432), with the tool-dependent sections
+   * soul → systemPrompt → constitution → team summary → memory (no
+   * datetime — KPR-432), with the tool-dependent sections
    * (toolkit, file-tier guidance, skills) rendered unconditionally
    * post-KPR-352 (`toolsExecutable: true` — Lane B invariant).
    */
@@ -158,30 +156,16 @@ export interface ProviderTurnAssembly {
 }
 
 /**
- * KPR-347 (§D1.5): default fail-closed guardrail gate — the mirror of the
- * buildHooks posture (agent-runner.ts). Predicate is the identical two-part
- * presence check buildHooks uses (archetypeDef && archetypeConfig):
- *  - both present → real archetype PreToolUse evaluation (KPR-348 canon 6 —
- *    a port of buildHooks' semantics; the deny-all placeholder body is gone);
- *  - otherwise → allow-all, exactly the Claude lane (no PreToolUse hooks
- *    unless both parts resolve). Registry sanitization strips unresolvable
- *    archetype ids at load time, so the mixed state is unreachable for any
- *    registry-loaded agent.
- *
- * KPR-348 (canon 6): predicate, allow-all branch, location, and export are
- * preserved; the signature gains one optional trailing param so matcher
- * production takes the turn's context, exactly as buildHooks(context) does.
+ * KPR-347 (§D1.5): default guardrail gate — the mirror of the Claude lane's
+ * buildHooks posture (agent-runner.ts). KPR-435: the conditional branch that
+ * used to return a real PreToolUse-derived gate here is gone; this now
+ * always allows, exactly matching the Claude lane's default no-PreToolUse-
+ * hooks behavior.
  */
 export function buildDefaultGuardrailGate(
-  config: AgentConfig,
-  workItemContext?: WorkItemContext,
+  _config: AgentConfig,
+  _workItemContext?: WorkItemContext,
 ): GuardrailGate {
-  const archetypeDef = config.archetype ? getArchetype(config.archetype) : undefined;
-  if (archetypeDef && config.archetypeConfig) {
-    // KPR-348 (canon 6): real archetype PreToolUse evaluation — ports
-    // buildHooks' semantics (the deny-all placeholder body is gone).
-    return buildArchetypeGuardrailGate(config, archetypeDef, workItemContext);
-  }
   return async () => ({ behavior: "allow" });
 }
 

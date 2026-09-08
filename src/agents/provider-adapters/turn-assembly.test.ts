@@ -1,7 +1,6 @@
 import { describe, expect, it, vi, beforeEach, type Mock } from "vitest";
 import type { AgentConfig } from "../../types/agent-config.js";
 import type { AgentRunner } from "../agent-runner.js";
-import { registerArchetype } from "../../archetypes/registry.js";
 import { classifyThrown, TurnAssemblyError } from "./error-classification.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import {
@@ -30,7 +29,7 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     channels: [], passiveChannels: [], keywords: [], isDefault: false,
     schedule: [], budgetUsd: 10, maxTurns: 25, coreServers: [], delegateServers: [],
     icon: "", soul: "pilot soul", systemPrompt: "pilot system",
-    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    autonomy: { externalComms: true, codeAccess: false },
     ...overrides,
   };
 }
@@ -186,7 +185,7 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
     const promise = assembleProviderTurn({
       runner: makeRunner([], {
         resolveTurnCwd: vi.fn(() => {
-          throw new Error("Archetype cwd unavailable at session start — refusing to run");
+          throw new Error("cwd resolution failed");
         }),
       }),
       config: makeAgentConfig(),
@@ -258,37 +257,9 @@ describe("assembleProviderTurn (KPR-347 §D1.4 / KPR-349 §D1/§D3)", () => {
 });
 
 describe("buildDefaultGuardrailGate (KPR-347 §D1.5, T8)", () => {
-  it("archetype-less agent → allow-all (mirror of the Claude lane's no-hooks state)", async () => {
+  it("always allow-all (archetype system removed, KPR-435)", async () => {
     const gate = buildDefaultGuardrailGate(makeAgentConfig());
     await expect(gate({ toolName: "anything", input: {} })).resolves.toEqual({ behavior: "allow" });
-  });
-
-  // KPR-348: the KPR-347 "archetyped agent ⇒ deny-all placeholder" assertion is
-  // RELOCATED (not deleted) — the placeholder body is gone; the archetyped path
-  // now ports buildHooks' real evaluation. The remaining fail-closed obligation
-  // this test pins is: a matcher-production throw ⇒ deny-all (canon 6 fallback).
-  it("archetyped agent whose preToolUseHooks throws at production → deny-all (fail-closed port of buildHooks)", async () => {
-    registerArchetype({
-      id: "kpr348-throwing-stub",
-      validateConfig: (c: unknown) => c,
-      preToolUseHooks: () => {
-        throw new Error("boom at production");
-      },
-      systemPromptCard: () => "",
-    } as never);
-    const gate = buildDefaultGuardrailGate(
-      makeAgentConfig({ archetype: "kpr348-throwing-stub", archetypeConfig: {} }),
-    );
-    const decision = await gate({ toolName: "Bash", input: { command: "ls" } });
-    expect(decision.behavior).toBe("deny");
-    expect((decision as { reason: string }).reason).toContain("Archetype hook initialization failed");
-  });
-
-  it("archetype id that does not resolve → allow-all (unreachable post-registry-sanitization; posture matches buildHooks)", async () => {
-    const gate = buildDefaultGuardrailGate(
-      makeAgentConfig({ archetype: "no-such-archetype", archetypeConfig: {} }),
-    );
-    await expect(gate({ toolName: "x", input: null })).resolves.toEqual({ behavior: "allow" });
   });
 
   it("gate never throws for well-formed input", async () => {
@@ -407,25 +378,6 @@ describe("buildNestedDelegateAssembly (KPR-354 §D5.3, T4)", () => {
       sessionCwd: "/tmp/nested-cwd-verbatim",
     });
     expect(assembly.sessionCwd).toBe("/tmp/nested-cwd-verbatim");
-  });
-
-  it("archetyped config → gate is the archetype gate, not the allow-all stub", async () => {
-    // Reuse the buildDefaultGuardrailGate describe's throwing archetype fixture
-    // (registration is idempotent) — its rule denies (fail-closed).
-    registerArchetype({
-      id: "kpr348-throwing-stub",
-      validateConfig: (c: unknown) => c,
-      preToolUseHooks: () => {
-        throw new Error("boom at production");
-      },
-      systemPromptCard: () => "",
-    } as never);
-    const { assembly } = buildNestedDelegateAssembly({
-      config: makeAgentConfig({ archetype: "kpr348-throwing-stub", archetypeConfig: {} }),
-      delegate: "google", entry: makeSubagentEntry(), sessionCwd: "/tmp/nested",
-    });
-    const decision = await assembly.guardrailGate({ toolName: "Bash", input: { command: "ls" } });
-    expect(decision.behavior).toBe("deny");
   });
 
   it("passthrough pin: assembleProviderTurn carries delegateTurnRunner; omitted → undefined", async () => {
