@@ -616,7 +616,7 @@ describe("standalone model catalog", () => {
     }
   }, 30_000);
 
-  it("invalidates a missing seeded bit but permits seeded metadata and export changes", async () => {
+  it("invalidates a missing seeded bit but permits seeded metadata changes", async () => {
     const missingStore = new ModelCatalogStore(mongo.db);
     const missing = await missingStore.readCatalogState("codex");
     await new ModelCatalogStore(mongo.db).replaceManual(input("model-a"));
@@ -632,6 +632,203 @@ describe("standalone model catalog", () => {
       .updateOne({ _id: "codex" }, { $set: { updatedBy: "metadata-only" } });
     const accepted = await seeded.beginDiscoveryAttempt("codex", proposal(observed.observed, await serverNow()));
     expect(accepted.kind).toBe("started");
+  });
+
+  it("keeps a due observation eligible across real pending-export recovery", async () => {
+    const seedAt = await serverNow();
+    const seedId = randomUUID();
+    const seedStore = new ModelCatalogStore(mongo.db, { now: () => seedAt, uuid: () => seedId });
+    const seeded = await seedStore.replaceManual(input("model-a"));
+    expect(seeded).toMatchObject({
+      kind: "committed",
+      commitId: seedId,
+      revision: 1,
+      bootstrap: true,
+      added: ["model-a"],
+      removed: [],
+      recoveryPending: false,
+    });
+    if (seeded.kind !== "committed") throw new Error("seed did not commit");
+
+    const predecessorStore = new ModelCatalogStore(mongo.db);
+    const predecessor = await begin(predecessorStore);
+    if (predecessor.kind !== "started") throw new Error("predecessor did not start");
+    const failedAt = await serverNow();
+    expect(
+      await predecessorStore.failDiscoveryAttempt(
+        predecessor.attempt,
+        { code: "timeout", message: "ignored" },
+        failedAt,
+      ),
+    ).toEqual({ kind: "recorded" });
+    const failedScan = (await predecessorStore.readCatalogState("codex")).snapshot?.scan;
+    expect(failedScan).toMatchObject({
+      attemptId: predecessor.attempt.attemptId,
+      startedAt: predecessor.attempt.startedAt,
+      finishedAt: failedAt,
+      outcome: "failed",
+      error: { code: "timeout" },
+    });
+    if (!failedScan) throw new Error("failed predecessor was not persisted");
+
+    const exportAt = await serverNow();
+    const exportId = randomUUID();
+    let blockedHistoryInserts = 0;
+    const interruptedExportDb = faultDb(mongo.db, async (collection, method, args, run) => {
+      if (collection === "agent_model_catalog_versions" && method === "insertOne" && args[0]?._id === exportId) {
+        blockedHistoryInserts++;
+        throw new Error("test history projection unavailable");
+      }
+      return run();
+    });
+    const interruptedExport = await new ModelCatalogStore(interruptedExportDb, {
+      now: () => exportAt,
+      uuid: () => exportId,
+    }).replaceManual({
+      provider: "codex",
+      updatedBy: "export-race-editor",
+      changeSummary: "add model-b before recovery",
+      models: [
+        { id: "model-a", displayName: "Manual A", notes: "retained note" },
+        { id: "model-b", displayName: "Manual B" },
+      ],
+    });
+    expect(interruptedExport).toMatchObject({
+      kind: "committed",
+      commitId: exportId,
+      revision: 2,
+      bootstrap: false,
+      added: ["model-b"],
+      removed: [],
+      recoveryPending: true,
+    });
+    expect(blockedHistoryInserts).toBe(1);
+    if (interruptedExport.kind !== "committed") throw new Error("interrupted export did not commit");
+
+    const claimStore = new ModelCatalogStore(mongo.db);
+    const due = await claimStore.readCatalogState("codex");
+    expect(due.recoveryPending).toBe(true);
+    expect(due.scan).toEqual(failedScan);
+
+    const seedModel = { id: "model-a", displayName: "MODEL-A", addedAt: seedAt };
+    const recoveredModels = [
+      { id: "model-a", displayName: "Manual A", notes: "retained note", addedAt: seedAt },
+      { id: "model-b", displayName: "Manual B", addedAt: exportAt },
+    ];
+    const seedCommon = {
+      _id: seedId,
+      provider: "codex",
+      revision: 1,
+      snapshotId: seeded.snapshotId,
+      createdAt: seedAt,
+      source: "manual",
+      updatedBy: "test-operator",
+      bootstrap: true,
+      added: ["model-a"],
+      removed: [],
+      modelCount: 1,
+    };
+    const exportCommon = {
+      _id: exportId,
+      provider: "codex",
+      revision: 2,
+      snapshotId: interruptedExport.snapshotId,
+      createdAt: exportAt,
+      source: "manual",
+      updatedBy: "export-race-editor",
+      bootstrap: false,
+      added: ["model-b"],
+      removed: [],
+      modelCount: 2,
+    };
+    const pendingState = await completeState(claimStore);
+    expect(due.snapshot).toEqual(pendingState.catalog);
+    expect(pendingState).toEqual({
+      catalog: {
+        _id: "codex",
+        provider: "codex",
+        models: recoveredModels,
+        revision: 2,
+        commitId: exportId,
+        snapshotId: interruptedExport.snapshotId,
+        source: "manual",
+        updatedBy: "export-race-editor",
+        updatedAt: exportAt,
+        scan: failedScan,
+        pendingExport: {
+          version: {
+            ...exportCommon,
+            snapshot: recoveredModels,
+            changeSummary: "add model-b before recovery",
+          },
+          change: exportCommon,
+        },
+      },
+      versions: [{ ...seedCommon, snapshot: [seedModel], changeSummary: "+1 (model-a), -0" }],
+      changes: [
+        {
+          ...seedCommon,
+          delivery: { state: "pending", attempts: 0, nextAttemptAt: seedAt },
+        },
+      ],
+    });
+
+    const freshRecoveryStore = new ModelCatalogStore(mongo.db);
+    expect(await freshRecoveryStore.recoverPendingExports("codex")).toEqual([{ provider: "codex", kind: "recovered" }]);
+    const recoveredState = await completeState(claimStore);
+    expect(recoveredState).toEqual({
+      catalog: {
+        _id: "codex",
+        provider: "codex",
+        models: recoveredModels,
+        revision: 2,
+        commitId: exportId,
+        snapshotId: interruptedExport.snapshotId,
+        source: "manual",
+        updatedBy: "export-race-editor",
+        updatedAt: exportAt,
+        scan: failedScan,
+      },
+      versions: [
+        { ...seedCommon, snapshot: [seedModel], changeSummary: "+1 (model-a), -0" },
+        { ...exportCommon, snapshot: recoveredModels, changeSummary: "add model-b before recovery" },
+      ],
+      changes: [
+        {
+          ...seedCommon,
+          delivery: { state: "pending", attempts: 0, nextAttemptAt: seedAt },
+        },
+        {
+          ...exportCommon,
+          delivery: { state: "pending", attempts: 0, nextAttemptAt: exportAt },
+        },
+      ],
+    });
+    expect(recoveredState.catalog?.models).toEqual(due.snapshot?.models);
+    expect(recoveredState.catalog?.scan).toEqual(due.scan);
+
+    const proposed = proposal(due.observed, await serverNow());
+    expect(await claimStore.beginDiscoveryAttempt("codex", proposed)).toEqual({
+      kind: "started",
+      attempt: {
+        provider: "codex",
+        attemptId: proposed.attemptId,
+        startedAt: proposed.startedAt,
+        leaseExpiresAt: proposed.leaseExpiresAt,
+      },
+    });
+    expect(await completeState(claimStore)).toEqual({
+      ...recoveredState,
+      catalog: {
+        ...recoveredState.catalog,
+        scan: {
+          attemptId: proposed.attemptId,
+          startedAt: proposed.startedAt,
+          leaseExpiresAt: proposed.leaseExpiresAt,
+          outcome: "running",
+        },
+      },
+    });
   });
 
   it("matches the exact BSON observation through the production literal filter", async () => {
