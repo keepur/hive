@@ -41,7 +41,7 @@ vi.mock("@slack/web-api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@slack/web-api")>();
   class ScopedWebClient extends actual.WebClient {
     constructor(token?: string, options: import("@slack/web-api").WebClientOptions = {}) {
-      const fetch = externalSlack.fetch;
+      const fetch = options.fetch ?? externalSlack.fetch;
       if (!fetch) throw new Error("Catalog E2E WebClient constructed before its scoped fetch was installed");
       super(token, { ...options, fetch });
     }
@@ -204,6 +204,25 @@ function ordinarySlack(request: CatalogSlackRequest): Response {
   }
   throw new Error("ordinarySlack requires an explicit post outcome");
 }
+
+const applicationRetryCases = [
+  {
+    label: "a definite JSON refusal",
+    postResponse: () => slackJson({ ok: false, error: "channel_not_found" }),
+    returned: { ok: false, error: "channel_not_found" },
+    uncertainSend: false,
+  },
+  {
+    label: "a malformed non-JSON channel_not_found response",
+    postResponse: () =>
+      new Response("channel_not_found", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    returned: undefined,
+    uncertainSend: true,
+  },
+] as const;
 
 beforeEach(() => {
   externalSlack.fetch = undefined;
@@ -697,81 +716,81 @@ describe("catalog notification application E2E", () => {
     expect(await assignments(harness.db)).toEqual(assignmentAtRepair);
   });
 
-  it("reuses one persisted preparation after a definite refusal and fresh-process restart", async () => {
-    const mongo = await startCatalogNotificationMongo();
-    let first: CatalogNotificationHarness | undefined;
-    let restarted: CatalogNotificationHarness | undefined;
-    try {
-      first = await createCatalogNotificationHarness({
-        db: mongo.db,
-        installExternalFetch,
-        slack: async (request) =>
-          request.kind === "post" ? slackJson({ ok: false, error: "channel_not_found" }) : ordinarySlack(request),
-      });
-      harness = first;
-      const assignmentBefore = await assignments(first.db);
-      await first.manual({ provider: "sol", models: [{ id: "sol-refusal", displayName: "Sol Refusal" }] });
-      await first.notifier.tick();
-      const pending = (await providerState(first.db, "sol")).changes[0]!;
-      const preparation = copy(pending.delivery.preparation!);
-      expect(pending.delivery).toMatchObject({
-        state: "pending",
-        attempts: 1,
-        preparation,
-        uncertainSend: false,
-        diagnostic: { reason: "delivery-unconfirmed" },
-      });
-      expect(pending.delivery.claim).toBeUndefined();
-      expect(pending.delivery.receipt).toBeUndefined();
-      expect(first.turns).toHaveLength(1);
-      expect(first.posts).toEqual([
-        { channel: "CNOTICE1", text: preparation.text, returned: { ok: false, error: "channel_not_found" } },
-      ]);
+  it.each(applicationRetryCases)(
+    "reuses one persisted preparation after $label and fresh-process restart",
+    async ({ postResponse, returned, uncertainSend }) => {
+      const mongo = await startCatalogNotificationMongo();
+      let first: CatalogNotificationHarness | undefined;
+      let restarted: CatalogNotificationHarness | undefined;
+      try {
+        first = await createCatalogNotificationHarness({
+          db: mongo.db,
+          installExternalFetch,
+          slack: async (request) => (request.kind === "post" ? postResponse() : ordinarySlack(request)),
+        });
+        harness = first;
+        const assignmentBefore = await assignments(first.db);
+        await first.manual({ provider: "sol", models: [{ id: "sol-refusal", displayName: "Sol Refusal" }] });
+        await first.notifier.tick();
+        const pending = (await providerState(first.db, "sol")).changes[0]!;
+        const preparation = copy(pending.delivery.preparation!);
+        expect(pending.delivery).toMatchObject({
+          state: "pending",
+          attempts: 1,
+          preparation,
+          uncertainSend,
+          diagnostic: { reason: "delivery-unconfirmed" },
+        });
+        expect(pending.delivery.claim).toBeUndefined();
+        expect(pending.delivery.receipt).toBeUndefined();
+        expect(first.turns).toHaveLength(1);
+        expect(first.posts).toEqual([{ channel: "CNOTICE1", text: preparation.text, returned }]);
 
-      await first.close();
-      harness = undefined;
-      await makeDeliveryDue(mongo.db, pending._id);
-      restarted = await createCatalogNotificationHarness({
-        db: mongo.db,
-        seedAgent: false,
-        installExternalFetch,
-        turn: async () => {
-          throw new Error("Persisted preparation unexpectedly regenerated after restart");
-        },
-      });
-      harness = restarted;
-      await restarted.notifier.tick();
-      await restarted.notifier.tick();
+        await first.close();
+        harness = undefined;
+        await makeDeliveryDue(mongo.db, pending._id);
+        restarted = await createCatalogNotificationHarness({
+          db: mongo.db,
+          seedAgent: false,
+          installExternalFetch,
+          turn: async () => {
+            throw new Error("Persisted preparation unexpectedly regenerated after restart");
+          },
+        });
+        harness = restarted;
+        await restarted.notifier.tick();
+        await restarted.notifier.tick();
 
-      const final = (await providerState(restarted.db, "sol")).changes[0]!;
-      expect(final.delivery).toMatchObject({
-        state: "delivered",
-        attempts: 2,
-        preparation,
-        uncertainSend: false,
-        receipt: {
-          preparationId: preparation.id,
-          binding: preparation.binding,
-          channelId: "CNOTICE1",
-          messageTs: expect.stringMatching(/^1900000000\./),
-        },
-      });
-      expect(restarted.turns).toEqual([]);
-      expect(restarted.posts).toEqual([
-        {
-          channel: "CNOTICE1",
-          text: preparation.text,
-          returned: { ok: true, channel: "CNOTICE1", ts: expect.stringMatching(/^1900000000\./) },
-        },
-      ]);
-      expect(await assignments(restarted.db)).toEqual(assignmentBefore);
-    } finally {
-      await first?.close();
-      await restarted?.close();
-      harness = undefined;
-      await mongo.close();
-    }
-  });
+        const final = (await providerState(restarted.db, "sol")).changes[0]!;
+        expect(final.delivery).toMatchObject({
+          state: "delivered",
+          attempts: 2,
+          preparation,
+          uncertainSend,
+          receipt: {
+            preparationId: preparation.id,
+            binding: preparation.binding,
+            channelId: "CNOTICE1",
+            messageTs: expect.stringMatching(/^1900000000\./),
+          },
+        });
+        expect(restarted.turns).toEqual([]);
+        expect(restarted.posts).toEqual([
+          {
+            channel: "CNOTICE1",
+            text: preparation.text,
+            returned: { ok: true, channel: "CNOTICE1", ts: expect.stringMatching(/^1900000000\./) },
+          },
+        ]);
+        expect(await assignments(restarted.db)).toEqual(assignmentBefore);
+      } finally {
+        await first?.close();
+        await restarted?.close();
+        harness = undefined;
+        await mongo.close();
+      }
+    },
+  );
 
   it("waits for a delayed unknown catalog commit and lets scanner recovery export its exact event", async () => {
     const mongo = await startCatalogNotificationMongo();

@@ -1,4 +1,69 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+const { TEST_HIVE_HOME, ORIGINAL_HIVE_HOME, testKeychain } = vi.hoisted(() => {
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const { mkdtempSync } = require("node:fs");
+  const { tmpdir } = require("node:os");
+  const { join } = require("node:path");
+  /* eslint-enable @typescript-eslint/no-require-imports */
+  const originalHiveHome = process.env.HIVE_HOME;
+  const dir = mkdtempSync(join(tmpdir(), "hive-dispatcher-catalog-test-"));
+  process.env.HIVE_HOME = dir;
+  return {
+    TEST_HIVE_HOME: dir,
+    ORIGINAL_HIVE_HOME: originalHiveHome,
+    testKeychain: vi.fn(() => ""),
+  };
+});
+
+vi.mock("../keychain/from-keychain.js", () => ({ fromKeychain: testKeychain }));
+
+vi.mock("../config.js", () => ({
+  config: {
+    instance: { id: "dispatcher-catalog-test" },
+    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    modelRouter: { enabled: false },
+    defaultAgent: "chief-of-staff",
+    plugins: [],
+    anthropic: { apiKey: "" },
+    openai: { apiKey: "", agentModel: "" },
+    codex: { agentModel: "" },
+    gemini: { apiKey: "", agentModel: "" },
+    kimi: { apiKey: "", agentModel: "" },
+    deepseek: { apiKey: "", agentModel: "" },
+    grok: { agentModel: "" },
+    slack: { botToken: "", appToken: "", mcpToken: "", localMcpServer: false },
+    slackInternal: { port: 0, authToken: "" },
+    mongo: { uri: "", dbName: "dispatcher-catalog-test" },
+    memory: { reflectionMinTurns: 3 },
+    workflow: { enabled: false },
+    toolSearch: { mode: "off", source: "default" },
+    google: { client: "", accounts: {}, sharedFolder: "" },
+    quo: { apiKey: "", phoneNumberId: "", lines: [] },
+    voice: { enabled: false, apiKey: "", phoneNumberId: "", assistants: {} },
+    taskLedger: { apiUrl: "", apiKey: "", agentKeys: {} },
+    brave: { apiKey: "" },
+    resend: {
+      apiKey: "",
+      emailDomain: "",
+      businessName: "",
+      fromAddress: "",
+      defaultCc: "",
+      defaultBcc: "",
+    },
+    linear: { apiKey: "", teamId: "" },
+    github: { repo: "", token: "" },
+    clickup: { apiToken: "" },
+    recall: { apiKey: "", region: "", monitorPort: 0, monitorPublicUrl: "", webhookSecret: "" },
+    browser: { cdpEndpoint: "" },
+    background: { port: 0, authToken: "" },
+    codeTask: { port: 0, authToken: "", pluginDir: "" },
+  },
+  resolveToolSearchMode: () => ({ mode: "off", source: "default" }),
+  resolveToolSearchEnv: () => "false",
+}));
+
+import { rmSync } from "node:fs";
 import type { AgentManager, TurnResult } from "../agents/agent-manager.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import {
@@ -188,8 +253,19 @@ async function currentRoute(dispatcher: Dispatcher): Promise<NoticeRoute> {
   return result.route;
 }
 
+beforeAll(() => {
+  expect(testKeychain).not.toHaveBeenCalled();
+});
+
 afterEach(() => {
+  expect(testKeychain).not.toHaveBeenCalled();
   vi.restoreAllMocks();
+});
+
+afterAll(() => {
+  if (ORIGINAL_HIVE_HOME === undefined) delete process.env.HIVE_HOME;
+  else process.env.HIVE_HOME = ORIGINAL_HIVE_HOME;
+  rmSync(TEST_HIVE_HOME, { recursive: true, force: true });
 });
 
 describe("Dispatcher catalog notification route", () => {

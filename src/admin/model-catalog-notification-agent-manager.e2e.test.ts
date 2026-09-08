@@ -84,7 +84,7 @@ vi.mock("@slack/web-api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@slack/web-api")>();
   class ScopedWebClient extends actual.WebClient {
     constructor(token?: string, options: import("@slack/web-api").WebClientOptions = {}) {
-      const fetch = externalSlack.fetch;
+      const fetch = options.fetch ?? externalSlack.fetch;
       if (!fetch) throw new Error("Catalog AgentManager E2E WebClient constructed before fetch installation");
       super(token, { ...options, fetch });
     }

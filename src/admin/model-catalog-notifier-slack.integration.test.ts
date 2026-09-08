@@ -1,6 +1,69 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { WebClientOptions } from "@slack/web-api";
 import type { Db } from "mongodb";
+
+const { TEST_HIVE_HOME, ORIGINAL_HIVE_HOME, testKeychain } = vi.hoisted(() => {
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const { mkdtempSync } = require("node:fs");
+  const { tmpdir } = require("node:os");
+  const { join } = require("node:path");
+  /* eslint-enable @typescript-eslint/no-require-imports */
+  const originalHiveHome = process.env.HIVE_HOME;
+  const dir = mkdtempSync(join(tmpdir(), "hive-catalog-notifier-slack-test-"));
+  process.env.HIVE_HOME = dir;
+  return {
+    TEST_HIVE_HOME: dir,
+    ORIGINAL_HIVE_HOME: originalHiveHome,
+    testKeychain: vi.fn(() => ""),
+  };
+});
+
+vi.mock("../keychain/from-keychain.js", () => ({ fromKeychain: testKeychain }));
+
+vi.mock("../config.js", () => ({
+  config: {
+    instance: { id: "catalog-notifier-slack-test" },
+    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    modelRouter: { enabled: false },
+    defaultAgent: "chief-of-staff",
+    plugins: [],
+    anthropic: { apiKey: "" },
+    openai: { apiKey: "", agentModel: "" },
+    codex: { agentModel: "" },
+    gemini: { apiKey: "", agentModel: "" },
+    kimi: { apiKey: "", agentModel: "" },
+    deepseek: { apiKey: "", agentModel: "" },
+    grok: { agentModel: "" },
+    slack: { botToken: "", appToken: "", mcpToken: "", localMcpServer: false },
+    slackInternal: { port: 0, authToken: "" },
+    mongo: { uri: "", dbName: "catalog-notifier-slack-test" },
+    memory: { reflectionMinTurns: 3 },
+    workflow: { enabled: false },
+    toolSearch: { mode: "off", source: "default" },
+    google: { client: "", accounts: {}, sharedFolder: "" },
+    quo: { apiKey: "", phoneNumberId: "", lines: [] },
+    voice: { enabled: false, apiKey: "", phoneNumberId: "", assistants: {} },
+    taskLedger: { apiUrl: "", apiKey: "", agentKeys: {} },
+    brave: { apiKey: "" },
+    resend: {
+      apiKey: "",
+      emailDomain: "",
+      businessName: "",
+      fromAddress: "",
+      defaultCc: "",
+      defaultBcc: "",
+    },
+    linear: { apiKey: "", teamId: "" },
+    github: { repo: "", token: "" },
+    clickup: { apiToken: "" },
+    recall: { apiKey: "", region: "", monitorPort: 0, monitorPublicUrl: "", webhookSecret: "" },
+    browser: { cdpEndpoint: "" },
+    background: { port: 0, authToken: "" },
+    codeTask: { port: 0, authToken: "", pluginDir: "" },
+  },
+  resolveToolSearchMode: () => ({ mode: "off", source: "default" }),
+  resolveToolSearchEnv: () => "false",
+}));
 
 const testLog = vi.hoisted(() => ({
   debug: vi.fn(),
@@ -21,6 +84,7 @@ vi.mock("@slack/socket-mode", () => ({
   }),
 }));
 
+import { rmSync } from "node:fs";
 import type { AgentManager, TurnResult } from "../agents/agent-manager.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
 import { Dispatcher } from "../channels/dispatcher.js";
@@ -315,12 +379,23 @@ const malformedCases = [
 ] as const;
 
 beforeAll(async () => {
+  expect(testKeychain).not.toHaveBeenCalled();
   mongo = await startStandaloneMongo();
 }, 30_000);
 
 afterAll(async () => {
-  await mongo?.close();
+  try {
+    await mongo?.close();
+  } finally {
+    if (ORIGINAL_HIVE_HOME === undefined) delete process.env.HIVE_HOME;
+    else process.env.HIVE_HOME = ORIGINAL_HIVE_HOME;
+    rmSync(TEST_HIVE_HOME, { recursive: true, force: true });
+  }
 }, 30_000);
+
+afterEach(() => {
+  expect(testKeychain).not.toHaveBeenCalled();
+});
 
 beforeEach(async () => {
   expect(mongo.db.databaseName).toMatch(/^hive_kpr459_test_/);
