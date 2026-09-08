@@ -115,6 +115,27 @@ describe("Slack notification receipt SDK integration", () => {
     expect(transport.calls[0]?.url).toBe("https://slack.com/api/conversations.list");
   });
 
+  it("returns a channel found on the first physical page without requesting its advertised successor", async () => {
+    const transport = recordingFetch(() =>
+      response(
+        JSON.stringify({
+          ok: true,
+          channels: [{ id: "CNOTICE", name: "catalog-notices" }],
+          response_metadata: { next_cursor: "unused-next-page" },
+        }),
+      ),
+    );
+    const gateway = new SlackGateway("xapp-test", "xoxb-test", { fetch: transport.fetch });
+    const gate = { check: vi.fn().mockResolvedValue(true), current: vi.fn(() => true) };
+
+    await expect(gateway.resolveNotificationChannel("catalog-notices", gate)).resolves.toEqual({
+      channelId: "CNOTICE",
+    });
+    expect(transport.calls).toHaveLength(1);
+    expect(transport.calls[0]?.url).toBe("https://slack.com/api/conversations.list");
+    expect(gate.check).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ["HTTP 500", () => response("server detail", 500)],
     ["network throw", () => Promise.reject(new Error("network detail"))],

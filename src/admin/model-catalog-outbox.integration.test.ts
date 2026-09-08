@@ -547,6 +547,62 @@ describe("standalone outbox contention and uncertain writes", () => {
     ]);
   });
 
+  it("executes an expired delayed proposal after a successor and records a real zero match", async () => {
+    const now = await serverNow();
+    const row = change(now);
+    await seed(row);
+    const proposalExpiry = plus(now, 80);
+    const oldProposal = transition(
+      "claim",
+      row,
+      claimDelivery(row, now, "expired-delayed-proposal", proposalExpiry),
+      now,
+      false,
+    );
+    const entered = deferred<void>();
+    const resume = deferred<void>();
+    const matched: number[] = [];
+    const delayed = new ModelCatalogOutbox(
+      faultDb(mongo.db, async (collection, method, args, run) => {
+        if (
+          collection === CHANGES &&
+          method === "updateOne" &&
+          args[1]?.$set?.delivery?.claim?.token === "expired-delayed-proposal"
+        ) {
+          entered.resolve();
+          await resume.promise;
+          const result = await run();
+          matched.push(result.matchedCount);
+          return result;
+        }
+        return run();
+      }),
+    );
+    const oldOperation = delayed.apply(oldProposal);
+    await entered.promise;
+    let snapshot: CatalogChangeDoc;
+    try {
+      const successor = new ModelCatalogOutbox(mongo.db);
+      const observed = await successor.read(row._id);
+      if (!observed) throw new Error("missing successor observation");
+      const successorNow = await serverNow();
+      const claimed = await claim(successor, observed, successorNow, "successor-token");
+      snapshot = await applied(
+        successor,
+        transition("release", claimed, releaseDelivery(claimed, successorNow), successorNow, false),
+      );
+      const remaining = proposalExpiry.getTime() - Date.now();
+      if (remaining >= 0) await new Promise((resolve) => setTimeout(resolve, remaining + 20));
+      expect((await serverNow()).getTime()).toBeGreaterThanOrEqual(proposalExpiry.getTime());
+    } finally {
+      resume.resolve();
+    }
+    expect(await oldOperation).toEqual({ kind: "superseded" });
+    expect(matched).toEqual([0]);
+    expect(await stored(row._id)).toEqual(snapshot!);
+    expect(immutableBytes(snapshot!)).toEqual(immutableBytes(row));
+  });
+
   it("can return an acknowledged claim after its short lease expires while the response is held", async () => {
     const now = await serverNow();
     const row = change(now);

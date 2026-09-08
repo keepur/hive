@@ -6,7 +6,7 @@ vi.mock("../logging/logger.js", () => ({ createLogger: () => testLog }));
 
 import { MAX_NOTICE_DATE_MS, makePreparation, sameBinding, type NoticeRoute } from "./model-catalog-notification.js";
 import { ModelCatalogNotifier, NOTIFIER_DEFAULTS } from "./model-catalog-notifier.js";
-import { copy, ModelCatalogOutbox } from "./model-catalog-outbox.js";
+import { copy, ModelCatalogOutbox, validChange } from "./model-catalog-outbox.js";
 import type { CatalogChangeDoc } from "./model-catalog-types.js";
 import { cloneBson, createCatalogFake, deferred, faultDb } from "./testing/catalog-db.test-support.js";
 
@@ -106,6 +106,12 @@ function stored(fake: ReturnType<typeof createCatalogFake>, id: string): Catalog
   return cloneBson(fake.rows(CHANGES).get(id) as CatalogChangeDoc);
 }
 
+function immutable(row: CatalogChangeDoc): Omit<CatalogChangeDoc, "delivery"> {
+  const value = cloneBson(row) as Partial<CatalogChangeDoc>;
+  delete value.delivery;
+  return value as Omit<CatalogChangeDoc, "delivery">;
+}
+
 beforeEach(() => {
   testLog.info.mockReset();
   testLog.warn.mockReset();
@@ -183,7 +189,7 @@ describe("ModelCatalogNotifier delivery and retries", () => {
 
     fixture.clock.now = row.delivery.nextAttemptAt.getTime();
     fixture.dispatcher.api.sendPreparedCatalogNotification.mockResolvedValueOnce({
-      kind: "not-accepted",
+      kind: "outcome-unknown",
       reason: "delivery-unconfirmed",
       retryAfterMs: MAX_NOTICE_DATE_MS - fixture.clock.now + 1,
     });
@@ -193,12 +199,49 @@ describe("ModelCatalogNotifier delivery and retries", () => {
       state: "pending",
       attempts: 2,
       retryBlocked: true,
+      uncertainSend: true,
       diagnostic: { reason: "retry-deadline-unrepresentable", at: new Date(fixture.clock.now) },
       nextAttemptAt: new Date(fixture.clock.now),
     });
     const attempts = row.delivery.attempts;
-    await fixture.notifier.tick();
+    const preparation = copy(row.delivery.preparation!);
+    await fixture.notifier.stop();
+    fixture.clock.now += NOTIFIER_DEFAULTS.leaseMs + 1;
+    const restartedDispatcher = dispatcherFixture(fixture.clock);
+    const restarted = new ModelCatalogNotifier(fixture.outbox, restartedDispatcher.api as any, {
+      now: () => new Date(fixture.clock.now),
+      uuid: uuidSequence("blocked-restart"),
+    });
+    await restarted.tick();
     expect(stored(fixture.fake, row._id).delivery.attempts).toBe(attempts);
+    expect(stored(fixture.fake, row._id).delivery.preparation).toEqual(preparation);
+    expect(restartedDispatcher.api.resolveCatalogNotificationRoute).not.toHaveBeenCalled();
+    await restarted.stop();
+  });
+
+  it("persists an accepted retry exactly at the maximum representable Date", async () => {
+    const fixture = subjectFixture();
+    fixture.dispatcher.api.sendPreparedCatalogNotification.mockResolvedValueOnce({
+      kind: "outcome-unknown",
+      reason: "delivery-unconfirmed",
+      retryAfterMs: MAX_NOTICE_DATE_MS - fixture.clock.now,
+    });
+
+    await expect(fixture.notifier.tick()).resolves.toBeUndefined();
+
+    const row = stored(fixture.fake, "change-001");
+    expect(row.delivery).toMatchObject({
+      state: "pending",
+      attempts: 1,
+      nextAttemptAt: new Date(MAX_NOTICE_DATE_MS),
+      uncertainSend: true,
+      preparation: expect.objectContaining({ id: expect.any(String), text: expect.any(String) }),
+    });
+    expect(row.delivery.retryBlocked).toBeUndefined();
+    fixture.clock.now = MAX_NOTICE_DATE_MS - 1;
+    await fixture.notifier.tick();
+    expect(stored(fixture.fake, row._id).delivery.attempts).toBe(1);
+    expect(fixture.dispatcher.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
     await fixture.notifier.stop();
   });
 
@@ -229,6 +272,132 @@ describe("ModelCatalogNotifier delivery and retries", () => {
     await notifier.stop();
   });
 
+  it.each([
+    { label: "an absent version", version: undefined, expired: false, terminal: "delivered" },
+    { label: "an explicit numeric version", version: 7, expired: false, terminal: "pending" },
+    { label: "an expired prior claim", version: 4, expired: true, terminal: "delivered" },
+  ] as const)("lets only the fresh consumer work after both observe $label", async ({ version, expired, terminal }) => {
+    const clock = { now: BASE };
+    const fake = createCatalogFake(() => new Date(clock.now));
+    const row = change();
+    row.delivery = {
+      ...row.delivery,
+      ...(version === undefined ? {} : { version }),
+      ...(expired
+        ? {
+            state: "claimed" as const,
+            attempts: 2,
+            lastAttemptAt: plus(BASE, -180_000),
+            claim: {
+              token: "expired-token",
+              owner: "expired-owner",
+              startedAt: plus(BASE, -180_000),
+              leaseExpiresAt: new Date(BASE),
+              stage: "preparing" as const,
+            },
+          }
+        : {}),
+    };
+    expect(validChange(row)).toBe(true);
+    fake.rows(CHANGES).set(row._id, cloneBson(row));
+    const delayedEntered = deferred<void>();
+    const delayedResume = deferred<void>();
+    const matched: number[] = [];
+    const delayedDb = faultDb(fake.db, async (collection, method, args, run) => {
+      const next = args[1]?.$set?.delivery;
+      if (
+        collection === CHANGES &&
+        method === "updateOne" &&
+        next?.state === "claimed" &&
+        next?.claim?.token === "consumer-b-2"
+      ) {
+        delayedEntered.resolve();
+        await delayedResume.promise;
+        const result = await run();
+        matched.push(result.matchedCount);
+        return result;
+      }
+      return run();
+    });
+    const dispatchA = dispatcherFixture(clock);
+    const dispatchB = dispatcherFixture(clock);
+    if (terminal === "pending") {
+      dispatchA.api.sendPreparedCatalogNotification.mockResolvedValueOnce({
+        kind: "not-accepted",
+        reason: "delivery-unconfirmed",
+      });
+    }
+    const consumerB = new ModelCatalogNotifier(new ModelCatalogOutbox(delayedDb), dispatchB.api as any, {
+      now: () => new Date(clock.now),
+      uuid: uuidSequence("consumer-b"),
+    });
+    const consumerA = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), dispatchA.api as any, {
+      now: () => new Date(clock.now),
+      uuid: uuidSequence("consumer-a"),
+    });
+
+    const delayed = consumerB.tick();
+    await delayedEntered.promise;
+    await consumerA.tick();
+    const survivor = stored(fake, row._id);
+    delayedResume.resolve();
+    await delayed;
+
+    expect(matched).toEqual([0]);
+    expect(stored(fake, row._id)).toEqual(survivor);
+    expect(survivor.delivery.state).toBe(terminal);
+    expect(immutable(survivor)).toEqual(immutable(row));
+    expect(dispatchA.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(dispatchA.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(dispatchB.api.resolveCatalogNotificationRoute).not.toHaveBeenCalled();
+    expect(dispatchB.api.prepareCatalogNotification).not.toHaveBeenCalled();
+    expect(dispatchB.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+    await Promise.all([consumerA.stop(), consumerB.stop()]);
+  });
+
+  it("blocks external work after a fake claim installs at its frozen operation time but returns expired", async () => {
+    const clock = { now: BASE };
+    const fake = createCatalogFake(() => new Date(clock.now), {
+      afterTimestamp: async ({ update, serverNow }) => {
+        if (update.$set?.delivery?.claim?.token !== "frozen-2") return;
+        expect(serverNow).toEqual(new Date(BASE));
+        clock.now = BASE + 100;
+      },
+    });
+    const row = change();
+    fake.rows(CHANGES).set(row._id, cloneBson(row));
+    const firstDispatch = dispatcherFixture(clock);
+    const first = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), firstDispatch.api as any, {
+      now: () => new Date(clock.now),
+      uuid: uuidSequence("frozen"),
+      leaseMs: 100,
+    });
+
+    await first.tick();
+
+    const expired = stored(fake, row._id);
+    expect(expired.delivery).toMatchObject({
+      state: "claimed",
+      attempts: 1,
+      claim: { token: "frozen-2", leaseExpiresAt: new Date(BASE + 100) },
+    });
+    expect(firstDispatch.api.resolveCatalogNotificationRoute).not.toHaveBeenCalled();
+    expect(firstDispatch.api.prepareCatalogNotification).not.toHaveBeenCalled();
+    expect(firstDispatch.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+
+    clock.now++;
+    const recoveredDispatch = dispatcherFixture(clock);
+    const recovered = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), recoveredDispatch.api as any, {
+      now: () => new Date(clock.now),
+      uuid: uuidSequence("recovered"),
+    });
+    await recovered.tick();
+    expect(stored(fake, row._id).delivery).toMatchObject({ state: "delivered", attempts: 2 });
+    expect(recoveredDispatch.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(recoveredDispatch.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+    await Promise.all([first.stop(), recovered.stop()]);
+  });
+
   it("reuses a same-binding preparation across restart and never repeats the CoS turn", async () => {
     const fixture = subjectFixture();
     fixture.dispatcher.api.sendPreparedCatalogNotification.mockResolvedValueOnce({
@@ -255,32 +424,63 @@ describe("ModelCatalogNotifier delivery and retries", () => {
     expect(delivered.delivery.preparation).toEqual(preparation);
     expect(delivered.delivery.state).toBe("delivered");
     await restarted.stop();
+
+    const terminalDispatcher = dispatcherFixture(fixture.clock);
+    const terminalRestart = new ModelCatalogNotifier(fixture.outbox, terminalDispatcher.api as any, {
+      now: () => new Date(fixture.clock.now),
+      uuid: uuidSequence("terminal-restart"),
+    });
+    await terminalRestart.tick();
+    expect(terminalDispatcher.api.resolveCatalogNotificationRoute).not.toHaveBeenCalled();
+    expect(terminalDispatcher.api.prepareCatalogNotification).not.toHaveBeenCalled();
+    expect(terminalDispatcher.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+    await terminalRestart.stop();
   });
 
-  it("regenerates preparation after a recipient binding changes", async () => {
+  it.each([
+    ["default agent binding", { ...ROUTE_A, agentId: "chief-next", agentName: "Chief Next" }],
+    ["home base binding", { ...ROUTE_A, homeBase: "ops-next" }],
+    ["adapter binding", { ...ROUTE_A, adapterId: "slack-next" }],
+    ["channel binding", { ...ROUTE_A, channelId: "CNEXT12" }],
+    ["bot label", { ...ROUTE_A, botLabel: "secondary" }],
+  ] as const)("regenerates preparation after the %s changes", async (_label, nextRoute) => {
     const fixture = subjectFixture();
     fixture.dispatcher.api.sendPreparedCatalogNotification.mockResolvedValueOnce({
-      kind: "not-accepted",
+      kind: "outcome-unknown",
       reason: "delivery-unconfirmed",
     });
     await fixture.notifier.tick();
     const first = stored(fixture.fake, "change-001");
     const oldPreparation = copy(first.delivery.preparation!);
+    expect(first.delivery.uncertainSend).toBe(true);
     fixture.clock.now = first.delivery.nextAttemptAt.getTime();
-    fixture.dispatcher.setRoute(ROUTE_B);
+    fixture.dispatcher.setRoute(nextRoute);
 
     await fixture.notifier.tick();
 
     const delivered = stored(fixture.fake, first._id);
     expect(fixture.dispatcher.api.prepareCatalogNotification).toHaveBeenCalledTimes(2);
+    expect(fixture.dispatcher.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(2);
     expect(delivered.delivery.preparation?.binding).toEqual({
-      agentId: ROUTE_B.agentId,
-      homeBase: ROUTE_B.homeBase,
-      adapterId: ROUTE_B.adapterId,
-      channelId: ROUTE_B.channelId,
+      agentId: nextRoute.agentId,
+      homeBase: nextRoute.homeBase,
+      adapterId: nextRoute.adapterId,
+      channelId: nextRoute.channelId,
+      ...(nextRoute.botLabel === undefined ? {} : { botLabel: nextRoute.botLabel }),
     });
     expect(delivered.delivery.preparation?.id).not.toBe(oldPreparation.id);
-    expect(delivered.delivery.state).toBe("delivered");
+    expect(delivered.delivery).toMatchObject({
+      state: "delivered",
+      uncertainSend: true,
+      receipt: {
+        preparationId: delivered.delivery.preparation?.id,
+        binding: delivered.delivery.preparation?.binding,
+        channelId: nextRoute.channelId,
+      },
+    });
+    fixture.dispatcher.setRoute(ROUTE_B);
+    await fixture.notifier.tick();
+    expect(fixture.dispatcher.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(2);
     await fixture.notifier.stop();
   });
 
@@ -318,6 +518,34 @@ describe("ModelCatalogNotifier delivery and retries", () => {
       await fixture.notifier.stop();
     },
   );
+
+  it("records a returned receipt against the posted preparation when the default changes in flight", async () => {
+    const fixture = subjectFixture();
+    const receipt = deferred<{ kind: "acknowledged"; channelId: string; messageTs: string }>();
+    fixture.dispatcher.api.sendPreparedCatalogNotification.mockImplementationOnce(async () => receipt.promise);
+    const flight = fixture.notifier.tick();
+    await vi.waitFor(() => expect(fixture.dispatcher.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1));
+    const posted = copy(fixture.dispatcher.api.sendPreparedCatalogNotification.mock.calls[0]![0]);
+
+    fixture.dispatcher.setRoute(ROUTE_B);
+    receipt.resolve({ kind: "acknowledged", channelId: ROUTE_A.channelId, messageTs: "1770000000.777777" });
+    await flight;
+
+    const delivered = stored(fixture.fake, "change-001");
+    expect(delivered.delivery).toMatchObject({
+      state: "delivered",
+      preparation: posted,
+      receipt: {
+        preparationId: posted.id,
+        binding: posted.binding,
+        channelId: ROUTE_A.channelId,
+        messageTs: "1770000000.777777",
+      },
+    });
+    expect(fixture.dispatcher.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(fixture.dispatcher.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+    await fixture.notifier.stop();
+  });
 
   it("continues serially to a later due change while an older change backs off", async () => {
     const clock = { now: BASE };
@@ -384,6 +612,76 @@ describe("ModelCatalogNotifier delivery and retries", () => {
     );
     await notifier.stop();
   });
+
+  it("leaves every BSON falsey preparation and preparing send intent untouched in actual candidate work", async () => {
+    const clock = { now: BASE };
+    const fake = createCatalogFake(() => new Date(clock.now));
+    const before = new Map<string, CatalogChangeDoc>();
+    const falsey = [null, false, 0, "", []] as const;
+    for (const [offset, value] of falsey.entries()) {
+      const prepared = change(offset + 1);
+      (prepared.delivery as any).preparation = value;
+      fake.rows(CHANGES).set(prepared._id, cloneBson(prepared));
+      before.set(prepared._id, cloneBson(prepared));
+
+      const intent = change(offset + 11);
+      intent.delivery = {
+        state: "claimed",
+        attempts: 1,
+        nextAttemptAt: plus(BASE, -60_000),
+        version: 2,
+        lastAttemptAt: plus(BASE, -120_000),
+        claim: {
+          token: `intent-${offset}`,
+          owner: "prior-owner",
+          startedAt: plus(BASE, -120_000),
+          leaseExpiresAt: plus(BASE, -1),
+          stage: "preparing",
+          sendIntent: value as never,
+        },
+      };
+      fake.rows(CHANGES).set(intent._id, cloneBson(intent));
+      before.set(intent._id, cloneBson(intent));
+    }
+    const undefinedPreparation = change(30);
+    (undefinedPreparation.delivery as any).preparation = undefined;
+    const undefinedIntent = change(31);
+    undefinedIntent.delivery = {
+      state: "claimed",
+      attempts: 1,
+      nextAttemptAt: plus(BASE, -1),
+      claim: {
+        token: "undefined-intent",
+        owner: "prior-owner",
+        startedAt: plus(BASE, -120_000),
+        leaseExpiresAt: plus(BASE, -1),
+        stage: "preparing",
+        sendIntent: undefined as never,
+      },
+    };
+    expect(validChange(undefinedPreparation)).toBe(false);
+    expect(validChange(undefinedIntent)).toBe(false);
+
+    const dispatcher = dispatcherFixture(clock);
+    const outbox = new ModelCatalogOutbox(fake.db);
+    const apply = vi.spyOn(outbox, "apply");
+    const notifier = new ModelCatalogNotifier(outbox, dispatcher.api as any, {
+      now: () => new Date(clock.now),
+      uuid: uuidSequence("falsey"),
+    });
+    await notifier.tick();
+
+    expect(apply).not.toHaveBeenCalled();
+    expect(dispatcher.api.resolveCatalogNotificationRoute).not.toHaveBeenCalled();
+    expect(dispatcher.api.prepareCatalogNotification).not.toHaveBeenCalled();
+    expect(dispatcher.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+    for (const [rowId, original] of before) {
+      const actual = stored(fake, rowId);
+      expect(validChange(actual), rowId).toBe(false);
+      expect(actual, rowId).toEqual(original);
+    }
+    await notifier.stop();
+  });
 });
 
 describe("ModelCatalogNotifier fencing and lifecycle", () => {
@@ -410,40 +708,69 @@ describe("ModelCatalogNotifier fencing and lifecycle", () => {
     await fixture.notifier.stop();
   });
 
-  it("never turns an uncertain acquisition into permission for external work", async () => {
-    const row = change();
-    const clock = { now: BASE };
-    const fake = createCatalogFake(() => new Date(clock.now));
-    fake.rows(CHANGES).set(row._id, cloneBson(row));
-    let thrown = false;
-    const uncertainDb = faultDb(fake.db, async (collection, method, args, run) => {
-      const next = args[1]?.$set?.delivery;
-      if (!thrown && collection === CHANGES && method === "updateOne" && next?.state === "claimed") {
-        thrown = true;
-        await run();
-        throw new Error("secret acquisition response");
-      }
-      return run();
-    });
-    const dispatcher = dispatcherFixture(clock);
-    const notifier = new ModelCatalogNotifier(new ModelCatalogOutbox(uncertainDb), dispatcher.api as any, {
-      now: () => new Date(clock.now),
-      uuid: uuidSequence("uncertain-claim"),
-      pollMs: 10_000,
-      leaseMs: 20_000,
-      drainMs: 100,
-    });
-    const flight = notifier.tick();
-    await vi.waitFor(() => expect(stored(fake, row._id).delivery.state).toBe("claimed"));
+  it.each([
+    { label: "the token appears", applyBeforeThrow: true, readUnavailable: false },
+    { label: "the evidence read is negative", applyBeforeThrow: false, readUnavailable: false },
+    { label: "the evidence read is unavailable", applyBeforeThrow: false, readUnavailable: true },
+  ])(
+    "never turns an uncertain acquisition into permission when $label",
+    async ({ applyBeforeThrow, readUnavailable }) => {
+      const row = change();
+      const clock = { now: BASE };
+      const fake = createCatalogFake(() => new Date(clock.now));
+      fake.rows(CHANGES).set(row._id, cloneBson(row));
+      let thrown = false;
+      const uncertainDb = faultDb(fake.db, async (collection, method, args, run) => {
+        const next = args[1]?.$set?.delivery;
+        if (collection === CHANGES && method === "findOne" && thrown && readUnavailable) {
+          throw new Error("secret acquisition evidence");
+        }
+        if (!thrown && collection === CHANGES && method === "updateOne" && next?.state === "claimed") {
+          thrown = true;
+          if (applyBeforeThrow) await run();
+          throw new Error("secret acquisition response");
+        }
+        return run();
+      });
+      const dispatcher = dispatcherFixture(clock);
+      const notifier = new ModelCatalogNotifier(new ModelCatalogOutbox(uncertainDb), dispatcher.api as any, {
+        now: () => new Date(clock.now),
+        uuid: uuidSequence("uncertain-claim"),
+        pollMs: 10_000,
+        leaseMs: 20_000,
+        drainMs: 100,
+      });
+      const flight = notifier.tick();
+      await vi.waitFor(() => expect(thrown).toBe(true));
 
-    await notifier.stop();
-    await flight;
+      await notifier.stop();
+      await flight;
 
-    expect(dispatcher.api.resolveCatalogNotificationRoute).not.toHaveBeenCalled();
-    expect(dispatcher.api.prepareCatalogNotification).not.toHaveBeenCalled();
-    expect(dispatcher.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
-    expect(stored(fake, row._id).delivery.attempts).toBe(1);
-  });
+      expect(dispatcher.api.resolveCatalogNotificationRoute).not.toHaveBeenCalled();
+      expect(dispatcher.api.prepareCatalogNotification).not.toHaveBeenCalled();
+      expect(dispatcher.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+      const uncertain = stored(fake, row._id);
+      expect(uncertain.delivery.state).toBe(applyBeforeThrow ? "claimed" : "pending");
+      expect(immutable(uncertain)).toEqual(immutable(row));
+
+      clock.now += 20_001;
+      const recoveredDispatch = dispatcherFixture(clock);
+      const recovered = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), recoveredDispatch.api as any, {
+        now: () => new Date(clock.now),
+        uuid: uuidSequence("fresh-token"),
+      });
+      await recovered.tick();
+      expect(stored(fake, row._id).delivery).toMatchObject({
+        state: "delivered",
+        attempts: applyBeforeThrow ? 2 : 1,
+        receipt: { preparationId: expect.any(String) },
+      });
+      expect(recoveredDispatch.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+      expect(recoveredDispatch.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(testLog.warn.mock.calls)).not.toContain("secret");
+      await recovered.stop();
+    },
+  );
 
   it.each(["prepare", "ack"] as const)(
     "accepts exact positive evidence when a %s write applies and then throws",
@@ -535,6 +862,349 @@ describe("ModelCatalogNotifier fencing and lifecycle", () => {
     vi.useRealTimers();
   });
 
+  it("resends only the exact persisted preparation after a crash loses durable acknowledgment", async () => {
+    const clock = { now: BASE };
+    const fake = createCatalogFake(() => new Date(clock.now));
+    const row = change();
+    fake.rows(CHANGES).set(row._id, cloneBson(row));
+    const ackEntered = deferred<void>();
+    const crashDb = faultDb(fake.db, async (collection, method, args, run) => {
+      if (collection === CHANGES && method === "updateOne" && args[1]?.$set?.delivery?.state === "delivered") {
+        ackEntered.resolve();
+        throw new Error("private lost acknowledgment");
+      }
+      return run();
+    });
+    const firstDispatch = dispatcherFixture(clock);
+    const first = new ModelCatalogNotifier(new ModelCatalogOutbox(crashDb), firstDispatch.api as any, {
+      now: () => new Date(clock.now),
+      uuid: uuidSequence("crashed"),
+      leaseMs: 100,
+      pollMs: 1_000,
+      drainMs: 100,
+    });
+    const flight = first.tick();
+    await ackEntered.promise;
+    await first.stop();
+    await flight;
+
+    const stranded = stored(fake, row._id);
+    const preparation = copy(stranded.delivery.preparation!);
+    expect(stranded.delivery).toMatchObject({
+      state: "claimed",
+      attempts: 1,
+      claim: {
+        stage: "sending",
+        sendIntent: { preparationId: preparation.id },
+      },
+    });
+    expect(firstDispatch.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(firstDispatch.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+
+    clock.now = stranded.delivery.claim!.leaseExpiresAt.getTime() + 1;
+    const recoveredDispatch = dispatcherFixture(clock);
+    const recovered = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), recoveredDispatch.api as any, {
+      now: () => new Date(clock.now),
+      uuid: uuidSequence("after-crash"),
+    });
+    await recovered.tick();
+
+    const delivered = stored(fake, row._id);
+    expect(recoveredDispatch.api.prepareCatalogNotification).not.toHaveBeenCalled();
+    expect(recoveredDispatch.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(recoveredDispatch.api.sendPreparedCatalogNotification.mock.calls[0]![0]).toEqual(preparation);
+    expect(delivered.delivery).toMatchObject({
+      state: "delivered",
+      attempts: 2,
+      preparation,
+      uncertainSend: true,
+      receipt: {
+        preparationId: preparation.id,
+        binding: preparation.binding,
+        channelId: preparation.binding.channelId,
+      },
+    });
+    expect(immutable(delivered)).toEqual(immutable(row));
+    expect(
+      firstDispatch.api.sendPreparedCatalogNotification.mock.calls.length +
+        recoveredDispatch.api.sendPreparedCatalogNotification.mock.calls.length,
+    ).toBe(2);
+    expect(JSON.stringify(testLog.warn.mock.calls)).not.toContain("private");
+    await recovered.stop();
+  });
+
+  it("keeps a known receipt while a delayed acknowledgment applies before its exact retry", async () => {
+    vi.useFakeTimers({ now: BASE });
+    const delayedEntered = deferred<void>();
+    const delayedResume = deferred<void>();
+    let holdFirst = true;
+    const fake = createCatalogFake(() => new Date(), {
+      afterTimestamp: async ({ collection, update }) => {
+        if (holdFirst && collection === CHANGES && update.$set?.delivery?.state === "delivered") {
+          holdFirst = false;
+          delayedEntered.resolve();
+          await delayedResume.promise;
+        }
+      },
+    });
+    const row = change();
+    fake.rows(CHANGES).set(row._id, cloneBson(row));
+    let ackCalls = 0;
+    let delayedAck: Promise<any> | undefined;
+    const matched: number[] = [];
+    const faultedDb = faultDb(fake.db, async (collection, method, args, run) => {
+      if (collection === CHANGES && method === "updateOne" && args[1]?.$set?.delivery?.state === "delivered") {
+        ackCalls++;
+        if (ackCalls === 1) {
+          delayedAck = run();
+          await delayedEntered.promise;
+          throw new Error("private first ack response");
+        }
+        delayedResume.resolve();
+        const first = await delayedAck!;
+        matched.push(first.matchedCount);
+        const second = await run();
+        matched.push(second.matchedCount);
+        return second;
+      }
+      return run();
+    });
+    const clock = {
+      get now() {
+        return Date.now();
+      },
+    };
+    const dispatcher = dispatcherFixture(clock as { now: number });
+    const notifier = new ModelCatalogNotifier(new ModelCatalogOutbox(faultedDb), dispatcher.api as any, {
+      now: () => new Date(),
+      uuid: uuidSequence("delayed-ack"),
+      pollMs: 10,
+    });
+    const flight = notifier.tick();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ackCalls).toBe(1);
+    expect(dispatcher.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(10);
+    await flight;
+
+    const delivered = stored(fake, row._id);
+    expect(matched).toEqual([1, 0]);
+    expect(delivered.delivery).toMatchObject({
+      state: "delivered",
+      receipt: {
+        preparationId: delivered.delivery.preparation?.id,
+        binding: delivered.delivery.preparation?.binding,
+      },
+    });
+    expect(dispatcher.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(dispatcher.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(testLog.warn.mock.calls)).not.toContain("private");
+    await notifier.stop();
+    vi.useRealTimers();
+  });
+
+  it("settles a stale known receipt after a successor releases a newer pending state", async () => {
+    vi.useFakeTimers({ now: BASE });
+    const delayedEntered = deferred<void>();
+    const delayedResume = deferred<void>();
+    let holdAck = true;
+    const fake = createCatalogFake(() => new Date(), {
+      afterTimestamp: async ({ collection, update }) => {
+        if (holdAck && collection === CHANGES && update.$set?.delivery?.state === "delivered") {
+          holdAck = false;
+          delayedEntered.resolve();
+          await delayedResume.promise;
+        }
+      },
+    });
+    const row = change();
+    fake.rows(CHANGES).set(row._id, cloneBson(row));
+    let ackFaulted = false;
+    let delayedAck: Promise<any> | undefined;
+    const faultedDb = faultDb(fake.db, async (collection, method, args, run) => {
+      if (
+        !ackFaulted &&
+        collection === CHANGES &&
+        method === "updateOne" &&
+        args[1]?.$set?.delivery?.state === "delivered"
+      ) {
+        delayedAck = run();
+        await delayedEntered.promise;
+        ackFaulted = true;
+        throw new Error("private stale ack response");
+      }
+      return run();
+    });
+    const clock = {
+      get now() {
+        return Date.now();
+      },
+    };
+    const dispatchA = dispatcherFixture(clock as { now: number });
+    const notifierA = new ModelCatalogNotifier(new ModelCatalogOutbox(faultedDb), dispatchA.api as any, {
+      now: () => new Date(),
+      uuid: uuidSequence("ack-a"),
+      leaseMs: 100,
+      renewMs: 1_000,
+      pollMs: 10,
+    });
+    const flightA = notifierA.tick();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ackFaulted).toBe(true);
+    expect(dispatchA.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+    const preparation = copy(stored(fake, row._id).delivery.preparation!);
+
+    vi.setSystemTime(BASE + 101);
+    const dispatchB = dispatcherFixture(clock as { now: number });
+    dispatchB.api.sendPreparedCatalogNotification.mockResolvedValueOnce({
+      kind: "not-accepted",
+      reason: "delivery-unconfirmed",
+    });
+    const notifierB = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), dispatchB.api as any, {
+      now: () => new Date(),
+      uuid: uuidSequence("ack-b"),
+    });
+    await notifierB.tick();
+    const pendingSuccessor = stored(fake, row._id);
+    expect(pendingSuccessor.delivery).toMatchObject({
+      state: "pending",
+      attempts: 2,
+      preparation,
+      uncertainSend: true,
+    });
+    expect(pendingSuccessor.delivery.claim).toBeUndefined();
+    expect(dispatchB.api.prepareCatalogNotification).not.toHaveBeenCalled();
+    expect(dispatchB.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(10);
+    await flightA;
+    delayedResume.resolve();
+    expect(await delayedAck!).toMatchObject({ matchedCount: 0 });
+    expect(stored(fake, row._id)).toEqual(pendingSuccessor);
+    expect(dispatchA.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(pendingSuccessor.delivery.nextAttemptAt);
+    const dispatchC = dispatcherFixture(clock as { now: number });
+    const notifierC = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), dispatchC.api as any, {
+      now: () => new Date(),
+      uuid: uuidSequence("ack-c"),
+    });
+    await notifierC.tick();
+    const delivered = stored(fake, row._id);
+    expect(delivered.delivery).toMatchObject({
+      state: "delivered",
+      attempts: 3,
+      preparation,
+      uncertainSend: true,
+      receipt: { preparationId: preparation.id, binding: preparation.binding },
+    });
+    expect(dispatchC.api.prepareCatalogNotification).not.toHaveBeenCalled();
+    expect(dispatchC.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(immutable(delivered)).toEqual(immutable(row));
+    expect(JSON.stringify(testLog.warn.mock.calls)).not.toContain("private");
+    await Promise.all([notifierA.stop(), notifierB.stop(), notifierC.stop()]);
+    vi.useRealTimers();
+  });
+
+  it.each([
+    { label: "an unexecuted predecessor with negative evidence", persisted: false },
+    { label: "a persisted predecessor with unavailable evidence", persisted: true },
+  ])("lets a fresh owner recover after uncertain preparation from $label", async ({ persisted }) => {
+    vi.useFakeTimers({ now: BASE });
+    const delayedEntered = deferred<void>();
+    const delayedResume = deferred<void>();
+    let holdDelayed = !persisted;
+    const fake = createCatalogFake(() => new Date(), {
+      afterTimestamp: async ({ collection, update }) => {
+        const next = update.$set?.delivery;
+        if (
+          holdDelayed &&
+          collection === CHANGES &&
+          next?.state === "claimed" &&
+          next?.claim?.token === "prep-a-2" &&
+          next?.preparation
+        ) {
+          holdDelayed = false;
+          delayedEntered.resolve();
+          await delayedResume.promise;
+        }
+      },
+    });
+    const row = change();
+    fake.rows(CHANGES).set(row._id, cloneBson(row));
+    let firstTarget = true;
+    let faulted = false;
+    let delayedMutation: Promise<any> | undefined;
+    const faultedDb = faultDb(fake.db, async (collection, method, args, run) => {
+      const next = args[1]?.$set?.delivery;
+      const target =
+        collection === CHANGES &&
+        method === "updateOne" &&
+        next?.state === "claimed" &&
+        next?.claim?.token === "prep-a-2" &&
+        next?.preparation;
+      if (collection === CHANGES && method === "findOne" && faulted && persisted) {
+        throw new Error("private preparation evidence");
+      }
+      if (target && firstTarget) {
+        firstTarget = false;
+        if (persisted) await run();
+        else {
+          delayedMutation = run();
+          await delayedEntered.promise;
+        }
+        faulted = true;
+        throw new Error("private preparation response");
+      }
+      return run();
+    });
+    const clock = {
+      get now() {
+        return Date.now();
+      },
+    };
+    const dispatchA = dispatcherFixture(clock as { now: number });
+    const notifierA = new ModelCatalogNotifier(new ModelCatalogOutbox(faultedDb), dispatchA.api as any, {
+      now: () => new Date(),
+      uuid: uuidSequence("prep-a"),
+      leaseMs: 100,
+      renewMs: 1_000,
+      pollMs: 1_000,
+    });
+    const flightA = notifierA.tick();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(faulted).toBe(true);
+    expect(dispatchA.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(dispatchA.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+
+    vi.setSystemTime(BASE + 101);
+    const dispatchB = dispatcherFixture(clock as { now: number });
+    const notifierB = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), dispatchB.api as any, {
+      now: () => new Date(),
+      uuid: uuidSequence("prep-b"),
+    });
+    await notifierB.tick();
+    const successor = stored(fake, row._id);
+    expect(successor.delivery.state).toBe("delivered");
+    expect(dispatchB.api.prepareCatalogNotification).toHaveBeenCalledTimes(persisted ? 0 : 1);
+    expect(dispatchB.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+
+    if (delayedMutation) {
+      delayedResume.resolve();
+      expect(await delayedMutation).toMatchObject({ matchedCount: 0 });
+    }
+    await vi.advanceTimersByTimeAsync(100);
+    await flightA;
+    expect(stored(fake, row._id)).toEqual(successor);
+    expect(immutable(successor)).toEqual(immutable(row));
+    expect(dispatchA.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(dispatchA.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+    expect(JSON.stringify(testLog.warn.mock.calls)).not.toContain("private");
+    await Promise.all([notifierA.stop(), notifierB.stop()]);
+    vi.useRealTimers();
+  });
+
   it("renews a long turn and serializes preparation behind an in-flight renewal", async () => {
     vi.useFakeTimers({ now: BASE });
     const fake = createCatalogFake(() => new Date());
@@ -594,6 +1264,171 @@ describe("ModelCatalogNotifier fencing and lifecycle", () => {
     await notifier.stop();
     vi.useRealTimers();
   });
+
+  it("advances repeated leases monotonically and keeps a competitor out past the original lease", async () => {
+    vi.useFakeTimers({ now: BASE });
+    const fake = createCatalogFake(() => new Date());
+    const row = change();
+    fake.rows(CHANGES).set(row._id, cloneBson(row));
+    const clock = {
+      get now() {
+        return Date.now();
+      },
+    };
+    const dispatchA = dispatcherFixture(clock as { now: number });
+    const turn = deferred<void>();
+    dispatchA.api.prepareCatalogNotification.mockImplementationOnce(async (selected, route) => {
+      await turn.promise;
+      return {
+        kind: "prepared",
+        preparation: makePreparation(selected, route, "long turn", new Date()),
+      };
+    });
+    const notifierA = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), dispatchA.api as any, {
+      now: () => new Date(),
+      uuid: uuidSequence("renewing-a"),
+      leaseMs: 100,
+      renewMs: 30,
+      pollMs: 1_000,
+    });
+    const flight = notifierA.tick();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(dispatchA.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+    const leases = [stored(fake, row._id).delivery.claim!.leaseExpiresAt.getTime()];
+
+    for (let renewal = 0; renewal < 4; renewal++) {
+      await vi.advanceTimersByTimeAsync(30);
+      leases.push(stored(fake, row._id).delivery.claim!.leaseExpiresAt.getTime());
+    }
+    expect(leases.every((lease, index) => index === 0 || lease > leases[index - 1]!)).toBe(true);
+    expect(Date.now()).toBeGreaterThan(BASE + 100);
+
+    const dispatchB = dispatcherFixture(clock as { now: number });
+    const notifierB = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), dispatchB.api as any, {
+      now: () => new Date(),
+      uuid: uuidSequence("renewing-b"),
+    });
+    await notifierB.tick();
+    expect(dispatchB.api.resolveCatalogNotificationRoute).not.toHaveBeenCalled();
+    expect(dispatchB.api.prepareCatalogNotification).not.toHaveBeenCalled();
+    expect(dispatchB.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+
+    turn.resolve();
+    await flight;
+    expect(stored(fake, row._id).delivery.state).toBe("delivered");
+    expect(dispatchA.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(dispatchA.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+    await Promise.all([notifierA.stop(), notifierB.stop()]);
+    vi.useRealTimers();
+  });
+
+  it.each([
+    {
+      label: "a pre-application throw and negative read",
+      applyBeforeThrow: false,
+      readUnavailable: false,
+      successorState: "delivered",
+    },
+    {
+      label: "a pre-application throw and unavailable read",
+      applyBeforeThrow: false,
+      readUnavailable: true,
+      successorState: "pending",
+    },
+    {
+      label: "a post-application throw and unavailable read",
+      applyBeforeThrow: true,
+      readUnavailable: true,
+      successorState: "delivered",
+    },
+  ] as const)(
+    "starts no later stage after uncertain renewal from $label",
+    async ({ applyBeforeThrow, readUnavailable, successorState }) => {
+      vi.useFakeTimers({ now: BASE });
+      const fake = createCatalogFake(() => new Date());
+      const row = change();
+      fake.rows(CHANGES).set(row._id, cloneBson(row));
+      let renewalFaulted = false;
+      let renewalCalls = 0;
+      const faultedDb = faultDb(fake.db, async (collection, method, args, run) => {
+        const next = args[1]?.$set?.delivery;
+        const target =
+          collection === CHANGES &&
+          method === "updateOne" &&
+          next?.state === "claimed" &&
+          next?.claim?.token === "renew-a-2" &&
+          next?.version === 2;
+        if (collection === CHANGES && method === "findOne" && renewalFaulted && readUnavailable) {
+          throw new Error("private renewal evidence");
+        }
+        if (target) {
+          renewalCalls++;
+          if (!renewalFaulted && applyBeforeThrow) await run();
+          renewalFaulted = true;
+          throw new Error("private renewal response");
+        }
+        return run();
+      });
+      const clock = {
+        get now() {
+          return Date.now();
+        },
+      };
+      const dispatchA = dispatcherFixture(clock as { now: number });
+      const turn = deferred<void>();
+      dispatchA.api.prepareCatalogNotification.mockImplementationOnce(async (selected, route) => {
+        await turn.promise;
+        return {
+          kind: "prepared",
+          preparation: makePreparation(selected, route, "old owner turn", new Date()),
+        };
+      });
+      const notifierA = new ModelCatalogNotifier(new ModelCatalogOutbox(faultedDb), dispatchA.api as any, {
+        now: () => new Date(),
+        uuid: uuidSequence("renew-a"),
+        leaseMs: 100,
+        renewMs: 30,
+        pollMs: 1_000,
+      });
+      const flightA = notifierA.tick();
+      await vi.advanceTimersByTimeAsync(30);
+      expect(renewalFaulted).toBe(true);
+      expect(renewalCalls).toBe(1);
+      expect(dispatchA.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+      expect(dispatchA.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+
+      const uncertain = stored(fake, row._id);
+      const successorAt = uncertain.delivery.claim!.leaseExpiresAt.getTime() + 1;
+      vi.setSystemTime(successorAt);
+      const dispatchB = dispatcherFixture(clock as { now: number });
+      if (successorState === "pending") {
+        dispatchB.api.sendPreparedCatalogNotification.mockResolvedValueOnce({
+          kind: "not-accepted",
+          reason: "delivery-unconfirmed",
+        });
+      }
+      const notifierB = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), dispatchB.api as any, {
+        now: () => new Date(),
+        uuid: uuidSequence("renew-b"),
+      });
+      await notifierB.tick();
+      const successor = stored(fake, row._id);
+      expect(successor.delivery.state).toBe(successorState);
+      expect(dispatchB.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+      expect(dispatchB.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      turn.resolve();
+      await flightA;
+      expect(stored(fake, row._id)).toEqual(successor);
+      expect(immutable(successor)).toEqual(immutable(row));
+      expect(dispatchA.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+      expect(dispatchA.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+      expect(JSON.stringify(testLog.warn.mock.calls)).not.toContain("private");
+      await Promise.all([notifierA.stop(), notifierB.stop()]);
+      vi.useRealTimers();
+    },
+  );
 
   it("rebases a known receipt only after a delayed own-token renewal proves version advancement", async () => {
     vi.useFakeTimers({ now: BASE });
@@ -701,6 +1536,216 @@ describe("ModelCatalogNotifier fencing and lifecycle", () => {
     fixture.notifier.start();
     await fixture.notifier.tick();
     expect(due).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["index", "due", "claim", "lookup", "prepare", "send-intent"] as const)(
+    "stops within the drain bound during a held %s stage and starts no following stage",
+    async (stage) => {
+      const clock = { now: BASE };
+      const fake = createCatalogFake(() => new Date(clock.now));
+      const row = change();
+      fake.rows(CHANGES).set(row._id, cloneBson(row));
+      const entered = deferred<void>();
+      const resume = deferred<void>();
+      let held = false;
+      const gatedDb = faultDb(fake.db, async (collection, method, args, run) => {
+        const next = args[1]?.$set?.delivery;
+        const target =
+          (stage === "index" && method === "createIndex") ||
+          (stage === "due" && method === "find") ||
+          (stage === "claim" && method === "updateOne" && next?.state === "claimed" && next?.version === 1) ||
+          (stage === "prepare" &&
+            method === "updateOne" &&
+            next?.state === "claimed" &&
+            next?.claim?.stage === "preparing" &&
+            next?.preparation) ||
+          (stage === "send-intent" &&
+            method === "updateOne" &&
+            next?.state === "claimed" &&
+            next?.claim?.stage === "sending");
+        if (!held && collection === CHANGES && target) {
+          held = true;
+          entered.resolve();
+          await resume.promise;
+        }
+        return run();
+      });
+      const outbox = new ModelCatalogOutbox(gatedDb);
+      const ensure = vi.spyOn(outbox, "ensureIndexes");
+      const due = vi.spyOn(outbox, "due");
+      const read = vi.spyOn(outbox, "read");
+      const apply = vi.spyOn(outbox, "apply");
+      const storeCalls = () =>
+        ensure.mock.calls.length + due.mock.calls.length + read.mock.calls.length + apply.mock.calls.length;
+      const dispatcher = dispatcherFixture(clock);
+      if (stage === "lookup") {
+        dispatcher.api.resolveCatalogNotificationRoute.mockImplementationOnce(async (gate) => {
+          expect(await gate.check()).toBe(true);
+          held = true;
+          entered.resolve();
+          await resume.promise;
+          return { kind: "route", route: copy(ROUTE_A) } as const;
+        });
+      }
+      const notifier = new ModelCatalogNotifier(outbox, dispatcher.api as any, {
+        now: () => new Date(clock.now),
+        uuid: uuidSequence(`stop-${stage}`),
+        leaseMs: 100,
+        renewMs: 1_000,
+        drainMs: 10,
+      });
+      const flight = notifier.tick();
+      await entered.promise;
+
+      const started = Date.now();
+      await notifier.stop();
+      expect(Date.now() - started).toBeLessThan(5_000);
+      const callsAtDrain = storeCalls();
+      resume.resolve();
+      await flight;
+
+      expect(storeCalls()).toBe(callsAtDrain);
+      expect(dispatcher.api.prepareCatalogNotification).toHaveBeenCalledTimes(
+        stage === "prepare" || stage === "send-intent" ? 1 : 0,
+      );
+      expect(dispatcher.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+      const stranded = stored(fake, row._id);
+      expect(immutable(stranded)).toEqual(immutable(row));
+
+      clock.now += 101;
+      const recoveredDispatch = dispatcherFixture(clock);
+      const recovered = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), recoveredDispatch.api as any, {
+        now: () => new Date(clock.now),
+        uuid: uuidSequence(`recover-${stage}`),
+      });
+      await recovered.tick();
+      expect(stored(fake, row._id).delivery.state).toBe("delivered");
+      expect(recoveredDispatch.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+      await recovered.stop();
+    },
+  );
+
+  it("closes the store while the lookup ownership gate DB read is held", async () => {
+    const clock = { now: BASE };
+    const fake = createCatalogFake(() => new Date(clock.now));
+    const row = change();
+    fake.rows(CHANGES).set(row._id, cloneBson(row));
+    const entered = deferred<void>();
+    const resume = deferred<void>();
+    let gateReadArmed = false;
+    let held = false;
+    const gatedDb = faultDb(fake.db, async (collection, method, _args, run) => {
+      if (gateReadArmed && !held && collection === CHANGES && method === "findOne") {
+        held = true;
+        entered.resolve();
+        await resume.promise;
+      }
+      return run();
+    });
+    const outbox = new ModelCatalogOutbox(gatedDb);
+    const reads = vi.spyOn(outbox, "read");
+    const applies = vi.spyOn(outbox, "apply");
+    const dispatcher = dispatcherFixture(clock);
+    dispatcher.api.resolveCatalogNotificationRoute.mockImplementationOnce(async (gate) => {
+      gateReadArmed = true;
+      return (await gate.check()) && gate.current()
+        ? ({ kind: "route", route: copy(ROUTE_A) } as const)
+        : ({ kind: "unresolved", reason: "recipient-changed" } as const);
+    });
+    const notifier = new ModelCatalogNotifier(outbox, dispatcher.api as any, {
+      now: () => new Date(clock.now),
+      uuid: uuidSequence("gate-stop"),
+      leaseMs: 100,
+      drainMs: 10,
+    });
+    const flight = notifier.tick();
+    await entered.promise;
+
+    await notifier.stop();
+    const callsAtDrain = reads.mock.calls.length + applies.mock.calls.length;
+    resume.resolve();
+    await flight;
+
+    expect(reads.mock.calls.length + applies.mock.calls.length).toBe(callsAtDrain);
+    expect(dispatcher.api.prepareCatalogNotification).not.toHaveBeenCalled();
+    expect(dispatcher.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+    clock.now += 101;
+    const recoveredDispatch = dispatcherFixture(clock);
+    const recovered = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), recoveredDispatch.api as any, {
+      now: () => new Date(clock.now),
+      uuid: uuidSequence("gate-recovery"),
+    });
+    await recovered.tick();
+    expect(stored(fake, row._id).delivery.state).toBe("delivered");
+    await recovered.stop();
+  });
+
+  it("observes an in-flight renewal through bounded stop and starts no later external stage", async () => {
+    const clock = { now: BASE };
+    const fake = createCatalogFake(() => new Date(clock.now));
+    const row = change();
+    fake.rows(CHANGES).set(row._id, cloneBson(row));
+    const entered = deferred<void>();
+    const resume = deferred<void>();
+    let held = false;
+    const gatedDb = faultDb(fake.db, async (collection, method, args, run) => {
+      const next = args[1]?.$set?.delivery;
+      if (
+        !held &&
+        collection === CHANGES &&
+        method === "updateOne" &&
+        next?.state === "claimed" &&
+        next?.claim?.token === "renew-stop-2" &&
+        next?.version === 2
+      ) {
+        held = true;
+        entered.resolve();
+        await resume.promise;
+      }
+      return run();
+    });
+    const outbox = new ModelCatalogOutbox(gatedDb);
+    const reads = vi.spyOn(outbox, "read");
+    const applies = vi.spyOn(outbox, "apply");
+    const dispatcher = dispatcherFixture(clock);
+    const turn = deferred<void>();
+    dispatcher.api.prepareCatalogNotification.mockImplementationOnce(async (selected, route) => {
+      await turn.promise;
+      return {
+        kind: "prepared",
+        preparation: makePreparation(selected, route, "late renewal turn", new Date(clock.now)),
+      };
+    });
+    const notifier = new ModelCatalogNotifier(outbox, dispatcher.api as any, {
+      now: () => new Date(clock.now),
+      uuid: uuidSequence("renew-stop"),
+      leaseMs: 100,
+      renewMs: 5,
+      drainMs: 10,
+    });
+    const flight = notifier.tick();
+    await entered.promise;
+
+    await notifier.stop();
+    const callsAtDrain = reads.mock.calls.length + applies.mock.calls.length;
+    resume.resolve();
+    turn.resolve();
+    await flight;
+
+    expect(reads.mock.calls.length + applies.mock.calls.length).toBe(callsAtDrain);
+    expect(dispatcher.api.prepareCatalogNotification).toHaveBeenCalledTimes(1);
+    expect(dispatcher.api.sendPreparedCatalogNotification).not.toHaveBeenCalled();
+    const stranded = stored(fake, row._id);
+    clock.now = stranded.delivery.claim!.leaseExpiresAt.getTime() + 1;
+    const recoveredDispatch = dispatcherFixture(clock);
+    const recovered = new ModelCatalogNotifier(new ModelCatalogOutbox(fake.db), recoveredDispatch.api as any, {
+      now: () => new Date(clock.now),
+      uuid: uuidSequence("renew-stop-recovery"),
+    });
+    await recovered.tick();
+    expect(stored(fake, row._id).delivery.state).toBe("delivered");
+    expect(recoveredDispatch.api.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
+    await recovered.stop();
   });
 
   it("starts no store work after the drain when a held turn completes late", async () => {

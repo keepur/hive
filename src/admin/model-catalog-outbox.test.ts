@@ -388,6 +388,59 @@ describe("model catalog outbox transitions", () => {
     });
   });
 
+  it.each([
+    { label: "exact delegation equality", delegationAt: at(100), successor: false },
+    { label: "server ahead of the local claimant", delegationAt: at(101), successor: false },
+    { label: "exact equality after a successor release", delegationAt: at(100), successor: true },
+  ])("refuses a claim proposal that expires before $label", async ({ delegationAt, successor }) => {
+    let serverTime = new Date(BASE);
+    const fake = createCatalogFake(() => serverTime);
+    const initial = change();
+    const immutable = immutableBytes(initial);
+    seed(fake, initial);
+    const raw = new ModelCatalogOutbox(fake.db);
+    const proposal = transition("claim", initial, claimDelivery(initial, "expiring-proposal", at(100)), BASE, false);
+    const matched: number[] = [];
+    let survivor = cloneBson(initial);
+    const delayed = new ModelCatalogOutbox(
+      faultDb(fake.db, async (collection, method, args, run) => {
+        if (
+          collection === CHANGES &&
+          method === "updateOne" &&
+          args[1]?.$set?.delivery?.claim?.token === "expiring-proposal"
+        ) {
+          serverTime = new Date(delegationAt);
+          if (successor) {
+            const observed = await raw.read(initial._id);
+            if (!observed) throw new Error("missing successor observation");
+            const claimed = await raw.apply(
+              transition("claim", observed, claimDelivery(observed, "successor", at(120_100)), delegationAt, false),
+            );
+            if (claimed.kind !== "applied") throw new Error("successor claim failed");
+            const prepared = await raw.apply(
+              transition("prepare", claimed.row, preparedDelivery(claimed.row), delegationAt, true),
+            );
+            if (prepared.kind !== "applied") throw new Error("successor preparation failed");
+            const released = await raw.apply(
+              transition("release", prepared.row, releasedDelivery(prepared.row), delegationAt, false),
+            );
+            if (released.kind !== "applied") throw new Error("successor release failed");
+            survivor = cloneBson(released.row);
+          }
+          const result = await run();
+          matched.push(result.matchedCount);
+          return result;
+        }
+        return run();
+      }),
+    );
+
+    expect(await delayed.apply(proposal)).toEqual(successor ? { kind: "superseded" } : { kind: "miss" });
+    expect(matched).toEqual([0]);
+    expect(await raw.read(initial._id)).toEqual(survivor);
+    expect(immutableBytes(survivor)).toEqual(immutable);
+  });
+
   it("runs monotonic claim, renewal, preparation, intent and post-expiry acknowledgment without changing immutable bytes", async () => {
     let serverTime = new Date(BASE);
     const fake = createCatalogFake(() => serverTime);
@@ -544,24 +597,32 @@ describe("model catalog outbox transitions", () => {
     expect(await refused.apply(prepare)).toEqual({ kind: "miss" });
     expect(await refused.read(prepare.before._id)).toEqual(prepare.before);
 
-    for (const [kind, expected] of [
-      ["claim", "unknown"],
-      ["prepare", "applied"],
+    for (const { kind, applyBeforeThrow, readUnavailable, expected } of [
+      { kind: "claim", applyBeforeThrow: true, readUnavailable: false, expected: "unknown" },
+      { kind: "claim", applyBeforeThrow: false, readUnavailable: false, expected: "unknown" },
+      { kind: "claim", applyBeforeThrow: false, readUnavailable: true, expected: "unknown" },
+      { kind: "renew", applyBeforeThrow: true, readUnavailable: false, expected: "applied" },
+      { kind: "prepare", applyBeforeThrow: true, readUnavailable: false, expected: "applied" },
     ] as const) {
       const mutation = mutationFixture(kind);
       const fake = createCatalogFake(() => BASE);
       seed(fake, mutation.before);
       const outbox = new ModelCatalogOutbox(
         faultDb(fake.db, async (collection, method, _args, run) => {
+          if (collection === CHANGES && method === "findOne" && readUnavailable) {
+            throw new Error("evidence unavailable");
+          }
           if (collection === CHANGES && method === "updateOne") {
-            await run();
+            if (applyBeforeThrow) await run();
             throw new Error("acknowledgment lost");
           }
           return run();
         }),
       );
       expect(await outbox.apply(mutation)).toMatchObject({ kind: expected });
-      expect(await outbox.read(mutation.before._id)).toEqual(mutation.after);
+      expect(await new ModelCatalogOutbox(fake.db).read(mutation.before._id)).toEqual(
+        applyBeforeThrow ? mutation.after : mutation.before,
+      );
     }
 
     const beforeFake = createCatalogFake(() => BASE);
@@ -614,7 +675,7 @@ describe("model catalog outbox transitions", () => {
     expect(persisted?.delivery.claim?.leaseExpiresAt.getTime()).toBeLessThanOrEqual(current.getTime());
   });
 
-  it.each(["prepare", "release", "ack"] as const)(
+  it.each(["renew", "prepare", "send-intent", "release", "ack"] as const)(
     "lets an actually delayed old %s CAS miss a newer successor",
     async (kind) => {
       const mutation = mutationFixture(kind);
@@ -655,6 +716,7 @@ describe("model catalog outbox transitions", () => {
       expect(await operation).toEqual({ kind: "superseded" });
       expect(matched).toEqual([0]);
       expect(await new ModelCatalogOutbox(fake.db).read(snapshot._id)).toEqual(snapshot);
+      expect(immutableBytes(snapshot)).toEqual(immutableBytes(mutation.before));
     },
   );
 });
