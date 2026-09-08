@@ -1,0 +1,422 @@
+# KPR-463 — Packaged engine and voice-worker lifecycle implementation plan
+
+> **For agentic workers:** After this plan passes the child plan-review gate, use the repository's required `/spec-and-implement` workflow, then `dodi-dev:implement` within the dispatched implementation lanes. `/spec-and-implement` is currently unavailable in the supplied runtime. The driver must resolve that operational handoff dependency; do not invent the entrypoint or bypass it. This document authorizes planning only.
+
+**Status:** DRAFT_READY for review; no readiness label, implementation, deployment, or call is asserted.
+
+**Goal:** Ship, install, operate, and recover the enabled LiveKit worker and engine as one instance-owned npm release, then record the required dodi migration evidence.
+
+**Architecture:** Extend the existing `.hive.next/.hive/.hive.prev/.hive.broken` lifecycle with a bundled TypeScript single-instance transaction helper. A supervisor-owned accepted-job ledger and reversible local admission barrier establish quiescence before launchd shutdown. Package identity, locked production dependencies, process ownership, registration-aware SDK health, and a no-turn authenticated bridge probe determine activation and recovery success.
+
+**Tech Stack:** TypeScript/ESM, Node `>=22.19.0`, npm publishable shrinkwrap, esbuild, Vitest, macOS launchd, Mongo telemetry, LiveKit Agents `1.6.4`, RTC Node `0.13.33`; operational native proof on macOS ARM64/Node 24.
+
+**Authority:** Approved [spec](./kpr-463-spec.md) at `2063bacd5bf41b8e035909d1d3d07790fe4bbb43`. Gate 1 and routine spec/plan delegation are recorded on KPR-462. No `Decision Register — Canon` section was present in the supplied epic. No sibling convention is invented. No scope demotion is requested by this draft; a failed feasibility proof that requires changing the approved contract returns to the spec lane.
+
+## Reading order and chunk boundaries
+
+All three files are one dependent implementation plan, split for review; they are not independently releasable subsystems. Each remains below 1,000 lines.
+
+1. This file: full Testing Contract, file map, dependency order, SDK proof, artifact/native install implementation.
+2. [Worker runtime and evidence](./kpr-463-plan-runtime.md): admission ledger/IPC, entry completion, identity, shared configuration and probes.
+3. [Lifecycle and delivery](./kpr-463-plan-lifecycle.md): service generation, reversible quiescence, transaction/recovery, CLI adoption, verification and operational acceptance.
+
+The code blocks prescribe complete core functions/types and exact replacement blocks. Named existing helpers retain behavior outside the listed edits. Adapter operation tables specify exact inputs, outputs, ordering, and failure behavior; they are implementation contracts, not permission to substitute mocked production behavior.
+
+## Testing Contract
+
+### Required Test Groups
+
+- Unit: **required**.
+  - Scope: release/lock validation; configuration/port derivation; XML generation; accepted ledger and barrier transitions; job completion wrapper; heartbeat field ownership; boot/health classification; transaction state machine; CLI argument routing.
+  - Reason: false idle or false success can interrupt a live call or leave an unrecoverable mixed release.
+  - Minimum assertions: all T3–T8 branches below, especially no ledger deletion on `accept()` resolution, no signal before quiescence, exact release/PID/boot matching, and nonzero deployment result after successful recovery.
+- Integration: **required**.
+  - Scope: actual pinned SDK JobRequest and job-child loader, filesystem IPC, candidate package installation, local HTTP auth boundary, fake launchctl/process ownership boundary, migration bootstrap and rollback profiles.
+  - Reason: mocks alone cannot prove SDK callback timing, native asset resolution, bundle relocation, self-replacement, or instance isolation.
+  - Harness: **setup-required**, building on Vitest, `src/voice-worker/*.test.ts`, `src/channels/voice/voice-adapter.integration.test.ts`, and `service/deploy.test.sh`.
+  - Minimum assertions: real SDK acceptance behavior and forked initialization; real packed `.tgz` production installation; native RTC and Silero/ONNX loading; engine and worker path/config equivalence; complete failure injection matrix; no vendor/model/launchd calls from automated tests.
+- E2E: **required, no-call deployment E2E**.
+  - Scope: disposable filesystem/process lifecycle E2E, then actual dodi install/restart/pilot rollback/reapply/final read-back under spec §7.
+  - Reason: only actual service/process/config evidence establishes migration acceptance.
+  - Harness: **setup-required** for the disposable process harness; **execution-dependent** for the inventoried dodi recovery route and verified legacy dispatch hold.
+  - Minimum assertions: T9 and full packaged profile after final reactivation; pilot recovery passes its separate profile; no Keepur restart/repoint, no operator-data drift; final current release identity recorded for KPR-466.
+
+### Critical Flows
+
+- Fresh install/resume receives the same package, shrinkwrap, complete production dependencies, and service entries as update.
+- Admission closes while engine/worker/call remain live; racing accepted work settles or the 30-second budget defers with admission verifiably reopened.
+- Quiescent worker exits with every child before engine stop and artifact rotation.
+- Fetch/stage failure preserves the live pair; post-stop failure restores and checks the exact prior pair while returning failure.
+- First adoption uses candidate tooling while installed updater remains old, exercises pilot recovery, and ends on the candidate.
+- Voice-disabled use needs no voice secrets/network and cleans stale worker registration without disturbing another instance.
+
+### Regression Surface
+
+- Existing engine CLI/foreground startup, startup marker ordering, update pin selection and developer deploy mode.
+- Vapi authentication, bridge abort behavior, agent/session loading, call shutdown order, vendor choices, warm-path/tool-ack flags, voice metrics and per-agent voice routing.
+- Existing npm pack exclusions, ABI declaration closure, Qdrant stub, bundle string/size guards and Node 22 support.
+- Shared instance config/dotenv/Honeypot precedence; operator skills, plugins, data identity, update-preflight plugin relocation and notifications.
+
+### Commands
+
+Run from the implementing worktree, with disposable test fixtures created by the harness. Do not use operator instance config or Keychain to make tests pass.
+
+```bash
+npm ci
+npx vitest run src/voice-worker/admission.test.ts src/voice-worker/job-lifecycle.test.ts src/deployment/release.test.ts src/deployment/ports.test.ts src/deployment/health.test.ts src/deployment/transaction.test.ts
+npx vitest run src/voice-worker/sdk-lifecycle.integration.test.ts src/voice-worker/maintenance-ipc.integration.test.ts src/deployment/lifecycle.integration.test.ts src/deployment/adoption.integration.test.ts src/channels/voice/voice-adapter.integration.test.ts
+npm run check:artifact
+bash service/deploy.test.sh
+bash service/install.test.sh
+npm run check
+npm run check:bundle
+```
+
+- Unit/integration expected: Vitest exit 0, no skipped contract cases.
+- Artifact expected: exit 0 and `ARTIFACT_RUNTIME_OK`, `SDK_IMPORT_OK`, `ARTIFACT_INSTALL_OK` records from the installed candidate; exit 0 without these records fails the harness.
+- Shell expected: exit 0 and each fixture assertion passes; launchctl is a test shim.
+- Broader regression expected: typecheck, ESLint, Prettier, complete Vitest suite, existing bundle guards, plus the newly required artifact check all exit 0.
+- Operational E2E commands are in Task 12 of the lifecycle chunk; do not run them during maturation.
+
+### Harness Requirements
+
+- Tests own all temporary roots, HOME/config/env files, fake Mongo/Keychain adapters, registry artifact fixtures, clocks and process/launchctl shims. For subprocess config tests on macOS, prepend a fixture `security` executable that exits 44 (Keychain item absent) and records invocation; scratch HOME alone does not isolate the login Keychain. Restore environment after every test; reject any fixture path equal to an actual instance root.
+- SDK proof and packed smoke use real `@livekit/agents@1.6.4`. Test-only imports of the installed SDK child helper may resolve its package path; they do not modify the SDK or become production runtime adapters.
+- Native acceptance uses a real `npm pack`, extracted outside any repository under a parent with no `node_modules`; `NODE_PATH`, `NODE_OPTIONS`, SDK credentials and operator HOME are absent. Install scripts run normally. Registry access during installation is allowed; runtime checks create no vendor connections.
+- Record `process.version`, `npm --version`, OS and architecture. The macOS ARM64/Node 24 native check is required. Retain Node 22 validation separately; no OS-support claims from an untested runner.
+- Packed tests use a scratch HOME and explicit `HIVE_HOME`/`HIVE_CONFIG`; native diagnostics must not import config at module initialization.
+- The SDK child test owns every process it forks, waits for exit and cleans its temporary root. No SIP participants, agent dispatches, real rooms, model turns or external notifications.
+- Migration requires inventoried current launchd service definitions, executable/dependency hashes, pilot listener, retained candidate tooling, validated recovery files, and a separately verifiable hold over all legacy dispatch sources and outstanding assignment work. Missing any of these is a concrete operational blocker.
+
+### Non-Required Rationale
+
+No required test group is waived. Live-call conversation/audio E2E is outside KPR-463 and belongs to KPR-466 after May's call authorization. Dodi migration is a required later execution step; a pending operational step cannot be marked passed by a fixture.
+
+### Verification Rules
+
+- Missing harness is not a skip reason; set it up or report a concrete blocker.
+- If a test exposes an implementation issue, fix the implementation, not the assertion.
+- If testing exposes a spec or plan mismatch, demote the ticket to the spec lane.
+- Do not invoke SDK drain, SIGTERM, bootout, `kickstart -k`, or port-owner killing as an abortable idle check.
+- Do not issue completion/readiness labels from this document. Apply the child review and dependency gates through the dispatcher.
+
+### T1–T9 executable ownership
+
+| Spec ID | Primary files/tests | Required cases |
+| --- | --- | --- |
+| T1 | `scripts/check-bundle-pack.mjs`, `scripts/check-artifact-install.mjs` | actual tarball, worker/helpers/manifest/shrinkwrap/MCP present; no src/dist/secrets/node_modules; unchanged size/string guards |
+| T2 | `src/voice-worker/runtime-diagnostic.ts`, `scripts/check-artifact-install.mjs` | fresh locked production install, RTC/ONNX/Silero load, SDK child imports packaged default agent |
+| T3 | `src/voice-worker/main.test.ts`, `src/deployment/services.test.ts`, artifact harness | relocate root; spaces, `&`, symlink home; actual direct/import distinction; missing entrypoint fails before writes |
+| T4 | `worker-config.test.ts`, bridge integration tests, `health.test.ts` | shared selectors and dotenv/Keychain precedence; no secret output; correct/missing/wrong token results; zero model spawns |
+| T5 | `src/deployment/lifecycle.integration.test.ts` | both service labels, order/idempotency, disabled transition, target-only ownership, port/collision validation |
+| T6 | `transaction.test.ts`, `adoption.integration.test.ts`, shell tests | every failure stage; old updater is never invoked; exact checked recovery; incompatible prior release rejected; separate legacy profile |
+| T7 | admission/IPC/SDK tests, transaction and health tests | call race >30s, unresolved assignment, after-close rejection, missing/wrong-boot/release acknowledgements, dead owner/marker, KeepAlive, stale health/logs, wrong owner |
+| T8 | `src/deployment/lifecycle.integration.test.ts` | sentinel hashes/permissions, second-instance process state, `.hive-state` survival, retry after recovered failure |
+| T9 | `docs/epics/kpr-462/kpr-463-deployment-evidence.md` | actual dodi migration/restart/rollback/reapply/current identity, read-only setup validation and Keepur/state comparisons |
+
+## File structure and dependency order
+
+| File(s) | Responsibility |
+| --- | --- |
+| `src/deployment/release.ts` + `.test.ts` | versioned manifest, artifact validation, runtime identity/containment |
+| `scripts/generate-shrinkwrap.mjs`, `build/bundle.ts`, `package.json`, `package-lock.json`, `.gitignore` | pinned production packaging, generated shrinkwrap and release manifest |
+| `src/voice-worker/runtime-diagnostic.ts`, `scripts/check-artifact-install.mjs` | offline native and packaged SDK-import acceptance |
+| `src/voice-worker/admission.ts` + `.test.ts` | synchronous admission/accepted ledger state machine |
+| `src/voice-worker/maintenance-ipc.ts` + `.integration.test.ts` | private local mailbox protocol and boot/operation ownership |
+| `src/voice-worker/job-lifecycle.ts` + `.test.ts` | entry and post-cleanup completion envelope |
+| `src/voice-worker/sdk-lifecycle.integration.test.ts`, `src/voice-worker/fixtures/sdk-agent.ts` | real pinned SDK acceptance and child lifecycle proof, no calls |
+| `src/voice-worker/main.ts`, `worker-config.ts`, `telemetry.ts` and existing tests | wire gate, lazy job imports, port and immutable supervisor identity |
+| `src/deployment/ports.ts`, `src/config.ts` and tests | worker health port validation alongside resolved engine ports |
+| `src/deployment/runtime-probe.ts`, `health.ts` and tests | config/auth/registration/dependency evidence, separate acceptance profiles |
+| `src/deployment/services.ts` + tests | service descriptions, XML and launchd/process ownership adapters |
+| `src/deployment/operation.ts`, `transaction.ts`, `artifact.ts` + tests | lock/marker/frozen helper, paired transaction, extraction/install/rotation |
+| `src/deployment/main.ts` | standalone bundled deploy helper, package-root-independent after freeze |
+| `src/cli/daemon.ts`, `update.ts`, `rollback.ts`, `single-instance-env.ts`, `src/cli.ts` + tests | existing CLI routes into same transaction, artifact/dry-run/adoption selection |
+| `src/setup/populate-engine.ts` + tests | share validated package entries and complete locked install/resume |
+| `src/cli/doctor.ts`, `doctor-checks.ts` + tests | installed versus observed identity and accurate worker-health display |
+| `service/deploy.sh`, `deploy-check.sh`, `install.sh`, `setup/generate-plist.ts`, shell tests | packaged single-instance delegation and developer-mode isolation |
+| `scripts/check-bundle-pack.mjs`, `.github/workflows/ci.yml`, `publish.yml` | required artifact guard and runtime matrix |
+| `CLAUDE.md`, `AGENTS.md`, `docs/epics/kpr-462/kpr-463-operations.md` | supported paths, native prerequisites, adoption/recovery/runbook |
+| `docs/epics/kpr-462/kpr-463-deployment-evidence.md` | sanitized actual delivery evidence; create only during delivery |
+
+Execution order: Task 1 proof first. Then Tasks 2–3 (artifact lane) and Tasks 4–6 (worker/evidence lane) can run in parallel once interfaces are fixed. Tasks 7–10 (lifecycle/CLI) depend on both. One owner edits `main.ts`, `telemetry.ts`, `config.ts`, `build/bundle.ts`, `package.json` and lockfile; integrate those serially with KPR-464/KPR-465. Task 11 regression follows integration; Task 12 operational acceptance follows reviewed delivery and required workflow handoff. No independent scope change is hidden in parallel work.
+
+## Task 1: Prove pinned SDK admission and accepted-job completion before broad implementation
+
+**Files:**
+- Create: `src/voice-worker/admission.ts`, `job-lifecycle.ts`, their tests, `sdk-lifecycle.integration.test.ts`, `fixtures/sdk-agent.ts` (code contracts in runtime chunk).
+- Read only: installed `@livekit/agents` package, especially `dist/job.js`, `dist/worker.js`, `dist/ipc/job_proc_lazy_main.js` and `dist/ipc/job_proc_executor.js`.
+
+- [ ] **Step 1:** Install the reviewed repository dependencies in this isolated worktree; record the SDK and host versions. At plan-writing time this worktree had no `node_modules`; the primary source review below is not an executed SDK proof.
+
+```bash
+npm ci
+node -e 'console.log(process.version, process.platform, process.arch); console.log(require("@livekit/agents/package.json").version)'
+npm --version
+```
+
+Expected: dependency install exits 0 and SDK version is exactly `1.6.4`; if package exports block `package.json`, resolve the package root using the diagnostic's path walker rather than changing versions.
+
+- [ ] **Step 2:** Implement the admission and cleanup envelope from Tasks 4–5 as small dependency-injected modules. Test the real exported SDK `JobRequest`, not an invented promise contract:
+
+```typescript
+it("accept resolution leaves an accepted-but-unassigned job unresolved", async () => {
+  const gate = new AdmissionLedger({ pid: 100, bootId: "boot-a" });
+  let assignmentResolved = false;
+  let finishAssignment!: () => void;
+  const assignment = new Promise<void>((resolve) => { finishAssignment = resolve; });
+  const req = new JobRequest(
+    { id: "job-a" } as JobRequest["job"],
+    async () => { throw new Error("unexpected rejection"); },
+    async () => { await assignment; assignmentResolved = true; },
+  );
+  await gate.request(req);
+  expect(assignmentResolved).toBe(false);
+  expect(gate.snapshot().unresolved).toHaveLength(1);
+  gate.close("op-a");
+  expect(gate.canStop("op-a", 0, 0)).toBe(false);
+  finishAssignment();
+  await assignment;
+  expect(gate.canStop("op-a", 0, 0)).toBe(false);
+});
+```
+
+Imports are `it/expect` from Vitest, `JobRequest` from `@livekit/agents`, and `AdmissionLedger` from the new local module. No SDK private field is accessed or patched.
+
+- [ ] **Step 3:** Fork the actual installed SDK `dist/ipc/job_proc_lazy_main.js` with the compiled Hive test agent as argv[2]. Drive its existing IPC messages: send `initializeRequest` with `{ loggerOptions: { level: "error", pretty: false } }`; require `initializeResponse`; send `startJobRequest` with a dummy `RunningJobInfo`; require Hive entry acknowledgement; send `shutdownRequest`; require Hive completion acknowledgement, SDK `done`, and process exit. The fixture uses `withJobLifecycle` and `ctx.shutdown`, never `ctx.connect` or `runCallSession`.
+
+Test `RunningJobInfo` contains `job: { id: "job-a", room: { name: "fixture" }, metadata: "{}" }`, `acceptArguments: { identity: "agent-job-a", name: "", metadata: "" }`, `url: "ws://127.0.0.1:1"`, `token: "fixture-token"`, `workerId: "fixture-worker"`; fill SDK-required protobuf defaults using the installed protocol's `Job`/`Room` constructors. Resolve `@livekit/protocol` through the Agents package's own resolver in this test, avoiding a new production direct dependency. Test process IPC is fixture-controlled; no LiveKit server is required.
+
+The fixture's shutdown callback awaits a parent-controlled cleanup release, then signals `cleanup-finished`; the ledger must remain unresolved until that release. Repeat with thrown work before session setup, process exit before Hive entry, and suppressed completion write. The latter two must leave diagnostic unresolved entries even when the SDK process has exited. Test-only subprocess budgets are 15 seconds and must clean up only their own child PIDs on failure.
+
+- [ ] **Step 4:** Add the fake-clock race proof: a request enters before barrier close, stays live beyond 30 seconds, and produces zero SDK-active count during the assignment gap. Assert zero drain/close/signal/bootout/swap calls, same service PIDs and call still alive, and verified `open` acknowledgement from the same boot after abort. After closure, another JobRequest is rejected. A stale or missing release acknowledgement yields `maintenance-unresolved`, never a restored-availability claim. The shutdown fake must model SDK 1.6.4 accurately: drain marks irreversible draining state, and the CLI calls close even if drain times out. Assert this entire path remains untouched during every abortable maintenance failure.
+
+- [ ] **Step 5:** Verify the proof and inspect it before permitting broad parallel implementation.
+
+```bash
+npm run build
+npx vitest run src/voice-worker/admission.test.ts src/voice-worker/job-lifecycle.test.ts src/voice-worker/sdk-lifecycle.integration.test.ts
+```
+
+Expected: all cases pass with the installed SDK. If completion cannot be proved with Hive-owned callbacks and the supported request hook, stop the implementation lane and return the exact mismatch to spec; do not patch SDK internals, replace the SDK, clear timed-out ledger entries, or silently reduce acceptance to `/worker.active_jobs === 0`.
+
+**Source findings used:** [JobRequest 1.6.4](https://github.com/livekit/agents-js/blob/%40livekit%2Fagents%401.6.4/agents/src/job.ts) does not await its internal acceptance callback. [Worker 1.6.4](https://github.com/livekit/agents-js/blob/%40livekit%2Fagents%401.6.4/agents/src/worker.ts) records pending assignment separately from active processes; assignment timeout does not settle the pending promise; drain sets persistent state. [SDK child](https://github.com/livekit/agents-js/blob/%40livekit%2Fagents%401.6.4/agents/src/ipc/job_proc_lazy_main.ts) awaits entry and later runs registered shutdown callbacks concurrently before exit. These findings dictate the proof rather than certify it.
+
+**Checkpoint commit after verification, in the implementation lane only:**
+
+```bash
+git add src/voice-worker/admission.ts src/voice-worker/admission.test.ts src/voice-worker/job-lifecycle.ts src/voice-worker/job-lifecycle.test.ts src/voice-worker/sdk-lifecycle.integration.test.ts src/voice-worker/fixtures/sdk-agent.ts
+git commit -m "feat: track voice admission and job completion for maintenance"
+```
+
+## Task 2: Package a reproducible worker release
+
+**Files:** `package.json`, `package-lock.json`, `.gitignore`, `scripts/generate-shrinkwrap.mjs`, `build/bundle.ts`, `src/deployment/release.ts`, `src/deployment/release.test.ts`, `scripts/check-bundle-pack.mjs`.
+
+- [ ] **Step 1:** Move these exact six entries from devDependencies to dependencies, preserve all other selected versions, then regenerate the repository lock with the same npm version used for release validation:
+
+```json
+{
+  "@livekit/agents": "1.6.4",
+  "@livekit/agents-plugin-cartesia": "1.6.4",
+  "@livekit/agents-plugin-deepgram": "1.6.4",
+  "@livekit/agents-plugin-elevenlabs": "1.6.4",
+  "@livekit/agents-plugin-silero": "1.6.4",
+  "@livekit/rtc-node": "0.13.33"
+}
+```
+
+```bash
+npm install --package-lock-only --ignore-scripts
+```
+
+Expected: root dependency classification and affected lock `dev` flags change; unrelated version upgrades require investigation, not acceptance by default. Keep the Node engine string `>=22.19.0` and all native install-script requirements. Do not remove ElevenLabs or change configured vendor selection.
+
+- [ ] **Step 2:** Add generated `/npm-shrinkwrap.json` to `.gitignore`; generate it byte-for-byte from the reviewed development lock during `bundle`. Add `prepack: node scripts/generate-shrinkwrap.mjs --check` so a stale tarball cannot package a mismatched lock. Complete generator:
+
+```javascript
+import { readFileSync, writeFileSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
+const source = readFileSync("package-lock.json");
+const lock = JSON.parse(source.toString("utf8"));
+const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+const root = lock.packages?.[""];
+if (lock.lockfileVersion !== 3 || !root || root.name !== pkg.name || root.version !== pkg.version) {
+  throw new Error("package-lock root identity mismatch");
+}
+for (const field of ["dependencies", "devDependencies", "optionalDependencies"]) {
+  if (!isDeepStrictEqual(root[field] ?? {}, pkg[field] ?? {})) {
+    throw new Error(`package-lock ${field} mismatch`);
+  }
+}
+if (process.argv.includes("--check")) {
+  if (!source.equals(readFileSync("npm-shrinkwrap.json"))) throw new Error("stale generated shrinkwrap");
+} else {
+  writeFileSync("npm-shrinkwrap.json", source);
+}
+```
+
+npm automatically includes root shrinkwrap in a package. Add it explicitly to `PACKAGE_ENTRIES` and required pack assertions; never ship `package-lock.json` as the deployment source of truth. This follows [npm shrinkwrap](https://docs.npmjs.com/cli/v11/configuring-npm/npm-shrinkwrap-json/) and uses [npm ci](https://docs.npmjs.com/cli/v11/commands/npm-ci/) for manifest/lock mismatch rejection.
+
+- [ ] **Step 3:** In `build/bundle.ts`, add the six package names to `external` and these named entries to the existing shared build: `voice-worker: dist/voice-worker/main.js`, `voice-worker-diagnostic: dist/voice-worker/runtime-diagnostic.js`, `runtime-probe: dist/deployment/runtime-probe.js`. Keep existing server/CLI/MCP bundles and externalizations.
+
+Build the orchestration helper separately with `entryPoints: { deploy: "dist/deployment/main.js" }`, existing Node/ESM/minification settings, and **no third-party externals**. Its import graph is restricted to `node:*`, bundled YAML parsing and `src/deployment/{operation,transaction,artifact,services,health,release,ports}`; it must never import `config.ts`, MongoDB, SDKs or the CLI module. Runtime/vendor probes run in explicit child diagnostics. Reject a non-`node:` external in this helper's esbuild metafile. This produces one frozen JS file that survives `.hive` replacement without copying or borrowing a dependency tree.
+
+At the start of bundling, execute `node scripts/generate-shrinkwrap.mjs`; at the end emit `pkg/release.json`:
+
+```typescript
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+const sourceRevision = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+const sourceDirty = execFileSync("git", ["status", "--porcelain", "--untracked-files=normal"], {
+  encoding: "utf8",
+}).trim().length > 0;
+if (!/^[a-f0-9]{40}$/.test(sourceRevision)) throw new Error("full source revision required");
+const release = {
+  schemaVersion: 1,
+  packageVersion: pkg.version,
+  sourceRevision,
+  sourceDirty,
+  dependencyLockSha256: createHash("sha256").update(readFileSync("npm-shrinkwrap.json")).digest("hex"),
+  voiceWorker: { path: "pkg/voice-worker.min.js", admissionProtocol: 1 },
+};
+writeFileSync(resolve(PKG_DIR, "release.json"), JSON.stringify(release, null, 2) + "\n");
+```
+
+Use the actual repository root as build cwd. Unknown revision is a build failure; dirty builds may be used in disposable tests but are rejected for migration. Clean release validation must run after the final implementation commit. Do not set dirty=false through a release environment override.
+
+- [ ] **Step 4:** Add the complete shared manifest decoder below to `src/deployment/release.ts`, together with exported SHA/containment helpers. Runtime readers receive an explicit package root; they never use operator cwd to infer the running revision.
+
+```typescript
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+export interface Release {
+  schemaVersion: 1;
+  packageVersion: string;
+  sourceRevision: string;
+  sourceDirty: boolean;
+  dependencyLockSha256: string;
+  voiceWorker: { path: "pkg/voice-worker.min.js"; admissionProtocol: 1 };
+}
+export const sha256 = (bytes: string | Buffer): string => createHash("sha256").update(bytes).digest("hex");
+export function contained(root: string, path: string): string {
+  const base = realpathSync(root);
+  const actual = realpathSync(path);
+  const rel = relative(base, actual);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error("runtime path escapes release");
+  return actual;
+}
+export function readRelease(root: string, requireClean = false): Release {
+  const pkg = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8"));
+  if (pkg.name !== "@keepur/hive" || typeof pkg.version !== "string") throw new Error("unexpected package identity");
+  const raw: unknown = JSON.parse(readFileSync(resolve(root, "pkg/release.json"), "utf8"));
+  if (!raw || typeof raw !== "object") throw new Error("release manifest missing");
+  const r = raw as Partial<Release>;
+  if (r.schemaVersion !== 1 || r.packageVersion !== pkg.version || typeof r.sourceDirty !== "boolean" ||
+      !/^[a-f0-9]{40}$/.test(r.sourceRevision ?? "") ||
+      !/^[a-f0-9]{64}$/.test(r.dependencyLockSha256 ?? "") ||
+      r.voiceWorker?.path !== "pkg/voice-worker.min.js" || r.voiceWorker.admissionProtocol !== 1) {
+    throw new Error("unsupported or inconsistent release manifest");
+  }
+  if (requireClean && r.sourceDirty) throw new Error("dirty candidate is ineligible for migration");
+  const lock = readFileSync(resolve(root, "npm-shrinkwrap.json"));
+  if (sha256(lock) !== r.dependencyLockSha256) throw new Error("dependency lock digest mismatch");
+  const locked = JSON.parse(lock.toString("utf8"));
+  if (locked.packages?.[""]?.version !== pkg.version) throw new Error("shrinkwrap version mismatch");
+  for (const file of ["pkg/server.min.js", "pkg/cli.min.js", r.voiceWorker.path,
+    "pkg/voice-worker-diagnostic.min.js", "pkg/runtime-probe.min.js", "pkg/deploy.min.js", "pkg/mcp/voice-livekit.min.js"]) {
+    if (!statSync(contained(root, resolve(root, file))).isFile()) throw new Error(`missing artifact: ${file}`);
+  }
+  return r as Release;
+}
+export function bootIdentity(release: Release, component: "engine" | "voice-worker") {
+  return { release, component, pid: process.pid, bootId: randomUUID(), startedAt: new Date().toISOString() };
+}
+export type BootIdentity = ReturnType<typeof bootIdentity>;
+```
+
+Also compare all three dependency maps in `readRelease` using `isDeepStrictEqual`, as in the generator, before accepting an artifact; this closes the forged-manifest/lock-root mismatch path before npm runs. `readRelease` is a strict packaged-release decoder. Separate legacy classification returns unavailable fields; it never synthesizes a Release from the installed candidate.
+
+- [ ] **Step 5:** Extend `scripts/check-bundle-pack.mjs` required files with worker, both diagnostic helpers, deploy helper, manifest and shrinkwrap. Preserve all MCP/ABI requirements, exclusions and the 10 MB compressed failure threshold. Add `readRelease`/manifest fixture tests for missing file, external symlink, bad digest, unknown schema, dirty migration, mismatched package/version/dependency maps. Verify and commit the artifact slice only after passing:
+
+```bash
+npm run bundle
+node scripts/generate-shrinkwrap.mjs --check
+node scripts/check-bundle-pack.mjs
+npx vitest run src/deployment/release.test.ts
+```
+
+Expected: all exit 0, worker assets appear in real pack listing and no forbidden paths appear. Final Task 11 runs all existing guards and native acceptance.
+
+## Task 3: Fresh production installation and native/SDK artifact acceptance
+
+**Files:** `src/setup/populate-engine.ts`, `src/setup/populate-engine.test.ts`, `src/voice-worker/runtime-diagnostic.ts`, `scripts/check-artifact-install.mjs`, `package.json`.
+
+- [ ] **Step 1:** Add `npm-shrinkwrap.json` to `PACKAGE_ENTRIES`. Replace `ensureEngineDeps`'s node_modules-exists shortcut with strict artifact validation followed by complete `npm ci --omit=dev --no-audit --no-fund --no-progress` on every explicit resume/install attempt. Never run this repair against a loaded active release during update; stage in `.hive.next`. A complete install marker can be diagnostic, but is not permission to skip revalidation after an interrupted attempt.
+
+```typescript
+export function ensureEngineDeps(engineDir: string): void {
+  readRelease(engineDir);
+  execFileSync("npm", ["ci", "--omit=dev", "--no-audit", "--no-fund", "--no-progress"], {
+    cwd: engineDir,
+    stdio: "inherit",
+  });
+  execFileSync(process.execPath, [resolve(engineDir, "pkg/voice-worker-diagnostic.min.js"), "offline"], {
+    cwd: engineDir,
+    stdio: "inherit",
+    env: { PATH: process.env.PATH, HOME: process.env.HOME },
+  });
+}
+```
+
+Here `readRelease` is imported from `../deployment/release.js`. `skipInstall` remains an injected unit-test-only option and must not be reachable from shipped CLI flags. Resume without package/lock/helper fails with a named missing artifact; do not silently return. `populateEngine` verifies the source artifact before creating `.hive` and copies only `PACKAGE_ENTRIES`. Add the same post-install diagnostic in staged update and bootstrap tooling installation. Record npm/Node versions in the operation evidence. A lock/native/install mismatch must fail while old services remain up.
+
+- [ ] **Step 2:** Create a secret-free `runtime-diagnostic.ts` entrypoint. It imports only builtins/release decoder at top level. For `offline`, validate the explicit package root derived from this helper's `import.meta.url`, load every external LiveKit package from that root, validate pinned versions by walking from the resolved module to its package.json, construct/dispose a native RTC Room, and call `silero.VAD.load({ forceCPU: true })`. It never imports the shared config, loads dotenv, consults Keychain, connects Mongo/LiveKit, or enters a job.
+
+Required load code within `offline()`:
+
+```typescript
+const agents = await import("@livekit/agents");
+const rtc = await import("@livekit/rtc-node");
+const cartesia = await import("@livekit/agents-plugin-cartesia");
+const deepgram = await import("@livekit/agents-plugin-deepgram");
+const elevenlabs = await import("@livekit/agents-plugin-elevenlabs");
+const silero = await import("@livekit/agents-plugin-silero");
+if (typeof agents.defineAgent !== "function" || !cartesia.TTS || !deepgram.STT || !elevenlabs.TTS) {
+  throw new Error("worker runtime export missing");
+}
+const room = new rtc.Room();
+await silero.VAD.load({ forceCPU: true });
+await room.disconnect();
+await rtc.dispose();
+```
+
+Resolve and inspect the actual RTC addon, ONNX shared library and installed `silero_vad.onnx`, with realpaths inside the inspected release. Compare `process.report.getReport().sharedObjects` before/after loading to identify the loaded native files, excluding Node/system libraries; require evidence of RTC and ONNX native load, not merely package directories. Walk only the resolved Silero package for its single `silero_vad.onnx` file and require containment/existence. Record paths relative to the release and hashes, package versions, SDK child/inference helper paths, Node/npm/platform/arch and the manifest in `ARTIFACT_RUNTIME_OK` JSON. Missing expected native load/asset is failure even if imports succeeded. Error output contains only named stage/package/path classifications, never arbitrary environment dumps. The process exits 0 only after all checks and cleanup complete; catch sets a nonzero exit and prints `ARTIFACT_RUNTIME_FAILED`.
+
+- [ ] **Step 3:** In `scripts/check-artifact-install.mjs`, implement this exact flow using `execFileSync`/`spawn` argument arrays, a disposable scratch HOME and bounded subprocesses:
+
+1. `npm pack --json --pack-destination <scratch>` against the built repository; parse npm array/object JSON formats as the existing guard does. Hash the actual archive.
+2. List archive entries; require `package/` prefix, reject absolute/traversal members, unexpected links and forbidden content. Extract into `<scratch>/instance & space/.hive` with no links to repository files. The extraction adapter from Task 8 performs the same checks for update.
+3. Confirm no ancestor/global `node_modules` and unset `NODE_PATH`/`NODE_OPTIONS`; set scratch `HOME`, plain host `PATH`, no voice/model/Slack/Mongo keys. Run `npm ci --omit=dev --no-audit --no-fund --no-progress` inside the extracted root with install scripts enabled.
+4. Run installed `pkg/voice-worker-diagnostic.min.js offline`, require its structured success marker and validate every reported realpath under this release. Check both service entries are real files under this root.
+5. Fork the **installed SDK's actual** `dist/ipc/job_proc_lazy_main.js` with **installed** `pkg/voice-worker.min.js`, drive initializeRequest/initializeResponse/shutdownRequest, and require exit 0. This is only an import/prewarm test; never send startJobRequest to the production agent. Assert no supervisor boot/heartbeat/config lookup occurred. Print `SDK_IMPORT_OK` only after IPC and exit success.
+6. Direct-start the installed worker with scratch config `voice.livekit.enabled: false`, dummy Slack required keys in its scratch dotenv, and the fixture `security` shim (exit 44) at the front of PATH; require the deliberate named `voice.livekit.enabled is false` nonzero boot failure. This narrow test proves the entrypoint executes; it is separate from native success and does not count as native acceptance.
+Also execute the installed server with a separate empty scratch configuration and Keychain shim; require its exact `Missing required env var: SLACK_APP_TOKEN` failure and absence of module-resolution/native-load errors. This proves engine module loading only and is never counted as native or healthy-boot evidence. Neither entrypoint smoke connects Mongo or vendors.
+7. Move the complete instance directory to another non-repository parent and repeat steps 4–6. Add an intentional symlink to that instance and invoke through it, plus spaces/ampersands in directory/config selectors. Canonical containment follows the real instance root.
+8. Capture a structured `ARTIFACT_INSTALL_OK` record with archive digest, lock digest, release identity, relative path list and runtime versions. Clean only this harness's root/processes.
+
+Use a temporary child Node launcher if necessary to assert no source/dev/global resolution. Never install dev dependencies into the extracted release, symlink node_modules, use tsx for installed commands, replace the SDK loader with `import()` alone, or accept an arbitrary config error as native success.
+
+- [ ] **Step 4:** Add `check:artifact: node scripts/check-artifact-install.mjs`; append `npm run check:artifact` to `check:bundle` after existing bundle guards. `check:artifact` requires an already-built package to avoid recursive `npm pack`/bundle hooks. Test partial node_modules resume, missing/mismatched shrinkwrap, native-install failure, relocation, source package absence and library symlink escape. Run:
+
+```bash
+npm run bundle
+npm run check:artifact
+npx vitest run src/setup/populate-engine.test.ts
+```
+
+Expected: real artifact install/load/import markers and all tests pass. A native prerequisite failure names the failed package/runtime stage and blocks T2; it is not skipped. On the implementation host record whether this was Node 24/macOS ARM64 or a supplementary platform.
+
+**Checkpoint:** commit only the reviewed, verified artifact/install files. Continue with [Tasks 4–6](./kpr-463-plan-runtime.md) and [Tasks 7–12](./kpr-463-plan-lifecycle.md); this chunk alone cannot be declared deployable.
