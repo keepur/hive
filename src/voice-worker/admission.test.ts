@@ -1,6 +1,6 @@
 import { JobRequest } from "@livekit/agents";
 import { expect, it, vi } from "vitest";
-import { AdmissionLedger, type AdmissionSnapshot, type SupervisorRef } from "./admission.js";
+import { AdmissionLedger, unresolvedJobDiagnostics, type AdmissionSnapshot, type SupervisorRef } from "./admission.js";
 
 const SUPERVISOR: SupervisorRef = { pid: 100, bootId: "boot-a" };
 
@@ -134,6 +134,116 @@ it("retains the attempted reservation and rejects when its first persistence wri
     persistenceFault: true,
     unresolved: [{ jobId: "job-a", phase: "accepted-awaiting-entry" }],
   });
+});
+
+it("keeps a failed reservation fault closed until an explicit same-owner release", async () => {
+  let fail = true;
+  const acceptFirst = vi.fn(async () => {});
+  const rejectFirst = vi.fn(async () => {});
+  const rejectSecond = vi.fn(async () => {});
+  let stateAtFinalization: AdmissionSnapshot | undefined;
+  const gate = new AdmissionLedger(SUPERVISOR, () => {
+    if (fail) {
+      fail = false;
+      throw new Error("one-shot-write-failure");
+    }
+  });
+
+  await expect(gate.request(request("unknown-job", acceptFirst, rejectFirst))).rejects.toThrow(
+    "one-shot-write-failure",
+  );
+  await gate.request(request("next-job", async () => {}, rejectSecond));
+  const refreshed = gate.refresh();
+
+  expect(acceptFirst).not.toHaveBeenCalled();
+  expect(rejectFirst).toHaveBeenCalledOnce();
+  expect(rejectSecond).toHaveBeenCalledOnce();
+  expect(refreshed).toMatchObject({
+    admission: "closed",
+    operationId: null,
+    persistenceFault: true,
+    unresolved: [{ jobId: "unknown-job", phase: "accepted-awaiting-entry" }],
+  });
+  expect(gate.canStop("op-a", 0, 0)).toBe(false);
+
+  const released = gate.release("op-a", () => {
+    stateAtFinalization = gate.snapshot();
+  });
+  expect(stateAtFinalization).toMatchObject({
+    admission: "closed",
+    operationId: "op-a",
+    persistenceFault: true,
+    unresolved: [{ jobId: "unknown-job" }],
+  });
+  expect(released).toMatchObject({
+    admission: "open",
+    operationId: null,
+    persistenceFault: false,
+    unresolved: [{ jobId: "unknown-job" }],
+  });
+});
+
+it("retains the close owner and latch when close persistence fails", () => {
+  let fail = true;
+  const gate = new AdmissionLedger(SUPERVISOR, () => {
+    if (fail) {
+      fail = false;
+      throw new Error("close-write-failed");
+    }
+  });
+
+  expect(() => gate.close("op-a")).toThrow("close-write-failed");
+  expect(gate.snapshot()).toMatchObject({ admission: "closed", operationId: "op-a", persistenceFault: true });
+  expect(gate.refresh()).toMatchObject({ admission: "closed", operationId: "op-a", persistenceFault: true });
+});
+
+it.each(["closed", "open"] as const)("retains closed ownership when the release %s write fails", (stage) => {
+  let writes = 0;
+  const gate = new AdmissionLedger(SUPERVISOR, () => {
+    writes += 1;
+    const failingWrite = stage === "closed" ? 2 : 3;
+    if (writes === failingWrite) throw new Error(`${stage}-write-failed`);
+  });
+  gate.close("op-a");
+
+  expect(() => gate.release("op-a", () => {})).toThrow(`${stage}-write-failed`);
+  expect(gate.snapshot()).toMatchObject({ admission: "closed", operationId: "op-a", persistenceFault: true });
+});
+
+it("retains a completed child when prune persistence fails", async () => {
+  let failPrune = false;
+  const gate = new AdmissionLedger(SUPERVISOR, () => {
+    if (failPrune) throw new Error("prune-write-failed");
+  });
+  await gate.request(request("job-a"));
+  gate.entered(SUPERVISOR, "job-a", 321);
+  gate.completed(SUPERVISOR, "job-a", 321);
+  failPrune = true;
+
+  expect(() => gate.pruneExitedChildren(new Set([321]))).toThrow("prune-write-failed");
+  expect(gate.snapshot()).toMatchObject({ persistenceFault: true, unresolved: [], childPids: [321] });
+});
+
+it("projects retained operator diagnostics without mutating admission state", async () => {
+  const gate = new AdmissionLedger(
+    SUPERVISOR,
+    () => {},
+    () => 100,
+  );
+  await gate.request(request("job-a"));
+  gate.entered(SUPERVISOR, "job-a", 321);
+
+  expect(unresolvedJobDiagnostics(gate.snapshot(), 250)).toEqual([
+    {
+      jobId: "job-a",
+      acceptedAt: 100,
+      ageMs: 150,
+      phase: "entered-awaiting-completion",
+      childPid: 321,
+      supervisorPid: SUPERVISOR.pid,
+      supervisorBootId: SUPERVISOR.bootId,
+    },
+  ]);
 });
 
 class Sdk164ShutdownFake {

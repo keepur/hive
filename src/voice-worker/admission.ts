@@ -19,6 +19,21 @@ export interface AdmissionSnapshot {
   childPids: number[];
 }
 
+export interface UnresolvedJobDiagnostic extends AcceptedJob {
+  supervisorPid: number;
+  supervisorBootId: string;
+  ageMs: number;
+}
+
+export function unresolvedJobDiagnostics(snapshot: AdmissionSnapshot, now = Date.now()): UnresolvedJobDiagnostic[] {
+  return snapshot.unresolved.map((job) => ({
+    ...job,
+    supervisorPid: snapshot.supervisor.pid,
+    supervisorBootId: snapshot.supervisor.bootId,
+    ageMs: Math.max(0, now - job.acceptedAt),
+  }));
+}
+
 export interface RequestLike {
   id: string;
   accept(): Promise<void>;
