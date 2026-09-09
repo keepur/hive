@@ -6,6 +6,7 @@ This records capability observations and their limits. It is not implementation 
 
 - Repository HEAD for the initial documentation/probe run: `8d0dcfeef8756305df0aefc25d8f019f2fa51587`.
 - Repository HEAD during this revision's worktree re-executions: `5bf114e0855034fc3550303f9428a02284ee9c44` (uncommitted documentation/probe revisions only).
+- Repository HEAD for the pending-input revision and consolidated observer-prerequisite re-execution: `b91e34295aea275ec9818277896929d13a18d500` (uncommitted documentation/probe revisions only).
 - Repository `package-lock.json` SHA-256: `197bbe521ff1ff5000d8ad0586dc0765e013d770e6588b909e4e7c3e9b3f1089`.
 - `@livekit/agents`: `1.6.4`; npm tarball SHA-512 verified against that lock: `sha512-Q+qlXmR8wLB4aMm2K5bt1ijItuMcoyfHvAHp047ORf2+yhIwR6csKfo95ErPbszWzgnLf7nIGSvJjvNVSh9okA==`.
 - `@livekit/rtc-node`: `0.13.33`.
@@ -30,6 +31,8 @@ An optional first argument selects an isolated npm runtime directory containing 
 ```
 
 That scratch path is not required to reproduce any checked-in source; use the normal worktree `npm ci` installation. This revision ran all four commands with `/opt/homebrew/opt/node@24/bin/node` and no runtime argument, using the existing worktree `node_modules`. Do not create runtime/deployment dependency links to the scratch directory.
+
+The pending-input revision re-executed the expanded `kpr-464-revision-seams-probe.mjs` with that same Node binary and no runtime argument, capturing stdout in `docs/epics/kpr-462/probes/kpr-464-revision-seams-results.json`; exit 0. The other three probe sources/results retain the earlier runs above. The expanded source also preserves and re-executes the independently supplied synthesis/observer prerequisite cases.
 
 ## Executed observations
 
@@ -61,10 +64,10 @@ Source: [revision-seams probe](./probes/kpr-464-revision-seams-probe.mjs). Fresh
 
 | Scripted input/configuration | Observed causal order |
 | --- | --- |
-| STT detection, preemptive enabled, final transcript + end-of-speech only | Accepted hook enter/return → speech created → LLM text → fake output frames. |
-| VAD detection, preemptive enabled, final transcript while speaking | Speech created → speculative LLM text → accepted hook enter/return → fake output frames. |
-| VAD detection, preemptive disabled in this comparison fixture | Accepted hook enter/return → speech created → LLM text → fake output frames. |
-| STT detection, preemptive enabled, preflight transcript before final/end-of-speech | Speech created → speculative LLM text → accepted hook enter/return → fake output frames. |
+| STT detection, preemptive enabled, final transcript + end-of-speech only | Final transcript → listening → accepted hook enter/return → speech created → LLM text → fake output frames. |
+| VAD detection, preemptive enabled, final transcript while speaking | Final transcript → speech created → speculative LLM text → listening → accepted hook enter/return → fake output frames. |
+| VAD detection, preemptive disabled in this comparison fixture | Final transcript → listening → accepted hook enter/return → speech created → LLM text → fake output frames. |
+| STT detection, preemptive enabled, preflight transcript before final/end-of-speech | Provisional transcript → speech created → speculative LLM text → final transcript → listening → accepted hook enter/return → fake output frames. |
 
 All four fixtures hold the accepted hook open and assert no output frames until it returns. They use `preemptiveTts: false`; they deliberately permit preemptive LLM text before accepting the turn. This reconciles the initial STT probe and the later VAD probe without changing either observation. Source inspection of the installed, lock-matching artifact explains the paths:
 
@@ -74,7 +77,27 @@ All four fixtures hold the accepted hook open and assert no output frames until 
 
 Thus the supported hook guarantee is before admission of the accepted response to output, not before every handle or speculative bridge token. Startup state must consume the pending opening at that hook regardless of whether a caller handle already exists. No assignment to the next/latest handle follows from hook ordering.
 
+The pending-input extension adds a test-local `StartupObserver` that uses only public `UserStateChanged`, `UserInputTranscribed`, the accepted hook, `generateReply()`, and its own returned opening handle. It has no scheduling timer, reads no private SDK state, and makes no caller-handle association. The `until` helper polls fixture observations with a failure timeout; it does not decide startup behavior. The SIP answer is a modeled callback and this is not a production Hive arbiter test.
+
+| Pending-input case | Executed evidence |
+| --- | --- |
+| Four caller-ordering fixtures above; answer observed while speaking | All observe final text before listening, and listening before the accepted hook. The final-pending latch survives listening; zero explicit openings, one caller handle, and two fake output frames per case. |
+| Six answer-order permutations: STT/VAD × answer after final, at listening, or after acceptance | Known final/accepted input suppresses the explicit opening in every case; caller output progresses. The listening callback is exercised before the accepted hook, not after a guessed settle delay. |
+| Eight no-final cases: STT/VAD × absent, interim-only, empty final, or preflight-only transcript | Listening immediately requests exactly one opening; it reaches fake output and settles without an accepted hook. Empty final STT input produces no public final event. Preflight can create a speculative handle, but without final input it does not consume the opening or emit that caller response. |
+| Four delayed-final cases: STT/VAD × absent or interim input at listening | Opening text is held by a fake-provider gate; after listening requests the opening, a final transcript is injected. The SDK interrupts the known opening before the accepted hook, and replacement output follows acceptance without releasing the opening gate or another utterance. The hook's cancellation check is idempotent; only the stored opening handle is inspected. |
+
+Installed `audio_recognition` source explains why listening cannot prove transcript absence: interim and preflight text may never be finalized, empty final text is filtered before the public event, and EOU detection skips absent final text. `UserTranscriptionTimeout` is optional (`AgentSession` default `null`), armed by the VAD path, and canceled by received final text; it is not a universal STT/turn-rejection event. The chosen startup observer leaves it disabled. Definitive final text transfers the pending startup path to ordinary SDK turn detection until the accepted hook; a provider/SDK failure to deliver a necessary turn boundary is not proved absent or successful by this probe and remains error/incomplete evidence. No indefinite wait for *absent* final text is introduced: no-final listening releases immediately.
+
+This supports the bounded §3/S2 adjustment: suppression is guaranteed for final/accepted input observed before the decision. A greeting whose final arrives later may instead interrupt one requested opening. The observable call acceptance remains an audible opening or appropriate early-greeting response, normal interruption, and no stale duplicate. Requiring zero opening requests for all physically early speech would require an unavailable absence signal, an added deadline, or indefinite waiting; none is selected. Initial extension attempts caught a fake LLM abort-signal property error and an assertion that sampled output after it could already advance. The corrected fixture checks unexpected provider errors and causal event order; the complete consolidated run exited 0.
+
 The revision probe also records an application-owned LLM error under its immutable turn context before the SDK public error, metric, and handle-done callback. A synchronous public TTS error listener retains the application synthesis context created around the actual default node. For failures both before and after a frame, that error precedes the node observer's terminal, which is `failed` even though the reader completes normally. The failed synthesis remains explicitly unbound to speech. The small observer uses one upstream read per pull with no added utterance queue; this is evidence for that test-local observer, not a bound on the SDK's internal producer queues or verification of a future production wrapper.
+
+The consolidated probe also closes the previously listed test-local observer capability checks:
+
+- A real `AgentSession.say()` through the actual default TTS node emits a real `tts_metrics` event with both the node's ALS `synthesisId` and the exact returned handle's `speechId`, and delivers an original frame to fake output. This proves the optional normal enrichment seam; cancellation cases without metrics remain unbound.
+- Two actual default-node invocations overlap on one fake TTS provider and fail in reverse order. Their synchronous public errors retain distinct owning synthesis contexts, each before its reader completes normally. This proves isolation for these provider/default-node error paths.
+- A test-local transparent observer races an in-flight read against cancellation on a controlled upstream stream. It latches cancellation before `reader.cancel`, forwards no frame afterward, propagates upstream cancellation, and releases its reader once. This tests the observer's own race; earlier actual default-node before/after-frame cancellation cases separately prove provider cancellation propagation. It does not bound inaccessible SDK queues or establish a universal output-to-speech binding.
+- A four-attempt test-local registry exercises synthetic bookkeeping permutations for missing/late bindings and error-before-EOF. All attempts survive; late binding supplements preserve `incomplete`/`failed` terminals. These are registry inputs, not emitted/fabricated SDK metrics or real identity proof. Its modeled normal-completion case does not make metric presence sufficient for production success: the spec still requires causal application error/cancellation settlement before terminal classification.
 
 ## HTTP ownership reproduction
 
@@ -94,7 +117,7 @@ This proves the unsafe adapter API/order. It does **not** prove the exact cold/w
 
 The supplied full-probe JSON's `unproved` entries describe failures of the prior universal-correlation/backpressure/error-inference contract. The specification now records their resolution explicitly: every speech/bridge/synthesis attempt survives; public metrics enrich real bindings when available; missing synthesis associations remain unbound; application error observations precede terminal classification; and wrapper streaming/cancellation is preserved without claiming inaccessible queue bounds. The supplemental error probe proves the local causal observation seam, not universal speech attribution. No SDK upgrade, patch, private identity lookup, or inferred binding is selected.
 
-Before plan readiness, reconcile the plan's retained findings and finish any required **test-local** capability gaps in the chosen wrapper/error/finalization design: normal TTS metric enrichment with both synthesis context and SDK speech ID, overlapping synthesis error isolation, the observer's own cancellation/cleanup behavior, and handling unavailable/late associations without premature success. Use the actual default node and fake providers; do not require a not-yet-implemented production collector or startup arbiter as a prerequisite for planning. A TTS stream without a metric is expected to remain unbound, and missing optional enrichment must not gate output or teardown.
+The listed **test-local** normal TTS enrichment, overlapping-error isolation, observer cancellation/cleanup, unavailable/late bookkeeping, and pending-input startup cases have now executed as recorded above. Before plan readiness, reconcile the plan's retained findings with the revised contract and these evidence limits; any newly chosen seam still needs its own proof. Do not require a not-yet-implemented production collector or startup arbiter as a prerequisite for planning. A TTS stream without a metric is expected to remain unbound, and missing optional enrichment must not gate output or teardown.
 
 After implementation, run the specification's product regressions against the real Hive startup and HTTP/manager boundaries, including request-owned predecessor cancellation, replacement progression, diagnostics aggregation, bounded retention, shutdown, and preserved compatibility. Existing probes do not establish those product requirements, the implemented fix, or plan readiness.
 

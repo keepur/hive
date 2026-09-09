@@ -11,9 +11,16 @@
       "mode": "stt",
       "preemptive": true,
       "preflight": false,
+      "answerAt": "speaking",
       "events": [
+        "user_state_speaking",
+        "answer_observed",
         "transcript_observed",
+        "final_transcript",
+        "user_state_listening",
+        "defer_pending_final",
         "accepted_hook_enter",
+        "startup_caller_accepted",
         "accepted_hook_return",
         "speech_created",
         "llm_text",
@@ -21,31 +28,47 @@
         "output_frame"
       ],
       "handleCount": 1,
-      "outputFrames": 2
+      "outputFrames": 2,
+      "openingRequested": false
     },
     {
       "mode": "vad",
       "preemptive": true,
       "preflight": false,
+      "answerAt": "speaking",
       "events": [
+        "user_state_speaking",
+        "answer_observed",
         "transcript_observed",
+        "final_transcript",
         "speech_created",
         "llm_text",
+        "user_state_listening",
+        "defer_pending_final",
         "accepted_hook_enter",
+        "startup_caller_accepted",
         "accepted_hook_return",
         "output_frame",
         "output_frame"
       ],
       "handleCount": 1,
-      "outputFrames": 2
+      "outputFrames": 2,
+      "openingRequested": false
     },
     {
       "mode": "vad",
       "preemptive": false,
       "preflight": false,
+      "answerAt": "speaking",
       "events": [
+        "user_state_speaking",
+        "answer_observed",
         "transcript_observed",
+        "final_transcript",
+        "user_state_listening",
+        "defer_pending_final",
         "accepted_hook_enter",
+        "startup_caller_accepted",
         "accepted_hook_return",
         "speech_created",
         "llm_text",
@@ -53,24 +76,466 @@
         "output_frame"
       ],
       "handleCount": 1,
-      "outputFrames": 2
+      "outputFrames": 2,
+      "openingRequested": false
     },
     {
       "mode": "stt",
       "preemptive": true,
       "preflight": true,
+      "answerAt": "speaking",
       "events": [
+        "user_state_speaking",
+        "answer_observed",
         "transcript_observed",
+        "provisional_transcript",
         "speech_created",
         "llm_text",
         "transcript_observed",
+        "final_transcript",
+        "user_state_listening",
+        "defer_pending_final",
         "accepted_hook_enter",
+        "startup_caller_accepted",
         "accepted_hook_return",
         "output_frame",
         "output_frame"
       ],
       "handleCount": 1,
-      "outputFrames": 2
+      "outputFrames": 2,
+      "openingRequested": false
+    }
+  ],
+  "answerOrderings": [
+    {
+      "mode": "stt",
+      "preemptive": true,
+      "preflight": false,
+      "answerAt": "final",
+      "events": [
+        "user_state_speaking",
+        "transcript_observed",
+        "final_transcript",
+        "answer_observed",
+        "user_state_listening",
+        "defer_pending_final",
+        "accepted_hook_enter",
+        "startup_caller_accepted",
+        "accepted_hook_return",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "handleCount": 1,
+      "outputFrames": 2,
+      "openingRequested": false
+    },
+    {
+      "mode": "stt",
+      "preemptive": true,
+      "preflight": false,
+      "answerAt": "listening",
+      "events": [
+        "user_state_speaking",
+        "transcript_observed",
+        "final_transcript",
+        "user_state_listening",
+        "answer_observed",
+        "defer_pending_final",
+        "accepted_hook_enter",
+        "startup_caller_accepted",
+        "accepted_hook_return",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "handleCount": 1,
+      "outputFrames": 2,
+      "openingRequested": false
+    },
+    {
+      "mode": "stt",
+      "preemptive": true,
+      "preflight": false,
+      "answerAt": "accepted",
+      "events": [
+        "user_state_speaking",
+        "transcript_observed",
+        "final_transcript",
+        "user_state_listening",
+        "accepted_hook_enter",
+        "startup_caller_accepted",
+        "answer_observed",
+        "accepted_hook_return",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "handleCount": 1,
+      "outputFrames": 2,
+      "openingRequested": false
+    },
+    {
+      "mode": "vad",
+      "preemptive": true,
+      "preflight": false,
+      "answerAt": "final",
+      "events": [
+        "user_state_speaking",
+        "transcript_observed",
+        "final_transcript",
+        "speech_created",
+        "llm_text",
+        "answer_observed",
+        "user_state_listening",
+        "defer_pending_final",
+        "accepted_hook_enter",
+        "startup_caller_accepted",
+        "accepted_hook_return",
+        "output_frame",
+        "output_frame"
+      ],
+      "handleCount": 1,
+      "outputFrames": 2,
+      "openingRequested": false
+    },
+    {
+      "mode": "vad",
+      "preemptive": true,
+      "preflight": false,
+      "answerAt": "listening",
+      "events": [
+        "user_state_speaking",
+        "transcript_observed",
+        "final_transcript",
+        "speech_created",
+        "llm_text",
+        "user_state_listening",
+        "answer_observed",
+        "defer_pending_final",
+        "accepted_hook_enter",
+        "startup_caller_accepted",
+        "accepted_hook_return",
+        "output_frame",
+        "output_frame"
+      ],
+      "handleCount": 1,
+      "outputFrames": 2,
+      "openingRequested": false
+    },
+    {
+      "mode": "vad",
+      "preemptive": true,
+      "preflight": false,
+      "answerAt": "accepted",
+      "events": [
+        "user_state_speaking",
+        "transcript_observed",
+        "final_transcript",
+        "speech_created",
+        "llm_text",
+        "user_state_listening",
+        "accepted_hook_enter",
+        "startup_caller_accepted",
+        "answer_observed",
+        "accepted_hook_return",
+        "output_frame",
+        "output_frame"
+      ],
+      "handleCount": 1,
+      "outputFrames": 2,
+      "openingRequested": false
+    }
+  ],
+  "pendingInputs": [
+    {
+      "mode": "stt",
+      "transcriptKind": "absent",
+      "delayedFinal": false,
+      "events": [
+        "user_state_speaking",
+        "answer_observed",
+        "user_state_listening",
+        "request_opening",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "openingRequested": true,
+      "callerAccepted": false,
+      "openingInterrupted": false,
+      "outputFrames": 2,
+      "handleCount": 1,
+      "configuredTranscriptionTimeout": null
+    },
+    {
+      "mode": "stt",
+      "transcriptKind": "interim",
+      "delayedFinal": false,
+      "events": [
+        "user_state_speaking",
+        "answer_observed",
+        "provisional_transcript",
+        "user_state_listening",
+        "request_opening",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "openingRequested": true,
+      "callerAccepted": false,
+      "openingInterrupted": false,
+      "outputFrames": 2,
+      "handleCount": 1,
+      "configuredTranscriptionTimeout": null
+    },
+    {
+      "mode": "stt",
+      "transcriptKind": "empty-final",
+      "delayedFinal": false,
+      "events": [
+        "user_state_speaking",
+        "answer_observed",
+        "user_state_listening",
+        "request_opening",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "openingRequested": true,
+      "callerAccepted": false,
+      "openingInterrupted": false,
+      "outputFrames": 2,
+      "handleCount": 1,
+      "configuredTranscriptionTimeout": null
+    },
+    {
+      "mode": "stt",
+      "transcriptKind": "preflight",
+      "delayedFinal": false,
+      "events": [
+        "user_state_speaking",
+        "answer_observed",
+        "provisional_transcript",
+        "speech_created",
+        "llm_text",
+        "user_state_listening",
+        "request_opening",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "openingRequested": true,
+      "callerAccepted": false,
+      "openingInterrupted": false,
+      "outputFrames": 2,
+      "handleCount": 2,
+      "configuredTranscriptionTimeout": null
+    },
+    {
+      "mode": "stt",
+      "transcriptKind": "absent",
+      "delayedFinal": true,
+      "events": [
+        "user_state_speaking",
+        "answer_observed",
+        "user_state_listening",
+        "request_opening",
+        "speech_created",
+        "llm_waiting_for_test_release",
+        "final_transcript",
+        "speech_created",
+        "llm_text",
+        "accepted_hook_enter",
+        "startup_caller_accepted",
+        "owned_opening_already_interrupted",
+        "output_frame",
+        "output_frame"
+      ],
+      "openingRequested": true,
+      "callerAccepted": true,
+      "openingInterrupted": true,
+      "outputFrames": 2,
+      "handleCount": 2,
+      "configuredTranscriptionTimeout": null
+    },
+    {
+      "mode": "stt",
+      "transcriptKind": "interim",
+      "delayedFinal": true,
+      "events": [
+        "user_state_speaking",
+        "answer_observed",
+        "provisional_transcript",
+        "user_state_listening",
+        "request_opening",
+        "speech_created",
+        "llm_waiting_for_test_release",
+        "final_transcript",
+        "speech_created",
+        "llm_text",
+        "accepted_hook_enter",
+        "startup_caller_accepted",
+        "owned_opening_already_interrupted",
+        "output_frame",
+        "output_frame"
+      ],
+      "openingRequested": true,
+      "callerAccepted": true,
+      "openingInterrupted": true,
+      "outputFrames": 2,
+      "handleCount": 2,
+      "configuredTranscriptionTimeout": null
+    },
+    {
+      "mode": "vad",
+      "transcriptKind": "absent",
+      "delayedFinal": false,
+      "events": [
+        "user_state_speaking",
+        "answer_observed",
+        "user_state_listening",
+        "request_opening",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "openingRequested": true,
+      "callerAccepted": false,
+      "openingInterrupted": false,
+      "outputFrames": 2,
+      "handleCount": 1,
+      "configuredTranscriptionTimeout": null
+    },
+    {
+      "mode": "vad",
+      "transcriptKind": "interim",
+      "delayedFinal": false,
+      "events": [
+        "user_state_speaking",
+        "answer_observed",
+        "provisional_transcript",
+        "user_state_listening",
+        "request_opening",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "openingRequested": true,
+      "callerAccepted": false,
+      "openingInterrupted": false,
+      "outputFrames": 2,
+      "handleCount": 1,
+      "configuredTranscriptionTimeout": null
+    },
+    {
+      "mode": "vad",
+      "transcriptKind": "empty-final",
+      "delayedFinal": false,
+      "events": [
+        "user_state_speaking",
+        "answer_observed",
+        "user_state_listening",
+        "request_opening",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "openingRequested": true,
+      "callerAccepted": false,
+      "openingInterrupted": false,
+      "outputFrames": 2,
+      "handleCount": 1,
+      "configuredTranscriptionTimeout": null
+    },
+    {
+      "mode": "vad",
+      "transcriptKind": "preflight",
+      "delayedFinal": false,
+      "events": [
+        "user_state_speaking",
+        "answer_observed",
+        "provisional_transcript",
+        "speech_created",
+        "llm_text",
+        "user_state_listening",
+        "request_opening",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "openingRequested": true,
+      "callerAccepted": false,
+      "openingInterrupted": false,
+      "outputFrames": 2,
+      "handleCount": 2,
+      "configuredTranscriptionTimeout": null
+    },
+    {
+      "mode": "vad",
+      "transcriptKind": "absent",
+      "delayedFinal": true,
+      "events": [
+        "user_state_speaking",
+        "answer_observed",
+        "user_state_listening",
+        "request_opening",
+        "speech_created",
+        "llm_waiting_for_test_release",
+        "final_transcript",
+        "speech_created",
+        "llm_text",
+        "accepted_hook_enter",
+        "startup_caller_accepted",
+        "owned_opening_already_interrupted",
+        "output_frame",
+        "output_frame"
+      ],
+      "openingRequested": true,
+      "callerAccepted": true,
+      "openingInterrupted": true,
+      "outputFrames": 2,
+      "handleCount": 2,
+      "configuredTranscriptionTimeout": null
+    },
+    {
+      "mode": "vad",
+      "transcriptKind": "interim",
+      "delayedFinal": true,
+      "events": [
+        "user_state_speaking",
+        "answer_observed",
+        "provisional_transcript",
+        "user_state_listening",
+        "request_opening",
+        "speech_created",
+        "llm_waiting_for_test_release",
+        "final_transcript",
+        "speech_created",
+        "llm_text",
+        "accepted_hook_enter",
+        "startup_caller_accepted",
+        "owned_opening_already_interrupted",
+        "output_frame",
+        "output_frame"
+      ],
+      "openingRequested": true,
+      "callerAccepted": true,
+      "openingInterrupted": true,
+      "outputFrames": 2,
+      "handleCount": 2,
+      "configuredTranscriptionTimeout": null
     }
   ],
   "llmError": {
@@ -89,7 +554,7 @@
       },
       {
         "event": "metric",
-        "speechId": "speech_fd42bdaf-eff",
+        "speechId": "speech_ba593f13-75d",
         "trace": {
           "turnId": "revision-turn"
         }
@@ -140,5 +605,158 @@
       "association": "unbound",
       "readerCompletedNormally": true
     }
-  ]
+  ],
+  "ttsSessionMetric": {
+    "handleId": "speech_779793ae-e30",
+    "synthesisId": "normal-session-synth-1",
+    "metric": {
+      "event": "tts_metrics",
+      "speechId": "speech_779793ae-e30",
+      "synthesisId": "normal-session-synth-1"
+    },
+    "outputFrames": 1
+  },
+  "overlappingSynthesisErrors": {
+    "observations": [
+      {
+        "event": "public_error",
+        "synthesisId": "overlap-synth-2"
+      },
+      {
+        "event": "node_terminal",
+        "text": "right",
+        "synthesisId": "overlap-synth-2"
+      },
+      {
+        "event": "public_error",
+        "synthesisId": "overlap-synth-1"
+      },
+      {
+        "event": "node_terminal",
+        "text": "left",
+        "synthesisId": "overlap-synth-1"
+      }
+    ]
+  },
+  "observerCancellationRace": {
+    "events": [
+      "cancel_latched",
+      "reader_cancel",
+      "upstream_cancel",
+      "pull_saw_cancel_latch",
+      "cleanup",
+      "upstream_frame_rejected_after_cancel"
+    ]
+  },
+  "registryPermutations": {
+    "attempts": [
+      {
+        "synthesisId": "late-bound",
+        "speechId": "speech-late",
+        "terminal": {
+          "outcome": "incomplete",
+          "reason": "reader_eof_without_metric"
+        },
+        "supplements": [
+          {
+            "event": "late_binding",
+            "synthesisId": "late-bound",
+            "speechId": "speech-late"
+          }
+        ]
+      },
+      {
+        "synthesisId": "unavailable",
+        "speechId": null,
+        "terminal": {
+          "outcome": "incomplete",
+          "reason": "reader_eof_without_metric"
+        },
+        "supplements": []
+      },
+      {
+        "synthesisId": "error-then-late",
+        "speechId": "speech-error-late",
+        "terminal": {
+          "outcome": "failed",
+          "reason": "application_error"
+        },
+        "supplements": [
+          {
+            "event": "late_binding",
+            "synthesisId": "error-then-late",
+            "speechId": "speech-error-late"
+          }
+        ]
+      },
+      {
+        "synthesisId": "bound-before-eof",
+        "speechId": "speech-bound",
+        "terminal": {
+          "outcome": "completed",
+          "reason": "metric_before_eof"
+        },
+        "supplements": [
+          {
+            "event": "binding",
+            "synthesisId": "bound-before-eof",
+            "speechId": "speech-bound"
+          }
+        ]
+      }
+    ],
+    "events": [
+      {
+        "event": "start",
+        "synthesisId": "late-bound"
+      },
+      {
+        "event": "start",
+        "synthesisId": "unavailable"
+      },
+      {
+        "event": "start",
+        "synthesisId": "error-then-late"
+      },
+      {
+        "event": "start",
+        "synthesisId": "bound-before-eof"
+      },
+      {
+        "event": "eof",
+        "synthesisId": "late-bound"
+      },
+      {
+        "event": "late_binding",
+        "synthesisId": "late-bound",
+        "speechId": "speech-late"
+      },
+      {
+        "event": "eof",
+        "synthesisId": "unavailable"
+      },
+      {
+        "event": "error",
+        "synthesisId": "error-then-late"
+      },
+      {
+        "event": "eof",
+        "synthesisId": "error-then-late"
+      },
+      {
+        "event": "late_binding",
+        "synthesisId": "error-then-late",
+        "speechId": "speech-error-late"
+      },
+      {
+        "event": "binding",
+        "synthesisId": "bound-before-eof",
+        "speechId": "speech-bound"
+      },
+      {
+        "event": "eof",
+        "synthesisId": "bound-before-eof"
+      }
+    ]
+  }
 }
