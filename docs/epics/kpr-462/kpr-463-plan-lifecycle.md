@@ -1,10 +1,12 @@
 # KPR-463 implementation plan — lifecycle, recovery and delivery
 
-This is chunk 3 of the [parent plan](./kpr-463-plan.md). Its Testing Contract, authority, workflow dependency and execution restrictions apply in full. Draft for review; operational commands below are later delivery steps, not maturation actions.
+This is chunk 3 of the [parent plan](./kpr-463-plan.md). Its Testing Contract, authority, authorized dodi-dev workflow substitution and S0–S12 serial schedule apply in full. Draft sequencing revision for review; operational commands below are later delivery steps, not maturation actions.
 
 ## Task 7: Generate and operate the target service pair
 
 **Files:** Create `src/deployment/services.ts`, `src/deployment/services.test.ts`; modify `src/paths.ts`, `src/paths.test.ts`, `src/cli/daemon.ts`, `src/cli/daemon.test.ts`, `setup/generate-plist.ts`, `service/install.sh`; create `service/install.test.sh`.
+
+**Schedule:** S3 implements Steps 1–2 and their `paths.test.ts`/`services.test.ts` foundation cases from Step 5. `services.ts` provides the shared environment and OS adapters needed by Tasks 4–6; it must not import transaction/CLI/config code. Reuse the existing builtin-only `src/paths.ts` selector helpers and import-free `src/logging/logger.ts` within Task 2 Step 3's explicit helper closure; non-secret YAML parsing stays bundled. Service inputs carry the selected home/config explicitly, without relying on `paths.ts`'s module-level derived paths. S7 implements Steps 3–4 and CLI/shell shim tests after Task 8's transaction source exists. S9 completes Step 5 with the actual packaged config/bridge probe and full service/lifecycle assertions. Keep existing daemon wrappers callable until their S7 routing change.
 
 - [ ] **Step 1:** Replace engine-only plist construction with this reusable pure serializer. Keep `getLabel/getPlistPath/getLaunchAgentLink` as engine-compatible wrappers; add component-aware helpers used by both labels. Validate instance ID against `^[a-zA-Z0-9][a-zA-Z0-9_-]*$` before constructing labels/paths; config selectors remain explicit file paths, not label content.
 
@@ -112,7 +114,7 @@ No foreground engine behavior changes. Document the separate packaged foreground
 
 Make `setup/generate-plist.ts` share `buildServicePlist` for production definitions and explicit instance selectors. Keep developer-only log/deploy generation behind an explicit existing developer mode or move its old body to a clearly developer-only invocation; no documented production path emits `dist/voice-worker/main.js`. Test the production wrapper's args against a node/CLI shim; never invoke real launchd from the shell test.
 
-- [ ] **Step 5:** Verify and checkpoint:
+- [ ] **Step 5:** Complete this full verification in S9. The S3 foundation subset and S7 CLI/shell subset use their parent-schedule commands; they do not execute the packaged loader fixture below before S8 has built it. Add that fixture in S9, with no skipped placeholder cases.
 
 ```bash
 npx vitest run src/paths.test.ts src/deployment/services.test.ts src/cli/daemon.test.ts src/voice-worker/worker-config.test.ts src/deployment/health.test.ts
@@ -126,6 +128,8 @@ Add `resolveDotenvPath` cases for absent/default, relative `hive-personal.yaml`,
 ## Task 8: Serialize, stage and recover the paired transaction
 
 **Files:** Create `src/deployment/operation.ts`, `artifact.ts`, `transaction.ts`, `main.ts`, `transaction.test.ts`, `lifecycle.integration.test.ts`, `adoption.integration.test.ts`; modify `service/deploy.sh`, `service/deploy-check.sh`, `service/deploy.test.sh`.
+
+**Schedule:** S7 implements Steps 1–5 and Step 6's injected transaction unit matrix, then finishes Task 7 daemon/install and Task 9 CLI/wrapper/bootstrap routing in that same source checkpoint. All release/ports/services/health/diagnostic imports already exist. S9 adds and runs the complete `lifecycle.integration.test.ts` and Task 9 `adoption.integration.test.ts`, including actual frozen-helper execution, packed preflight and Task 6 closed-gate propagation. S7 unit tests inject the existing filesystem/process/probe boundaries; they cannot certify the future S8 bundle. Keep each deferred integration assertion pending until S9.
 
 - [ ] **Step 1:** Define the minimal durable operation record and exclusive lock. Canonicalize the instance first; a symlink alias and real path must obtain the same lock. Acquire with atomic `mkdir(<home>/.hive-state/deployment/lock)` and write owner record atomically before doing work. Directory permissions 0700, records 0600.
 
@@ -172,7 +176,7 @@ Atomic marker writes bracket every irreversible step: write intended phase befor
 
 Before every rename, atomically write `artifactMove` with `state: "intended"`, source identity and absent destination; revalidate both paths, perform the rename, then record its observed location and `state: "observed"`. Recovery locates identities against the original snapshot and this last move even if the post-rename marker write failed; never infer ownership from a slot name alone. Before any owned diagnostic directory is removed, write `artifactDisposal` with its exact identity/path and `state: "intended"`, then `state: "observed"` after verified absence. Interrupted removal may resume only against that recorded directory identity and the already-durable verified resolution. `retainedPaths` names all surviving operation and instance slots. `finishResolved` persists the verified `resolution` and final inventory before diagnostic cleanup or lock removal. On ordinary resolved failure remove its lock/staging; retain the newest `.hive.broken`, prior recovery files and final diagnostic record according to Step 5. On unresolved failure release process ownership only after persisting `unresolved`; subsequent invocations still refuse rotation until reconciliation. Do not erase another `.hive-state` consumer's files.
 
-- [ ] **Step 2:** Freeze the dependency-free `pkg/deploy.min.js` into `<home>/.hive-state/deployment/operations/<id>/deploy.min.js` before running the transaction. Compute/record its SHA-256, invoke the frozen file with `process.execPath`, and pass the explicit operation record path and command arguments. The original CLI/shell wrapper performs no deferred code reads from its replaced package. The frozen helper's esbuild external check proves its runtime graph needs only builtins. Diagnostic subprocess paths are chosen explicitly for the candidate/current/recovery release and validated before each use.
+- [ ] **Step 2:** Implement in S7 the freeze/invoke path for the dependency-free `pkg/deploy.min.js` into `<home>/.hive-state/deployment/operations/<id>/deploy.min.js` before running the transaction. Compute/record its SHA-256, invoke the frozen file with `process.execPath`, and pass the explicit operation record path and command arguments. The original CLI/shell wrapper performs no deferred code reads from its replaced package. Task 2/S8's esbuild external check proves the helper's runtime graph needs only builtins; S9 exercises the real frozen bundle. Diagnostic subprocess paths are chosen explicitly for the candidate/current/recovery release and validated before each use.
 
 Dry-run branches **before** lock/directory creation, freeze, npm lookup or config-secret import. It reads only config paths/manifests/current marker as needed and prints target, phase list, resolved selectors, voice enablement, known recovery profile and unknown evidence still needed. It performs no fetch/install/writes/vendor probes/service control/notifications. Test filesystem snapshots and all injected side-effect spies remain identical/zero.
 
@@ -251,7 +255,7 @@ export async function quiesce(io: QuiescenceIO, operationId: string): Promise<Id
 }
 ```
 
-The adapter uses Task 4's exact `close`/`status`/`release` protocol. Validate the reply envelope's `operationId` as request correlation, separately from `snapshot.operationId`, which identifies the current gate owner. Close/status proof requires the expected owning operation, closed admission, no `snapshot.persistenceFault`, and matching protocol/request/PID/boot. For abort or stale-owner reconciliation, require a fresh matching terminal **release** acknowledgement: its envelope retains the supplied operationId, its snapshot is open with `operationId: null`, and the supervisor has durably finalized that operation against delayed/replayed close. This release is required even if the close never arrived and fresh status reports open; status is observation only. Release cannot open another operation's gate, and any persistence fault or unacknowledged release yields `UnresolvedMaintenance` with ownership/evidence retained. At the last instruction before bootout, recheck same PID/start time and confirmed closed gate/no unresolved ledger/no persistence fault; no new request can enter after the barrier.
+The adapter imports the single `requestMaintenance` from `../voice-worker/maintenance-ipc.js` for Task 4's exact `close`/`status`/`release` protocol and injects the existing S3 read-only process-identity checks. Task 2 Step 3 bundles this module and its allowed pure dependencies; do not reproduce client matching, wire decoding or mailbox writes in `deployment/`. Validate the reply envelope's `operationId` as request correlation, separately from `snapshot.operationId`, which identifies the current gate owner. Close/status proof requires the expected owning operation, closed admission, no `snapshot.persistenceFault`, and matching protocol/request/PID/boot. For abort or stale-owner reconciliation, require a fresh matching terminal **release** acknowledgement: its envelope retains the supplied operationId, its snapshot is open with `operationId: null`, and the supervisor has durably finalized that operation against delayed/replayed close. This release is required even if the close never arrived and fresh status reports open; status is observation only. Release cannot open another operation's gate, and any persistence fault or unacknowledged release yields `UnresolvedMaintenance` with ownership/evidence retained. At the last instruction before bootout, recheck same PID/start time and confirmed closed gate/no unresolved ledger/no persistence fault; no new request can enter after the barrier.
 
 All paths after `recordBarrierRequested` but before a signal must use the release/reconcile cleanup, including filesystem errors while writing `quiescent`. Treat no-running-worker as separate evidence, not `activeJobs=0`. A previously existing worker that exited or became unregistered during preflight is uncertain/deferred, not an idle result. An already-active call never receives a shutdown signal.
 
@@ -353,7 +357,7 @@ The broken-slot lifecycle retains one diagnostic generation. A recovered failed 
 
 `recoverPriorPair` first stops only positively identified candidate services/children (worker before engine) and verifies their exit. It then restores original artifact positions and exact definitions/link state, starts engine, requires fresh boot, starts the prior worker, then checks the captured packaged or pilot profile. A bootstrap/plist/link/rename/health exception all enter this path; shell `set -e` cannot bypass it because the supported transaction runs inside this bundled helper. If a process cannot be stopped or a file move cannot be reconciled, do not start a conflicting prior pair on occupied ports; retain and report both failures.
 
-- [ ] **Step 6:** Add the failure-injection matrix to transaction/lifecycle tests. Use real disposable filesystem renames, fixture PIDs/process trees, fake clock and fake launchctl that models KeepAlive respawn while loaded. Record every adapter call in order. Assertions:
+- [ ] **Step 6:** Add the failure-injection matrix to transaction unit tests in S7 and complete lifecycle integration tests in S9. Source unit tests use injected boundary results; S9 verifies those boundaries against the actual S8 helper/artifact. Use real disposable filesystem renames, fixture PIDs/process trees, fake clock and fake launchctl that models KeepAlive respawn while loaded. Record every adapter call in order. Assertions:
 
 | Injection | Required result |
 | --- | --- |
@@ -377,6 +381,8 @@ Also create sentinels with content hash and mode in `hive.yaml`, alternate doten
 ## Task 9: Route CLI, deploy wrappers and first adoption through the same release implementation
 
 **Files:** `src/cli.ts`, `src/cli/update.ts`, `src/cli/rollback.ts`, `src/cli/single-instance-env.ts`, relevant tests, `service/deploy.sh`, `service/deploy-check.sh`, `service/deploy.test.sh`, `src/deployment/main.ts`, `src/deployment/adoption.integration.test.ts`.
+
+**Schedule:** S7 implements Steps 1–4, including all final helper option handlers and CLI/shell shim tests, after Task 8 source implementation. Do not run the bootstrap commands against the repository or a live instance at this source checkpoint. S8 builds these real entries, and S9 creates/runs Step 5's artifact-backed bootstrap/adoption tests. The bootstrap runbook procedure remains a later Task 12 operational action.
 
 - [ ] **Step 1:** Add string option `artifact` and boolean option `dry-run` to the CLI parser/helper types. Extend UpdateOptions to `{ tag?: string; artifact?: string; instance?: string; dryRun?: boolean }`, RollbackOptions with `dryRun?: boolean`. Reject `--artifact` plus `--tag`, nonabsolute/nonregular/non-tgz artifact, and explicit instance ID unequal to selected config before writes. Help describes update/rollback as the engine and enabled worker release unit.
 
@@ -465,7 +471,7 @@ For the one-time recovery exercise, the retained helper exposes internal runbook
 
 A legacy hold record is **evidence**, never an authorization boolean that bypasses checks. It enumerates all inventoried dodi dispatch sources, how each was held, observed outstanding dispatch/assignment completion, verification/release procedures, target live pilot PID/start-time, verification time and exact local read-back locations. Before stopping the pilot on first cutover or later reapply, execute the recorded read-only checks and verify the hold is still in effect, no outstanding work is unresolved, and the same pilot is live and idle. Repeated idle polling or merely providing a JSON file is insufficient. If the live inventory cannot provide this proof, defer before signaling and leave T9 pending. Do not retrofit the protected pilot code to obtain a handshake.
 
-- [ ] **Step 5:** Add the adoption test with a deliberate old-updater sentinel script in target `.hive/service/deploy.sh` that writes `OLD_UPDATER_CALLED` and exits 97. Run candidate CLI from the bootstrap fixture. Require the sentinel never runs; candidate helper hash equals bootstrap package helper, both new plists point to target `.hive/pkg`, pilot snapshot survives, failure restores the pilot profile, and reapply needs a freshly verified legacy hold. After successful migration, ordinary future updates/rollbacks must work with independent packaged prior releases without reading pilot paths.
+- [ ] **Step 5:** In S9, add the adoption test with a deliberate old-updater sentinel script in target `.hive/service/deploy.sh` that writes `OLD_UPDATER_CALLED` and exits 97. Run the actual S8 candidate CLI from the bootstrap fixture. Require the sentinel never runs; candidate helper hash equals bootstrap package helper, both new plists point to target `.hive/pkg`, pilot snapshot survives, failure restores the pilot profile, and reapply needs a freshly verified legacy hold. After successful migration, ordinary future updates/rollbacks must work with independent packaged prior releases without reading pilot paths.
 
 ```bash
 npx vitest run src/cli/update.test.ts src/deployment/adoption.integration.test.ts src/deployment/transaction.test.ts src/deployment/lifecycle.integration.test.ts
@@ -482,16 +488,17 @@ Expected: all tests pass with target-only fixture activity and nonzero status fo
 - [ ] **Step 2:** Document Node installed host path, supported engine range, operational Node24/macOS ARM64 proof, recorded npm version, command-line/build/native install prerequisites determined by the real T2 install, network registry requirement, no ignored native scripts, larger voice-disabled dependency footprint, instance health-port override and collision behavior.
 - [ ] **Step 3:** Document exact update/artifact/dry-run/start/stop/rollback commands, admission deferral/release-unresolved messages, retained ledger diagnostics, staging/recovery paths, first-adoption bootstrap and separate pilot recovery profile. Explain no automatic clearing of unknown accepted work and no force-call-termination option.
 - [ ] **Step 4:** Include operator-owned preservation baseline, dodi-only updater inventory, Keepur comparison, legacy hold evidence requirements, candidate tooling retention, no pilot worktree retirement, and migration-pending status until actual T9 passes. The new package is the supported runtime after acceptance; retained pilot artifacts remain a historical recovery route until a known-good packaged previous generation exists.
-- [ ] **Step 5:** Record the `/spec-and-implement` entrypoint absence as the current **workflow handoff dependency**, not an implementation design blocker. The driver must locate/install/restore the required entrypoint after plan approval, or obtain an explicit repository workflow exception through its authorized process. This draft does not substitute `dodi-dev:implement` for that step.
+- [ ] **Step 5:** Record the user's explicit authorization (`ac95b136`) to use dodi-dev in place of the unavailable `/spec-and-implement` entrypoint. Follow the existing dodi-dev plan-review and delivery gates and the parent schedule; no workflow restoration is pending. This substitution does not establish operational prerequisites or authorize live calls.
 
 ## Task 11: Integrated verification and release gate
 
 **Files:** `.github/workflows/ci.yml`, `.github/workflows/publish.yml`, `package.json`, all touched tests/guards.
 
-- [ ] **Step 1:** Retain existing Node22 checks and declared engine support. Add a macOS ARM64 Node24 packed-artifact check using the same check:artifact script; make the existing release validation path run it rather than relying on symlink runtime smoke. Existing CI host is self-hosted macOS ARM64; explicitly select Node24 for this job and retain a Node22 build/test/bundle job. Increase job timeout only enough for fresh production native installs (30 minutes); do not skip the guard because it is slower. Publishing must depend on successful check:bundle/artifact validation and a clean manifest, while its existing publication authorization remains unchanged.
+- [ ] **Step 1:** Retain existing Node22 checks and declared engine support. Add a macOS ARM64 Node24 packed-artifact check using the same check:artifact script; make the existing release validation path run it rather than relying on symlink runtime smoke. Existing CI host is self-hosted macOS ARM64; explicitly select Node24 for this job and retain a Node22 build/test/bundle job. Each fresh job builds before SDK-child tests and builds the complete bundle before artifact checks. Increase job timeout only enough for fresh production native installs (30 minutes); do not skip the guard because it is slower. Publishing must depend on successful check:bundle/artifact validation and a clean manifest, while its existing publication authorization remains unchanged.
 - [ ] **Step 2:** Run the full contract once integrated:
 
 ```bash
+npm run bundle
 npm run check
 bash service/deploy.test.sh
 bash service/install.test.sh
@@ -504,7 +511,7 @@ Expected: all exit 0; no skipped T1–T8 cases; actual fresh install/native and 
 
 ## Task 12: Dodi operational acceptance and KPR-466 evidence handoff
 
-This task runs only after reviewed delivery and the repository's implementation workflow. Maturation runs none of these commands. It requires no live call; do not dispatch one. Existing Gate1 delegation covers routine planning, not a claim that operational prerequisites already exist.
+This task is S12 and runs only after reviewed, verified delivery through the authorized dodi-dev workflow and establishment of its real operational prerequisites. Maturation runs none of these commands. It requires no live call; do not dispatch one. Existing Gate1 delegation covers routine sequencing choices, not a claim that the candidate, pilot recovery inventory or verified legacy hold already exists.
 
 **Files:** Create `docs/epics/kpr-462/kpr-463-deployment-evidence.md` during actual delivery. Keep precise service snapshots/secret-bearing originals under dodi `.hive-state`; commit only sanitized evidence.
 
@@ -551,9 +558,9 @@ KPR-466 consumes this ticket as passed only after actual migration/restart/rollb
 ## Draft assumptions and review handoff
 
 - The approved six pinned dependencies and Node engine contract remain unchanged.
-- The initial SDK proof is required work, not a result claimed from source inspection.
+- Task 1's initial SDK proof is preserved on child commit `438115f2788e19c01dc8d7e08a43be17ef3a30bb` with the recorded build/20-test evidence in the parent schedule; subsequent runtime changes retain the prescribed affected SDK checks.
 - Filesystem IPC is the delegated local-IPC implementation choice; it avoids a public control server and macOS socket-path length constraints.
 - A dependency-free bundled transaction helper is the concrete solution to self-replacement and first adoption; SDK/native/config probes remain separate installed helpers.
 - No merged sibling canon was supplied. Shared main/config/telemetry changes must be integrated serially with later KPR-464/KPR-465 work.
 - Actual pilot identity/port/hold mechanisms are filled from delivery inventory; absence of verifiable hold/recovery evidence defers migration without a force bypass.
-- `/spec-and-implement` remains an unresolved operational implementation handoff dependency. This planning draft can be reviewed before it is restored; no implementation readiness is implied.
+- The user authorized dodi-dev to replace unavailable `/spec-and-implement` (`ac95b136`). Resume requires clean plan review and integration of these epic documents into the preserved child; deployment prerequisites and actual T9 evidence remain separate pending gates.
