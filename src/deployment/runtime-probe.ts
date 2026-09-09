@@ -154,16 +154,17 @@ export interface WorkerHeartbeatEvidence {
   identity: ReturnType<typeof parseBootIdentity> | null;
   ageMs: number | null;
   fresh: boolean;
+  activeCalls: number | null;
 }
 
 export function classifyWorkerHeartbeatDocument(value: unknown, now = Date.now()): WorkerHeartbeatEvidence {
-  if (!value || typeof value !== "object") return { identity: null, ageMs: null, fresh: false };
+  if (!value || typeof value !== "object") return { identity: null, ageMs: null, fresh: false, activeCalls: null };
   const document = value as { supervisorIdentity?: unknown; supervisorUpdatedAt?: unknown };
   let identity: ReturnType<typeof parseBootIdentity>;
   try {
     identity = parseBootIdentity(document.supervisorIdentity);
   } catch {
-    return { identity: null, ageMs: null, fresh: false };
+    return { identity: null, ageMs: null, fresh: false, activeCalls: null };
   }
   const updatedAt =
     document.supervisorUpdatedAt instanceof Date
@@ -176,6 +177,11 @@ export function classifyWorkerHeartbeatDocument(value: unknown, now = Date.now()
     identity,
     ageMs,
     fresh: ageMs !== null && ageMs >= -5_000 && ageMs <= 60_000,
+    activeCalls:
+      Number.isSafeInteger((document as { activeCalls?: unknown }).activeCalls) &&
+      ((document as { activeCalls?: number }).activeCalls ?? -1) >= 0
+        ? (document as { activeCalls: number }).activeCalls
+        : null,
   };
 }
 

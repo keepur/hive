@@ -885,6 +885,20 @@ export class ServiceController {
     return { definition, inspection, plist, link, loaded: inspection.loaded, enabled: inspection.enabled };
   }
 
+  /** Capture exact bytes/link/load state before any service or plist mutation. */
+  async capture(definition: ServiceDefinition | readonly ServiceDefinition[]): Promise<ServiceSnapshot> {
+    const definitions = Array.isArray(definition) ? definition : [definition];
+    await this.validateDefinitions(definitions);
+    const captured = await Promise.all(definitions.map((item) => this.#capture(item)));
+    await this.#io.mkdir(this.#options.operationDir, { recursive: true, mode: 0o700 });
+    await this.#io.chmod(this.#options.operationDir, 0o700);
+    for (const prior of captured) {
+      const privatePath = resolve(this.#options.operationDir, `${prior.definition.label}.plist.original`);
+      if (prior.plist.existed) await this.#atomicWrite(privatePath, prior.plist.bytes!);
+    }
+    return { services: captured };
+  }
+
   async #atomicWrite(path: string, bytes: string | Buffer): Promise<void> {
     const temporary = `${path}.tmp-${this.#io.randomId()}`;
     await this.#io.writeFile(temporary, bytes, { mode: 0o600, flag: "wx" });
@@ -900,14 +914,7 @@ export class ServiceController {
 
   async write(definition: ServiceDefinition | readonly ServiceDefinition[]): Promise<ServiceSnapshot> {
     const definitions = Array.isArray(definition) ? definition : [definition];
-    await this.validateDefinitions(definitions);
-    const captured = await Promise.all(definitions.map((item) => this.#capture(item)));
-    await this.#io.mkdir(this.#options.operationDir, { recursive: true, mode: 0o700 });
-    await this.#io.chmod(this.#options.operationDir, 0o700);
-    for (const prior of captured) {
-      const privatePath = resolve(this.#options.operationDir, `${prior.definition.label}.plist.original`);
-      if (prior.plist.existed) await this.#atomicWrite(privatePath, prior.plist.bytes!);
-    }
+    const snapshot = await this.capture(definitions);
     await this.#io.mkdir(resolve(this.#options.hiveHome, "service"), { recursive: true, mode: 0o700 });
     await this.#io.mkdir(resolve(this.#options.home, "Library", "LaunchAgents"), { recursive: true, mode: 0o700 });
     for (const item of definitions) {
@@ -919,11 +926,11 @@ export class ServiceController {
       await this.#io.rename(temporary, plistPath);
       await this.#atomicLink(this.#linkPath(item.label), plistPath);
     }
-    return { services: captured };
+    return snapshot;
   }
 
-  async removeWorkerLink(definition: ServiceDefinition): Promise<void> {
-    if (componentForLabel(definition.label) !== "voice-worker") throw new Error("expected voice-worker definition");
+  async removeServiceLink(definition: ServiceDefinition): Promise<void> {
+    componentForLabel(definition.label);
     const inspection = await this.inspect(definition.label);
     if (inspection.livePID !== null) throw new Error("cannot remove a live worker registration");
     const domain = `gui/${this.#io.getuid()}`;
@@ -945,12 +952,17 @@ export class ServiceController {
         resolvedTarget !== this.#plistPath(definition.label) &&
         resolvedTarget !== this.#pilotPlists.get(definition.label)
       ) {
-        throw new Error("foreign worker LaunchAgent link target");
+        throw new Error("foreign LaunchAgent link target");
       }
       await this.#io.unlink(linkPath);
     } catch (error) {
       if (!missingFile(error)) throw error;
     }
+  }
+
+  async removeWorkerLink(definition: ServiceDefinition): Promise<void> {
+    if (componentForLabel(definition.label) !== "voice-worker") throw new Error("expected voice-worker definition");
+    await this.removeServiceLink(definition);
   }
 
   async restore(snapshot: ServiceSnapshot): Promise<void> {

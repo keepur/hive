@@ -14,6 +14,15 @@ set -euo pipefail
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ "${HIVE_SINGLE_INSTANCE:-}" == "1" ]]; then
+  DEPLOY_HELPER="$SCRIPT_DIR/../pkg/deploy.min.js"
+  if [[ ! -f "$DEPLOY_HELPER" ]]; then
+    echo "ERROR: packaged deployment helper missing" >&2
+    exit 1
+  fi
+  exec "${HIVE_NODE_PATH:-node}" "$DEPLOY_HELPER" --check "--tag=${HIVE_SINGLE_TAG:-latest}" "$@"
+fi
+
 BUILD_DIR="${BUILD_DIR:-$HOME/build/hive}"
 DEPLOY_DIR="${DEPLOY_DIR:-$HOME/services/hive}"
 # HIVE_INSTANCES_CONF (KPR-70) lets multi-instance dev hosts point at a

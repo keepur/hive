@@ -22,7 +22,7 @@ function resolveCliHiveHome(): string {
  */
 function ensureHiveInstallOrExit(): string {
   const home = resolveCliHiveHome();
-  if (existsSync(join(home, "hive.yaml"))) return home;
+  if (existsSync(resolve(home, process.env.HIVE_CONFIG ?? "hive.yaml"))) return home;
 
   const lines: string[] = [
     `No Hive install found at ${home}.`,
@@ -67,13 +67,18 @@ const { positionals, values } = parseArgs({
     version: { type: "boolean", short: "v", default: false },
     verbose: { type: "boolean", default: false },
     tag: { type: "string" },
+    artifact: { type: "string" },
     instance: { type: "string" },
+    "dry-run": { type: "boolean", default: false },
   },
 });
 
 const command = positionals[0];
 
-function stringOption(name: "config" | "tag" | "instance", parsed: string | undefined): string | undefined {
+function stringOption(
+  name: "config" | "tag" | "artifact" | "instance",
+  parsed: string | undefined,
+): string | undefined {
   if (typeof parsed === "string") return parsed;
   const args = process.argv.slice(2);
   for (let i = 0; i < args.length; i += 1) {
@@ -89,15 +94,17 @@ function stringOption(name: "config" | "tag" | "instance", parsed: string | unde
   return undefined;
 }
 
-function booleanOption(name: "verbose", parsed: boolean | undefined): boolean {
+function booleanOption(name: "verbose" | "dry-run", parsed: boolean | undefined): boolean {
   if (parsed) return true;
   return process.argv.slice(2).includes(`--${name}`);
 }
 
 const configValue = stringOption("config", typeof values.config === "string" ? values.config : undefined);
 const tagValue = stringOption("tag", typeof values.tag === "string" ? values.tag : undefined);
+const artifactValue = stringOption("artifact", typeof values.artifact === "string" ? values.artifact : undefined);
 const instanceValue = stringOption("instance", typeof values.instance === "string" ? values.instance : undefined);
 const verboseValue = booleanOption("verbose", typeof values.verbose === "boolean" ? values.verbose : undefined);
+const dryRunValue = booleanOption("dry-run", typeof values["dry-run"] === "boolean" ? values["dry-run"] : undefined);
 
 if (values.version) {
   const pkg = JSON.parse(readFileSync(resolve(import.meta.dirname, "..", "package.json"), "utf-8"));
@@ -118,8 +125,8 @@ Commands:
   start --daemon    Install + start as LaunchAgent
   stop              Stop LaunchAgent
   status            Health check
-  update            Update engine to latest (or --tag=<tag>) and restart
-  rollback          Restore the previous engine (.hive.prev) and restart
+  update            Update engine + enabled worker (--tag or --artifact)
+  rollback          Restore the previous engine + enabled worker release
   migrate-0.2       Migrate a 0.1.x instance dir to the 0.2.0 layout
   doctor            Check prereqs, services, agent health
   plugin add <pkg>  Install a plugin package
@@ -140,6 +147,8 @@ Commands:
 
 Options:
   --config <path>   Path to hive.yaml
+  --artifact <tgz>  Absolute local @keepur/hive artifact for update
+  --dry-run         Print the lifecycle plan without effects
   -v, --version     Show version
   -h, --help        Show this help
 `);
@@ -153,6 +162,7 @@ if (typeof configValue === "string") {
   if (existsSync(configPath)) {
     const stat = statSync(configPath);
     process.env.HIVE_HOME = stat.isDirectory() ? configPath : resolve(configPath, "..");
+    process.env.HIVE_CONFIG = stat.isDirectory() ? resolve(configPath, "hive.yaml") : configPath;
   } else {
     console.error(`Config not found: ${configPath}`);
     process.exit(1);
@@ -202,7 +212,9 @@ switch (command) {
     const { runUpdate } = await import("./cli/update.js");
     await runUpdate({
       tag: tagValue,
+      artifact: artifactValue,
       instance: instanceValue,
+      dryRun: dryRunValue,
     });
     break;
   }
@@ -210,6 +222,7 @@ switch (command) {
     const { runRollback } = await import("./cli/rollback.js");
     await runRollback({
       instance: instanceValue,
+      dryRun: dryRunValue,
     });
     break;
   }

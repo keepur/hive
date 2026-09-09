@@ -7,6 +7,15 @@ set -euo pipefail
 
 # --- Configuration ---
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ "${HIVE_SINGLE_INSTANCE:-}" == "1" ]]; then
+  DEPLOY_HELPER="$SCRIPT_DIR/../pkg/deploy.min.js"
+  if [[ ! -f "$DEPLOY_HELPER" ]]; then
+    echo "ERROR: packaged deployment helper missing" >&2
+    exit 1
+  fi
+  exec "${HIVE_NODE_PATH:-node}" "$DEPLOY_HELPER" "$@"
+fi
+
 BUILD_DIR="${BUILD_DIR:-$HOME/build/hive}"
 DEPLOY_DIR="${DEPLOY_DIR:-$HOME/services/hive}"
 INSTANCES_CONF="${HIVE_INSTANCES_CONF:-$SCRIPT_DIR/instances.conf}"
@@ -25,9 +34,6 @@ HEALTH_CHECK_WAIT_BETWEEN=10
 # build-from-source phase + the shipped instances.conf entirely. The instance
 # running the update is the only instance to update — no global registry read.
 SINGLE_INSTANCE_MODE=false
-if [[ "${HIVE_SINGLE_INSTANCE:-}" == "1" ]]; then
-  SINGLE_INSTANCE_MODE=true
-fi
 
 # --- Flags ---
 DRY_RUN=false

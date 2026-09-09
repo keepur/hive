@@ -17,6 +17,7 @@ import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { buildServiceDefinitions, buildServicePlist } from "../src/deployment/services.js";
 
 const ROOT = resolve(import.meta.dirname, "..");
 
@@ -41,7 +42,8 @@ const instanceId = hiveConfig.instance?.id ?? "hive";
 
 const home = process.env.HOME ?? "/tmp";
 const DEPLOY_DIR = process.env.HIVE_DEPLOY_DIR ?? resolve(home, "services", instanceId);
-const SERVICE_DIR = join(ROOT, "service");
+const productionMode = process.env.HIVE_PRODUCTION_PLISTS === "1";
+const SERVICE_DIR = productionMode ? join(DEPLOY_DIR, "service") : join(ROOT, "service");
 const LOGS_DIR = join(DEPLOY_DIR, "logs");
 
 const LABEL = `com.hive.${instanceId}.agent`;
@@ -51,6 +53,14 @@ const LABEL_DEPLOY = `com.hive.${instanceId}.deploy-check`;
 // Detect paths
 const nodePath = execSync("which node", { encoding: "utf-8" }).trim();
 const pathEnv = process.env.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+const packagedDefinitions = buildServiceDefinitions({
+  instanceId,
+  nodePath,
+  hiveHome: DEPLOY_DIR,
+  configPath: resolve(DEPLOY_DIR, process.env.HIVE_CONFIG ?? "hive.yaml"),
+  home,
+  pathEnv,
+});
 
 // Ensure directories exist
 if (!existsSync(SERVICE_DIR)) mkdirSync(SERVICE_DIR, { recursive: true });
@@ -58,7 +68,9 @@ if (!existsSync(LOGS_DIR)) mkdirSync(LOGS_DIR, { recursive: true });
 
 // ── Main Hive service plist ────────────────────────────────────────
 
-const hivePlist = `<?xml version="1.0" encoding="UTF-8"?>
+const hivePlist = productionMode
+  ? buildServicePlist(packagedDefinitions.engine)
+  : `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -193,16 +205,15 @@ writeFileSync(deployCheckPlistPath, deployCheckPlist);
 console.log(`Generated: ${deployCheckPlistPath}`);
 console.log(`  Label: ${LABEL_DEPLOY}`);
 
-// ── Voice worker plist (KPR-322 S4) — only when voice.livekit.enabled ──
-// Pilot deploy runs from a built checkout (`npm run build` → dist/ + node_modules
-// present). The npm-published tarball does NOT carry dist/ — packaging the worker
-// into `hive update` artifacts is out of scope for the pilot.
-// Restart: launchctl kickstart -k gui/$(id -u)/com.hive.<id>.voice-worker
-// Dev: npx tsx src/voice-worker/main.ts dev
+// ── Voice worker plist ────────────────────────────────────────────
+// Production mode emits only the packaged worker. The source checkout body is
+// retained solely for the explicit developer generator mode.
 const voiceLivekitEnabled = (hiveConfig.voice?.livekit?.enabled ?? false) === true;
 if (voiceLivekitEnabled) {
   const LABEL_VOICE = `com.hive.${instanceId}.voice-worker`;
-  const voiceWorkerPlist = `<?xml version="1.0" encoding="UTF-8"?>
+  const voiceWorkerPlist = productionMode
+    ? buildServicePlist(packagedDefinitions.worker)
+    : `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>

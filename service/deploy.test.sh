@@ -293,4 +293,42 @@ if ! health_check "$LOG_FILE" "$OFFSET" >/dev/null; then
   exit 1
 fi
 
+# --- Test 15: supported single-instance branch bypasses developer state ---
+echo "test 15: supported branch invokes sibling packaged helper before developer reads"
+SUPPORTED="$TESTROOT/supported"
+mkdir -p "$SUPPORTED/service" "$SUPPORTED/pkg"
+cp "$SCRIPT_DIR/deploy.sh" "$SCRIPT_DIR/deploy-check.sh" "$SUPPORTED/service/"
+: > "$SUPPORTED/pkg/deploy.min.js"
+cat > "$SUPPORTED/node-shim" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$SUPPORTED_OUTPUT"
+exit "${SUPPORTED_EXIT:-0}"
+SHIM
+chmod +x "$SUPPORTED/node-shim" "$SUPPORTED/service/deploy.sh" "$SUPPORTED/service/deploy-check.sh"
+export SUPPORTED_OUTPUT="$SUPPORTED/output"
+HIVE_SINGLE_INSTANCE=1 HIVE_NODE_PATH="$SUPPORTED/node-shim" \
+  BUILD_DIR="$TESTROOT/MUST_NOT_READ" HIVE_INSTANCES_CONF="$TESTROOT/MUST_NOT_READ.conf" \
+  "$SUPPORTED/service/deploy.sh" --artifact=/tmp/reviewed.tgz --instance=dodi
+grep -Fxq "$SUPPORTED/service/../pkg/deploy.min.js" "$SUPPORTED_OUTPUT"
+grep -Fxq -- "--artifact=/tmp/reviewed.tgz" "$SUPPORTED_OUTPUT"
+
+# --- Test 16: deploy-check uses the same helper and selected pin ---
+echo "test 16: supported deploy-check routes through paired helper"
+HIVE_SINGLE_INSTANCE=1 HIVE_SINGLE_TAG=v0.16.0 HIVE_NODE_PATH="$SUPPORTED/node-shim" \
+  BUILD_DIR="$TESTROOT/MUST_NOT_READ" HIVE_INSTANCES_CONF="$TESTROOT/MUST_NOT_READ.conf" \
+  "$SUPPORTED/service/deploy-check.sh"
+grep -Fxq -- "--check" "$SUPPORTED_OUTPUT"
+grep -Fxq -- "--tag=v0.16.0" "$SUPPORTED_OUTPUT"
+
+# --- Test 17: helper nonzero is propagated and never falls through ---
+echo "test 17: supported helper failure status is preserved"
+if HIVE_SINGLE_INSTANCE=1 HIVE_NODE_PATH="$SUPPORTED/node-shim" SUPPORTED_EXIT=23 \
+  "$SUPPORTED/service/deploy.sh" --dry-run; then
+  echo "FAIL: deploy wrapper swallowed helper failure" >&2
+  exit 1
+else
+  status=$?
+fi
+[[ "$status" == "23" ]] || { echo "FAIL: expected status 23, got $status" >&2; exit 1; }
+
 echo "all tests passed."
