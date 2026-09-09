@@ -82,7 +82,18 @@ There is no source-file map, because no source file is touched. The complete sur
 
 ### Harness Requirements
 
-- A worktree on `epic/kpr-451` at `3aa6d06` or later. No service, fixture, seed data, browser, env var, mock, or account is required for Tasks 1–2.
+- A worktree on `epic/kpr-451` at `3aa6d06` or later. No service, fixture, seed data, browser, mock, or account is required for Task 1, or for Task 2 steps 1–4 and 6–8.
+- **Task 2 step 5 needs one read from Linear, and it is the only external dependency in Tasks 1–2.** The KPR-451 Decision Register lives in the epic's tracker body; there is no copy in this repo, so the canon check cannot be satisfied from the worktree. It is deliberately a live read rather than text inlined into this plan, because the register grows as siblings merge — KPR-452's own canon is still in flight in this epic, and a snapshot pasted here would be stale before Task 2 runs. Exact command:
+
+  ```bash
+  export LINEAR_API_KEY="$(grep '^LINEAR_KPR_API_KEY=' ~/.linear.env | cut -d= -f2-)"
+  curl -s -X POST https://api.linear.app/graphql \
+    -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json" \
+    -d '{"query":"query { issue(id: \"KPR-451\") { description } }"}' \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]["issue"]["description"]; i=d.find("## Decision Register"); print(d[i:] if i>=0 else "NO REGISTER SECTION")'
+  ```
+
+  The key is the raw `LINEAR_KPR_API_KEY` value from `~/.linear.env` in the `Authorization` header with **no** `Bearer` prefix, per `reference_linear_api_direct.md`. Observed at 2026-09-08 against `epic/kpr-451`'s epic: sixteen canon lines from three merged children — KPR-453 ×4, KPR-456 ×6, KPR-457 ×6. If the read is unavailable, check against that sixteen-line floor, say so in the step-8 commit message, and do not skip the check.
 - Task 3 requires Linear write access (`~/.linear.env`, per `reference_linear_api_direct.md`) **or** the driver/operator performing it interactively. Task 3 is explicitly not blocking for Tasks 1–2 and does not gate the epic-branch push.
 
 ### Non-Required Rationale
@@ -187,7 +198,12 @@ Run:
 grep -n 'Spawn-capable boundary' src/index.ts
 grep -n '(c) no unallowlisted spawn-capable start precedes the wiring' src/boot-order.test.ts
 ```
-Expected: one hit each — the marker in `src/index.ts` (around line 474) and the superset-sweep test in `src/boot-order.test.ts` (around line 84). Line numbers may move; presence is the assertion.
+Expected: one hit each. Observed at `771c63c`, exactly:
+```
+474:  // ── Spawn-capable boundary (KPR-394, restated by KPR-414) ──────────────
+84:  it("(c) no unallowlisted spawn-capable start precedes the wiring (superset sweep)", () => {
+```
+Presence is the assertion — a different line number is a move, not a failure. Record the observed numbers alongside the result so a later reader can tell a move from a removal.
 
 - [ ] **Step 7:** Record the results. Write down, for each of A1–A7, `verified` or `drifted: <what moved or changed>`. This list is the input to Task 2's anchor table. Do not commit anything in this task — Task 1 produces a finding, not a file change.
 
@@ -214,7 +230,7 @@ Expected: clean tree (no output from `status --porcelain`), `476 docs/epics/kpr-
 
 - [ ] **Step 2:** Append the addendum. Use a quoted heredoc (`<<'ADDENDUM_EOF'`) so nothing in the payload is expanded, which is the repo's known-good append mechanism under the Write hook's exec-pattern flagging.
 
-Replace the four `<...>` placeholders in subsection A.3 with Task 1's recorded results before running. Everything else is literal.
+Subsection A.3 carries **eight** `<...>` placeholders — `<HEAD-SHA>` in its header sentence and `<A1>` … `<A7>` in its table. Append them **as written here** and fill them afterwards, in step 3; do not substitute anything into the payload before running. Everything else in the heredoc is literal.
 
 ```bash
 cat >> docs/epics/kpr-451/kpr-458-design.md <<'ADDENDUM_EOF'
@@ -227,7 +243,7 @@ cat >> docs/epics/kpr-451/kpr-458-design.md <<'ADDENDUM_EOF'
 
 ### A.1 Scoping resolved: both unowned components now have owners
 
-The body states, in six places, that two components this contract requires are chartered to no child, and closes by naming that as an open epic-level scoping item "blocking for implementation, not for this contract". **That item is closed.** The operator resolved it in the epic driver session immediately after spec review closed, recorded at [KPR-455#comment-1b79ee1a](https://linear.app/keepur/issue/KPR-455#comment-1b79ee1a):
+The body reads, at thirteen lines in ten places — each one mapped in A.2 below, which is authoritative over this sentence — as though two components this contract requires are chartered to no child, and it closes by naming that as an open epic-level scoping item "blocking for implementation, not for this contract". **That item is closed.** The operator resolved it in the epic driver session immediately after spec review closed, recorded at [KPR-455#comment-1b79ee1a](https://linear.app/keepur/issue/KPR-455#comment-1b79ee1a):
 
 | Component | Body reference | Owner |
 | --- | --- | --- |
@@ -247,20 +263,21 @@ Each location below reads, at `3aa6d06`, as though ownership is open. Each is su
 | Line(s) at `3aa6d06` | Body text superseded | Now reads as |
 | --- | --- | --- |
 | 5 | TL;DR: "Two components this contract requires are chartered to **no child**… neither is assigned" | Both assigned; see A.1. |
+| 9 | Key Points, "no fourth part" bullet, closing clause: "two pieces of that wire are chartered to nobody" | Both pieces owned; see A.1. The architectural claim the clause qualifies — that the wire is not a fourth part — is untouched. |
 | 10 | Key Points: "⚠ Unowned, blocking for implementation: the matcher–deliverer (D12)" | Owned by KPR-468. The ⚠ marker no longer applies; the exhaustive obligation list in that bullet does. |
 | 11 | Key Points: "⚠ Unowned: the inbound acknowledgement edge (D6)" | Owned by KPR-455. |
 | 33 | Scope and authority: "plan for a document, a Gate-1 conversation, and the two scoping decisions named below" | The two scoping decisions are made; the document and the Gate-1 conversation remain this ticket's work. |
 | 35 | Scope and authority: "this document assigns neither… that is a scoping decision for the epic driver with the operator" | The driver made it with the operator. The paragraph's statement of *what* is unowned remains an accurate statement of the two obligation sets. |
 | 260, 267 | D6: "owned by nobody"; "No child in the epic's list is chartered for this" | KPR-455. D6's four obligations on the edge — translate-only, no ledger or subscription access, attribute-or-refuse, idempotency/legality belong to intake — are unchanged and bind KPR-455. |
 | 377 | D11 table row: "Each carrying surface's own inbound edge — **⚠ chartered to no child**" | Chartered to KPR-455 for the surfaces it carries; the row's third column (which surfaces expose one) stays operator-registered data. |
-| 386, 412 | D12 heading "ownership open"; "Ownership is open, and this document does not close it — for two items, not one" | Closed, for both items, per A.1. D12's exhaustive "what it owns" list is unchanged and is KPR-468's scope statement. |
+| 386, 388, 412 | D12 heading "ownership open"; "Placed last because it is the epic's open scoping item"; "Ownership is open, and this document does not close it — for two items, not one" | Closed, for both items, per A.1. D12 keeps its place and its name; its exhaustive "what it owns" list is unchanged and is KPR-468's scope statement. |
 | 475 | Assumptions: "Open, epic-level scoping (blocking for implementation, not for this contract) — two items, not one" | Resolved. Reclassify as closed. |
 
 Nothing else in the body is superseded. In particular the four operator rulings (D1), the three vocabularies (D3), the filter grammar (D5), the transport interface and its two closed reason sets (D6), the ledger transition table (D7), the retention posture (D9), the boundaries against `agent_events` / KPR-456 / KPR-457 (D10), the three-column split (D11), and C1–C19 stand exactly as signed off.
 
 ### A.3 Runtime-anchor verification record
 
-The contract's evidence table, D3, D10 and C6/C12 cite live source by file and line. Re-verified against `epic/kpr-451` at the commit that lands this addendum:
+The contract's evidence table, D3, D10 and C6/C12 cite live source by file and line. Re-verified against `epic/kpr-451` at `<HEAD-SHA>` — the epic-branch head the verification actually read at, which is the parent of the commit that lands this addendum:
 
 | # | Anchor | Claim it supports | Result |
 | --- | --- | --- | --- |
@@ -295,18 +312,50 @@ Restating D11's third column and D1's collection rule as a checklist, because th
 ADDENDUM_EOF
 ```
 
-- [ ] **Step 3:** Fill the anchor table. Replace `<A1>` … `<A7>` with Task 1's recorded results — `verified`, or `drifted: <what moved>`. Do this with an editor or targeted `sed`; do not re-run the heredoc.
+- [ ] **Step 3:** Fill the eight placeholders the append just left in A.3, with an editor or targeted `sed`. Do not re-run the heredoc. `<HEAD-SHA>` takes the short SHA recorded in Task 1 step 1 — the epic-branch head Task 1 read at, which is the parent of the commit step 8 creates. `<A1>` … `<A7>` take Task 1 step 7's recorded results: `verified`, or `drifted: <what moved>`.
+
+Confirm none survives:
+```bash
+grep -n '<HEAD-SHA>\|<A[1-7]>' docs/epics/kpr-451/kpr-458-design.md
+```
+Expected: no output.
 
 - [ ] **Step 4:** Read the appended section back in full and check it against the body it supersedes. Specifically confirm: every line number in A.2 still points at the text it quotes; A.1's statement that match evaluation stays with KPR-454 matches D12's own split; A.4 contains no cadence value, recipient, severity, or registry row.
 
 Run:
 ```bash
 sed -n '477,$p' docs/epics/kpr-451/kpr-458-design.md
-sed -n '5p;10p;11p;33p;35p;260p;267p;377p;386p;412p;475p' docs/epics/kpr-451/kpr-458-design.md | cut -c1-110
 ```
-Expected: the addendum renders as written, and each of the eleven sampled lines begins with the text A.2's table quotes.
+Expected: the addendum renders as written.
 
-- [ ] **Step 5:** Check the canon lines against the merged register. Read the KPR-451 Decision Register (epic body, `## Decision Register — Canon`) and confirm no KPR-458 line contradicts a KPR-453, KPR-456 or KPR-457 entry. The three known adjacencies and why each is compatible: KPR-453's "identity proves neither unique attempt nor task continuity" is what D2's dedupe rule is built on, not against; KPR-456's obligation contract is preserved verbatim by D10 and its sweep becomes a future *producer*, not a redirect; KPR-457's watchdog independence is preserved by D10, which forbids making it an adapter. If a genuine contradiction appears, that is a spec-lane demotion, not an edit.
+Then check each of A.2's thirteen line references against the text that row quotes. A truncating `cut` is the wrong instrument here — several of these quotes sit hundreds of characters into a long paragraph line, so a fixed-width slice would report a false miss. Grep for the fragment *within* the cited line instead:
+
+```bash
+while IFS='|' read -r ln frag; do
+  if sed -n "${ln}p" docs/epics/kpr-451/kpr-458-design.md | grep -qF -- "$frag"; then
+    echo "$ln OK"
+  else
+    echo "$ln MOVED — expected to contain: $frag"
+  fi
+done <<'ANCHORS'
+5|chartered to **no child**
+9|two pieces of that wire are chartered to nobody
+10|Unowned, blocking for implementation
+11|Unowned: the inbound acknowledgement edge
+33|the two scoping decisions named below
+35|chartered to no existing child, and this document assigns neither
+260|owned by nobody
+267|No child in the epic's list is chartered for this
+377|chartered to no child
+386|ownership open
+388|Placed last because it is the epic's open scoping item
+412|Ownership is open, and this document does not close it
+475|Open, epic-level scoping
+ANCHORS
+```
+Expected: thirteen lines, every one `OK`. A `MOVED` line means the body shifted under the map — which cannot happen from this ticket's own append (it only adds lines after 476), so it would mean the worktree is not at the baseline step 1 confirmed. Re-check the baseline before touching the map.
+
+- [ ] **Step 5:** Check the canon lines against the merged register. The register is the KPR-451 epic body's `## Decision Register — Canon` section in Linear — it is not in this repo; fetch it with the exact command in **Harness Requirements** above. Confirm no KPR-458 line contradicts a KPR-453, KPR-456 or KPR-457 entry. The three known adjacencies and why each is compatible: KPR-453's "identity proves neither unique attempt nor task continuity" is what D2's dedupe rule is built on, not against; KPR-456's obligation contract is preserved verbatim by D10 and its sweep becomes a future *producer*, not a redirect; KPR-457's watchdog independence is preserved by D10, which forbids making it an adapter. If a genuine contradiction appears, that is a spec-lane demotion, not an edit.
 
 - [ ] **Step 6:** Verify the append-only invariant and the diff scope.
 
@@ -351,13 +400,13 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 - [ ] **Step 1:** Put the `needs-human-spec` question to the operator, in these terms and no broader. The spec is explicit that a draft does not close that gate and that it does not claim to; it is equally explicit about what the gate covers: *"What the four rulings settle is the **structure**… What remains human policy is **content**: which reasons exist, who subscribes to what, and at what cadence."* The question is therefore:
 
-> KPR-458's contract is signed off and its structure is settled by your four rulings. The content half — reason rows, subscription rows, cadence values, the nudge floor, staleness horizons, retention values — is D11's third column, which this ticket ships none of and which is registered per-deployment rather than per-ticket. Does the signoff at KPR-458#comment-3f6e8a4a close `needs-human-spec` for this ticket, with the content half tracked as a deployment gate on KPR-454/KPR-468 instead? Four assumptions in the spec are marked ⚠ Delegated and non-blocking and would ride along with a yes: `(subscriptionId, dedupeKey)` notification identity, registry-declared `class`/`retry`, the D9 retention posture (a privacy call, not an engineering one), and retaining the reason registry rather than simplifying it away.
+> KPR-458's contract is signed off and its structure is settled by your four rulings. The content half — reason rows, subscription rows, cadence values, the nudge floor, staleness horizons, retention values — is D11's third column, which this ticket ships none of and which is registered per-deployment rather than per-ticket. Does the signoff at KPR-458#comment-3f6e8a4a close `needs-human-spec` for this ticket, with the content half tracked as a deployment gate on KPR-454/KPR-468 instead? Five bullets in the spec's Assumptions section are marked ⚠ Delegated and non-blocking and would ride along with a yes: `(subscriptionId, dedupeKey)` notification identity; registry-declared `class`/`retry`; the D9 retention posture (a privacy call, not an engineering one); retaining the reason registry rather than simplifying it away; and a fifth bullet bundling three named residuals — D4's rule that a `class: resource` reason cannot be *enabled* until some registered reason clears it, D12's sweep cursor held outside the immutable log (its location the implementing child's choice), and D2's in-process open-condition set, where a restart costs at most one epoch boundary per open condition and never a lost fact.
 
 Remove the label only on an explicit yes. A no returns the ticket to the spec lane with the operator's scope for the remaining conversation; it does not reopen the four-round-clean review.
 
 - [ ] **Step 2:** Post a pointer comment on **KPR-454** naming the contract path and the obligations it inherits:
 
-> KPR-458's contract is at `docs/epics/kpr-451/kpr-458-design.md` on `epic/kpr-451`. As the producer you own the whole accept path, which is more than the publish call: match evaluation (pure, no I/O), the `matchedSubscriptionIds` + `matchedSubscriptions` stamp into the one immutable insert, the `ops_events` and `ops_subscriptions` collections, their indexes and `CLAUDE.md` entries, the loaded subscription set, and `hive-runtime`'s own reason-registry rows including its clearing reason. Engine obligations in D10: wire above `index.ts`'s spawn-capable boundary with anchors in all three lists of `src/boot-order.test.ts`; contain every publish fault so it can never fail, delay or alter a turn (C15); co-locate `waitingFor` with `policyFor` sharing one prefix table (C6) — and read that prefix table, not its stale "team DM" comment. Your conformance criteria are C1–C6, C12–C16, C18, C19.
+> KPR-458's contract is at `docs/epics/kpr-451/kpr-458-design.md` on `epic/kpr-451`. As the producer you own the whole accept path, which is more than the publish call: match evaluation (pure, no I/O), the `matchedSubscriptionIds` + `matchedSubscriptions` stamp into the one immutable insert, the `ops_events` and `ops_subscriptions` collections, their indexes and `CLAUDE.md` entries, the loaded subscription set, and `hive-runtime`'s own reason-registry rows including its clearing reason. Engine obligations in D10: wire above `index.ts`'s spawn-capable boundary with anchors in all three lists of `src/boot-order.test.ts`; contain every publish fault so it can never fail, delay or alter a turn (C15); co-locate `waitingFor` with `policyFor` sharing one prefix table (C6) — and read that prefix table, not its stale "team DM" comment. Your conformance criteria are C1–C7, C12–C16, C18, C19. C7 is yours because match evaluation ships on the accept path with the producer (D12's opening: "matching itself is not this component's"), so the test that enumerates the D5 grammar and fails every operator, negation, wildcard and nesting outside it lands here, not with the notifier.
 
 - [ ] **Step 3:** Post a pointer comment on **KPR-455**:
 
