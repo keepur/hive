@@ -1,6 +1,6 @@
 # KPR-463 implementation plan — lifecycle, recovery and delivery
 
-This is chunk 3 of the [parent plan](./kpr-463-plan.md). Its Testing Contract, authority, authorized dodi-dev workflow substitution and S0–S12 serial schedule apply in full. Draft revision for review; operational commands below are later delivery steps, not maturation actions. [Chunk 4](./kpr-463-plan-pilot.md) supplies the concrete pilot-evidence, current-readback, stale-reconciliation, compatibility and bootstrap substeps required to finish partial S7.
+This is chunk 3 of the [parent plan](./kpr-463-plan.md). Its Testing Contract, authority, authorized dodi-dev workflow substitution and S0–S12 serial schedule apply in full. Draft revision for review; operational commands below are later delivery steps, not maturation actions. [Chunk 4](./kpr-463-plan-pilot.md) supplies the concrete pilot-evidence, current-readback, stale-reconciliation, compatibility and bootstrap substeps required to finish partial S7. [Chunk 5](./kpr-463-plan-pilot-boundaries.md) completes initial capture, the historical probe ABI, absolute stop freshness and non-lifecycle bootstrap/registry reconciliation.
 
 ## Task 7: Generate and operate the target service pair
 
@@ -132,6 +132,8 @@ Add `resolveDotenvPath` cases for absent/default, relative `hive-personal.yaml`,
 **Schedule:** S7 implements Steps 1–5 and Step 6's injected transaction unit matrix, then finishes Task 7 daemon/install and Task 9 CLI/wrapper/bootstrap routing in that same source checkpoint. All release/ports/services/health/diagnostic imports already exist. S9 adds and runs the complete `lifecycle.integration.test.ts` and Task 9 `adoption.integration.test.ts`, including actual frozen-helper execution, packed preflight and Task 6 closed-gate propagation. S7 unit tests inject the existing filesystem/process/probe boundaries; they cannot certify the future S8 bundle. Keep each deferred integration assertion pending until S9.
 
 - [ ] **Step 1:** Define the minimal durable operation record and exclusive lock. Canonicalize the instance first; a symlink alias and real path must obtain the same lock. Acquire with atomic `mkdir(<home>/.hive-state/deployment/lock)` and write owner record atomically before doing work. Directory permissions 0700, records 0600.
+
+The original lifecycle-only record shape below is the preserved schema-1 starting point. Remaining S7 migrates producers/consumers to chunk 5’s strict schema-2 work union; its prior/profile/artifact fields belong only to lifecycle work. Bootstrap/registry reconciliation dispatches before reading them. Incomplete historical schema-1 records remain unresolved.
 
 ```typescript
 export type Phase = "preflight" | "staged" | "barrier-requested" | "quiescent" |
