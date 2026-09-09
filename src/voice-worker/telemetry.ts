@@ -11,12 +11,9 @@ import { MongoClient, type Collection } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import type { VendorCell } from "./cells.js";
 import type { BridgeFailureClass } from "./error-map.js";
-import type { HiveLLM } from "./hive-llm.js";
 import type { WorkerConfig } from "./worker-config.js";
 
 const log = createLogger("voice-worker-metrics");
-
-type LastTurnTiming = NonNullable<HiveLLM["lastTurnTiming"]>;
 
 export type CallDirection = "inbound" | "outbound";
 
@@ -61,13 +58,11 @@ export function percentile(samples: number[], p: number): number {
  * order is EOU (with `speechId` = the new SpeechHandle) → this turn's LLM →
  * this turn's TTS TTFB. Hold the pending EOU; emit one TurnMetricsLine when
  * matching TTS TTFB arrives (join on `speechId`). Cancelled TTS still emits
- * (interrupted turns must score). Snapshot `lastTurnTiming` at EOU hold;
- * at emit, `llmTtftMs` is matching `llm_metrics.ttftMs` for that `speechId`
- * if present, else `lastTurnTiming` only when it is a *different object*
- * than the EOU snapshot (this-turn first-token publish), else -1.
- * `maxInterChunkGapMs` uses the same this-turn object-identity rule, else
- * -1. Do not inherit a leftover prior-turn `lastTurnTiming` that HiveLLM
- * has not yet replaced. `ttsTtfbMs` is the matching TTS event.
+ * (interrupted turns must score). `llmTtftMs` is populated only from matching
+ * genuine `llm_metrics`; the old mutable object-identity bridge timing fallback
+ * was removed because overlapping attempts could cross-wire it. The legacy
+ * summary has no correlated maximum-gap source, so that field remains -1 until
+ * Task 3 replaces this class with the schema-v2 reducer.
  * `totalToFirstAudioMs` is the sum of EOU + LLM TTFT + TTS TTFB when all
  * are >= 0, else -1. Incomplete turns are dropped, not cross-wired with
  * another speech's TTS. `interrupted` is true when `numInterruptions`
@@ -80,7 +75,6 @@ export class TurnMetrics {
   private pendingEou: {
     speechId: string;
     endOfUtteranceDelayMs: number;
-    staleTiming: LastTurnTiming | null;
   } | null = null;
   private llmTtftBySpeechId = new Map<string, number>();
   private lastInterruptionCount = 0;
@@ -90,7 +84,6 @@ export class TurnMetrics {
   constructor(
     private readonly callId: string,
     private readonly cell: VendorCell,
-    private readonly hiveLLM: Pick<HiveLLM, "lastTurnTiming">,
     private readonly direction: CallDirection = "outbound",
     private readonly onTurn?: (line: TurnMetricsLine) => void,
   ) {}
@@ -114,7 +107,7 @@ export class TurnMetrics {
         if (m.speechId !== undefined && this.pendingEou?.speechId === m.speechId) {
           const eou = this.pendingEou;
           this.pendingEou = null;
-          this.emitTurn(eou.endOfUtteranceDelayMs, m.ttfbMs, m.speechId, eou.staleTiming);
+          this.emitTurn(eou.endOfUtteranceDelayMs, m.ttfbMs, m.speechId);
         }
         return;
       case "llm_metrics":
@@ -125,16 +118,13 @@ export class TurnMetrics {
         this.lastInterruptionCount = m.numInterruptions;
         return;
       case "eou_metrics":
-        // Hold until matching TTS TTFB. Snapshot lastTurnTiming so a leftover
-        // prior-turn object is not joined if TTS fires before this turn's
-        // first-token publish. A new EOU replaces an unmatched one
+        // Hold until matching TTS TTFB. A new EOU replaces an unmatched one
         // (incomplete turns are dropped, never flushed with another speech's TTS).
         this.pendingEou =
           m.speechId !== undefined
             ? {
                 speechId: m.speechId,
                 endOfUtteranceDelayMs: m.endOfUtteranceDelayMs,
-                staleTiming: this.hiveLLM.lastTurnTiming,
               }
             : null;
         return;
@@ -143,11 +133,9 @@ export class TurnMetrics {
     }
   }
 
-  private emitTurn(eouDelayMs: number, ttsTtfbMs: number, speechId: string, staleTiming: LastTurnTiming | null): void {
-    const bridge = this.hiveLLM.lastTurnTiming;
-    const thisTurn = bridge !== null && bridge !== staleTiming ? bridge : null;
-    const llmTtftMs = this.llmTtftBySpeechId.get(speechId) ?? thisTurn?.llmTtftMs ?? -1;
-    const maxInterChunkGapMs = thisTurn?.maxInterChunkGapMs ?? -1;
+  private emitTurn(eouDelayMs: number, ttsTtfbMs: number, speechId: string): void {
+    const llmTtftMs = this.llmTtftBySpeechId.get(speechId) ?? -1;
+    const maxInterChunkGapMs = -1;
     this.llmTtftBySpeechId.delete(speechId);
     const totalToFirstAudioMs =
       eouDelayMs >= 0 && llmTtftMs >= 0 && ttsTtfbMs >= 0 ? eouDelayMs + llmTtftMs + ttsTtfbMs : -1;

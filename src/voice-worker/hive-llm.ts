@@ -16,22 +16,26 @@
  */
 import { llm, DEFAULT_API_CONNECT_OPTIONS, type APIConnectOptions } from "@livekit/agents";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { createLogger } from "../logging/logger.js";
+import { VOICE_PROCESS_ID, type VoiceTraceMetadata } from "../voice/voice-trace.js";
 import { serializeTranscript, type BridgeMessage } from "./chat-ctx.js";
 import { classifyHttpFailure, type BridgeFailureClass } from "./error-map.js";
 import { applyInterruptionMarker } from "./interruption-marker.js";
+import type { BridgeAttempt, SpeechTracePort } from "./speech-trace.js";
 import { SSEParser } from "./sse.js";
+import { bridgeTraceContext, type BridgeTraceContext } from "./trace-context.js";
 
 const log = createLogger("hive-llm");
 
 export class BridgeError extends Error {
   constructor(
     public readonly failureClass: BridgeFailureClass,
-    message: string,
+    public readonly turnId: string,
     /** True when at least one content chunk was already yielded (mid-stream). */
     public readonly bytesReceived: boolean,
   ) {
-    super(message);
+    super("Hive voice bridge request failed");
     this.name = "BridgeError";
   }
 }
@@ -43,13 +47,12 @@ export interface HiveLLMOptions {
   callId: string; // = LiveKit room name, `call-<uuid>`
   goal: string;
   context: string;
+  trace: SpeechTracePort;
 }
 
 export class HiveLLM extends llm.LLM {
   /** Set by the session layer when the previous agent turn was interrupted. */
   interruptedSpokenText: string | null = null;
-  /** Per-turn bridge timing for §13 telemetry (read by the session layer). */
-  lastTurnTiming: { llmTtftMs: number; maxInterChunkGapMs: number } | null = null;
 
   constructor(private readonly opts: HiveLLMOptions) {
     super();
@@ -67,15 +70,42 @@ export class HiveLLM extends llm.LLM {
     toolChoice?: llm.ToolChoice;
     extraKwargs?: Record<string, unknown>;
   }): HiveLLMStream {
-    return new HiveLLMStream(this, this.opts, {
-      chatCtx: chatOpts.chatCtx,
-      toolCtx: chatOpts.toolCtx,
-      connOptions: chatOpts.connOptions ?? DEFAULT_API_CONNECT_OPTIONS,
+    const traceContext = Object.freeze({
+      workerBootId: VOICE_PROCESS_ID,
+      callId: this.opts.callId,
+      turnId: randomUUID(),
     });
+    const attempt = this.opts.trace.bridgeCreated(traceContext);
+    try {
+      return bridgeTraceContext.run(
+        traceContext,
+        () =>
+          new HiveLLMStream(
+            this,
+            this.opts,
+            {
+              chatCtx: chatOpts.chatCtx,
+              toolCtx: chatOpts.toolCtx,
+              connOptions: chatOpts.connOptions ?? DEFAULT_API_CONNECT_OPTIONS,
+            },
+            traceContext,
+            attempt,
+          ),
+      );
+    } catch (error) {
+      attempt.fail("stream_construction_failed");
+      attempt.finish("failed", "unknown");
+      throw error;
+    }
   }
 }
 
 export class HiveLLMStream extends llm.LLMStream {
+  readonly traceContext: BridgeTraceContext;
+  private readonly attempt: BridgeAttempt;
+  private readonly onLifecycleAbort: () => void;
+  private runEntered = false;
+
   constructor(
     private readonly parent: HiveLLM,
     private readonly opts: HiveLLMOptions,
@@ -84,8 +114,16 @@ export class HiveLLMStream extends llm.LLMStream {
       toolCtx?: llm.ToolContextLike;
       connOptions: APIConnectOptions;
     },
+    traceContext: BridgeTraceContext,
+    attempt: BridgeAttempt,
   ) {
     super(parent, args);
+    this.traceContext = traceContext;
+    this.attempt = attempt;
+    this.onLifecycleAbort = () => {
+      if (!this.runEntered) this.attempt.finish("cancelled", "framework_cancelled");
+    };
+    this.abortController.signal.addEventListener("abort", this.onLifecycleAbort, { once: true });
   }
 
   private toBridgeMessages(interruptedSpokenText: string | null): BridgeMessage[] {
@@ -114,20 +152,23 @@ export class HiveLLMStream extends llm.LLMStream {
   }
 
   protected async run(): Promise<void> {
-    // Abort-before-first-token must not leak the previous turn's object into
-    // TurnMetrics (EOU can join cancelled TTS before this turn's finally).
-    this.parent.lastTurnTiming = null;
-    const controller = new AbortController();
-    // §7: framework cancels the stream (barge-in) → abort the HTTP request.
-    const onAbort = () => controller.abort();
-    this.abortController.signal.addEventListener("abort", onAbort);
-    if (this.abortController.signal.aborted) controller.abort();
+    this.runEntered = true;
+    if (this.abortController.signal.aborted) {
+      this.abortController.signal.removeEventListener("abort", this.onLifecycleAbort);
+      return;
+    }
 
-    const startedAt = Date.now();
-    let firstTokenAt = 0;
-    let lastChunkAt = 0;
-    let maxGapMs = 0;
+    const controller = new AbortController();
+    const onFetchAbort = () => controller.abort();
+    this.abortController.signal.addEventListener("abort", onFetchAbort, { once: true });
+    if (this.abortController.signal.aborted) onFetchAbort();
+
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let yielded = false;
+    let responseStatus: number | undefined;
+    let outcome: "completed" | "cancelled" | "failed" = "completed";
+    let cause: "framework_cancelled" | "unknown" = "unknown";
+    this.attempt.started();
     try {
       // Snapshot once so a second toBridgeMessages() in this run cannot
       // re-read a mutated flag; clear the parent field only after POST ok.
@@ -151,39 +192,46 @@ export class HiveLLMStream extends llm.LLMStream {
               context: this.opts.context,
             },
           },
+          metadata: {
+            voiceTrace: {
+              schemaVersion: 2,
+              workerBootId: this.traceContext.workerBootId,
+              turnId: this.traceContext.turnId,
+            } satisfies VoiceTraceMetadata,
+          },
         }),
       });
+      responseStatus = res.status;
+      this.attempt.response(res.status);
       if (!res.ok || !res.body) {
         const snippet = (await res.text().catch(() => "")).slice(0, 200);
-        throw new BridgeError(classifyHttpFailure(res.status, snippet), `bridge HTTP ${res.status}: ${snippet}`, false);
+        throw new BridgeError(
+          res.ok ? "engine_unreachable" : classifyHttpFailure(res.status, snippet),
+          this.traceContext.turnId,
+          false,
+        );
       }
       // Engine accepted the marked user message. Leave the flag cleared on a
       // later barge-in abort — do not restore. BridgeError (503/500) above
       // leaves the flag set so §8's generateReply() retry still prefixes.
       this.parent.interruptedSpokenText = null;
-      const reader = res.body.getReader();
+      reader = res.body.getReader();
       const decoder = new TextDecoder();
       const parser = new SSEParser();
-      const requestId = `hive-${randomUUID()}`;
+      const requestId = `hive-${this.traceContext.turnId}`;
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
         for (const ev of parser.push(decoder.decode(value, { stream: true }))) {
           if (ev.kind === "content") {
-            if (this.abortController.signal.aborted) return;
-            const now = Date.now();
-            if (!firstTokenAt) {
-              firstTokenAt = now;
-              // New object so TurnMetrics can tell this-turn TTFT from a
-              // leftover prior-turn lastTurnTiming snapshotted at EOU.
-              this.parent.lastTurnTiming = {
-                llmTtftMs: firstTokenAt - startedAt,
-                maxInterChunkGapMs: maxGapMs,
-              };
+            if (this.abortController.signal.aborted) {
+              outcome = "cancelled";
+              cause = "framework_cancelled";
+              return;
             }
-            if (lastChunkAt) maxGapMs = Math.max(maxGapMs, now - lastChunkAt);
-            lastChunkAt = now;
+            if (ev.text.length === 0) continue;
             yielded = true;
+            this.attempt.text(ev.text.length, performance.now());
             // Yield immediately — NEVER buffer (§5.4).
             this.queue.put({ id: requestId, delta: { role: "assistant", content: ev.text } });
           } else {
@@ -195,18 +243,44 @@ export class HiveLLMStream extends llm.LLMStream {
       // the session synthesizes nothing.
     } catch (err) {
       if (controller.signal.aborted || this.abortController.signal.aborted) {
-        log.info("Bridge request aborted (barge-in)", { callId: this.opts.callId });
+        outcome = "cancelled";
+        cause = "framework_cancelled";
+        log.info("Bridge request aborted", {
+          callId: this.opts.callId,
+          turnId: this.traceContext.turnId,
+          cause,
+        });
         return; // cancelled turn — not an error
       }
-      if (err instanceof BridgeError) throw err;
-      const failureClass: BridgeFailureClass = yielded ? "midstream_error" : "engine_unreachable";
-      throw new BridgeError(failureClass, String(err), yielded);
+      const failure =
+        err instanceof BridgeError
+          ? err
+          : new BridgeError(yielded ? "midstream_error" : "engine_unreachable", this.traceContext.turnId, yielded);
+      outcome = "failed";
+      this.attempt.fail(failure.failureClass);
+      log.warn("Bridge request failed", {
+        callId: this.opts.callId,
+        turnId: this.traceContext.turnId,
+        failureClass: failure.failureClass,
+        status: responseStatus,
+      });
+      throw failure;
     } finally {
-      this.abortController.signal.removeEventListener("abort", onAbort);
-      this.parent.lastTurnTiming = {
-        llmTtftMs: firstTokenAt ? firstTokenAt - startedAt : -1,
-        maxInterChunkGapMs: maxGapMs,
-      };
+      this.abortController.signal.removeEventListener("abort", onFetchAbort);
+      this.abortController.signal.removeEventListener("abort", this.onLifecycleAbort);
+      if (reader) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The original bridge outcome remains authoritative.
+        }
+        try {
+          reader.releaseLock();
+        } catch {
+          // A failed release is cleanup-only and does not replace the request outcome.
+        }
+      }
+      this.attempt.finish(outcome, cause);
       // Do not queue.close() — 1.6.4 LLMStream already closes in startSoon's finally.
     }
   }

@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import {
   Agent,
   AgentSession,
@@ -12,6 +14,15 @@ import {
   type ModelSettings,
 } from "@livekit/agents";
 import { afterAll, describe, expect, it } from "vitest";
+import { formatSSEDone, formatSSETextChunk } from "../channels/voice/openai-translator.js";
+import {
+  VOICE_PROCESS_ID,
+  type VoiceDiagnosticEvent,
+  type VoiceTraceWriteCounts,
+  type VoiceTraceWriter,
+} from "../voice/voice-trace.js";
+import { HiveLLM } from "./hive-llm.js";
+import { SpeechTrace } from "./speech-trace.js";
 import {
   CaptureAudioOutput,
   ControlledLLM,
@@ -32,6 +43,29 @@ import {
 initializeLogger({ pretty: false, level: "silent" });
 
 const sessions = new Set<AgentSession>();
+
+const COMPLETE_WRITES: VoiceTraceWriteCounts = {
+  attempted: 0,
+  acknowledged: 0,
+  filtered: 0,
+  failed: 0,
+  overflow: 0,
+  pending: 0,
+  unacknowledged: 0,
+  sinkErrors: 0,
+  complete: true,
+};
+
+function traceHarness(callId: string) {
+  const rows: VoiceDiagnosticEvent[] = [];
+  const writer: VoiceTraceWriter = {
+    write: (event) => rows.push(event),
+    emit: (event) => rows.push(event),
+    snapshot: () => ({ ...COMPLETE_WRITES, attempted: rows.length, acknowledged: rows.length }),
+    settleWrites: async () => ({ ...COMPLETE_WRITES, attempted: rows.length, acknowledged: rows.length }),
+  };
+  return { rows, trace: new SpeechTrace({ callId, workerBootId: VOICE_PROCESS_ID, writer }) };
+}
 
 async function startSession(session: AgentSession, agent: Agent): Promise<void> {
   sessions.add(session);
@@ -317,6 +351,57 @@ describe("public TTS observer seams", () => {
 });
 
 describe("public speech and LLM lifecycle seams", () => {
+  it("binds a real HiveLLM bridge turn to the exact handle from the genuine SDK metric", async () => {
+    const server = createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end(
+        formatSSETextChunk("chatcmpl-capability", "bound", "hive") + formatSSEDone("chatcmpl-capability", "hive"),
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+    const callId = "call-capability-bridge";
+    const { rows, trace } = traceHarness(callId);
+    const model = new HiveLLM({
+      bridgeUrl: `http://127.0.0.1:${port}/v1/chat/completions`,
+      bridgeToken: "capability-token",
+      hiveAgentId: "capability-agent",
+      callId,
+      goal: "offline capability",
+      context: "test-only",
+      trace,
+    });
+    const session = new AgentSession({ llm: model, vad: null, turnHandling: { turnDetection: null } });
+    session.output.setAudioEnabled(false);
+    session.on(AgentSessionEventTypes.MetricsCollected, (event) => trace.metrics(event));
+    await startSession(session, new Agent({ instructions: "offline capability fixture" }));
+    try {
+      const handle = session.generateReply({ userInput: "bind this exact bridge" });
+      await handle.waitForPlayout();
+      await until(
+        () => rows.some((row) => row.event === "bridge_bound" && row.speechId === handle.id),
+        "HiveLLM bridge binding",
+      );
+
+      const created = rows.find((row) => row.event === "bridge_created")!;
+      expect(created.turnId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(rows.filter((row) => row.event === "bridge_bound")).toEqual([
+        expect.objectContaining({ turnId: created.turnId, speechId: handle.id, source: "sdk_metrics_context" }),
+      ]);
+      expect(rows.filter((row) => row.event === "bridge_terminal")).toEqual([
+        expect.objectContaining({ turnId: created.turnId, outcome: "completed", textLength: 5 }),
+      ]);
+      expect(rows.filter((row) => row.event === "sdk_metric" && row.turnId === created.turnId)).toEqual([
+        expect.objectContaining({ speechId: handle.id, metric: "llm", source: "sdk_metrics_context" }),
+      ]);
+    } finally {
+      await closeSession(session);
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("exposes handle-owned settlement and item evidence without awaiting the thenable directly", async () => {
     const llm = new ControlledLLM();
     llm.plans.push({ turnId: "public-handle", text: "handled" });

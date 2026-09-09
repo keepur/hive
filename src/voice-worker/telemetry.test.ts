@@ -294,8 +294,7 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
   });
 
   it("emits one JSONL line on matching TTS after production-order EOU/LLM — callId only, no to / number / text / speechId", () => {
-    const hiveLLM = { lastTurnTiming: null };
-    const metrics = new TurnMetrics("call-abc", CELL, hiveLLM, "outbound");
+    const metrics = new TurnMetrics("call-abc", CELL, "outbound");
     const session = makeFakeSession();
     metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
 
@@ -325,8 +324,7 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
   });
 
   it("joins EOU to this-turn TTS on speechId — previous-turn TTS does not complete the next EOU", () => {
-    const hiveLLM = { lastTurnTiming: { llmTtftMs: 10, maxInterChunkGapMs: 0 } };
-    const metrics = new TurnMetrics("call-x", CELL, hiveLLM);
+    const metrics = new TurnMetrics("call-x", CELL);
     const session = makeFakeSession();
     metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
 
@@ -348,35 +346,13 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
     assertNoPii(lineB);
   });
 
-  it("uses this-turn lastTurnTiming published after EOU (first-token object)", () => {
-    const hiveLLM: { lastTurnTiming: { llmTtftMs: number; maxInterChunkGapMs: number } | null } = {
-      lastTurnTiming: null,
-    };
-    const metrics = new TurnMetrics("call-bridge", CELL, hiveLLM);
+  it("leaves LLM timing unknown when no matching genuine metric exists", () => {
+    const metrics = new TurnMetrics("call-bridge", CELL);
     const session = makeFakeSession();
     metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
 
     session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110, "s1"));
-    hiveLLM.lastTurnTiming = { llmTtftMs: 200, maxInterChunkGapMs: 15 };
     session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
-
-    const logged = mockLog.info.mock.calls[0]![1] as Record<string, unknown>;
-    expect(logged.llmTtftMs).toBe(200);
-    expect(logged.maxInterChunkGapMs).toBe(15);
-    expect(logged.ttsTtfbMs).toBe(80);
-    expect(logged.totalToFirstAudioMs).toBe(110 + 200 + 80);
-    expect(logged).not.toHaveProperty("speechId");
-    assertNoPii(logged);
-  });
-
-  it("does not join leftover lastTurnTiming from before EOU (stale prior turn)", () => {
-    const hiveLLM = { lastTurnTiming: { llmTtftMs: 200, maxInterChunkGapMs: 15 } };
-    const metrics = new TurnMetrics("call-stale", CELL, hiveLLM);
-    const session = makeFakeSession();
-    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
-
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(90, "s2"));
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s2"));
 
     const logged = mockLog.info.mock.calls[0]![1] as Record<string, unknown>;
     expect(logged.llmTtftMs).toBe(-1);
@@ -387,9 +363,8 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
     assertNoPii(logged);
   });
 
-  it("prefers matching llm_metrics ttft over leftover lastTurnTiming", () => {
-    const hiveLLM = { lastTurnTiming: { llmTtftMs: 200, maxInterChunkGapMs: 15 } };
-    const metrics = new TurnMetrics("call-map", CELL, hiveLLM);
+  it("uses matching llm_metrics timing", () => {
+    const metrics = new TurnMetrics("call-map", CELL);
     const session = makeFakeSession();
     metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
 
@@ -406,8 +381,7 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
   });
 
   it("does not emit on EOU alone — incomplete turns are dropped", () => {
-    const hiveLLM = { lastTurnTiming: { llmTtftMs: 200, maxInterChunkGapMs: 15 } };
-    const metrics = new TurnMetrics("call-xyz", CELL, hiveLLM, "inbound");
+    const metrics = new TurnMetrics("call-xyz", CELL, "inbound");
     const session = makeFakeSession();
     metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
 
@@ -416,7 +390,7 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
   });
 
   it("does not emit a turn line on tts/llm metrics alone", () => {
-    const metrics = new TurnMetrics("call-none", CELL, { lastTurnTiming: null });
+    const metrics = new TurnMetrics("call-none", CELL);
     const session = makeFakeSession();
     metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
     session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(9, "s1"));
@@ -425,8 +399,7 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
   });
 
   it("maps interruption_metrics and agent_false_interruption onto the next TTS-joined line", () => {
-    const hiveLLM = { lastTurnTiming: { llmTtftMs: 1, maxInterChunkGapMs: 0 } };
-    const metrics = new TurnMetrics("call-int", CELL, hiveLLM);
+    const metrics = new TurnMetrics("call-int", CELL);
     const session = makeFakeSession();
     metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
 
@@ -454,16 +427,13 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
 
   it("invokes onTurn with the emitted line when matching TTS arrives", () => {
     const onTurn = vi.fn();
-    const hiveLLM: { lastTurnTiming: { llmTtftMs: number; maxInterChunkGapMs: number } | null } = {
-      lastTurnTiming: null,
-    };
-    const metrics = new TurnMetrics("call-abc", CELL, hiveLLM, "outbound", onTurn);
+    const metrics = new TurnMetrics("call-abc", CELL, "outbound", onTurn);
     const session = makeFakeSession();
     metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
 
     session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110, "s1"));
     expect(onTurn).not.toHaveBeenCalled();
-    hiveLLM.lastTurnTiming = { llmTtftMs: 200, maxInterChunkGapMs: 15 };
+    session.emit(voice.AgentSessionEventTypes.MetricsCollected, llmEvent(200, "s1"));
     session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
 
     expect(onTurn).toHaveBeenCalledTimes(1);
@@ -474,6 +444,7 @@ describe("TurnMetrics (KPR-322 Task 8)", () => {
     expect(line.cell).toEqual(CELL);
     expect(line.eouDelayMs).toBe(110);
     expect(line.llmTtftMs).toBe(200);
+    expect(line.maxInterChunkGapMs).toBe(-1);
     expect(line.ttsTtfbMs).toBe(80);
     expect(line.totalToFirstAudioMs).toBe(110 + 200 + 80);
     expect(line).not.toHaveProperty("speechId");

@@ -48,7 +48,9 @@ import type { VendorCell } from "./cells.js";
 import type { DispatchMetadata } from "./dispatch-meta.js";
 import { FAILURE_BEHAVIOR, FALLBACK_LINES, resolveFailureAction } from "./error-map.js";
 import { BridgeError, HiveLLM } from "./hive-llm.js";
+import { SpeechTrace } from "./speech-trace.js";
 import { CallStats, TurnMetrics, type VoiceWorkerHeartbeat } from "./telemetry.js";
+import { VOICE_PROCESS_ID } from "../voice/voice-trace.js";
 import { normalizeForTTS } from "./tts-normalize.js";
 import type { WorkerConfig } from "./worker-config.js";
 
@@ -157,6 +159,7 @@ export async function runCallSession(
     ({ agentId: hiveAgentId, goal, context } = resolved);
   }
 
+  const speechTrace = new SpeechTrace({ callId, workerBootId: VOICE_PROCESS_ID });
   const hiveLLM = new HiveLLM({
     bridgeUrl: wc.bridgeUrl,
     bridgeToken: wc.bridgeToken,
@@ -164,6 +167,7 @@ export async function runCallSession(
     callId,
     goal,
     context,
+    trace: speechTrace,
   });
 
   const vad = await silero.VAD.load();
@@ -182,7 +186,7 @@ export async function runCallSession(
     cell,
     direction: outbound ? "outbound" : "inbound",
   });
-  const metrics = new TurnMetrics(callId, cell, hiveLLM, outbound ? "outbound" : "inbound", (line) => {
+  const metrics = new TurnMetrics(callId, cell, outbound ? "outbound" : "inbound", (line) => {
     if (line.totalToFirstAudioMs >= 0) stats.recordTurnLatency(line.totalToFirstAudioMs);
   });
   metrics.attach(session);
