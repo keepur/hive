@@ -11,7 +11,9 @@ This is chunk 5 of the [parent plan](./kpr-463-plan.md), completing the affected
 | `src/deployment/pilot-probe.ts`, `.test.ts` | secret-free wire decoder/projection/inventory normalization; shared by installed probes |
 | `src/deployment/runtime-probe.ts`, `.test.ts` | production `pilot-abi` and `pilot-abi-v1` process entrypoints; historical loader executes its own reads |
 | `src/deployment/health.ts`, `.test.ts` | distinct correlated closed-and-same-owner validator; existing open-health behavior stays binding |
+| `src/voice-worker/maintenance-ipc.ts`, `.integration.test.ts` | export existing strict reply decoder for historical-wire reuse; no protocol or gate semantics change |
 | `src/deployment/operation.ts`, `bootstrap.ts`, `reconcile.ts`, `main.ts`, their tests | discriminated durable work state, preparation/process/registration fences, mode-specific recovery |
+| `src/deployment/artifact.ts`, `lifecycle.ts`, `artifact.test.ts`, `lifecycle.integration.test.ts` | route every package-writing subprocess through mode-checked owned jobs, including fetch/extraction/install and reapply |
 | `src/deployment/adoption.integration.test.ts`, `lifecycle.integration.test.ts` | actual separately built historical ABI, first capture, freshness and process-death cases |
 
 Read-only comparison at `bc0d47aaa5ae9c39366e185715cbde407837ce2f`: `ServiceController.inspect` rejects external LaunchAgent targets unless already captured; `runtime-probe.ts` exports `runRuntimeProbe`, not `loadWorkerConfig`; its old `config` output lacks routing and credential-bearing connection data; `freshAdmissionStatus` requires open admission/null owner; `reconcileInterruptedOperation` assumes lifecycle work. These are interfaces to extend in the implementation child, not capabilities supplied by an imagined historical version. The frozen helper remains builtin-only; `pilot-probe.ts` must have only builtin runtime imports, with SDK/Mongo/loader imports lazy inside installed `runtime-probe.ts`.
@@ -94,6 +96,25 @@ Invoke `execFile(capturedNode, [historicalProbePath, "pilot-abi"])` with the exa
 For a successful handshake, the registered bootstrap probe launches `execFile(capturedNode, [historicalProbePath, "pilot-abi-v1", inputPath])`. It supplies a private canonical request, not config/credentials. The historical subprocess reads/seals that exact request, validates its selected service environment and expected own release/loader path/hash, and imports **its own bundled** `loadWorkerConfig` and config lazily. It must not import candidate config or export its loader/credentials to the bootstrap. The bootstrap accepts only the exact response ABI and subject; the frozen caller independently checks the same envelope and OS ownership. Deadline expiry kills only this operation-owned probe child and fails without returning partial results.
 
 ```typescript
+import type { BootIdentity } from "./release.js";
+import type { MaintenanceReply } from "../voice-worker/maintenance-ipc.js";
+
+export type HistoricalIdleRequest = {
+  expectedAdmission: "open" | "closed";
+  expectedSupervisor: BootIdentity; // current verified generation, not the snapshot's old boot after recovery
+  statusRequestId: string; // fresh UUID distinct from the outer observe requestId
+};
+export type HistoricalTelemetry = {
+  queryStartedAt: number;
+  queryFinishedAt: number;
+  supervisorIdentity: BootIdentity;
+  supervisorUpdatedAt: number; // epoch milliseconds; raw Mongo Date never leaves the loader process
+  activeCalls: number; // safe nonnegative integer, including measured nonzero values
+};
+export type HistoricalIdle = {
+  status: { requestedAt: number; finishedAt: number; reply: MaintenanceReply };
+  telemetry: HistoricalTelemetry;
+};
 export type HistoricalProbeRequest = {
   schemaVersion: 1;
   abi: "hive-pilot-probe/1";
@@ -108,6 +129,7 @@ export type HistoricalProbeRequest = {
   expectedProbe: FileSeal;
   sdkPort: number; // captured and independently OS-corroborated, not a candidate default
   dependencyFiles: FileSeal[]; // exact required set within verified historical closure
+  idle: HistoricalIdleRequest | null; // observe only; inventory requires null
 };
 export type HistoricalObservation = {
   schemaVersion: 1;
@@ -124,6 +146,7 @@ export type HistoricalObservation = {
   configIdentity: Digest;
   bridge: PilotProbeResult["bridge"];
   sdk: PilotProbeResult["sdk"];
+  idle: HistoricalIdle | null;
   dependencyFiles: PilotProbeResult["dependencyFiles"];
 };
 export type InventoryItem = {
@@ -133,7 +156,7 @@ export type InventoryItem = {
   agentName: string | null;
 };
 export type HistoricalInventory = Omit<HistoricalObservation,
-  "action" | "bridge" | "sdk" | "dependencyFiles"> & {
+  "action" | "bridge" | "sdk" | "idle" | "dependencyFiles"> & {
   action: "inventory";
   items: InventoryItem[];
   counts: { rooms: number; participants: number; dispatches: number; rules: number; inboundTrunks: number };
@@ -141,7 +164,7 @@ export type HistoricalInventory = Omit<HistoricalObservation,
 };
 ```
 
-Failure for either historical mode is exactly `{schemaVersion:1, abi:"hive-pilot-probe/1", requestId, classification}` and exit 1; classification is one of `PILOT_PROBE_ABI_UNSUPPORTED`, `PILOT_PROBE_INPUT_INVALID`, `PILOT_LOADER_UNAVAILABLE`, `PILOT_CONFIGURATION_MISMATCH`, `PILOT_BRIDGE_FAILED`, `PILOT_DEPENDENCY_MISMATCH`, `PILOT_INVENTORY_INCOMPLETE`, `PILOT_PROBE_DEADLINE`. Input parse failures use the all-zero UUID if the request UUID cannot be safely decoded. Suppress stdout/stderr from config imports as the existing main does; emit only canonical sanitized output. Reject unknown fields, mismatched header/subject/release, oversized output, extra lines and nonzero exit even with a plausible response.
+Failure for either historical mode is exactly `{schemaVersion:1, abi:"hive-pilot-probe/1", requestId, classification}` and exit 1; classification is one of `PILOT_PROBE_ABI_UNSUPPORTED`, `PILOT_PROBE_INPUT_INVALID`, `PILOT_LOADER_UNAVAILABLE`, `PILOT_CONFIGURATION_MISMATCH`, `PILOT_BRIDGE_FAILED`, `PILOT_DEPENDENCY_MISMATCH`, `PILOT_INVENTORY_INCOMPLETE`, `PILOT_PROBE_DEADLINE`, `PILOT_ADMISSION_MISMATCH`, `PILOT_TELEMETRY_MISSING`, `PILOT_TELEMETRY_INVALID`, `PILOT_TELEMETRY_STALE`, `PILOT_TELEMETRY_WRONG_BOOT`, `PILOT_TELEMETRY_QUERY_FAILED`. Input parse failures use the all-zero UUID if the request UUID cannot be safely decoded. Suppress stdout/stderr from config imports as the existing main does; emit only canonical sanitized output. Reject unknown fields, mismatched header/subject/release, oversized output, extra lines and nonzero exit even with a plausible response.
 
 - [ ] **Step 2:** Implement a versioned pure projection shared by legacy and historical adapters. It consumes the **captured loader's** return shape, not sanitized old `configMode` output. All required keys are strictly validated; no missing field is defaulted from the candidate. Capture listener provides the legacy health port if that old loader lacks `healthPort`; the historical ABI requires its own `healthPort` and exact port equality. Require `instanceHome` canonical equality, exact instance ID and explicit selected `HIVE_CONFIG`; require bridge URL to be loopback HTTP, correct captured port/path and without userinfo/query/fragment. Config-files seals already retain voice flags and selectors. The configuration identity projection is exactly:
 
@@ -171,9 +194,80 @@ export function pilotConfigProjection(
 
 `sha256(canonical(projection))` is returned, never the routing maps themselves. Exclude credentials, Mongo URI and LiveKit URL. Hashing config/dotenv source files is separate and never copies their contents to evidence. No candidate projection of the candidate's own loaded config can authenticate this result.
 
-Observation execution inside the historical process: check seals/environment/request -> record `startedAt` before any decisive reads -> lazy own loader -> compute projection -> `probeBridge(wc.bridgeUrl,wc.bridgeToken)` -> `probeWorkerHttp(request.sdkPort)` -> resolve/hash required dependency files relative to the historical entrypoint and compare exact request set -> finish before deadline. Perform slow complete tree checks in the frozen caller before this window. Resolve external SDK via `createRequire(historicalEntry).resolve`, and native/model paths via the installed package walkers from the runtime diagnostic. Paths outside expected sealed roots or OS-unconfirmed required loaded files fail. Return bridge fields only if existing `authenticated/missingDenied/wrongDenied` all pass; map `correctClassification` to `missing-agent` only then. Return the actual SDK status/name/count (non-null, correctly typed), never constants substituted for observations.
+Observation execution inside the historical process: check seals/environment/request -> record `startedAt` before any decisive reads -> lazy own loader -> compute projection -> `probeBridge(wc.bridgeUrl,wc.bridgeToken)` -> `probeWorkerHttp(request.sdkPort)` and, when `request.idle !== null`, the owner-correlated status/Mongo read in Step 2a -> resolve/hash required dependency files relative to the historical entrypoint and compare exact request set -> finish before deadline. Perform slow complete tree checks in the frozen caller before this window. Resolve external SDK via `createRequire(historicalEntry).resolve`, and native/model paths via the installed package walkers from the runtime diagnostic. Paths outside expected sealed roots or OS-unconfirmed required loaded files fail. Return bridge fields only if existing `authenticated/missingDenied/wrongDenied` all pass; map `correctClassification` to `missing-agent` only then. Return the actual SDK status/name/count (non-null, correctly typed), never constants substituted for observations.
 
-Mapping to `PilotProbeResult` is mechanical: validate ABI/projection/release/operation first, copy `requestId, subject, instance, startedAt, finishedAt, configIdentity, bridge, sdk, dependencyFiles`, set `classification="PILOT_OBSERVED"`; include no credential fields. The outer caller validates the result against its request and independent evidence. This wrapper mapping cannot manufacture missing historical fields.
+Mapping to `PilotProbeResult` is mechanical: validate ABI/projection/release/operation first, copy `requestId, subject, instance, startedAt, finishedAt, configIdentity, bridge, sdk, idle, dependencyFiles`, set `classification="PILOT_OBSERVED"`; include no credential fields. The outer caller validates the result against its request and independent evidence. This wrapper mapping cannot manufacture missing historical fields.
+
+- [ ] **Step 2a:** Implement the native idle read in `runtime-probe.ts` inside that **same historical loader process**. No `worker`-mode subprocess or candidate Mongo config participates. The frozen caller sets `idle` only after independently verifying native capability/current release/descriptor/process lineage; native capture/baseline uses `expectedAdmission="open"`, and all post-close/final reads use `"closed"` with the **owning operation ID**. Inventory requires `idle=null`; a legacy-module profile without native capability also returns `idle=null`. A native request returning null or an unsolicited non-null result fails decoding. Missing native telemetry cannot be downgraded to legacy availability. The internal outer pilot request gains this same exact `idle` field, sealed with its subject, operation and expected processes. Validate `expectedSupervisor` with `parseBootIdentity`, exact worker component/current captured release/PID/boot/startedAt and independent current process/start evidence. Reject reused status UUIDs and unknown keys. No CLI can supply telemetry or an admission expectation independently of the acquired operation.
+
+Status uses the existing shared client, with `randomId: () => request.idle.statusRequestId`, `operationId: request.operationId`, `kind:"status"`, `supervisor` set to the expected PID/boot, and `expectedAdmission` from this strict request. Its `corroborateSupervisor` reads the selected instance's current descriptor/boot identity and actual PID/start via the existing OS adapter before returning that PID/boot; it must not return the request's expected values without observing them. Capture `status.requestedAt` immediately before calling the client and `finishedAt` on return. Run it alongside the Mongo read and SDK HTTP reads within the **same** observation's absolute deadline; reject any failed branch, never return partial idle evidence. The status request cannot close or release the gate. Export the existing `parseReply` as `parseMaintenanceReply` from the shared maintenance module and reuse it in the frozen caller’s recursive wire decoder (do not duplicate protocol parsing). The frozen caller rechecks request/operation/boot correlation and OS correspondence, including `status.requestedAt <= reply.writtenAt <= status.finishedAt`; baseline uses `freshAdmissionStatus`, post-close/final use `freshClosedAdmissionStatus`. The old `workerMode` random-operation path remains unsuitable for this interface.
+
+Add the following complete Mongo read and normalization in `runtime-probe.ts`. `parseBootIdentity`, `canonical` and the types are the declared shared strict helpers; Mongo is imported lazily only here. The request has already passed the strict subject/environment/own-loader checks. The query filters **only kind**, not expected PID/boot, so wrong-boot rows and duplicate stats documents cannot be hidden by filtering. Select only these fields, never read raw call/phone/credential data into the response.
+
+```typescript
+export async function readHistoricalTelemetry(
+  wc: { mongoUri: string; mongoDbName: string },
+  request: HistoricalProbeRequest,
+): Promise<HistoricalTelemetry> {
+  if (request.action !== "observe" || request.idle === null)
+    throw new Error("PILOT_PROBE_INPUT_INVALID");
+  const queryStartedAt = Date.now();
+  const budget = request.deadline - queryStartedAt;
+  if (budget <= 0 || queryStartedAt < request.requestedAt)
+    throw new Error("PILOT_PROBE_DEADLINE");
+  const { MongoClient } = await import("mongodb");
+  const mongo = new MongoClient(wc.mongoUri, {
+    serverSelectionTimeoutMS: budget, connectTimeoutMS: budget,
+    socketTimeoutMS: budget, readPreference: "primary",
+  });
+  let rows: Record<string, unknown>[];
+  try {
+    await mongo.connect();
+    const remaining = request.deadline - Date.now();
+    if (remaining <= 0) throw new Error("PILOT_PROBE_DEADLINE");
+    rows = await mongo.db(wc.mongoDbName).collection("telemetry")
+      .find({ kind: "voice_worker_stats" }, {
+        projection: { _id: 0, kind: 1, supervisorIdentity: 1, supervisorUpdatedAt: 1, activeCalls: 1 },
+        maxTimeMS: remaining,
+      }).limit(2).toArray();
+  } catch {
+    throw new Error(Date.now() >= request.deadline
+      ? "PILOT_PROBE_DEADLINE" : "PILOT_TELEMETRY_QUERY_FAILED");
+  } finally {
+    await mongo.close().catch(() => {});
+  }
+  const queryFinishedAt = Date.now();
+  if (queryFinishedAt < queryStartedAt || queryFinishedAt > request.deadline)
+    throw new Error("PILOT_PROBE_DEADLINE");
+  if (rows.length === 0) throw new Error("PILOT_TELEMETRY_MISSING");
+  if (rows.length !== 1) throw new Error("PILOT_TELEMETRY_INVALID");
+  const row = rows[0];
+  if (row.kind !== "voice_worker_stats" || !Number.isSafeInteger(row.activeCalls) ||
+      (row.activeCalls as number) < 0) throw new Error("PILOT_TELEMETRY_INVALID");
+  let identity: BootIdentity;
+  try { identity = parseBootIdentity(row.supervisorIdentity); }
+  catch { throw new Error("PILOT_TELEMETRY_INVALID"); }
+  if (identity.component !== "voice-worker" ||
+      canonical(identity) !== canonical(request.idle.expectedSupervisor) ||
+      canonical(identity.release) !== canonical(request.expectedRelease))
+    throw new Error("PILOT_TELEMETRY_WRONG_BOOT");
+  const updatedAt = row.supervisorUpdatedAt instanceof Date ? row.supervisorUpdatedAt.getTime()
+    : typeof row.supervisorUpdatedAt === "string" ? Date.parse(row.supervisorUpdatedAt) : NaN;
+  const bootStartedAt = Date.parse(identity.startedAt);
+  if (!Number.isSafeInteger(updatedAt) || !Number.isFinite(bootStartedAt) || updatedAt < bootStartedAt)
+    throw new Error("PILOT_TELEMETRY_INVALID");
+  if (updatedAt > queryFinishedAt || queryFinishedAt - updatedAt > 60_000)
+    throw new Error("PILOT_TELEMETRY_STALE");
+  return { queryStartedAt, queryFinishedAt, supervisorIdentity: identity,
+    supervisorUpdatedAt: updatedAt, activeCalls: row.activeCalls as number };
+}
+```
+
+`BootIdentity.startedAt` is the existing ISO timestamp. Keep the existing 60,000 ms supervisor-heartbeat age bound; this native hold path accepts no future-heartbeat skew. Do not substitute job-owned `updatedAt` for `supervisorUpdatedAt`, infer freshness from a non-null document, coerce counts/booleans/strings, or use `classifyWorkerHeartbeatDocument`'s relaxed future-skew result as strict hold evidence. A valid nonzero count is returned unchanged; the adapter classifies `PILOT_TELEMETRY_ACTIVE` and cannot prove idle. The driver/parser bounds query/status timestamps within `request.requestedAt <= startedAt <= queryStartedAt <= queryFinishedAt <= finishedAt <= deadline <= requestedAt + 2000`, with the corresponding status interval, and checks every nested identity/count/date again. The request deadline is also capped by the original maintenance deadline. Connection/server-selection/query/cleanup delays cannot renew either deadline; the owned probe guardian enforces wall and local monotonic elapsed timeout for the entire descendant process, including hung driver cleanup, and never emits partial success. Neither a query error nor stale/missing/wrong-boot data can be mapped to zero.
+
+Populate baseline/post-close/final `NativeGateReadback` from this exact returned result: `operationId/requestId/requestedAt` come from the matching outer challenge; `worker/socketOwner` from independent current OS evidence; `bootId` from the validated telemetry identity agreeing with the current descriptor and status; `admission` from `idle.status.reply.snapshot.admission`, `closedOperationId` from its `operationId`, `unresolvedAccepted` from its strictly decoded `unresolved.length`, and `persistenceFault` from its `persistenceFault`; `sdkRootStatus/sdkAgentName/sdkActiveJobs` from the current SDK response; `telemetryActiveCalls` and `telemetryUpdatedAt` from `idle.telemetry`. Include all query/status/SDK/OS intervals in the original oldest-read/monotonic bounds below. Retain this complete sanitized readback privately, never a synthesized healthy profile. Map to quiesce's `IdleEvidence` only after these checks: registered requires root 200/exact agent name plus the phase-appropriate fresh admission status and heartbeat, socket ownership requires independent OS agreement, and both counts are the actual measured values. Baseline open/null-owner is health only and cannot construct a closed proof.
+
+Bind the historical `maintenanceQuiescenceIO.inspect` closure to the acquired operation and current generation. Start in open-baseline phase; after its close acknowledgement, set closed phase and use a new observe challenge/status UUID/query on **each** `inspect`, including final stop proof and reapply after rollback. Never reuse the pre-close query or let a new `status` call refresh it. If a baseline read fails or is nonzero, defer before close/signals. If any post-close/final read fails, terminal-release the same operation and defer without signals (or remain unresolved if release cannot be verified). A racing measured nonzero count may be polled only within the original 30-second quiescence budget; if still nonzero it must release/defer. The direct supplementary pre-stop IPC check does not replace this historical telemetry read. Activation/recovery health continues to require open/null-owner status separately.
 
 - [ ] **Step 3:** Implement inventory in that **same historical loader process**, retaining all credentials only in its local variables:
 
@@ -246,9 +340,9 @@ export function freshClosedAdmissionStatus(c: AdmissionReplyContext): boolean {
 }
 ```
 
-The hold adapter also requires an empty strict ledger, zero SDK active jobs and zero current telemetry calls. An open health status may never pass this validator and a closed-owner status may never pass activation health. `proveBarrierBeforeStop` remains a supplementary correlated IPC check; it cannot refresh the other observations.
+The hold adapter also requires an empty strict ledger, zero SDK active jobs and zero current telemetry calls from Step 4b.2a’s own-loader `idle` response, with fresh matching supervisor heartbeat at consumption. An open health status may never pass this validator and a closed-owner status may never pass activation health. `proveBarrierBeforeStop` remains a supplementary correlated IPC check; it cannot refresh the other observations.
 
-- [ ] **Step 2:** Assemble `NativeGateReadback.observedAt` as the minimum **request start** of IPC, SDK root/worker, current telemetry query and independent process/socket reads. `completedAt` is their maximum completion. Record equivalent monotonic starts/completions with `performance.now()` in the owning frozen process; subprocess wall timestamps must fit its measured interval, but cannot extend it. Retain the original wall and monotonic expiries in the private WeakMap; chunk 4’s core code includes both. Also track the last local wall/monotonic clock sample during collection, persistence and dispatch; either clock decreasing fails the attempt, even if still later than the oldest observation. No durable or subprocess output can reconstruct a proof.
+- [ ] **Step 2:** Assemble `NativeGateReadback.observedAt` as the minimum **request start** of IPC, SDK root/worker, current telemetry query and independent process/socket reads. `completedAt` is their maximum completion. Record equivalent monotonic starts/completions with `performance.now()` in the owning frozen process; subprocess wall timestamps must fit its measured interval, but cannot extend it. Retain the original wall and monotonic expiries in the private WeakMap; chunk 4’s core code includes both. The wall expiry is also bounded by `telemetryUpdatedAt + 60_000`, and the paired proof-time clock sample caps the monotonic expiry by that heartbeat’s remaining lifetime; heartbeat freshness cannot expire between proof construction and dispatch. Also track the last local wall/monotonic clock sample during collection, persistence and dispatch; either clock decreasing fails the attempt, even if still later than the oldest observation. No durable or subprocess output can reconstruct a proof.
 
 All tree/inventory work precedes this interval. At the final actual bootout `beforeExec` callback (after the existing controller's awaited inspection and `markIrreversible`), compare both clocks to their original expiry, consume once, then invoke OS `execFile` synchronously. If the OS adapter uses a queue, perform the check at dispatch out of that queue. Do not consume at entry to an async bootout method. An expiration before signal causes complete fresh observation or verified release/defer within the original maintenance deadline. An elapsed/future/clock-reversal error is fail-closed; persistence of `signalsBegun` is conservative crash metadata, not permission to ignore expiry. Extend `BootoutOptions` with synchronous `beforeExec():void`, called after `markIrreversible` and immediately before OS dispatch. Within the current live invocation, retain `signalIssued=false` until that dispatch; catch the specific expiry-before-dispatch result in `withVerifiedPilotStop`, before the generic transaction recovery catch. It runs the complete fresh-read retry or terminal-release/deferred cleanup path and returns a typed deferred outcome, never a successful stop. The durable signals fence stays conservative until that verified deferred outcome is recorded. On process death this in-memory distinction is lost and existing checked recovery remains required; never deserialize `signalIssued=false` to bypass it.
 
@@ -261,14 +355,19 @@ Required composed tests: observe at 1000, construct at 2999, attempt signal at 4
 Keep the existing common operation fields (`id`, canonical instance/config/UID, startedAt, tool path/hash, recorded Node/npm, original parent/frozen-child identities, phase, retainedPaths) and add the strict `jobs` array below, and move lifecycle-only prior/profile/artifact/barrier fields into `work.kind="lifecycle"`. Require `signalsBegun=false` for both non-lifecycle branches; they cannot stop/start services. Exact work fields:
 
 ```typescript
+export type ArtifactJobKind =
+  | "bootstrap-extract" | "bootstrap-install"
+  | "lifecycle-fetch" | "lifecycle-extract" | "lifecycle-install";
 export type TrackedJob = {
   id: string;
-  kind: "bootstrap-install" | "offline-diagnostic" | "pilot-probe";
+  kind: ArtifactJobKind | "offline-diagnostic" | "runtime-probe" | "pilot-probe";
   state: "launch-intended" | "ready" | "running" | "exited";
   input: FileSeal;
   readyReceipt: FileSeal | null;
   terminalReceipt: FileSeal | null;
   guardian: { pid: number; startTime: string; processGroup: number } | null;
+  launch: FileSeal; // fixed-mode resolved input, target identity, tools and sanitized environment
+  lineage: FileSeal | null; // immutable anchored process-generation census receipt
 };
 export type OwnedDirectory = { path: string; identity: { dev: number; ino: number; uid: number } };
 export type CreationFence = {
@@ -305,6 +404,7 @@ export type BootstrapWork = {
   creations: CreationFence[];
   copiedArchive: FileSeal | null;
   packageTree: TreeSeal | null;
+  extractionJobId: string | null;
   install: {
     state: "not-started" | "launch-intended" | "ready" | "running" | "exited";
     jobId: string | null;
@@ -344,30 +444,80 @@ Every nullable value is present and initially null; decode exact fields and lega
 
 - [ ] **Step 2:** Apply creation and commit fences to bootstrap, capture and registry writes. Before exclusive `mkdir`, persist intended path, same-parent identity and observed absence. Fsync parent after creation, then persist observed directory identity. If killed after mkdir but before identity persistence, it is ambiguous: retain the object and lock as `DIRECTORY_CREATION_UNRESOLVED`; do not infer ownership from its UUID/name. A crash before mkdir with absent path can abort cleanly. Observed own directories can be disposed by identity only, rejecting changed/symlinked/foreign targets. Journal disposal with `CreationFence.state="remove-intended"` and its already observed identity before removal, then `removed` only after verified absence/parent fsync. Reuse existing `disposeOwnedDirectory` identity and no-follow algorithm through a work-specific persistence callback; do not overwrite a lifecycle artifact fence. Interrupted remove-intended may finish only against that same identity or verified absence.
 
-Bootstrap path order: journal/create digest root -> journal/copy/fsync archive -> journal/create package extraction directory -> verify archive/extract strict members -> persist extracting complete -> install fence -> diagnostic/release/tree verification -> `RegistrationFence`. Persist phase before and after each effect; capture frozen helper before any possible disposal of its source. Never overwrite an existing digest directory. A selected complete prior bootstrap requires its registered archive/release/tree seals and fresh offline diagnostic; an incomplete existing directory routes to its recorded operation or stays unresolved.
+Bootstrap path order: journal/create digest root -> journal/copy/fsync archive -> journal/create package extraction directory -> `bootstrap-extract` launch/ready/go fence -> verify archive/extract strict members -> persist extraction terminal/complete -> `bootstrap-install` fence -> diagnostic/release/tree verification -> `RegistrationFence`. Persist phase before and after each effect; capture frozen helper before any possible disposal of its source. Never overwrite an existing digest directory. A selected complete prior bootstrap requires its registered archive/release/tree seals and fresh offline diagnostic; an incomplete existing directory routes to its recorded operation or stays unresolved.
 
 Registration order: persist `reserved` plus UUID/directory creation fence; create payload/files exclusively; validate/seal immutable payload and operation validation; persist `payload-written`; persist `commit-intended` with exact expected canonical `Registration` fields and payload digest; write `registration.json` exclusively and fsync its directory; seal it; persist `committed` plus ref; persist mode result before printing. Add expected registration bytes/digest to the intent's sealed validation file so a crash before recording the commit seal can compare actual bytes to already durable intended bytes. No manifest points at an incomplete payload. Payload/registration mismatch never resolves by rewriting. All registered selectors still require commit and strict associations.
 
 `reconcileRegistration` returns exactly one of: `absent` (no directory, intended only), `incomplete` (owned directory without commit; retain diagnostic evidence and mark aborted), `committed` (strict commit/payload/files match durable intent; seal existing commit and attach ref idempotently), `unresolved` (unexpected identities/contents/ambiguous creation). It never creates a missing commit during crash recovery. A commit-intended write present with valid bytes but unknown fsync outcome is revalidated and fsynced before recording committed; absent commit is incomplete. A valid committed capture remains a historical baseline; no fresh health is claimed during offline registration completion.
 
-- [ ] **Step 3:** Track bootstrap install descendants across parent death. Add internal frozen-helper `--operation-job=<operation-path>/jobs/<job-uuid>/input.json` entry, legal only for a job in the recorded operation’s strict `jobs` array, no user lifecycle flags. Its exact-key input is `{schemaVersion:1, operationId, jobId, kind, selectedInput:<FileSeal|null>}`; paths/Node/npm/probe and arguments come only from the associated work/registered snapshot, not an argv field. Kind restricts the handler to install, offline diagnostic or pilot probe. The install handler requires bootstrap work; registry jobs can only be pilot probes. Lifecycle offline/probe jobs reuse this mechanism with their existing validated stage paths. It runs builtin code until parent handoff. The parent first records a unique job UUID and launch-intended fence; it spawns the same hash-verified frozen helper in a new process group as a guardian. Guardian writes an exclusive, fsynced ready receipt with job UUID, own PID/start/group, original tool hash and operation ID, then waits for its exact private `go` message. If the parent dies before ready, a reconciler checks the fixed job receipt and exact job-path process census; a live unready guardian is busy, ambiguous identity is unresolved, and no go means no subprocess effects. Parent reads/OS-corroborates ready, persists guardian identity and running intent, and only then sends go. No npm executes before that durable identity exists. A ready guardian seeing the recorded parent exit without go records aborted and exits without install. Conflicting/missing job records remain unresolved.
+- [ ] **Step 3:** Track **every artifact-writing subprocess**, including extraction, fetch and lifecycle/reapply installation, through the owned-job fence. Add internal frozen-helper `--operation-job=<operation-path>/jobs/<job-uuid>/input.json` entry, legal only for a job in the recorded operation's strict `jobs` array, no user lifecycle flags. Its exact-key input is `{schemaVersion:1, operationId, jobId, kind, selectedInput:<FileSeal|null>}`. It matches `TrackedJob.kind/input/launch` and the narrowed work's active phase; no command/argv/path override is accepted. Decode the sealed launch record below and compare it to the derived active work before execution. The guardian is the same hash-verified builtin-only frozen helper; it never needs the candidate's dependencies to enforce liveness.
 
-Guardian invokes the recorded Node with `[recordedNpmCli,"ci","--omit=dev","--no-audit","--no-fund","--no-progress"]` in the recorded package path/sanitized environment; its own PID remains alive and reaps npm and known descendants. Guardian returns only sanitized exit/marker evidence in a sealed terminal receipt, remains a liveness participant until its process group/known descendants have exited, then exits. Reconciler rechecks both invoking parent and frozen child **and** install guardian/group. Any live one returns busy without cleanup; unknown descendant/group identity is unresolved. Do not terminate an installer as a reconciliation shortcut. If the guardian is killed and npm survives, identify the retained process group via OS PGID/PID/start census and stay busy; if ownership cannot be proved, retain unresolved. A future invocation can clean an interrupted tree only after verified process absence. Protect against PID/PGID reuse by ready and process-generation lineage; group number alone is not proof.
+```typescript
+export type ArtifactJobLaunch = {
+  schemaVersion: 1;
+  operationId: string;
+  jobId: string;
+  kind: ArtifactJobKind;
+  target: OwnedDirectory;
+  archive: FileSeal | null;
+  selector: string | null;
+  requireClean: boolean;
+  node: FileSeal;
+  npmCli: FileSeal;
+  tar: FileSeal;
+  environment: { HOME: string; PATH: string; TMPDIR: string; npm_config_cache: string };
+};
+export type JobProcess = {
+  pid: number; startTime: string; uid: number; parentPid: number;
+  processGroup: number; executable: string;
+};
+export type JobLineage = {
+  schemaVersion: 1; operationId: string; jobId: string;
+  guardian: JobProcess;
+  sequence: number;
+  previous: FileSeal | null;
+  observedAt: number;
+  members: JobProcess[]; // live observed descendants, retaining identity after reparenting
+  exited: { pid: number; startTime: string }[]; // previously observed generations now independently absent
+  accounting: "tracking" | "settled" | "unresolved";
+};
+```
 
-Crash recovery never resumes a partially executed npm install in place. With no committed registration and all owned processes gone, abort bootstrap and delete only observed owned package/archive/digest directories (or retain incomplete registry diagnostics), using disposal fences. A later fresh invocation reruns extraction and `npm ci` from the retained reviewed input; `node_modules` presence never means installed. With a committed registration, revalidate release/tree/archive/helper seals and rerun the offline native diagnostic with tracked operation-owned child liveness before recording validated. Failure remains unresolved with paths preserved; it cannot demote a published immutable registration by overwriting it.
+All artifact launch keys are mandatory, nullable values only where declared. Capture absolute recorded Node/npm CLI and `/usr/bin/tar` seals before launching; never resolve a different PATH command on recovery. Environment has only the declared host selectors and operation-owned temp/cache paths; no operator config/keys, NODE_OPTIONS or NODE_PATH. Journal temp/cache/downloads directories before use, include them in the job's write targets and retain them while any writer is live/unknown. `selector` is only the existing normalized package tag/version (null except fetch); `archive` is the already reviewed/resolved retained archive (null only for fetch); `requireClean` is derived from the active mode and cannot be supplied by a job selector. Diagnostic/probe jobs retain their fixed separately sealed inputs/environment; they do not decode this artifact-only launch schema. Guardian alone writes immutable, exclusive, fsynced `jobs/<jobId>/lineage/<zero-padded-sequence>.json` receipts, starting sequence 0/previous null after ready and before go, then incrementing by one with the preceding file seal. Parent anchors the first receipt in `TrackedJob.lineage` before go. Reconciler reads only this fixed owned directory, verifies the contiguous seal chain/operation/job/guardian identity and rejects gaps, replacement or forks; it can validate later receipts even when the parent died before recording their seals. Cap the chain at 100,000 receipts; exhaustion is unresolved, never truncated. A settled terminal receipt references its exact final chain entry; live and exited sets must account for every prior observed generation without reassignment on PID reuse.
 
-The same child launch/ready/identity discipline applies to offline diagnostic and installed probe subprocesses: command kind/argv are fixed by their adapter, owned identity is persisted before allowing execution, and a live/unknown child prevents registry/bootstrap cleanup. This does not add a general command executor. No service/config/vendor adapter is constructed for bootstrap reconciliation, including when HOME has no running services.
+| Job kind | Only legal work/mode/phase and target | Exact handler after go |
+| --- | --- | --- |
+| `bootstrap-extract` | bootstrap `extracting`, observed empty `package` directory under this digest root; `extractionJobId` matches | verify archive seal; `/usr/bin/tar -tzf` and `-tvzf`, strict existing member validation, then `/usr/bin/tar -xzf <archive> --strip-components=1 -C <target>`; recheck directory/archive and `readRelease(target,true)` |
+| `bootstrap-install` | bootstrap `installing`, same extracted target, successful extraction job/verified release; `install.jobId` matches | recorded Node `[recordedNpmCli,"ci","--omit=dev","--no-audit","--no-fund","--no-progress"]` at target cwd |
+| `lifecycle-fetch` | lifecycle `update`/`check`, staging with registry selector and absent owned downloads contents | recorded Node `[recordedNpmCli,"pack","@keepur/hive@" + selector,"--json","--pack-destination",target.path]`, target cwd; existing one-file JSON/containment/archive validation; no BUILD_DIR fallback |
+| `lifecycle-extract` | lifecycle `update`/`check`, staging, observed owned empty `.hive.next`; includes pilot migration and reapply, which remain update operations | same fixed tar list/validate/extract sequence; `readRelease` uses the mode-derived clean-provenance requirement |
+| `lifecycle-install` | lifecycle `update`/`check`, staging, same `.hive.next`, successful extraction/verified release | same fixed Node/npm `ci` invocation, stage cwd; works identically for ordinary update, first migration and reapply |
+| `offline-diagnostic` | bootstrap `validating`/committed offline revalidation or lifecycle validated selected stage/prior/current root | recorded Node `[derivedDiagnostic,"offline"]`, fixed offline environment |
+| `runtime-probe` | lifecycle preflight/health with its recorded selected stage/prior/current release | recorded Node and derived runtime probe; one fixed `config`, `bridge`, `worker` or `outbound` mode selected by the existing adapter; no user command arguments |
+| `pilot-probe` | registry capture/inventory/prepare/verify/release or lifecycle verified pilot profile/hold phase | recorded bootstrap probe and sealed subject request; historical probe/legacy loader children stay in this same tracked job and retain the same operation owner |
 
-- [ ] **Step 4:** Dispatch reconciliation by work kind **before** reading `priorSnapshotPath`, services, artifact slots or a maintenance descriptor. Common strict lock/owner/original-helper/serialized takeover checks from chunk 4 apply to every kind. The concrete terminal matrix is:
+No registry job can fetch/extract/install. Bootstrap cannot use lifecycle variants. Restart/start/stop/rollback cannot invoke a staging writer; rollback's offline/profile reads use their own allowed jobs. Require `signalsBegun=false` for every artifact-writing launch. Add exact lifecycle staging state `{fetchJobId:string|null, extractionJobId:string|null, installJobId:string|null}` alongside existing lifecycle artifact fields; each ID resolves uniquely to its legal typed job, while bootstrap keeps its own extraction/install references. The `jobs` array is authoritative for all descendant cleanup; work-local states must agree with it and cannot override missing job evidence. Wire the code routes explicitly:
+
+1. `artifact.ts` public `resolveArtifact`, `extractAndValidateArtifact`, and `installAndPreflightStage` require an acquired-operation-backed job runner for production effects. Their callers in `lifecycle.ts` (including reapply), `bootstrap.ts` and reconciliation supply it after narrowing work. Local archive hashing/copying stays an in-process journaled action. The shared `resolveArtifact` registry branch uses `lifecycle-fetch`; all tar listing/extraction and npm installation calls execute **inside** their table handler. Split private `extractInJob`, `installInJob`, `fetchInJob` primitives from the public orchestration functions so the handler does not recursively launch another job. Their existing validation and exact commands remain binding. There is no optional production fallback to `nodeArtifactIO.execFile` for a writer.
+2. `installAndPreflightStage` awaits `lifecycle-install` (or the bootstrap install handler's fixed caller) and verified terminal/descendant absence, then separately tracked offline/config jobs. Lifecycle never calls the bootstrap-only handler. Route `lifecycle.ts` direct diagnostic/runtime-probe invocations through their jobs as well; nested SDK/model helper processes inherit the guardian group. A caller performing setup population under its existing separate installer contract cannot use these operation APIs without acquiring their required work/ownership; keep source-only filesystem validation primitives available separately, without exposing an untracked artifact command escape hatch.
+3. Before spawn, the parent creates/fsyncs sealed input/launch under the owned job directory, persists its UUID and `launch-intended` in `jobs` **and** the work's reference, then spawns the frozen guardian in a new process group. Guardian reads/corroborates its fixed operation/input/tool, writes an exclusive fsynced ready receipt with operation/job UUID, own PID/start/group and frozen hash, and waits for the exact private `go`. Parent OS-corroborates ready, persists guardian identity/`ready` then `running` intent, and only then sends go. No tar/npm/diagnostic/probe executes before that identity is durable. A live unready guardian is busy; conflicting/missing receipt or ambiguous census is unresolved. A ready guardian whose parent dies before go records aborted and exits without invoking any handler. If the durable job never reached `running`, no go could have been sent: reconciliation may record a no-execution abort without a handler terminal receipt only after original parents and every recorded/fixed-job-path guardian are independently absent. An ambiguous job-path census stays unresolved. If `running` was durable, a settled guardian receipt is required even if the parent may have died before actually sending go.
+4. After go, all table commands are spawned with `detached:false`, inherited guardian process group and piped bounded output. Guardian stays alive when invoking CLI/frozen parent dies, records/fsyncs process-generation census before/after each subprocess transition, reaps its direct children, and waits until no live member of the job's full group **or any observed descendant** remains except the guardian itself before settling. Descendant records survive reparenting and are never identified by PID or PGID alone. Observed escaped groups, lost census, inaccessible identity or unresolved spawn/exit transitions set `accounting="unresolved"`; they never become absence by timeout. A killed guardian with no settled terminal receipt is conservatively unresolved once any known live processes disappear: an empty current group cannot account for descendants it may have missed before death. Do not manufacture a clean lineage after losing the observer. While a known writer/descendant is still live, report busy and preserve everything.
+5. Guardian writes a sealed terminal receipt only after the handler has returned **and** descendant accounting has settled, recording operation/job/launch digest, guardian PID/start/group, exit code, final lineage seal and sanitized validated output. It then exits. Parent/reconciler must validate this receipt and independently prove the recorded guardian/process generations absent before marking job `exited`/disposing any target. A missing/failed exit signal is not terminal evidence. Tar/pack budgets remain 120 seconds; npm ci's budget remains 600 seconds. A normal execution timeout may request termination of this owned group only, must await identity-based descendant settlement, and otherwise records unresolved. Reconciliation never kills a writer to enable cleanup.
+
+These are disposal prerequisites for **every mode**, checked before artifact rotation, directory disposal or lock finalization. Neither `node_modules`, extracted files, a dead parent, directory identity nor npm's direct exit grants permission while a guardian/descendant can still write. Recovery returns busy for a known live member and unresolved for missing/ambiguous lineage; no new requested operation starts. With a settled guardian receipt and all recorded generations absent, reconcile aborted staging using the mode's existing creation/rotation fences. Bootstrap abort deletes only its observed owned incomplete package/archive/digest/temp/cache trees. Lifecycle abort removes only its owned `.hive.next`/downloads/temp/cache through lifecycle fences and leaves the prior live pair/slots intact; it never enters bootstrap cleanup or signals services because staging failed. A failed extraction/install is never resumed in place; later fresh work reruns it from the retained reviewed input. Terminal job success is not a committed bootstrap or healthy lifecycle result.
+
+With a committed bootstrap registration, revalidate release/tree/archive/helper seals and rerun its offline native diagnostic through a fresh tracked job before recording validated; never install over committed tooling. Failure remains unresolved with paths preserved and does not overwrite the immutable registration. No service/config/vendor adapter is constructed for bootstrap reconciliation, including when HOME has no running services. Pre-operation host extraction remains the separate builtin host guard in Step 5: incomplete/orphan preparation is never automatically adopted/disposed. Its normal synchronous tar must have returned successfully before `validated` is durable; any interrupted host run retains its receipt/tree even after a reparented tar exits. This permanent pre-operation retention rule grants no cleanup authority from host-parent death and does not substitute for tracking the later **operation-owned** bootstrap extraction.
+
+- [ ] **Step 4:** Dispatch reconciliation by work kind **before** reading `priorSnapshotPath`, services, artifact slots or a maintenance descriptor. Common strict lock/owner/original-helper/serialized takeover and complete job-liveness checks from chunk 4 and Step 3 apply to every kind, including lifecycle before any rollback/disposal. The concrete terminal matrix is:
 
 | Work/current durable state | Required recovery and final outcome |
 | --- | --- |
-| Bootstrap before commit, all owned processes absent | Reconcile creation/disposal fences, abort owned incomplete install, retain diagnostic registry drafts and reviewed input, persist bootstrap `aborted`; no service calls |
+| Bootstrap before commit, all jobs settled and owned process generations absent | Reconcile creation/disposal fences, abort owned incomplete install, retain diagnostic registry drafts and reviewed input, persist bootstrap `aborted`; no service calls |
 | Bootstrap commit present, result write absent | Reconcile registration from intended bytes, offline revalidate matching installed package/native markers, attach existing ref, persist `validated`; never install over it |
 | Capture/inventory/verify before commit and no admission mutation | Reconcile private writes only, keep incomplete diagnostics nonselectable, mark `aborted`; never reuse abandoned probe output as current health or restart services |
 | Capture committed, operation reference/result absent | Validate original sealed capture validation and registration intent/payload; attach ref, persist `record-committed`; no live health claim and no service inspection needed |
 | Inventory/verify sealed result but unfinished operation | Validate result seal/subject/challenge as historical assessment only, persist `assessment-complete` or `migration-pending` from its fixed code; no hold proof retained |
-| Prepare/any registry command with close-intended/closed/release-intended | First settle its recorded barrier as below, even if close ack or hold registration was lost; then reconcile registration/results, persist `assessment-complete` or `aborted` |
+| Prepare/any registry command with close-intended/closed/release-intended | After common job-liveness fencing, first settle its recorded barrier as below, even if close ack or hold registration was lost; then reconcile registration/results, persist `assessment-complete` or `aborted` |
 | Release command interrupted | Retry recorded same-operation terminal release/verify prior terminal evidence; never select a new owner, then persist assessment result |
 | Already durable mode outcome | Revalidate that mode’s final immutable inventory and any required release evidence, complete exact pending own cleanup and lock archival; do not execute a newly requested operation |
 | Lifecycle | Existing chunk 4 prior-profile/slot/ordered recovery table; never sent through bootstrap/registry cleanup |
@@ -406,11 +556,11 @@ After helper completion, an operation-owned janitor invoked from the frozen path
 
 The parent Testing Contract applies without waivers. Add the new source file to S7 build/test ownership and S8 probe bundle closure; no build/artifact run occurs in this documentation revision.
 
-- [ ] **Step 1 (S7):** Implement unit cases for the strict new schemas, provisional subject refusal, discovery ticket non-serialization/expiry, two plist seals, ABI/projection mapping, pagination failure, closed-owner validator, monotonic/wall expiry, work-kind dispatch, creation/commit/adoption/job-ready fences and outcome matrix. Inject only OS/file/clock/process/vendor boundaries; never inject a `held=true` constructor. Run:
+- [ ] **Step 1 (S7):** Implement unit cases for the strict new schemas, provisional subject refusal, discovery ticket non-serialization/expiry, two plist seals, ABI/projection/idle mapping, owner-correlated historical status and strict Mongo row/count/boot/heartbeat/timestamp decoding, pagination failure, closed-owner validator, monotonic/wall/heartbeat expiry, work-kind dispatch, fixed job-kind/mode/phase/target refusal, creation/commit/adoption/job-ready/go/lineage fences and outcome matrix. Assert all three shared artifact entrypoints refuse a missing job runner before any writer spawn; enumerate every artifact `execFile` call and prove it is reached only inside its matching guardian handler. Verify lifecycle-install works for ordinary update and reapply while bootstrap-only/registry/wrong-phase variants fail. Assert unsettled/unknown/live descendants prohibit disposal in both work modes even after the direct tar/npm process exits. Inject only OS/file/clock/process/vendor boundaries; never inject a `held=true` constructor. Run:
 
 ```bash
 npm run build
-npx vitest run src/deployment/pilot-records.test.ts src/deployment/pilot.test.ts src/deployment/pilot-probe.test.ts src/deployment/runtime-probe.test.ts src/deployment/health.test.ts src/deployment/services.test.ts src/deployment/operation.test.ts src/deployment/reconcile.test.ts src/deployment/bootstrap.test.ts
+npx vitest run src/deployment/pilot-records.test.ts src/deployment/pilot.test.ts src/deployment/pilot-probe.test.ts src/deployment/runtime-probe.test.ts src/deployment/health.test.ts src/deployment/services.test.ts src/deployment/operation.test.ts src/deployment/reconcile.test.ts src/deployment/bootstrap.test.ts src/deployment/artifact.test.ts src/voice-worker/maintenance-ipc.integration.test.ts
 ```
 
 Expected: exit 0, no skipped required cases. Also run all original chunk 4 S7 transaction/CLI/plugin/shell commands; these additional commands do not replace them.
@@ -421,16 +571,38 @@ The process-level S9 harness must route SDK and bridge requests to disposable te
 
 Give H and C deliberately different fixture configuration projection behavior by using two real source commits (for example H's source has a deterministic different default voice selection while explicitly selected common fields still match the baseline). Seal each build and capture H's baseline using H's loader. Assert observation/inventory digest follows H, fails if C's result is substituted, and raw dummy secrets/URI/phone metadata never appear in stdout, stderr, operation records or logs. H's actual `pilot-abi` handshake reports H's release, and all real list RPCs must be observed from its process; replacing it with the old dispatcher must fail with no signals. Exercise full pagination including second-page rule/trunk, repeated cursor and permission failure. Never use a fake response for a historical ABI absent from the executable.
 
+For historical telemetry, start disposable **real Mongo** instances on loopback with fresh harness-owned dbpaths and ports (spawn the selected `mongodPath` with `["--bind_ip","127.0.0.1","--port",String(mongoPort),"--dbpath",mongoDbPath,"--logpath",mongoLogPath]`, all derived from this harness’s fresh fixture); await readiness and always reap them. Their binaries are an explicit S9 harness prerequisite; absence requires setup or a concrete blocker, never a skip or a mock that returns `HistoricalIdle`. Seed only the selected `telemetry` collection with fixture `voice_worker_stats` rows and current test-supervisor `BootIdentity`; `supervisorUpdatedAt` is a Mongo Date. Execute H's production lazy `MongoClient` import, own loader, actual find command and strict output decoder. Use loopback Mongo command profiling within these disposable databases to assert the projected kind-only query, primary read, and actual before/after-close read order. No query interception or injected telemetry/profile JSON is permitted. Keep raw profiler records test-local; shared evidence retains sanitized query counts/times/boot/operation UUIDs only.
+
+Give H and C distinct resolved Mongo endpoints using the same legitimate loader-default difference technique already required for their independently built source commits; keep the selected fixture config/environment sealed, and record the exact source difference. In the positive test H's endpoint has valid current zero telemetry, while C's endpoint has nonzero/wrong-boot telemetry; assert H queries only its own endpoint. Keep C poisoned through the H hold proof; once C actually starts, its test-owned production supervisor boot/heartbeat writes must establish C’s new valid row before separate packaged activation health can succeed. Reverse the rows for a negative case: C zero cannot rescue H's failure. These are isolated harness source builds, not a new production fixture API, an operator config edit, or a change to H after sealing. Query trace and real shared IPC receipts must show the owning operation on baseline, post-close and final status requests, with fresh distinct status UUIDs. Query after capture again for prepare, migration and reapply; the capture-time result is never sufficient. After rollback seed the newly observed test supervisor boot and require a fresh H read; an old-boot row must fail even when its PID or count matches.
+
+Run the following complete historical native-idle cases through the real CLI/frozen helper and H executable. Mutate **Mongo boundary rows**, never decoded results. A post-close mutation is latched after the real ledger's close acknowledgement but before H's query; record both query and status receipts so the test cannot pass by deferring before reaching Mongo.
+
+| Mongo/status boundary case | Required helper result |
+| --- | --- |
+| H current boot, recent heartbeat and `activeCalls:0`, C poisoned | baseline open/null-owner read, post-close closed/same-owner read and separate final read all query H; migration/rollback/fresh reapply succeeds with original required profiles |
+| Missing row; duplicate kind rows; missing/negative/fractional/string/boolean count; malformed identity/date | no idle proof; fixed missing/invalid classification; baseline defers before close, post-close/final terminal-releases same owner and defers without any bootout |
+| Heartbeat older than 60,000 ms; future heartbeat; job `updatedAt` fresh while `supervisorUpdatedAt` stale | fixed stale classification; no bootout; correct terminal release if close began |
+| Wrong PID/boot/release or identity from before recovered generation with zero count | fixed wrong-boot classification; retained snapshot unchanged; same-operation release/defer without signals |
+| Nonzero count at baseline; count becomes nonzero after close and persists beyond 30 seconds | baseline never closes; racing post-close case keeps call/pair alive for its bounded wait then terminal-releases/defer, no signals |
+| Mongo unavailable/denied/query stalls; response/close completes outside request deadline | fixed query/deadline classification, no partial result, original deadline unchanged; release/defer or explicit unresolved release failure |
+| Valid telemetry followed by wrong-owner closed status; open status supplied in closed phase | actual shared IPC/strict validator rejects; no fabricated ownership or fallback random operation; no signals |
+| Heartbeat crosses its 60-second expiry during persistence/inspection while 2-second read budget still holds | final dispatch rejects and releases/defers, proving heartbeat expiry is also retained in the private proof |
+
+For orphan writers, retain the production frozen helper/parser/job handler/reconciler unchanged and use only the existing test preloader's OS boundaries. The bootstrap extractor case spawns actual `/usr/bin/tar` on a sufficiently large valid archive and observes its PID/start/group and partial extraction before the harness sends that **owned** tar PID `SIGSTOP`. Kill the invoking CLI and frozen orchestrator, leaving its distinct guardian and tar alive. Invoke the CLI again: production reconciliation must report busy, preserve lock and every package/archive/digest/temp/cache inode, and neither clean nor stage/start the new action. Resume tar with `SIGCONT`; allow guardian to record its real terminal receipt and exit; next invocation can perform fenced bootstrap abort (pre-commit), exits 1 with `PREVIOUS_OPERATION_RECONCILED`, and never installs over the partial tree. Repeat loss of guardian too: while a recorded writer lives it stays busy; after it exits, missing settled lineage must remain unresolved with files retained. Do not convert a killed guardian into clean accounting merely because a later `ps` listing is empty.
+
+The ordinary update and pilot reapply installer cases use actual recorded Node/npm `ci` and real install-script descendants. Build a separate clean, provenance-recorded **test artifact** with the same production helper/code/full runtime entries and an additional harness-local npm fixture dependency in its generated lock/shrinkwrap; serve that fixture from a disposable loopback registry. Its normal lifecycle script spawns a non-detached Node child that periodically appends to a fixture sentinel inside the owned stage and exits only when the harness-owned latch is released. This fixture is install-boundary data, not a substitute helper/probe or a mutation of the accepted S8 artifact. Observe at least two real writes and guardian/census identity, then kill CLI/frozen orchestrator while the installer or its child remains alive. Exercise both npm-still-running and npm-exited/child-reparented cases for **ordinary update and reapply**. Reconciliation must stay busy, retain `.hive.next`, its npm temp/cache/downloads and prior pair/slot sentinels, and record continued child writes after parent death. Release the latch, wait for actual child exit plus settled guardian receipt/exit, then run reconciliation again: only owned staging trees are disposed through lifecycle fences, the live prior pair remains unchanged and the requested new operation does not start. Lost guardian/identity/reused PID scenarios remain unresolved after the writer exits unless the original settled receipt already existed. Also hold an actual registry `npm pack` writer under `lifecycle-fetch` across parent death and assert identical downloads/cache retention. Tear down any surviving test processes by their harness-owned PID/start identities only after assertions; test cleanup never counts as production reconciliation proof.
+
 - [ ] **Step 3 (S9):** Every row below runs through the **actual S8 frozen deployment helper**, using persistent disposable filesystem/process boundary state; start without a snapshot registry and derive selectors only from real command output.
 
 | Scenario | Minimum required result |
 | --- | --- |
 | First legacy capture with external LaunchAgent target and pre-existing distinct instance plist | Actual read-only discovery succeeds, draft subject is observed, registry commit occurs only after profile passes; no prior registry seeding; external original and unrelated instance sentinels untouched |
 | Draft selector on inventory/cutover/recovery; copied/wrong-op draft; process/link change during initial capture | Reject before stop/stage; no usable snapshot registration |
-| H first capture, inventory, prepare, migration, pilot rollback and fresh reapply | Actual H ABI/loader/SDK reads and ledger protocol complete; candidate packaged health after reapply; two plist role sentinels restore exactly and protected external bytes/inode/mode never change |
+| H first capture, inventory, prepare, migration, pilot rollback and fresh reapply | Actual H ABI/loader/SDK/Mongo reads and owner-correlated ledger protocol complete; candidate packaged health after reapply; two plist role sentinels restore exactly and protected external bytes/inode/mode never change |
 | Uninstrumented legacy plus old packaged-helper compatibility | Legacy available profile can register but native hold is unavailable -> `MIGRATION_PENDING`; unsupported packaged ABI explicitly fails its profile; neither branch can be made positive by a hand-authored response |
 | Composed stop freshness cases in Step 4c.2a | No bootout after original wall/monotonic expiry, including time spent in signals persistence; repeat all decisive reads or verified release; single-use proof at actual exec dispatch |
-| Kill frozen helper during bootstrap before/after each directory and extraction fence, during `npm ci`, after install exit, before/after diagnostic, payload, commit and result writes | Mode-specific recovery or exact ambiguous-identity unresolved; live guardian/npm/group busy; dead owned incomplete tree cleaned with fences; committed tooling validated offline and retained; zero service/config/vendor adapters invoked |
+| Kill frozen helper during bootstrap before/after each directory and extraction fence, during actual still-live tar/`npm ci`, after install exit, before/after diagnostic, payload, commit and result writes | Mode-specific recovery or exact ambiguous-identity unresolved; live guardian/tar/npm/descendant busy; dead owned incomplete tree cleaned with fences; committed tooling validated offline and retained; zero service/config/vendor adapters invoked |
+| Ordinary update/reapply npm and install-script descendants, plus registry fetch, outlive CLI/frozen parent | Actual helper stays busy while writer lives; after settled guardian/descendant exit perform only lifecycle staging cleanup; lost observer/lineage unresolved; prior live pair/slots preserved |
 | Kill host guard before/after preparation receipt, mkdir, identity, extraction, validation and adoption | No execution of unvalidated helper, stable receipt lineage; pre-operation or ambiguous orphan retained, adopted owned preparation cleanup fenced; no overwrite or lifecycle pair requirement |
 | Kill capture/inventory/verify before/after draft, payload, registration and sealed result writes | Uncommitted aborted/nonselectable; committed record attached without rewriting/reprobing it into fresh authority; next lifecycle still requires current evidence |
 | Kill prepare/release before close ack, after hold registration and before/after terminal release ack | Original recorded operation releases even when close may arrive late; no alternate owner/TTL accepted; unresolved retains lock; new requested command not executed |

@@ -194,6 +194,8 @@ Dry-run branches **before** lock/directory creation, freeze, npm lookup or confi
 | runtime/config preflight | staged `voice-worker-diagnostic offline`; staged `runtime-probe config` under intended service environment | native imports/assets contained; configured instance/database identity, selectors, voice flags/ports compatible; required secret names resolvable; no call/vendor mutation |
 | prior validation | captured effective running profile, compatible prior artifact/worker/deps OR registered pilot snapshot | fail before stopping if recovery unavailable; mere `.hive.prev` existence is insufficient |
 
+Chunk 5 Task 8 Step 1a.3/Task 9 Step 4d.1a completes these shared artifact APIs with mandatory mode-checked guardian jobs: lifecycle fetch, extraction and installation (including reapply), bootstrap extraction/installation, and separately tracked diagnostics/probes. Its durable launch/ready/go/descendant-settlement fences apply before **any** post-crash staging disposal; these operations have no untracked `execFile` writer fallback.
+
 Stage while existing pair remains up. If `.hive.next` exists without this operation's ownership record, fail/reconcile rather than delete it. Do not extract over a symlink or nonempty unowned directory. Native install has its own bounded staging budget (10 minutes); no service signal occurs during it. This budget is distinct from maintenance/health budgets.
 
 Before moving an old `.hive.prev`, ensure the captured current release/recovery route remains intact. Keep the old previous directory under this operation's private `prior-prev` until candidate health succeeds; do not delete the only usable prior generation during staging.
