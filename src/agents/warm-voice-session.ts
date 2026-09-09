@@ -9,6 +9,7 @@ import { createLogger } from "../logging/logger.js";
 import { composeTurnInput } from "./prefix-builder.js";
 import { config } from "../config.js";
 import { shouldInjectToolAck, nextAckPhrase, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
+import { bindVoiceRequest, checkVoiceRequest } from "./voice-request-cancellation.js";
 
 const log = createLogger("warm-voice-session");
 
@@ -93,6 +94,19 @@ export interface WarmTurnRequest {
   onStream?: StreamCallback;
   /** Per-turn watchdog, mapping the cold path's deadline (agent timeoutMs, default 300s). */
   timeoutMs: number;
+  /** Per-request voice cancellation. Ephemeral and never serialized. */
+  voiceRequestSignal?: AbortSignal;
+  selectText?: (admission: WarmInputAdmission) => string;
+}
+
+export interface WarmInputAdmission {
+  continuity: "fresh" | "resume" | "warm";
+  turnSeq: number;
+  launchSessionId?: string;
+}
+
+export interface WarmRunResult extends RunResult {
+  readonly voiceLifetimeSignal: AbortSignal;
 }
 
 export interface WarmVoiceSessionDeps {
@@ -133,13 +147,24 @@ export class WarmVoiceSession {
   private readonly input = new AsyncPushQueue<SDKUserMessage>();
   private closed = false;
   private closeReason: string | null = null;
+  private terminalError: Error | undefined;
+  private readonly lifetimeController = new AbortController();
+  readonly voiceLifetimeSignal = this.lifetimeController.signal;
+  private markReady!: () => void;
+  private readonly ready = new Promise<void>((resolve) => {
+    this.markReady = resolve;
+  });
+  private resumedSessionId: string | undefined;
+  private inputPushed = false;
   private turnCount = 0;
   private turnInFlight = false;
   private interruptRequested = false;
+  private enqueueGeneration = 0;
   // Internal one-turn-at-a-time gate (spec §4.2 demux invariant).
   private turnChain: Promise<unknown> = Promise.resolve();
   private idleTimer: NodeJS.Timeout | null = null;
   private lifetimeTimer: NodeJS.Timeout | null = null;
+  private readonly interruptGraceTimers = new Set<NodeJS.Timeout>();
 
   constructor(private readonly deps: WarmVoiceSessionDeps) {}
 
@@ -162,34 +187,12 @@ export class WarmVoiceSession {
   /**
    * Bind the opened SDK query; arm lifetime + idle timers.
    *
-   * Closed-guard (review round 2, issue 1): the manager publishes the lease
-   * into `warmLeases` BEFORE awaiting the session open, so anything that
-   * closes the lease during that window — ticket.abort() via
-   * stopAgent/stopAll/restartAgent, engine shutdown, or a second turn hitting
-   * notRunnableError() → runWarmTurn's `lease.close("turn-failure")` — lands
-   * while `this.query` is still null.
-   *
-   * That window is effectively ONE MICROTASK, not the CLI boot (final round,
-   * issue 3): `query()` is synchronous, openVoiceStreamingSession never
-   * awaits the CLI boot or MCP handshake (those surface later, inside turn
-   * 1's consumeOneTurn — hence initToFirstTokenMs carrying them on the first
-   * warm turn), and voice's buildQueryEnvelope has no await at all because
-   * systemPromptOverride short-circuits buildSystemPrompt. So the realistic
-   * closers here are callbacks already scheduled (abort/shutdown), not a
-   * newly-arriving request. Note too that a turn closed as collateral in this
-   * window would, on turn 1 specifically, have no effectiveResume — so the
-   * adapter's outer retry (which requires a resume attempt) would not fire
-   * and the caller sees a hard failure rather than a cold retry. Documented
-   * rather than engineered around, given the width of the window.
-   * Without this guard, start() would bind the late-arriving Query to an
-   * already-closed lease: close() early-returns on the idempotency guard,
-   * armIdleTimer() early-returns on `closed`, the registry entry is already
-   * deleted and the ticket already released — the CLI subprocess would run
-   * forever with no reachable close path (W-leak drill: orphan `claude`
-   * processes). Instead, close the Query immediately and leave the lease's
-   * state — including closeReason — exactly as the real close left it.
+   * The manager publishes after reserving opener A but before this method is
+   * called, so successor slots wait on `ready`. If stop/shutdown closes the
+   * lifetime during provider initialization, this guard disposes the late
+   * Query instead of binding it to an unreachable closed lease.
    */
-  start(query: Query): void {
+  start(query: Query, options: { resumedSessionId?: string } = {}): void {
     if (this.closed) {
       safeLog("warn", "Warm voice lease closed during session open — closing the late Query", {
         ...this.logCtx(),
@@ -206,6 +209,8 @@ export class WarmVoiceSession {
       return;
     }
     this.query = query;
+    this.resumedSessionId = options.resumedSessionId;
+    this.markReady();
     this.lifetimeTimer = setTimeout(() => {
       // Bare-timer throw-safety (spec §4.2).
       try {
@@ -226,11 +231,18 @@ export class WarmVoiceSession {
    * worker/Vapi POST serially per call), the gate makes interleaving
    * structurally impossible.
    */
-  async runTurn(req: WarmTurnRequest): Promise<RunResult> {
-    if (this.closed || !this.query) {
+  async runTurn(req: WarmTurnRequest): Promise<WarmRunResult> {
+    checkVoiceRequest(req.voiceRequestSignal);
+    if (this.closed) {
       throw this.notRunnableError();
     }
-    const run = this.turnChain.then(() => this.consumeOneTurn(req));
+    this.enqueueGeneration += 1;
+    const run = this.turnChain.then(async () => {
+      await this.ready;
+      checkVoiceRequest(req.voiceRequestSignal);
+      if (this.closed) throw this.notRunnableError();
+      return this.consumeOneTurn(req);
+    });
     // Keep the chain alive across a failed turn; the failure itself
     // propagates to THIS caller via `run`.
     this.turnChain = run.catch(() => {});
@@ -247,69 +259,62 @@ export class WarmVoiceSession {
    * avoidable; W2 in-run behavior check, spec §4.4/§7).
    */
   requestInterrupt(reason: string): void {
-    if (this.closed || !this.query) return;
+    const query = this.query;
+    if (this.closed || !query) return;
+    const turn = this.turnCount;
+    const inFlight = this.turnInFlight;
+    const enqueued = this.enqueueGeneration;
+    const stillOwns = () =>
+      !this.closed &&
+      this.query === query &&
+      this.turnCount === turn &&
+      this.turnInFlight === inFlight &&
+      (inFlight || this.enqueueGeneration === enqueued);
     this.interruptRequested = true;
-    const interruptedTurn = this.turnCount;
-    const hadTurnInFlight = this.turnInFlight;
-    this.query
-      .interrupt()
-      .then(
-        () => {
-          // Silent-wedge backstop (plan review r1 adv. 5 — distinct from the
-          // rejection path below): interrupt() resolved but the SDK never
-          // emits the interrupted turn's `result`. The turn chain would block
-          // with the idle timer disarmed, leaving reclaim to the 2h cap. If
-          // THAT turn (identity-checked — a barge-in successor turn must not
-          // trip this) is still in flight after the grace window, close:
-          // close() terminates the output stream, unblocking consumeOneTurn
-          // into the standard turn-failure → cold-fallback path (§6).
-          if (!hadTurnInFlight) return;
-          const grace = setTimeout(() => {
-            try {
-              if (!this.closed && this.turnInFlight && this.turnCount === interruptedTurn) {
-                safeLog("warn", "Interrupted turn yielded no result within grace — closing lease (cold fallback)", {
-                  ...this.logCtx(),
-                  reason,
-                  graceMs: WARM_INTERRUPT_GRACE_MS,
-                });
-                this.close("interrupt-noop");
-              }
-            } catch (err) {
-              safeLog("error", "interrupt-noop close threw — swallowed", { ...this.logCtx(), error: String(err) });
-            }
-          }, WARM_INTERRUPT_GRACE_MS);
-          grace.unref?.();
-        },
-        (err) => {
-          safeLog("warn", "Warm voice interrupt failed — closing lease (cold fallback)", {
-            ...this.logCtx(),
-            reason,
-            error: String(err),
-          });
+    const failed = () => {
+      if (!stillOwns()) return;
+      safeLog("warn", "Warm voice interrupt failed", { ...this.logCtx(), reason });
+      this.close(`interrupt-failed:${reason}`);
+    };
+    let interruption: Promise<unknown>;
+    try {
+      interruption = query.interrupt();
+    } catch {
+      failed();
+      return;
+    }
+    void interruption
+      .then(() => {
+        if (!inFlight || !stillOwns()) return;
+        const grace = setTimeout(() => {
+          this.interruptGraceTimers.delete(grace);
           try {
-            this.close(`interrupt-failed:${reason}`);
+            if (stillOwns()) this.close("interrupt-noop");
           } catch {
-            // close() never throws; belt-and-braces.
+            // close is throw-safe; contain foreign implementations.
           }
-        },
-      )
-      // Terminal guard: neither handler above should throw (both are
-      // internally guarded), but a floating rejection here would hit the
-      // engine's process-level unhandledRejection handler. One .catch makes
-      // the "always given a .catch" clause of the contract unconditional.
-      .catch((err) => {
-        safeLog("error", "warm interrupt handler threw — swallowed", { ...this.logCtx(), error: String(err) });
-      });
+        }, WARM_INTERRUPT_GRACE_MS);
+        grace.unref?.();
+        this.interruptGraceTimers.add(grace);
+      }, failed)
+      .catch(() => {});
   }
 
   /**
    * Release the lease. NO-THROW + IDEMPOTENT (spec §4.2 contract) — every
    * internal step individually guarded; a second call is a no-op.
    */
-  close(reason: string): void {
+  close(reason: string, terminalError?: Error): void {
     if (this.closed) return;
+    this.terminalError = terminalError;
     this.closed = true;
     this.closeReason = reason;
+    try {
+      this.lifetimeController.abort(this.notRunnableError());
+    } catch {
+      // AbortSignal listeners are foreign; close remains no-throw.
+    }
+    this.markReady();
     // Outer guard: the per-step guards below cover every step that can
     // realistically throw, but the contract is "close() never throws",
     // not "close() throws only if something unexpected happens".
@@ -317,6 +322,8 @@ export class WarmVoiceSession {
       try {
         if (this.idleTimer) clearTimeout(this.idleTimer);
         if (this.lifetimeTimer) clearTimeout(this.lifetimeTimer);
+        for (const grace of this.interruptGraceTimers) clearTimeout(grace);
+        this.interruptGraceTimers.clear();
       } catch {
         // clearTimeout cannot throw; belt-and-braces.
       }
@@ -353,23 +360,18 @@ export class WarmVoiceSession {
   }
 
   /**
-   * Why a lease cannot run a turn right now. Two distinct states share the
-   * `!this.query` test (review round 1, issue 4):
-   *  - CLOSED — released for a named reason.
-   *  - NOT YET STARTED — the manager publishes the lease into `warmLeases`
-   *    BEFORE `start(q)` (it must: the registry entry is what makes the
-   *    second turn of a call reuse this lease instead of queueing forever
-   *    behind the lease's own per-thread lock). A second turn arriving in
-   *    the narrow async window between publish and start therefore lands
-   *    here. It degrades safely — the throw is the adapter's cold-fallback
-   *    trigger — but reporting it as "closed" mis-describes a session that
-   *    is merely still opening.
+   * Preserve the first terminal Error object so every reserved request sees
+   * the same typed stop cause. The opening-state fallback remains useful for
+   * internal invariant failures; normal queued turns await `ready` first.
    */
   private notRunnableError(): Error {
-    return new Error(
+    return (
+      this.terminalError ??
+      new Error(
       this.closed
         ? `Warm voice lease closed (${this.closeReason ?? "unknown"})`
         : "Warm voice lease not started yet (session still opening)",
+      )
     );
   }
 
@@ -407,15 +409,33 @@ export class WarmVoiceSession {
    * per-pushed-message result emission is W2-verified; Task 0 pins the
    * typings).
    */
-  private async consumeOneTurn(req: WarmTurnRequest): Promise<RunResult> {
+  private async consumeOneTurn(req: WarmTurnRequest): Promise<WarmRunResult> {
     if (this.closed || !this.query) {
       throw this.notRunnableError();
     }
+    checkVoiceRequest(req.voiceRequestSignal);
     const q = this.query;
+    const admission: WarmInputAdmission = {
+      continuity: this.inputPushed ? "warm" : this.resumedSessionId ? "resume" : "fresh",
+      turnSeq: this.turnCount + 1,
+      launchSessionId: this.resumedSessionId,
+    };
+    const requestText = req.selectText?.(admission) ?? req.text;
+    checkVoiceRequest(req.voiceRequestSignal);
+    if (this.closed || this.query !== q) throw this.notRunnableError();
     this.clearIdleTimer(); // no idle reclaim while a turn runs
     this.turnInFlight = true;
     this.interruptRequested = false;
     this.turnCount += 1;
+    const ownedTurn = this.turnCount;
+    const detachRequest = bindVoiceRequest(req.voiceRequestSignal, () => {
+      if (this.closed || !this.turnInFlight || this.turnCount !== ownedTurn) return;
+      try {
+        this.requestInterrupt("voice-request-disconnected");
+      } catch {
+        // Existing interrupt rejection/grace paths own escalation.
+      }
+    });
     const pushedAt = Date.now();
 
     let text = "";
@@ -476,9 +496,10 @@ export class WarmVoiceSession {
     try {
       this.input.push({
         type: "user",
-        message: { role: "user", content: composeTurnInput({ prompt: req.text }) },
+        message: { role: "user", content: composeTurnInput({ prompt: requestText }) },
         parent_tool_use_id: null,
       });
+      this.inputPushed = true;
 
       // MANUAL next() loop — never `for await` here: `break` inside a
       // for-await invokes the generator's return(), which would close the
@@ -511,7 +532,7 @@ export class WarmVoiceSession {
               streamed = true;
               streamedThisSegment = true; // KPR-324 §4.1: the model spoke in this segment
               try {
-                req.onStream?.(event.delta.text);
+                if (!req.voiceRequestSignal?.aborted) req.onStream?.(event.delta.text);
               } catch (err) {
                 safeLog("warn", "onStream callback threw during warm turn", {
                   ...this.logCtx(),
@@ -587,7 +608,10 @@ export class WarmVoiceSession {
                     const next = nextAckPhrase(ackRotation);
                     ackRotation = { index: next.index };
                     try {
-                      req.onStream!(next.phrase + VOICE_TOOL_ACK_SEPARATOR);
+                      if (!req.voiceRequestSignal?.aborted) {
+                        toolAckInjected += 1;
+                        req.onStream!(next.phrase + VOICE_TOOL_ACK_SEPARATOR);
+                      }
                     } catch (err) {
                       // Same containment as the delta relay above: a throwing
                       // onStream must not kill the turn (322 E2 suppression
@@ -598,7 +622,6 @@ export class WarmVoiceSession {
                         error: String(err),
                       });
                     }
-                    toolAckInjected += 1;
                   }
                   // §4.1: tool-run gap starts now. Nested (subagent) tool calls
                   // open no caller-perceived gap — they must not reset the
@@ -679,7 +702,10 @@ export class WarmVoiceSession {
     } catch (err) {
       error = error ?? String(err);
     } finally {
+      detachRequest();
       clearTimeout(watchdog);
+      for (const grace of this.interruptGraceTimers) clearTimeout(grace);
+      this.interruptGraceTimers.clear();
       this.turnInFlight = false;
       if (!this.closed) this.armIdleTimer();
     }
@@ -708,6 +734,7 @@ export class WarmVoiceSession {
     const totalToolMs = toolCalls.reduce((sum, tc) => sum + ((tc.endMs ?? Date.now()) - tc.startMs), 0);
 
     return {
+      voiceLifetimeSignal: this.voiceLifetimeSignal,
       text,
       sessionId,
       costUsd,

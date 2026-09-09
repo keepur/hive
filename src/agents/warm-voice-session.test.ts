@@ -8,6 +8,7 @@ import {
   WARM_INTERRUPT_GRACE_MS,
 } from "./warm-voice-session.js";
 import { VOICE_TOOL_ACK_PHRASES, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
+import { VoiceRequestCancelledError } from "./voice-request-cancellation.js";
 
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
@@ -26,13 +27,17 @@ vi.mock("../config.js", () => ({
  * must never be needed (the lease's manual next() loop is what keeps the
  * long-lived generator open across turns — assertion 3).
  */
-function makeFakeQuery(opts: { closeThrows?: boolean; interruptRejects?: Error } = {}) {
+function makeFakeQuery(
+  opts: { closeThrows?: boolean; interruptRejects?: Error; interruptPromise?: Promise<unknown> } = {},
+) {
   const out = new AsyncPushQueue<SDKMessage>();
   const it = out[Symbol.asyncIterator]();
   const returnSpy = vi.fn();
-  const interrupt = opts.interruptRejects
-    ? vi.fn().mockRejectedValue(opts.interruptRejects)
-    : vi.fn().mockResolvedValue(undefined);
+  const interrupt = opts.interruptPromise
+    ? vi.fn(() => opts.interruptPromise)
+    : opts.interruptRejects
+      ? vi.fn().mockRejectedValue(opts.interruptRejects)
+      : vi.fn().mockResolvedValue(undefined);
   const close = opts.closeThrows
     ? vi.fn(() => {
         out.end();
@@ -522,6 +527,64 @@ describe("WarmVoiceSession", () => {
     }
   });
 
+  it("ignores a predecessor interrupt rejection after its successor owns the turn", async () => {
+    let rejectInterrupt!: (error: Error) => void;
+    const interruptPromise = new Promise<never>((_resolve, reject) => {
+      rejectInterrupt = reject;
+    });
+    const { q, emit } = makeFakeQuery({ interruptPromise });
+    const { lease, onClosed } = makeLease();
+    lease.start(q);
+    const a = lease.runTurn({ text: "A", timeoutMs: 60_000 });
+    await microFlush();
+    lease.requestInterrupt("A-disconnected");
+    const b = lease.runTurn({ text: "B", timeoutMs: 60_000 });
+    emit(resultMsg({ result: "A done", session_id: "s1" }));
+    await a;
+    await microFlush();
+    expect(lease.turns).toBe(2);
+    expect(lease.hasTurnInFlight).toBe(true);
+
+    rejectInterrupt(new Error("late A rejection"));
+    await microFlush();
+    expect(lease.isClosed).toBe(false);
+    expect(onClosed).not.toHaveBeenCalled();
+    emit(resultMsg({ result: "B done", session_id: "s2" }));
+    await expect(b).resolves.toMatchObject({ text: "B done" });
+    lease.close("test-cleanup");
+  });
+
+  it("invalidates an idle interrupt owner as soon as a successor queues", async () => {
+    let rejectInterrupt!: (error: Error) => void;
+    const interruptPromise = new Promise<never>((_resolve, reject) => {
+      rejectInterrupt = reject;
+    });
+    const { q, emit } = makeFakeQuery({ interruptPromise });
+    const { lease, onClosed } = makeLease();
+    lease.start(q);
+    lease.requestInterrupt("idle-owner");
+    rejectInterrupt(new Error("idle rejection"));
+    const b = lease.runTurn({ text: "B", timeoutMs: 60_000 });
+    expect(lease.turns).toBe(0);
+    expect(lease.hasTurnInFlight).toBe(false);
+    await microFlush();
+    expect(lease.isClosed).toBe(false);
+    expect(onClosed).not.toHaveBeenCalled();
+    emit(resultMsg({ result: "B done", session_id: "s1" }));
+    await expect(b).resolves.toMatchObject({ text: "B done" });
+    lease.close("test-cleanup");
+  });
+
+  it("still closes when an idle interrupt rejection retains ownership", async () => {
+    const { q } = makeFakeQuery({ interruptRejects: new Error("idle rejection") });
+    const { lease, onClosed } = makeLease();
+    lease.start(q);
+    lease.requestInterrupt("idle-owner");
+    await microFlush();
+    expect(lease.isClosed).toBe(true);
+    expect(onClosed).toHaveBeenCalledWith({ reason: "interrupt-failed:idle-owner", turns: 0 });
+  });
+
   // ------------------------------------------------------ 10: stream death
   it("returns an error result (never hangs) when the output stream ends mid-turn — with wall-clock duration fallback and accumulated usage (KPR-401 parity, round-2 finding A.1)", async () => {
     const { q, emit, endOutput } = makeFakeQuery();
@@ -745,17 +808,187 @@ describe("WarmVoiceSession", () => {
   });
 
   // ------------------------------- review round 1, issue 4: started vs closed
-  it("reports an unstarted lease as 'not started yet', and a closed one as closed", async () => {
+  it("queues an unstarted lease until readiness and reports the retained close reason", async () => {
     const { lease } = makeLease();
-    // Published-but-unstarted (the manager's narrow open window).
-    await expect(lease.runTurn({ text: "u1", timeoutMs: 1_000 })).rejects.toThrow(/not started yet/);
+    const pending = lease.runTurn({ text: "u1", timeoutMs: 1_000 });
+    let settled = false;
+    void pending.finally(() => {
+      settled = true;
+    }).catch(() => {});
+    await microFlush();
+    expect(settled).toBe(false);
     expect(lease.isClosed).toBe(false);
 
-    // Once genuinely closed, the message names the close reason.
     lease.close("idle-timeout");
-    await expect(lease.runTurn({ text: "u1", timeoutMs: 1_000 })).rejects.toThrow(
+    await expect(pending).rejects.toThrow(/Warm voice lease closed \(idle-timeout\)/);
+    await expect(lease.runTurn({ text: "u2", timeoutMs: 1_000 })).rejects.toThrow(
       /Warm voice lease closed \(idle-timeout\)/,
     );
+  });
+
+  it("skips a cancelled reserved opener and lets the first survivor select fresh input", async () => {
+    const { q, emit } = makeFakeQuery();
+    const { lease } = makeLease();
+    const pushed = drainInput(lease);
+    const first = new AbortController();
+    const admissions: string[] = [];
+    const a = lease.runTurn({
+      text: "obsolete opener",
+      timeoutMs: 5_000,
+      voiceRequestSignal: first.signal,
+      selectText: (admission) => {
+        admissions.push(`A:${admission.continuity}`);
+        return "obsolete opener";
+      },
+    });
+    const b = lease.runTurn({
+      text: "fallback",
+      timeoutMs: 5_000,
+      selectText: (admission) => {
+        admissions.push(`B:${admission.continuity}`);
+        return "earlier caller sentinel; current caller sentinel";
+      },
+    });
+
+    first.abort();
+    lease.start(q);
+    await expect(a).rejects.toBeInstanceOf(VoiceRequestCancelledError);
+    await microFlush();
+    expect(admissions).toEqual(["B:fresh"]);
+    expect(pushed).toEqual([
+      expect.stringMatching(/^earlier caller sentinel; current caller sentinel\n\n\*\*Current date\/time\*\*: /),
+    ]);
+    emit(resultMsg({ result: "survived", session_id: "fresh-session" }));
+    await expect(b).resolves.toMatchObject({ text: "survived" });
+    lease.close("test-cleanup");
+  });
+
+  it("uses launch resume continuity until the first successful push, then warm continuity", async () => {
+    const { q, emit } = makeFakeQuery();
+    const { lease } = makeLease();
+    const admissions: Array<{ continuity: string; launchSessionId?: string; turnSeq: number }> = [];
+    lease.start(q, { resumedSessionId: "stored-session" });
+
+    const first = lease.runTurn({
+      text: "latest one",
+      timeoutMs: 5_000,
+      selectText: (admission) => {
+        admissions.push(admission);
+        return "latest one";
+      },
+    });
+    emit(resultMsg({ result: "one", session_id: "stored-session" }));
+    await first;
+
+    const second = lease.runTurn({
+      text: "latest two",
+      timeoutMs: 5_000,
+      selectText: (admission) => {
+        admissions.push(admission);
+        return "latest two";
+      },
+    });
+    emit(resultMsg({ result: "two", session_id: "stored-session" }));
+    await second;
+
+    expect(admissions).toEqual([
+      { continuity: "resume", launchSessionId: "stored-session", turnSeq: 1 },
+      { continuity: "warm", launchSessionId: "stored-session", turnSeq: 2 },
+    ]);
+    lease.close("test-cleanup");
+  });
+
+  it("retains one typed lifetime cause for active and queued requests", async () => {
+    class StoppedForTest extends Error {}
+    const stopped = new StoppedForTest("stopped lifetime");
+    const { q, emit } = makeFakeQuery();
+    const { lease } = makeLease();
+    lease.start(q, { resumedSessionId: "stored-session" });
+
+    const a = lease.runTurn({ text: "A", timeoutMs: 60_000 });
+    const b = lease.runTurn({ text: "B", timeoutMs: 60_000 });
+    const c = lease.runTurn({ text: "C", timeoutMs: 60_000 });
+    await microFlush();
+    emit({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        id: "usage-before-stop",
+        content: [{ type: "text", text: "partial" }],
+        usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 2, cache_creation_input_tokens: 1 },
+      },
+      session_id: "stored-session",
+    });
+    await microFlush();
+    lease.close("ticket-abort", stopped);
+
+    const active = await a;
+    expect(active.error).toContain("ticket-abort");
+    expect(active.inputTokens).toBe(7);
+    expect(active.outputTokens).toBe(3);
+    expect(active.voiceLifetimeSignal).toBe(lease.voiceLifetimeSignal);
+    expect(active.voiceLifetimeSignal.aborted).toBe(true);
+    expect(active.voiceLifetimeSignal.reason).toBe(stopped);
+    await expect(b).rejects.toBe(stopped);
+    await expect(c).rejects.toBe(stopped);
+    lease.close("later", new Error("replacement"));
+    expect(lease.voiceLifetimeSignal.reason).toBe(stopped);
+  });
+
+  it("cancels a queued request without interrupting its predecessor or blocking a successor", async () => {
+    const { q, emit, interrupt } = makeFakeQuery();
+    const { lease } = makeLease();
+    const pushed = drainInput(lease);
+    lease.start(q);
+    const a = lease.runTurn({ text: "A", timeoutMs: 60_000 });
+    await microFlush();
+    const cancelled = new AbortController();
+    const b = lease.runTurn({ text: "B", timeoutMs: 60_000, voiceRequestSignal: cancelled.signal });
+    const c = lease.runTurn({ text: "C", timeoutMs: 60_000 });
+    cancelled.abort();
+    expect(interrupt).not.toHaveBeenCalled();
+
+    emit(resultMsg({ result: "A done", session_id: "s1" }));
+    await a;
+    await expect(b).rejects.toBeInstanceOf(VoiceRequestCancelledError);
+    await microFlush();
+    expect(pushed).toHaveLength(2);
+    expect(pushed[1]).toMatch(/^C\n\n\*\*Current date\/time\*\*: /);
+    emit(resultMsg({ result: "C done", session_id: "s2" }));
+    await expect(c).resolves.toMatchObject({ text: "C done" });
+    expect(interrupt).not.toHaveBeenCalled();
+    lease.close("test-cleanup");
+  });
+
+  it("detaches a completed request and suppresses post-cancel streaming for the active owner", async () => {
+    const { q, emit, interrupt } = makeFakeQuery();
+    const { lease } = makeLease();
+    lease.start(q);
+    const firstSignal = new AbortController();
+    const first = lease.runTurn({ text: "A", timeoutMs: 60_000, voiceRequestSignal: firstSignal.signal });
+    emit(resultMsg({ result: "A done", session_id: "s1" }));
+    await first;
+
+    const secondSignal = new AbortController();
+    const streamed: string[] = [];
+    const second = lease.runTurn({
+      text: "B",
+      timeoutMs: 60_000,
+      voiceRequestSignal: secondSignal.signal,
+      onStream: (text) => streamed.push(text),
+    });
+    await microFlush();
+    firstSignal.abort();
+    expect(interrupt).not.toHaveBeenCalled();
+    secondSignal.abort();
+    expect(interrupt).toHaveBeenCalledTimes(1);
+    emit(delta("late bytes"));
+    emit(resultMsg({ result: "", session_id: "s2" }));
+    const result = await second;
+    expect(result.aborted).toBe(true);
+    expect(streamed).toEqual([]);
+    expect(lease.isClosed).toBe(false);
+    lease.close("test-cleanup");
   });
 
   it("STILL sets `error` when a non-interrupted turn's result carries a non-success subtype", async () => {

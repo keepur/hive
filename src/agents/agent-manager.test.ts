@@ -260,6 +260,7 @@ vi.mock("../search/conversation-index.js", () => ({
 
 import {
   AgentManager,
+  AgentStoppedError,
   conferenceRoundOf,
   isStaleServerHandleError,
   resolveMemoryMark,
@@ -278,6 +279,7 @@ import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.
 import { classifyTurnResult, TurnAssemblyError } from "./provider-adapters/error-classification.js";
 import { AsyncPushQueue, WARM_IDLE_TIMEOUT_MS, type WarmVoiceSession } from "./warm-voice-session.js";
 import { VOICE_TOOL_ACK_PHRASES, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
+import { VoiceRequestCancelledError } from "./voice-request-cancellation.js";
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -7030,6 +7032,10 @@ describe("AgentManager", () => {
       return (m as unknown as { warmLeases: Map<string, WarmVoiceSession> }).warmLeases;
     }
 
+    function pendingWarmOpenings(m: AgentManager): Map<string, Promise<void>> {
+      return (m as unknown as { pendingWarmOpenings: Map<string, Promise<void>> }).pendingWarmOpenings;
+    }
+
     /**
      * Fake streaming Query driven by an AsyncPushQueue: answers each pushed
      * message with `deltas + result` (init emitted once, before turn 1).
@@ -7049,6 +7055,7 @@ describe("AgentManager", () => {
          * turn's delta — the shape the warm ack gate fires on.
          */
         silentToolOnTurn?: number;
+        openGate?: Promise<void>;
       } = {},
     ) {
       let releaseHang: () => void = () => {};
@@ -7063,6 +7070,7 @@ describe("AgentManager", () => {
       const pushed: string[] = [];
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       mockRunnerOpenStream.mockImplementation(async ({ input }: { input: AsyncIterable<any> }) => {
+        await opts.openGate;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const out = new AsyncPushQueue<any>();
         const it = out[Symbol.asyncIterator]();
@@ -7133,6 +7141,419 @@ describe("AgentManager", () => {
       for (const lease of [...warmLeases(manager).values()]) lease.close("test-cleanup");
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (appConfig as any).voice = { warmPath: { enabled: false }, toolAck: { enabled: false } };
+    });
+
+    it("coordinates concurrent openers before publication and reserves A before B", async () => {
+      let releaseOpen!: () => void;
+      const openGate = new Promise<void>((resolve) => {
+        releaseOpen = resolve;
+      });
+      const { pushed } = installEchoStreamingRunner({ openGate });
+      const launchA: string[] = [];
+      const launchB: string[] = [];
+      const selectedA: string[] = [];
+      const selectedB: string[] = [];
+      const a = manager.spawnTurn({
+        ...makeVoiceCtx({ text: "raw A" }),
+        voicePrompt: { latestUserMessage: "latest A", fullConversation: "full A" },
+        onVoiceLaunchAdmission: (value) => launchA.push(value),
+        onVoiceAdmission: (value) => selectedA.push(value),
+      });
+      const b = manager.spawnTurn({
+        ...makeVoiceCtx({ text: "raw B" }),
+        voicePrompt: { latestUserMessage: "latest B", fullConversation: "full B" },
+        onVoiceLaunchAdmission: (value) => launchB.push(value),
+        onVoiceAdmission: (value) => selectedB.push(value),
+      });
+      void a.catch(() => {});
+      void b.catch(() => {});
+
+      await vi.waitFor(() => expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1));
+      expect(warmLeases(manager).size).toBe(1);
+      expect(pendingWarmOpenings(manager).size).toBe(0);
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1);
+      expect(pushed).toEqual([]);
+      expect(launchA).toEqual(["fresh"]);
+      expect(launchB).toEqual(["fresh"]);
+
+      releaseOpen();
+      await expect(a).resolves.toMatchObject({ finalMessage: "reply-1", warmTurnSeq: 1 });
+      await expect(b).resolves.toMatchObject({ finalMessage: "reply-2", warmTurnSeq: 2 });
+      expect(selectedA).toEqual(["fresh"]);
+      expect(selectedB).toEqual(["warm"]);
+      expect(pushed[0]).toMatch(/^full A\n\n\*\*Current date\/time\*\*: /);
+      expect(pushed[1]).toMatch(/^latest B\n\n\*\*Current date\/time\*\*: /);
+    });
+
+    it("lets B inherit the healthy opening when A cancels at lifetime admission", async () => {
+      const { pushed } = installEchoStreamingRunner();
+      const requestA = new AbortController();
+      const a = manager.spawnTurn({
+        ...makeVoiceCtx({ text: "raw A" }),
+        voicePrompt: { latestUserMessage: "latest A", fullConversation: "obsolete full A" },
+        voiceRequestSignal: requestA.signal,
+        onVoiceLifetimeAdmission: () => requestA.abort(),
+      });
+      const b = manager.spawnTurn({
+        ...makeVoiceCtx({ text: "raw B" }),
+        voicePrompt: {
+          latestUserMessage: "latest B",
+          fullConversation: "earlier B sentinel; current B sentinel",
+        },
+      });
+      void a.catch(() => {});
+
+      await expect(a).rejects.toBeInstanceOf(VoiceRequestCancelledError);
+      await expect(b).resolves.toMatchObject({ finalMessage: "reply-1", warmTurnSeq: 1 });
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+      expect(pushed).toHaveLength(1);
+      expect(pushed[0]).toMatch(/^earlier B sentinel; current B sentinel\n\n\*\*Current date\/time\*\*: /);
+      expect(warmLeases(manager).get(WARM_KEY)?.isClosed).toBe(false);
+    });
+
+    it("retains a same-stack stop across restart before the opening continuation", async () => {
+      installEchoStreamingRunner();
+      const a = manager.spawnTurn(makeVoiceCtx());
+      void a.catch(() => {});
+      manager.stopAgent("agent-a");
+      manager.restartAgent("agent-a");
+
+      await expect(a).rejects.toBeInstanceOf(AgentStoppedError);
+      expect(mockRunnerOpenStream).not.toHaveBeenCalled();
+      expect(warmLeases(manager).size).toBe(0);
+      expect(pendingWarmOpenings(manager).size).toBe(0);
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0);
+
+      const { pushed } = installEchoStreamingRunner();
+      await expect(manager.spawnTurn(makeVoiceCtx({ text: "new C" }))).resolves.toMatchObject({
+        finalMessage: "reply-1",
+      });
+      expect(pushed).toHaveLength(1);
+    });
+
+    it("gives A/B/C the exact stopped lifetime through late initialization after restart", async () => {
+      let releaseOpen!: () => void;
+      const openGate = new Promise<void>((resolve) => {
+        releaseOpen = resolve;
+      });
+      const { close, pushed } = installEchoStreamingRunner({ openGate });
+      const signals: AbortSignal[] = [];
+      const resumed = (text: string): TurnContext => ({
+        ...makeVoiceCtx({ text, sessionId: "stored-resume" }),
+        sessionProvider: "claude",
+        voicePrompt: { latestUserMessage: text, fullConversation: `full ${text}` },
+        onVoiceLifetimeAdmission: (signal) => signals.push(signal),
+      });
+      const a = manager.spawnTurn(resumed("A"));
+      const b = manager.spawnTurn(resumed("B"));
+      const c = manager.spawnTurn(resumed("C"));
+      void a.catch(() => {});
+      void b.catch(() => {});
+      void c.catch(() => {});
+      await vi.waitFor(() => expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(signals).toHaveLength(3));
+      expect(new Set(signals).size).toBe(1);
+
+      manager.stopAgent("agent-a");
+      manager.restartAgent("agent-a");
+      const [bFailure, cFailure] = await Promise.all([b.catch((error) => error), c.catch((error) => error)]);
+      expect(bFailure).toBeInstanceOf(AgentStoppedError);
+      expect(cFailure).toBe(bFailure);
+      expect(signals[0]!.reason).toBe(bFailure);
+      expect(pushed).toEqual([]);
+
+      releaseOpen();
+      const aFailure = await a.catch((error) => error);
+      expect(aFailure).toBe(bFailure);
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(pushed).toEqual([]);
+      await vi.waitFor(() => expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0));
+      expect(warmLeases(manager).size).toBe(0);
+      expect(pendingWarmOpenings(manager).size).toBe(0);
+    });
+
+    it("cancels only the cold lock waiter and returns lock and budget to baseline", async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (appConfig as any).voice = { warmPath: { enabled: false }, toolAck: { enabled: false } };
+      let releaseA!: (result: ReturnType<typeof makeRunResult>) => void;
+      mockRunnerSend.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseA = resolve;
+          }),
+      );
+      const a = manager.spawnTurn(makeVoiceCtx({ text: "A" }));
+      await vi.waitFor(() => expect(mockRunnerSend).toHaveBeenCalledTimes(1));
+      const requestB = new AbortController();
+      const b = manager.spawnTurn({
+        ...makeVoiceCtx({ text: "B" }),
+        voiceRequestSignal: requestB.signal,
+      });
+      void b.catch(() => {});
+      requestB.abort();
+      expect(mockRunnerAbort).not.toHaveBeenCalled();
+
+      releaseA(makeRunResult({ text: "A done" }));
+      await expect(a).resolves.toMatchObject({ finalMessage: "A done" });
+      await expect(b).rejects.toBeInstanceOf(VoiceRequestCancelledError);
+      expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+      expect(mockRunnerAbort).not.toHaveBeenCalled();
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0);
+    });
+
+    it("detaches a completed cold request so its late abort cannot reach active B", async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (appConfig as any).voice = { warmPath: { enabled: false }, toolAck: { enabled: false } };
+      const requestA = new AbortController();
+      await manager.spawnTurn({ ...makeVoiceCtx({ text: "A" }), voiceRequestSignal: requestA.signal });
+
+      let releaseB!: (result: ReturnType<typeof makeRunResult>) => void;
+      mockRunnerSend.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseB = resolve;
+          }),
+      );
+      const b = manager.spawnTurn(makeVoiceCtx({ text: "B" }));
+      await vi.waitFor(() => expect(mockRunnerSend).toHaveBeenCalledTimes(2));
+      requestA.abort();
+      expect(mockRunnerAbort).not.toHaveBeenCalled();
+      releaseB(makeRunResult({ text: "B done" }));
+      await expect(b).resolves.toMatchObject({ finalMessage: "B done" });
+    });
+
+    it("contains a throwing cold adapter abort and prohibits its resume retry", async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (appConfig as any).voice = { warmPath: { enabled: false }, toolAck: { enabled: false } };
+      const request = new AbortController();
+      let settle!: (result: ReturnType<typeof makeRunResult>) => void;
+      mockRunnerSend.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            settle = resolve;
+          }),
+      );
+      mockRunnerAbort.mockImplementationOnce(() => {
+        throw new Error("runner abort/log/close failed");
+      });
+      const turn = manager.spawnTurn({
+        ...makeVoiceCtx({ sessionId: "stored-resume" }),
+        sessionProvider: "claude",
+        voiceRequestSignal: request.signal,
+      });
+      await vi.waitFor(() => expect(mockRunnerSend).toHaveBeenCalledTimes(1));
+      expect(() => request.abort()).not.toThrow();
+      expect(mockRunnerAbort).toHaveBeenCalledTimes(1);
+      settle(
+        makeRunResult({
+          error: "No conversation found with session ID: stored-resume",
+          sessionId: "stored-resume",
+          costUsd: 0.25,
+        }),
+      );
+      const result = await turn;
+      expect(result.errors).toHaveLength(1);
+      expect(result.usage.costUsd).toBe(0.25);
+      expect(mockRunnerSend).toHaveBeenCalledTimes(1);
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0);
+    });
+
+    it("keeps cancellation sticky across cold session preparation", async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (appConfig as any).voice = { warmPath: { enabled: false }, toolAck: { enabled: false } };
+      let finishLookup!: (value: undefined) => void;
+      sessionStore.get.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishLookup = resolve;
+          }),
+      );
+      const request = new AbortController();
+      const turn = manager.spawnTurn({ ...makeVoiceCtx(), voiceRequestSignal: request.signal });
+      await vi.waitFor(() => expect(sessionStore.get).toHaveBeenCalledTimes(1));
+      request.abort();
+      finishLookup(undefined);
+      const result = await turn;
+      expect(result.aborted).toBe(true);
+      expect(mockRunnerSend).not.toHaveBeenCalled();
+      expect(mockRunnerAbort).toHaveBeenCalledTimes(2);
+      expect(manager.circuitBreakers.stateFor("claude")?.consecutiveHardFaults ?? 0).toBe(0);
+      expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0);
+    });
+
+    it("replays sticky request cancellation after async adapter assembly without a provider call", async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (appConfig as any).voice = { warmPath: { enabled: false }, toolAck: { enabled: false } };
+      registry._agents.set(
+        "codex-pilot",
+        makeAgentConfig({ id: "codex-pilot", name: "Codex Pilot", model: "codex/gpt-5.5", coreServers: [] }),
+      );
+      const request = new AbortController();
+      mockRunnerToolInventory.mockImplementationOnce(() => {
+        request.abort();
+        return [];
+      });
+      mockCodexAbort.mockImplementationOnce(() => {
+        throw new Error("provider abort failed");
+      });
+      const result = await manager.spawnTurn({
+        ...makeVoiceCtx({ agentId: "codex-pilot", threadId: "voice:sticky", channelId: "sticky" }),
+        voiceRequestSignal: request.signal,
+      });
+      expect(result.aborted).toBe(true);
+      expect(mockCodexRunTurn).not.toHaveBeenCalled();
+      expect(mockCodexAbort).toHaveBeenCalledTimes(2);
+      expect(manager.circuitBreakers.stateFor("codex")?.consecutiveHardFaults ?? 0).toBe(0);
+      expect(manager.getSnapshot().perAgent["codex-pilot"]!.activeSpawns).toBe(0);
+    });
+
+    it.each(["EOF", "rejection"] as const)(
+      "retains stopped identity and observed usage when active resumed q.next settles as %s after restart",
+      async (settlement) => {
+        let resolveRead!: (value: IteratorResult<unknown>) => void;
+        let rejectRead!: (error: Error) => void;
+        const pendingRead = new Promise<IteratorResult<unknown>>((resolve, reject) => {
+          resolveRead = resolve;
+          rejectRead = reject;
+        });
+        const closeOld = vi.fn();
+        let nextIndex = 0;
+        const oldQuery = {
+          next: vi.fn(() => {
+            nextIndex += 1;
+            if (nextIndex === 1) {
+              return Promise.resolve({
+                value: { type: "system", subtype: "init", session_id: "stored-resume" },
+                done: false,
+              });
+            }
+            if (nextIndex === 2) {
+              return Promise.resolve({
+                value: {
+                  type: "assistant",
+                  session_id: "stored-resume",
+                  message: {
+                    role: "assistant",
+                    id: "usage-before-stop",
+                    content: [{ type: "text", text: "observed partial" }],
+                    usage: {
+                      input_tokens: 11,
+                      output_tokens: 4,
+                      cache_read_input_tokens: 3,
+                      cache_creation_input_tokens: 2,
+                    },
+                  },
+                },
+                done: false,
+              });
+            }
+            return pendingRead;
+          }),
+          interrupt: vi.fn().mockResolvedValue(undefined),
+          close: closeOld,
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+        };
+        mockRunnerOpenStream.mockResolvedValueOnce(oldQuery);
+        const oldSignals: AbortSignal[] = [];
+        const oldCtx = (text: string): TurnContext => ({
+          ...makeVoiceCtx({ text, sessionId: "stored-resume" }),
+          sessionProvider: "claude",
+          voicePrompt: { latestUserMessage: text, fullConversation: `full ${text}` },
+          onVoiceLifetimeAdmission: (signal) => oldSignals.push(signal),
+        });
+        const a = manager.spawnTurn(oldCtx("A"));
+        const b = manager.spawnTurn(oldCtx("B"));
+        const c = manager.spawnTurn(oldCtx("C"));
+        void a.catch(() => {});
+        void b.catch(() => {});
+        void c.catch(() => {});
+        await vi.waitFor(() => expect(oldQuery.next).toHaveBeenCalledTimes(3));
+        await vi.waitFor(() => expect(oldSignals).toHaveLength(3));
+
+        manager.stopAgent("agent-a");
+        manager.restartAgent("agent-a");
+        const stopped = oldSignals[0]!.reason;
+        expect(stopped).toBeInstanceOf(AgentStoppedError);
+        expect(closeOld).toHaveBeenCalledTimes(1);
+
+        const { pushed: newPushed } = installEchoStreamingRunner();
+        let newSignal: AbortSignal | undefined;
+        const d = await manager.spawnTurn({
+          ...makeVoiceCtx({ text: "new D" }),
+          voicePrompt: { latestUserMessage: "new D", fullConversation: "full new D" },
+          onVoiceLifetimeAdmission: (signal) => {
+            newSignal = signal;
+          },
+        });
+        expect(d.finalMessage).toBe("reply-1");
+        expect(newSignal).toBeDefined();
+        expect(newSignal).not.toBe(oldSignals[0]);
+        expect(newPushed).toHaveLength(1);
+
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        if (settlement === "EOF") resolveRead({ value: undefined, done: true });
+        else rejectRead(new Error("late provider rejection"));
+        const active = await a;
+        const [bFailure, cFailure] = await Promise.all([b.catch((error) => error), c.catch((error) => error)]);
+        expect(bFailure).toBe(stopped);
+        expect(cFailure).toBe(stopped);
+        expect(active.errors[0]).toContain(settlement === "EOF" ? "output ended" : "late provider rejection");
+        expect(active.usage.inputTokens).toBe(11);
+        expect(active.usage.outputTokens).toBe(4);
+        expect(active.usage.cacheReadTokens).toBe(3);
+        expect(active.usage.cacheCreationTokens).toBe(2);
+        expect(active.usage.durationMs).toBeGreaterThan(0);
+        expect(active.voiceLifetimeSignal).toBe(oldSignals[0]);
+        expect(active.voiceLifetimeSignal!.reason).toBe(stopped);
+        expect(warmLeases(manager).get(WARM_KEY)?.voiceLifetimeSignal).toBe(newSignal);
+        expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1);
+      },
+    );
+
+    it("preserves exact provider-reported cost on a warm returned failure", async () => {
+      const result = {
+        type: "result",
+        subtype: "error_during_execution",
+        errors: ["provider failed"],
+        session_id: "stored-resume",
+        total_cost_usd: 0.37,
+        duration_ms: 42,
+        usage: {
+          input_tokens: 19,
+          output_tokens: 5,
+          cache_read_input_tokens: 2,
+          cache_creation_input_tokens: 1,
+        },
+      };
+      const close = vi.fn();
+      mockRunnerOpenStream.mockResolvedValueOnce({
+        next: vi.fn().mockResolvedValueOnce({ value: result, done: false }),
+        interrupt: vi.fn().mockResolvedValue(undefined),
+        close,
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+      });
+      const turn = await manager.spawnTurn({
+        ...makeVoiceCtx({ sessionId: "stored-resume" }),
+        sessionProvider: "claude",
+        voicePrompt: { latestUserMessage: "latest", fullConversation: "full transcript" },
+      });
+      expect(turn.errors).toEqual(["provider failed"]);
+      expect(turn.usage).toMatchObject({
+        costUsd: 0.37,
+        durationMs: 42,
+        inputTokens: 19,
+        outputTokens: 5,
+        cacheReadTokens: 2,
+        cacheCreationTokens: 1,
+      });
+      expect(turn.resumedSession).toBe(true);
+      expect(turn.voiceLifetimeSignal?.aborted).toBe(true);
+      expect(turn.voiceLifetimeSignal?.reason).not.toBeInstanceOf(AgentStoppedError);
+      expect(close).toHaveBeenCalledTimes(1);
     });
 
     // ---- assertion 1 -----------------------------------------------------
@@ -8121,12 +8542,11 @@ describe("AgentManager", () => {
         expect(floated).toEqual([]);
       });
 
-      it("(11c) a SYNCHRONOUSLY throwing interrupt() does not propagate out of abortThread, and does NOT close the lease", async () => {
+      it("(11c) a synchronously throwing interrupt is contained and closes its still-owned lease", async () => {
         // abortThread is called from an HTTP `close` listener — a synchronous
         // throw there is an uncaughtException (review round 1, issue 3). The
-        // guard is LOG-ONLY (review round 2, issue 2): unlike a REJECTED
-        // interrupt promise (case 11), a synchronous throw is not evidence of a
-        // wedged session, and escalating would end a healthy warm call.
+        // The request owner contains the throw at the AbortSignal boundary;
+        // the still-owned failed interruption closes the wedged lease.
         mockConversationIndex.mockResolvedValue(undefined);
         const { interrupt, close } = installEchoStreamingRunner();
         interrupt.mockImplementationOnce(() => {
@@ -8140,18 +8560,9 @@ describe("AgentManager", () => {
         }).not.toThrow();
         expect(dispatched).toBe(true); // it DID dispatch; the throw was downstream
         expect(interrupt).toHaveBeenCalledTimes(1);
-        // Lease survives: no session close, registry entry intact, ticket held.
-        expect(close).not.toHaveBeenCalled();
-        const lease = warmLeases(manager).get(WARM_KEY);
-        expect(lease).toBeDefined();
-        expect(lease!.isClosed).toBe(false);
-        await new Promise((r) => setTimeout(r, 10));
-        expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(1);
-
-        // And the call keeps going warm on the same session.
-        const r = await manager.spawnTurn(makeVoiceCtx({ sessionId: "sess-warm-1" }));
-        expect(r.warmPath).toBe(true);
-        expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1); // no re-open
+        expect(close).toHaveBeenCalledTimes(1);
+        expect(warmLeases(manager).get(WARM_KEY)).toBeUndefined();
+        await vi.waitFor(() => expect(manager.getSnapshot().perAgent["agent-a"]!.activeSpawns).toBe(0));
       });
 
       it("(11b) falls through to the 322 ticket-walk when no lease exists (cold voice spawn)", async () => {
