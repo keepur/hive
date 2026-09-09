@@ -62,7 +62,7 @@ function detectCurrentPorts(): Record<string, number> | null {
         const offset = port % 100;
         if (offset === 0 && !detected.background) detected.background = port;
         else if (offset === 1 && !detected.recall) detected.recall = port;
-        else if (!detected.ws) detected.ws = port;
+        else if (offset === 3 && !detected.ws) detected.ws = port;
       }
     } catch {
       // ignore
