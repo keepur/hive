@@ -68,7 +68,7 @@ function agent(id: string, overrides: Partial<AgentConfig> = {}): AgentConfig {
     delegateServers: [],
     soul: "",
     systemPrompt: "",
-    autonomy: { externalComms: false, codeTask: false, codeAccess: false },
+    autonomy: { externalComms: false, codeAccess: false },
     ...overrides,
   };
 }

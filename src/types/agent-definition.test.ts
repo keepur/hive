@@ -35,32 +35,24 @@ function makeDefinition(overrides: Partial<AgentDefinition> = {}): AgentDefiniti
   };
 }
 
-describe("toAgentConfig — archetype passthrough", () => {
-  it("passes archetype, title, archetypeConfig through unchanged", () => {
+describe("toAgentConfig — title passthrough", () => {
+  it("passes title through unchanged", () => {
     const def = makeDefinition({
-      archetype: "software-engineer",
       title: "VP Engineering",
-      archetypeConfig: { workshop: "/Users/x/dev" },
     });
     const cfg = toAgentConfig(def);
-    expect(cfg.archetype).toBe("software-engineer");
     expect(cfg.title).toBe("VP Engineering");
-    expect(cfg.archetypeConfig).toEqual({ workshop: "/Users/x/dev" });
   });
 
-  it("leaves archetype, title, archetypeConfig undefined when unset", () => {
+  it("leaves title undefined when unset", () => {
     const def = makeDefinition();
     const cfg = toAgentConfig(def);
-    expect(cfg.archetype).toBeUndefined();
     expect(cfg.title).toBeUndefined();
-    expect(cfg.archetypeConfig).toBeUndefined();
   });
 
   it("does not mutate the input definition", () => {
     const def = makeDefinition({
-      archetype: "software-engineer",
       title: "VP Engineering",
-      archetypeConfig: { workshop: "/Users/x/dev" },
     });
     const before = JSON.stringify(def);
     toAgentConfig(def);

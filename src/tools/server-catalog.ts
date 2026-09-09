@@ -93,10 +93,6 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
     usage: "Finding code by what it does, not just by filename",
     notFor: "Broad web search — use brave-search instead",
   },
-  "code-task": {
-    description: "Spawn Claude Code CLI sessions for coding tasks",
-    usage: "Delegating implementation, debugging, or code analysis work",
-  },
   memory: {
     description: "Read and write your personal agent memory",
     usage: "Storing and retrieving facts across conversations. Auto-managed — don't over-save",

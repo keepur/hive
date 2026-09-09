@@ -385,7 +385,7 @@ export class ToolBridge {
   /**
    * KPR-354 (§D3): ONE Claude-lane-identical Task function tool synthesized
    * from the claude-subagent entries. Name + input schema match the SDK's
-   * Task tool (description/prompt/subagent_type) so archetype rules written
+   * Task tool (description/prompt/subagent_type) so prompt rules written
    * against `Task` transfer verbatim (KPR-348 name-preservation canon);
    * subagent_type is enum-restricted to the active delegate names. Routed
    * through wrap(): gate-deny, pre-execute abort check, containment, and

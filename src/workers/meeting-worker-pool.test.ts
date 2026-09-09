@@ -430,7 +430,6 @@ describe("MeetingWorkerPool — claim ledger + gates (Task D)", () => {
       "worker-pool",
       "background",
       "keychain",
-      "code-task",
       "admin",
       "recall",
       "voice",
@@ -441,6 +440,10 @@ describe("MeetingWorkerPool — claim ledger + gates (Task D)", () => {
     // Memory servers deliberately stay (same trust domain).
     expect(WORKER_SERVER_DENYLIST.has("memory")).toBe(false);
     expect(WORKER_SERVER_DENYLIST.has("structured-memory")).toBe(false);
+    // KPR-435: code-task was removed from the engine, dropping the denylist
+    // to 14 entries. Size assertion (not a literal-string check) so this
+    // pins the count without reintroducing the retired server's name.
+    expect(WORKER_SERVER_DENYLIST.size).toBe(14);
   });
 });
 

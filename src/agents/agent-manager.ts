@@ -2865,7 +2865,7 @@ export class AgentManager {
     // KPR-430 D3: the static field is resolved exactly once per turn, HERE —
     // after the voice / round-1 / Lane A / Lane B returns and before the
     // router gate — and rides every remaining claude-lane path: router-off,
-    // system-sender (cron, reflection, bg-/code-task callbacks,
+    // system-sender (cron, reflection, bg-task callbacks,
     // meeting-monitor prompts, worker-pool boss re-entry, first-boot), the
     // haiku/off-catalog skip (where it resolves undefined + warns), and the
     // router-on path (where it short-circuits the classifier below).
@@ -2904,7 +2904,7 @@ export class AgentManager {
     const staticLimits = resolveResourceLimits(staticTier, agentConfig.resourceTiers, agentConfig.timeoutMs);
 
     // KPR-431: system senders (scheduler/cron, reflection, callback/event
-    // deliveries, bg-/code-task completion callbacks, meeting-monitor prompts,
+    // deliveries, bg-task completion callbacks, meeting-monitor prompts,
     // worker-pool boss re-entry, first-boot) skip the classifier exactly as
     // before (R-311 — no routerCostUsd, no effort hint) but receive the SAME
     // static-tier envelope a human turn on this agent receives. This

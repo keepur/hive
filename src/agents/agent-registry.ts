@@ -3,14 +3,12 @@ import type { AgentConfig } from "../types/agent-config.js";
 import type { AgentDefinition } from "../types/agent-definition.js";
 import { toAgentConfig } from "../types/agent-definition.js";
 import { config as appConfig } from "../config.js";
-import { getArchetype } from "../archetypes/registry.js";
 import {
   IN_PROCESS_PORTED_SERVERS,
   VOICE_FIXTURE_SERVER_NAME,
   VOICE_FIXTURE_ALLOWED_AGENT_ID,
 } from "./in-process-servers.js";
 import { isAgentEffort, type AgentEffort } from "./agent-effort.js";
-import "../archetypes/index.js";
 import type { Collection, ChangeStream } from "mongodb";
 
 const log = createLogger("agent-registry");
@@ -26,13 +24,12 @@ const POLL_INTERVAL_MS = 30_000;
  * the admin tool (`admin-mcp-server.ts:checkDelegateContextDependent`).
  *
  * Note `memory` and `structured-memory` overlap with `IN_PROCESS_PORTED_SERVERS`
- * — they're rejected by either guard. `callback`, `background`, `code-task`,
- * and `recall` are uniquely caught here.
+ * — they're rejected by either guard. `callback`, `background`, and `recall`
+ * are uniquely caught here.
  */
 const CONTEXT_DEPENDENT_SERVERS = new Set<string>([
   "callback",
   "background",
-  "code-task",
   "recall",
   "structured-memory",
   "memory",
@@ -57,6 +54,28 @@ function sanitizeDelegateServers(agentId: string, delegateServers: string[]): st
       "Move these servers to coreServers (or remove) via admin_agent_update. Per KPR-122, they're in-process and the SDK's AgentDefinition type doesn't accept in-process configs.",
   });
   return delegateServers.filter((s) => !IN_PROCESS_PORTED_SERVERS.has(s));
+}
+
+/**
+ * KPR-435: strip the retired `code-task` server from `coreServers`/
+ * `delegateServers` on load. The server no longer exists — `admin_agent_update`
+ * rejects it at write time (kept as defense in depth, mirroring KPR-184), but a
+ * pre-existing doc (e.g. `alexandria` on hive_keepur at removal time) must keep
+ * loading rather than getting evicted. Logs an error so the operator notices
+ * and can clean up via admin_agent_update.
+ */
+const REMOVED_SERVERS = new Set<string>(["code-task"]);
+
+function sanitizeRemovedServers(agentId: string, servers: string[], field: "coreServers" | "delegateServers"): string[] {
+  const invalid = servers.filter((s) => REMOVED_SERVERS.has(s));
+  if (invalid.length === 0) return servers;
+  log.error(`Invalid ${field} — removed servers referenced. Stripping.`, {
+    agent: agentId,
+    field,
+    invalid,
+    remediation: "These servers were removed from the engine (KPR-435). Clean up via admin_agent_update.",
+  });
+  return servers.filter((s) => !REMOVED_SERVERS.has(s));
 }
 
 /**
@@ -285,6 +304,29 @@ export class AgentRegistry {
       // any downstream consumer (subagent assembly, toolkit listing, etc.)
       // sees the value. Logs an error if any are stripped.
       agentConfig.delegateServers = sanitizeDelegateServers(agentConfig.id, agentConfig.delegateServers);
+      // KPR-435: strip the retired `code-task` server from both server lists.
+      // Must run BEFORE validateDelegateServersOrThrow below so a doc carrying
+      // `code-task` alongside a genuinely context-dependent server only evicts
+      // for the real remaining violation, never for the retired one.
+      agentConfig.coreServers = sanitizeRemovedServers(agentConfig.id, agentConfig.coreServers, "coreServers");
+      agentConfig.delegateServers = sanitizeRemovedServers(agentConfig.id, agentConfig.delegateServers, "delegateServers");
+      // KPR-435: archetype/archetypeConfig were removed from AgentDefinition/
+      // AgentConfig entirely. A pre-existing doc may still carry either field
+      // (raw Mongo doc, not the typed agentConfig) — log so the operator
+      // notices and cleans up via admin_agent_update, but never evict for it.
+      // `archetype: ""` is excluded from this check: it was the pre-KPR-435
+      // documented "explicit clear" convention (agent_update's old empty-
+      // string-clears semantics), not a stray value — a doc cleared that way
+      // before this ticket shipped (e.g. Jasper on dodi, 2026-09-05) must not
+      // log a false "retired fields" alarm on every reload.
+      const rawDoc = doc as unknown as Record<string, unknown>;
+      const rawArchetype = typeof rawDoc.archetype === "string" && rawDoc.archetype.length > 0 ? rawDoc.archetype : undefined;
+      if (rawArchetype != null || rawDoc.archetypeConfig != null) {
+        log.error("Agent doc carries retired archetype/archetypeConfig fields — ignoring (KPR-435)", {
+          id: agentConfig.id,
+          archetype: rawArchetype,
+        });
+      }
       // KPR-324 C7: strip the test fixture from any non-pilot def.
       agentConfig.coreServers = sanitizeVoiceFixture(agentConfig.id, agentConfig.coreServers);
       // KPR-329: sanitize the optional toolSearch override before any
@@ -296,11 +338,11 @@ export class AgentRegistry {
       currentIds.add(agentConfig.id);
 
       // Disabled check FIRST — skip all validation for disabled agents.
-      // Without this, a disabled agent with invalid archetypeConfig or with
-      // a context-dependent server in delegateServers (KPR-221) would fail
-      // validation and get evicted instead of being quietly skipped. The
-      // operator-facing contract is "disable first, repair config later" —
-      // a disabled agent definition is an offline doc, not a live config.
+      // Without this, a disabled agent with a context-dependent server in
+      // delegateServers (KPR-221) would fail validation and get evicted
+      // instead of being quietly skipped. The operator-facing contract is
+      // "disable first, repair config later" — a disabled agent definition
+      // is an offline doc, not a live config.
       //
       // KPR-220 PR #266 review fix: previously, validateDelegateServersOrThrow
       // ran ahead of this block, causing disabled agents with bad
@@ -334,41 +376,6 @@ export class AgentRegistry {
           });
         }
         continue;
-      }
-
-      // Archetype validation (fail-closed on invalid archetypeConfig)
-      if (agentConfig.archetype) {
-        const def = getArchetype(agentConfig.archetype);
-        if (!def) {
-          // Graceful degradation — unknown archetype runs as unstructured.
-          log.warn("Unknown archetype — loading agent as unstructured", {
-            id: agentConfig.id,
-            archetype: agentConfig.archetype,
-          });
-          agentConfig.archetype = undefined;
-          agentConfig.archetypeConfig = undefined;
-        } else {
-          try {
-            // Replace raw blob with archetype-validated typed config.
-            agentConfig.archetypeConfig = def.validateConfig(agentConfig.archetypeConfig) as Record<string, unknown>;
-          } catch (err) {
-            log.error("Archetype config validation failed — agent will not load", {
-              id: agentConfig.id,
-              archetype: agentConfig.archetype,
-              error: String(err),
-            });
-            // Fail-closed: evict any previously-loaded version so a stale valid
-            // config doesn't keep serving requests after the DB doc goes bad.
-            if (this.agents.has(agentConfig.id)) {
-              this.agents.delete(agentConfig.id);
-              removed.push(agentConfig.id);
-              log.warn("Evicted previously-loaded agent due to archetype validation failure", {
-                id: agentConfig.id,
-              });
-            }
-            continue;
-          }
-        }
       }
 
       if (previousIds.has(agentConfig.id)) {

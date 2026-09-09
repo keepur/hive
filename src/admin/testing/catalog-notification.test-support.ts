@@ -112,7 +112,7 @@ export function makeCatalogAgent(overrides: Partial<AgentDefinition> = {}): Agen
     spawnBudget: 5,
     timeoutMs: 300_000,
     effort: "low",
-    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    autonomy: { externalComms: true, codeAccess: false },
     disabled: false,
     createdAt: at,
     updatedAt: at,

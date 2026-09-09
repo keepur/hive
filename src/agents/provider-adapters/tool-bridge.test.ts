@@ -657,7 +657,7 @@ function makeMemoryAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfi
     delegateServers: [],
     soul: "mem soul",
     systemPrompt: "mem system",
-    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    autonomy: { externalComms: true, codeAccess: false },
     ...overrides,
   };
 }

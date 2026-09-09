@@ -44,7 +44,6 @@ import { IMessageAdapter } from "./channels/imessage-adapter.js";
 import { TaskClient } from "./tasks/task-client.js";
 import { TaskLedger } from "./tasks/task-ledger.js";
 import { BackgroundTaskManager } from "./background/background-task-manager.js";
-import { CodeTaskManager } from "./code-task/code-task-manager.js";
 import { MeetingMonitor } from "./recall/meeting-monitor.js";
 import { RetryQueue } from "./sweeper/retry-queue.js";
 import { Sweeper } from "./sweeper/sweeper.js";
@@ -354,13 +353,11 @@ async function main(): Promise<void> {
     });
   }
 
-  // Code index prefetcher + knowledge extractor (optional — only when codeIndex enabled)
+  // Code index prefetcher (optional — only when codeIndex enabled)
   let prefetcher: import("./code-index/prefetcher.js").CodeIndexPrefetcher | undefined;
-  let knowledgeExtractor: import("./code-task/knowledge-extractor.js").KnowledgeExtractor | undefined;
 
   if (config.codeIndex.enabled) {
     const { CodeIndexPrefetcher } = await import("./code-index/prefetcher.js");
-    const { KnowledgeExtractor } = await import("./code-task/knowledge-extractor.js");
 
     prefetcher = new CodeIndexPrefetcher({
       db,
@@ -370,13 +367,8 @@ async function main(): Promise<void> {
       prefetchLimit: config.codeIndex.prefetchLimit,
     });
 
-    if (config.codeIndex.sessionKnowledge.enabled) {
-      knowledgeExtractor = new KnowledgeExtractor(memoryStore, memoryEmbedder);
-    }
-
     log.info("Code index integration enabled", {
       prefetch: true,
-      sessionKnowledge: knowledgeExtractor !== undefined,
     });
   }
 
@@ -472,9 +464,9 @@ async function main(): Promise<void> {
   });
 
   // ── Spawn-capable boundary (KPR-394, restated by KPR-414) ──────────────
-  // Everything BELOW this line can dispatch a turn: bgTaskManager /
-  // codeTaskManager orphan-completion callbacks, meetingMonitor, every
-  // channel adapter, the scheduler. Anything a turn READS PER SPAWN —
+  // Everything BELOW this line can dispatch a turn: bgTaskManager's
+  // orphan-completion callbacks, meetingMonitor, every channel adapter,
+  // the scheduler. Anything a turn READS PER SPAWN —
   // provider plugins, the worker pool, the meeting scribe, the ack lever —
   // must be wired ABOVE it, or turns in the boot window silently see the pre-feature
   // engine. Guarded by src/boot-order.test.ts.
@@ -492,28 +484,6 @@ async function main(): Promise<void> {
   await bgTaskManager.start();
   await bgTaskManager.scanOrphans();
   log.info("Background task manager started", { port: config.background.port });
-
-  // Code task manager — agents can spawn Claude Code CLI sessions
-  const codeTaskManager = new CodeTaskManager(
-    config.codeTask.port,
-    config.codeTask.authToken,
-    config.codeTask.pluginDirs,
-    config.codeTask.maxConcurrent,
-    config.tasksDir.code,
-    (item) =>
-      dispatcher.dispatch(item).catch((err) => {
-        log.error("Code task completion dispatch failed", { error: String(err) });
-      }),
-    {
-      prefetcher,
-      knowledgeExtractor,
-      maxLifetimeMs: config.codeTask.maxLifetimeMs,
-      staleGraceMs: config.codeTask.staleGraceMs,
-    },
-  );
-  await codeTaskManager.start();
-  await codeTaskManager.scanOrphans();
-  log.info("Code task manager started", { port: config.codeTask.port });
 
   // Meeting monitor — real-time meeting participation via Recall.ai
   let meetingMonitor: MeetingMonitor | undefined;
@@ -912,7 +882,6 @@ async function main(): Promise<void> {
       dispatcher,
       slackAdapters,
       bgTaskManager,
-      codeTaskManager,
       meetingMonitor,
       taskLedger: taskLedger.isConfigured ? taskLedger : undefined,
       slackGateways,
@@ -971,7 +940,6 @@ async function main(): Promise<void> {
     meetingScribe.stop();
     outageReplayProcessor?.stop();
     await bgTaskManager.stop();
-    await codeTaskManager.stop();
     await prefetcher?.close();
     meetingMonitor?.stop();
     spawnCoordinatorHeartbeat.stop();

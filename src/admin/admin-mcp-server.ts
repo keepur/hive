@@ -16,7 +16,6 @@ import type { AgentDefinition, AgentDefinitionVersion } from "../types/agent-def
 import { AGENT_DEFINITION_DEFAULTS } from "../types/agent-definition.js";
 import type { AutonomyFlags } from "../agents/autonomy.js";
 import type { InstanceCapabilities } from "../tools/instance-capabilities.js";
-import { getArchetype, listArchetypeIds } from "../archetypes/registry.js";
 import { IN_PROCESS_PORTED_SERVERS } from "../agents/in-process-servers.js";
 import { AGENT_EFFORT_LEVELS, isAgentEffort, type AgentEffort } from "../agents/agent-effort.js";
 import {
@@ -187,14 +186,7 @@ function checkDelegateServers(value: unknown): string | null {
  * at write time so operators see the error immediately, following the
  * same precedent as KPR-184.
  */
-const CONTEXT_DEPENDENT_SERVERS = new Set<string>([
-  "callback",
-  "background",
-  "code-task",
-  "recall",
-  "structured-memory",
-  "memory",
-]);
+const CONTEXT_DEPENDENT_SERVERS = new Set<string>(["callback", "background", "recall", "structured-memory", "memory"]);
 
 function checkDelegateContextDependent(value: unknown): string | null {
   if (!Array.isArray(value)) return null;
@@ -205,6 +197,31 @@ function checkDelegateContextDependent(value: unknown): string | null {
     `These embed channel/thread env vars and won't work as sub-agents (sub-agents spawn ` +
     `without that context). Move to coreServers or remove. Context-dependent: ` +
     `${[...CONTEXT_DEPENDENT_SERVERS].join(", ")}.`
+  );
+}
+
+/**
+ * KPR-435: `code-task` was removed from the engine entirely. Reject it at
+ * write time in either coreServers or delegateServers — unlike the
+ * context-dependent/in-process-ported checks above, this isn't about where
+ * the server can live, it's that the server doesn't exist. Registry load
+ * sanitizes pre-existing docs (agent-registry.ts REMOVED_SERVERS) rather
+ * than evicting; this is the write-time half of that same contract.
+ */
+const REMOVED_SERVERS = new Set<string>(["code-task"]);
+
+function checkRemovedServers(coreServers: unknown, delegateServers: unknown): string | null {
+  const invalid: string[] = [];
+  if (Array.isArray(coreServers)) {
+    invalid.push(...coreServers.filter((s): s is string => typeof s === "string" && REMOVED_SERVERS.has(s)));
+  }
+  if (Array.isArray(delegateServers)) {
+    invalid.push(...delegateServers.filter((s): s is string => typeof s === "string" && REMOVED_SERVERS.has(s)));
+  }
+  if (invalid.length === 0) return null;
+  return (
+    `coreServers/delegateServers cannot include removed servers: ${[...new Set(invalid)].join(", ")}. ` +
+    `These servers no longer exist in the engine (KPR-435). Remove them from the agent definition.`
   );
 }
 
@@ -487,7 +504,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
     ),
     tool(
       "agent_create",
-      'Create a new agent definition. Required: _id, name, model, homeBase, roles. Roles is an array of concise role labels (e.g. ["VP Engineering"] or ["Production Support", "Bilingual liaison"]) — used by team_lookup_agent and the team summary in agent system prompts. Archetype is optional — pass it when the role is a discipline with shared infrastructure (see list_archetypes). Soul/systemPrompt shape the agent\'s voice and role; if omitted they default to empty strings. Additional tuning (channels, schedule, budget, autonomy, archetypeConfig, etc.) goes in `fields`.',
+      'Create a new agent definition. Required: _id, name, model, homeBase, roles. Roles is an array of concise role labels (e.g. ["VP Engineering"] or ["Production Support", "Bilingual liaison"]) — used by team_lookup_agent and the team summary in agent system prompts. Soul/systemPrompt shape the agent\'s voice and role; if omitted they default to empty strings. Additional tuning (channels, schedule, budget, autonomy, etc.) goes in `fields`.',
       {
         _id: z.string().describe("Agent ID (lowercase with hyphens, e.g. 'my-agent')"),
         name: z.string().describe("Display name for the agent"),
@@ -522,23 +539,18 @@ export function buildAdminTools(deps: AdminToolDeps) {
           .string()
           .optional()
           .describe(
-            "Role definition and guardrails. Concise. Instance-specific flavor — archetype framing layers underneath.",
+            "Role definition and guardrails. Concise. Instance-specific flavor — the constitution and team summary layer underneath.",
           ),
         archetype: z
           .string()
           .optional()
-          .describe(
-            "Discipline id from list_archetypes (e.g. 'software-engineer'). Omit for plain unstructured agents.",
-          ),
-        title: z
-          .string()
-          .optional()
-          .describe("Customer-facing title (e.g. 'VP Engineering'). Typically paired with archetype."),
+          .describe("Retired (KPR-435) — the archetype system was removed from the engine. Omit this field."),
+        title: z.string().optional().describe("Customer-facing title, e.g. 'VP Engineering'."),
         fields: z
           .record(z.string(), z.any())
           .optional()
           .describe(
-            "Additional fields (channels, passiveChannels, schedule, coreServers override, delegateServers, plugins, autonomy, archetypeConfig, budgetUsd, maxTurns, toolSearch, effort, etc.). " +
+            "Additional fields (channels, passiveChannels, schedule, coreServers override, delegateServers, plugins, autonomy, budgetUsd, maxTurns, toolSearch, effort, etc.). " +
               "`effort`: static per-agent reasoning effort — one of low, medium, high, xhigh, max (the SDK EffortLevel). " +
               "Wins over the per-turn classifier (which is then skipped); the round-1 meeting-reaction pin still wins over it. " +
               "Claude-runtime lanes only (claude + kimi/deepseek, clamped to low/medium/high there); a no-op on openai/gemini/codex/grok — use the model's :effort suffix instead. " +
@@ -567,14 +579,6 @@ export function buildAdminTools(deps: AdminToolDeps) {
             };
           }
 
-          if (archetype !== undefined && !getArchetype(archetype)) {
-            const known = listArchetypeIds().join(", ") || "(none registered)";
-            return {
-              isError: true,
-              content: [{ type: "text", text: `Unknown archetype: "${archetype}". Known: ${known}.` }],
-            };
-          }
-
           const f = fields ?? {};
 
           // KPR-184: reject in-process-ported MCPs in delegateServers.
@@ -596,6 +600,20 @@ export function buildAdminTools(deps: AdminToolDeps) {
           const effortError = checkEffort(f.effort);
           if (effortError) {
             return { isError: true, content: [{ type: "text", text: effortError }] };
+          }
+          // KPR-435: reject removed servers in either coreServers or delegateServers.
+          const removedServersError = checkRemovedServers(f.coreServers, f.delegateServers);
+          if (removedServersError) {
+            return { isError: true, content: [{ type: "text", text: removedServersError }] };
+          }
+          // KPR-435: reject archetype/archetypeConfig from BOTH the top-level
+          // param and the `fields` bag (the bag was never covered before).
+          const archetypeError =
+            archetype !== undefined || f.archetype != null || f.archetypeConfig != null
+              ? "archetype/archetypeConfig are retired (KPR-435) — the archetype system was removed from the engine. Omit these fields."
+              : null;
+          if (archetypeError) {
+            return { isError: true, content: [{ type: "text", text: archetypeError }] };
           }
           const now = new Date();
           const doc: AgentDefinition = {
@@ -621,9 +639,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
             metadata: f.metadata as Record<string, unknown> | undefined,
             soul: soul ?? (f.soul as string) ?? "",
             systemPrompt: systemPrompt ?? (f.systemPrompt as string) ?? "",
-            archetype,
             title,
-            archetypeConfig: f.archetypeConfig as Record<string, unknown> | undefined,
             schedule: (f.schedule as Array<{ cron: string; task: string }>) ?? [...AGENT_DEFINITION_DEFAULTS.schedule],
             subscribe: f.subscribe as string[] | undefined,
             budgetUsd: (f.budgetUsd as number) ?? AGENT_DEFINITION_DEFAULTS.budgetUsd,
@@ -663,7 +679,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
             content: [
               {
                 type: "text",
-                text: `Agent '${_id}' (${name}) created with model ${model}${archetype ? ` — archetype ${archetype}` : ""}. Change will take effect within 30 seconds.${envelopeNote}`,
+                text: `Agent '${_id}' (${name}) created with model ${model}. Change will take effect within 30 seconds.${envelopeNote}`,
               },
             ],
           };
@@ -674,7 +690,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
     ),
     tool(
       "agent_update",
-      "Update fields on an existing agent definition. Saves a version snapshot before mutation. Cannot change _id. Creation-boundary fields (homeBase, archetype, title, soul, systemPrompt) are promoted to top-level for discoverability; everything else goes in `fields`.",
+      "Update fields on an existing agent definition. Saves a version snapshot before mutation. Cannot change _id. Creation-boundary fields (homeBase, title, soul, systemPrompt) are promoted to top-level for discoverability; everything else goes in `fields`.",
       {
         agent_id: z.string().describe("The agent ID to update"),
         homeBase: z.string().optional().describe("Primary Slack channel for scheduler delivery."),
@@ -684,7 +700,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
           .string()
           .optional()
           .describe(
-            "Discipline id from list_archetypes. Pass null-style empty string to clear (note: fields.archetype: null also works via the fields bag).",
+            "Retired (KPR-435) — the archetype system was removed from the engine. To clear a legacy value: fields: { archetype: null, archetypeConfig: null }.",
           ),
         title: z.string().optional().describe("Customer-facing title."),
         roles: z
@@ -700,7 +716,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
           .record(z.string(), z.any())
           .optional()
           .describe(
-            "Additional fields (channels, schedule, autonomy, archetypeConfig, budgetUsd, model, etc.). " +
+            "Additional fields (channels, schedule, autonomy, budgetUsd, model, etc.). " +
               "For `model`: bare id routes to Claude; <provider>/<model>[:effort] routes elsewhere " +
               "(e.g. 'codex/gpt-5.5:medium', 'grok/grok-4.6') — call agent_model_catalog_list to check valid ids per provider." +
               " `effort`: static per-agent reasoning effort — low | medium | high | xhigh | max, or null to unset. Wins over the per-turn classifier; " +
@@ -732,11 +748,18 @@ export function buildAdminTools(deps: AdminToolDeps) {
           }
           delete merged.createdAt;
 
-          if (typeof merged.archetype === "string" && merged.archetype.length > 0 && !getArchetype(merged.archetype)) {
-            const known = listArchetypeIds().join(", ") || "(none registered)";
+          // KPR-435: archetype/archetypeConfig are retired. `null` is allowed
+          // through (explicit unset — this file's established clearing
+          // convention; the registry treats null as absent).
+          if (merged.archetype != null || merged.archetypeConfig != null) {
             return {
               isError: true,
-              content: [{ type: "text", text: `Unknown archetype: "${merged.archetype}". Known: ${known}.` }],
+              content: [
+                {
+                  type: "text",
+                  text: `archetype/archetypeConfig are retired (KPR-435) — the archetype system was removed from the engine. Omit these fields.`,
+                },
+              ],
             };
           }
 
@@ -751,6 +774,16 @@ export function buildAdminTools(deps: AdminToolDeps) {
             if (contextError) {
               return { isError: true, content: [{ type: "text", text: contextError }] };
             }
+          }
+
+          // KPR-435: reject removed servers. Deliberately OUTSIDE the
+          // `"delegateServers" in merged` block above — a payload touching only
+          // `coreServers` carries no delegateServers key and would otherwise
+          // skip the check entirely. checkRemovedServers is Array.isArray-guarded,
+          // so calling it unconditionally is safe.
+          const removedServersError = checkRemovedServers(merged.coreServers, merged.delegateServers);
+          if (removedServersError) {
+            return { isError: true, content: [{ type: "text", text: removedServersError }] };
           }
 
           // KPR-329: reject invalid toolSearch at the write boundary. null is
@@ -1069,31 +1102,6 @@ export function buildAdminTools(deps: AdminToolDeps) {
       },
     ),
     tool(
-      "list_archetypes",
-      "List registered agent archetypes with self-descriptions. Use this to decide whether an agent you are creating is a discipline-bound archetype (e.g. software-engineer) or a plain unstructured agent.",
-      {},
-      async () => {
-        try {
-          const ids = listArchetypeIds();
-          const catalog = ids
-            .map((id) => {
-              const def = getArchetype(id);
-              if (!def) return null;
-              return {
-                id: def.id,
-                description: def.description ?? null,
-                whenToUse: def.whenToUse ?? null,
-                configSchema: def.configSchema ?? null,
-              };
-            })
-            .filter((x): x is NonNullable<typeof x> => x !== null);
-          return { content: [{ type: "text", text: JSON.stringify(catalog, null, 2) }] };
-        } catch (err) {
-          return { isError: true, content: [{ type: "text", text: `list_archetypes error: ${String(err)}` }] };
-        }
-      },
-    ),
-    tool(
       "agent_model_catalog_list",
       "List valid LLM model ids for agent model assignment. Claude/grok/codex use stored catalogs checked automatically every eight hours; notes report saved-list time, successful discovery, latest attempt, pending recovery, notification retry status, and acknowledged CoS processing/Slack acceptance. Plugins are manually maintained. Gemini is resolved live (cached ~10 min). Returns a JSON entries array followed by provider notes. Listing does not trigger built-in discovery.",
       {
@@ -1298,7 +1306,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
     ),
     tool(
       "verify_path",
-      "Check that an absolute filesystem path exists and is a directory. Used by the agent-builder skill to validate archetype-config paths (e.g. software-engineer `workshop`) before agent creation, so the caller catches typos at creation time instead of at agent-load time.",
+      "Check that an absolute filesystem path exists and is a directory. General-purpose path-validation utility for confirming a filesystem path before it's used elsewhere.",
       {
         path: z
           .string()

@@ -103,7 +103,6 @@ vi.mock("../config.js", () => ({
     recall: { apiKey: "", region: "", monitorPort: 3100, monitorPublicUrl: "", webhookSecret: "" },
     browser: { cdpEndpoint: "" },
     background: { port: 3200, authToken: "" },
-    codeTask: { port: 3202, authToken: "", pluginDir: "" },
     defaultAgent: "chief-of-staff",
   },
 }));
@@ -296,7 +295,7 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     icon: "",
     soul: "",
     systemPrompt: "",
-    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    autonomy: { externalComms: true, codeAccess: false },
     ...overrides,
   };
 }
@@ -8346,7 +8345,7 @@ describe("AgentManager — KPR-390 worker pool handshake", () => {
       delegateServers: [],
       soul: "",
       systemPrompt: "worker",
-      autonomy: { externalComms: false, codeTask: false, codeAccess: false },
+      autonomy: { externalComms: false, codeAccess: false },
     } as unknown as AgentConfig;
 
     const adapter = hooks.buildWorkerAdapter(workerConfig);
@@ -8391,7 +8390,7 @@ describe("AgentManager — KPR-390 worker pool handshake", () => {
       delegateServers: [],
       soul: "",
       systemPrompt: "scribe",
-      autonomy: { externalComms: false, codeTask: false, codeAccess: false },
+      autonomy: { externalComms: false, codeAccess: false },
     } as unknown as AgentConfig;
 
     const runner = (

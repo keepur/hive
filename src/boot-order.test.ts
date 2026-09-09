@@ -55,7 +55,6 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     offsetOf("dispatcher.setMeetingAckEnabled(config.meetingWorkers.ackEnabled)");
     offsetOf("await bgTaskManager.start()");
     offsetOf("await bgTaskManager.scanOrphans()");
-    offsetOf("await codeTaskManager.start()");
     offsetOf("await slackAdapter.start(");
     offsetOf("modelCatalogNotifier.start()");
     offsetOf("await smsAdapter.start(");
@@ -72,7 +71,6 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     const surfaceOffsets = [
       offsetOf("await bgTaskManager.start()"),
       offsetOf("await bgTaskManager.scanOrphans()"),
-      offsetOf("await codeTaskManager.start()"),
       offsetOf("await slackAdapter.start("),
       offsetOf("modelCatalogNotifier.start()"),
       offsetOf("await smsAdapter.start("),

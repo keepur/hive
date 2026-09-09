@@ -7,13 +7,28 @@
  * file listing) rides the turn input, so the `## Your Memory` /
  * `## Available Memory Files` sections left the prefix and the file-tier
  * guidance sentence was reworded ("delivered in the conversation"). G8, G9 and
- * G12 moved in that one sanctioned commit; nothing else did. Any LATER
- * snapshot churn is a Claude-lane parity break BY DEFINITION — fix the
- * refactor, never update the snapshots. The fixture matrix covers every
- * branch in buildPrefix; inputs are deterministic mocks so bytes are
- * machine-stable. HOT_TIER_FIXTURE stays: it is the renderMemoryBlock shape.
+ * G12 moved in that one sanctioned commit; nothing else did.
+ *
+ * RE-PINNED A SECOND TIME in KPR-435 — the archetype system was removed from
+ * the engine, so its prefix-section helper and its slot in the layer order
+ * are gone. G3/G4/G5 (the three archetype-card branch cases) were deleted and
+ * their snapshot entries removed as obsolete; G12 lost exactly the one
+ * archetype-card fixture line and its one SECTION_JOINER — the pre-re-pin
+ * diff was verified to contain nothing else, and the .snap diff is a PURE
+ * DELETION (no added bytes anywhere). Every other entry, G1 included, is
+ * byte-unchanged. G1's title still reads "no soul/archetype/roster/memory":
+ * that is deliberate — it documents the negative-space case and is also the
+ * .snap entry key, so renaming it would force an unrelated re-pin. This file
+ * and its .snap are named exceptions on KPR-435's archetype-scrub sweep.
+ *
+ * The standing rule is unchanged in spirit: any snapshot churn that is NOT
+ * carried by an explicit, ticketed prefix-shape change like the two above is a
+ * Claude-lane parity break BY DEFINITION — fix the refactor, never update the
+ * snapshots. The fixture matrix covers every branch in buildPrefix; inputs are
+ * deterministic mocks so bytes are machine-stable. HOT_TIER_FIXTURE stays: it
+ * is the renderMemoryBlock shape.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { AgentConfig } from "../types/agent-config.js";
 
 vi.mock("../logging/logger.js", () => ({
@@ -33,8 +48,6 @@ vi.mock("../config.js", async (importOriginal) => {
 });
 
 import { buildPrefix, type PrefixBuildContext } from "./prefix-builder.js";
-import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
-import type { ArchetypeDefinition } from "../archetypes/registry.js";
 
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -53,7 +66,7 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     delegateServers: [],
     soul: "",
     systemPrompt: "GOLDEN-SYSTEM-PROMPT: you are the golden fixture agent.",
-    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    autonomy: { externalComms: true, codeAccess: false },
     ...overrides,
   };
 }
@@ -91,30 +104,6 @@ const HOT_TIER_FIXTURE = [
   "---\nYou have 7 additional memories available via `memory_recall`. Use it to search for context before starting tasks.",
 ].join("\n\n");
 
-const GOLDEN_ARCHETYPE: ArchetypeDefinition = {
-  id: "golden-archetype",
-  validateConfig: (c) => c,
-  systemPromptCard: () => "GOLDEN-ARCHETYPE-CARD: fixture discipline card.",
-  preToolUseHooks: () => [],
-  memoryScopes: () => [],
-  sessionOptions: () => ({}),
-};
-
-const THROWING_ARCHETYPE: ArchetypeDefinition = {
-  ...GOLDEN_ARCHETYPE,
-  id: "throwing-archetype",
-  systemPromptCard: () => {
-    throw new Error("card exploded");
-  },
-};
-
-beforeEach(() => {
-  __resetRegistryForTests();
-  registerArchetype(GOLDEN_ARCHETYPE);
-  registerArchetype(THROWING_ARCHETYPE);
-});
-afterEach(() => __resetRegistryForTests());
-
 describe("buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first)", () => {
   it("G1: bare-bones agent (no soul/archetype/roster/memory)", async () => {
     expect(await buildPrefix(makeAgentConfig(), makeCtx())).toMatchSnapshot();
@@ -129,25 +118,6 @@ describe("buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first)", () 
       }) as never,
     });
     expect(await buildPrefix(makeAgentConfig({ soul: "GOLDEN-SOUL: warm, precise." }), ctx)).toMatchSnapshot();
-  });
-
-  it("G3: archetype card rendered (archetypeConfig present)", async () => {
-    const cfg = makeAgentConfig({ archetype: "golden-archetype", archetypeConfig: { k: "v" } });
-    expect(await buildPrefix(cfg, makeCtx())).toMatchSnapshot();
-  });
-
-  it("G4: archetype card throws → omitted, rest of prefix intact", async () => {
-    const cfg = makeAgentConfig({ archetype: "throwing-archetype", archetypeConfig: { k: "v" } });
-    const out = await buildPrefix(cfg, makeCtx());
-    expect(out).not.toContain("GOLDEN-ARCHETYPE-CARD");
-    expect(out).toMatchSnapshot();
-  });
-
-  it("G5: archetype id resolves but archetypeConfig absent → card skipped (prefix-builder.ts:75 conjunction)", async () => {
-    const cfg = makeAgentConfig({ archetype: "golden-archetype" }); // no archetypeConfig
-    const out = await buildPrefix(cfg, makeCtx());
-    expect(out).not.toContain("GOLDEN-ARCHETYPE-CARD");
-    expect(out).toMatchSnapshot();
   });
 
   it("G6: team summary present", async () => {
@@ -240,8 +210,6 @@ describe("buildPrefix golden byte-parity (KPR-349 §D2 — snapshot-first)", () 
     });
     const cfg = makeAgentConfig({
       soul: "GOLDEN-SOUL: warm, precise.",
-      archetype: "golden-archetype",
-      archetypeConfig: { k: "v" },
       coreServers: ["memory", "contacts"],
     });
     expect(await buildPrefix(cfg, ctx)).toMatchSnapshot();

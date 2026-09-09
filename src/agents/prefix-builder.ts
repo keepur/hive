@@ -29,7 +29,6 @@ import type { TeamRoster } from "../team-roster/team-roster.js";
 import type { LoadedPlugin } from "../plugins/types.js";
 import type { SkillIndex } from "./skill-loader.js";
 import type { CodeIndexPrefetcher } from "../code-index/prefetcher.js";
-import { getArchetype } from "../archetypes/registry.js";
 import { buildToolkitSection, buildProviderToolkitSection } from "./toolkit-section.js";
 import { config, resolveToolSearchMode } from "../config.js";
 import type { HiveToolInventoryEntry } from "./provider-adapters/tool-transport.js";
@@ -69,28 +68,6 @@ export const SECTION_JOINER = "\n\n---\n\n";
 
 export function soulSection(agentConfig: AgentConfig): string | null {
   return agentConfig.soul ? agentConfig.soul : null;
-}
-
-/** Archetype card. Catch-and-omit posture unchanged (prefix-builder.ts:71-89).
- *  The `archetypeDef && archetypeConfig` conjunction short-circuits before the
- *  card is attempted — golden G5 pins that branch. */
-export function archetypeCardSection(agentConfig: AgentConfig): string | null {
-  const archetypeDef = agentConfig.archetype ? getArchetype(agentConfig.archetype) ?? null : null;
-  if (!archetypeDef || !agentConfig.archetypeConfig) return null;
-  try {
-    const card = archetypeDef.systemPromptCard({
-      agentConfig,
-      archetypeConfig: agentConfig.archetypeConfig,
-    });
-    return card ? card : null;
-  } catch (err) {
-    log.error("Archetype systemPromptCard threw — omitting card", {
-      agent: agentConfig.id,
-      archetype: agentConfig.archetype,
-      error: String(err),
-    });
-    return null;
-  }
 }
 
 export function systemPromptSection(agentConfig: AgentConfig): string {
@@ -366,7 +343,7 @@ export function composeTurnInput(input: {
  * TURN INPUT under the digest gate instead (AgentRunner.send →
  * renderMemoryBlock / shouldInjectMemory / composeTurnInput). The KPR-349
  * golden gate was re-pinned at this shape in KPR-434 (D7).
- * Layer order: soul → archetype card → systemPrompt → constitution →
+ * Layer order: soul → systemPrompt → constitution →
  * team summary → toolkit → file-tier guidance.
  */
 export async function buildPrefix(agentConfig: AgentConfig, ctx: PrefixBuildContext): Promise<string> {
@@ -374,9 +351,6 @@ export async function buildPrefix(agentConfig: AgentConfig, ctx: PrefixBuildCont
 
   const soul = soulSection(agentConfig);
   if (soul) parts.push(soul);
-
-  const card = archetypeCardSection(agentConfig);
-  if (card) parts.push(card);
 
   parts.push(systemPromptSection(agentConfig));
 
@@ -471,7 +445,7 @@ export function skillsSection(skillIndex: ProviderSkillIndexEntry[]): string {
  * Lane B instructions: the SAME section helpers as buildPrefix, minus
  * Claude-specific fragments, plus the inventory-rendered toolkit and the
  * skills section. Layer order (spec G2, † = gated by toolsExecutable):
- * soul → archetype card → systemPrompt → constitution → team summary →
+ * soul → systemPrompt → constitution → team summary →
  * †toolkit → †follow-through (KPR-393) → †file-tier guidance (iff memory entry in inventory;
  * wording by memoryPlacement — KPR-434) →
  * †skills (iff index non-empty) → hot-tier/legacy memory ONLY for
@@ -486,9 +460,6 @@ export async function buildProviderInstructions(
 
   const soul = soulSection(agentConfig);
   if (soul) parts.push(soul);
-
-  const card = archetypeCardSection(agentConfig);
-  if (card) parts.push(card);
 
   parts.push(systemPromptSection(agentConfig));
 

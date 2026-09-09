@@ -40,7 +40,7 @@ export interface HiveToolTransportDescriptor {
 
 /**
  * Claude Agent SDK built-ins advertised by Hive's toolkit section — per-tool
- * (KPR-348 replaced the compound display names so archetype rules and the
+ * (KPR-348 replaced the compound display names so prompt rules and the
  * builtin executor address tools by their real names).
  */
 export const CLAUDE_SDK_BUILTIN_TOOL_NAMES: readonly string[] = [

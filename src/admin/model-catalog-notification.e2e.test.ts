@@ -54,7 +54,7 @@ vi.mock("../keychain/from-keychain.js", () => ({ fromKeychain: vi.fn(() => "") }
 vi.mock("../config.js", () => ({
   config: {
     instance: { id: "catalog-notification-e2e" },
-    autonomy: { externalComms: true, codeTask: false, codeAccess: false },
+    autonomy: { externalComms: true, codeAccess: false },
     modelRouter: { enabled: false },
     defaultAgent: "chief-of-staff",
     plugins: [],
@@ -87,7 +87,6 @@ vi.mock("../config.js", () => ({
     recall: { apiKey: "", region: "", monitorPort: 0, monitorPublicUrl: "", webhookSecret: "" },
     browser: { cdpEndpoint: "" },
     background: { port: 0, authToken: "" },
-    codeTask: { port: 0, authToken: "", pluginDir: "" },
   },
 }));
 
