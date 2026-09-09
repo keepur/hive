@@ -1,11 +1,18 @@
 import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
-import type { UsersInfoResponse } from "@slack/web-api";
+import type { UsersInfoResponse, WebClientOptions } from "@slack/web-api";
 import { createLogger } from "../logging/logger.js";
 import type { IncomingMessage } from "../types/agent-config.js";
+import type { NoticeDestination, NoticeLookupGate, SendResult } from "../admin/model-catalog-notification.js";
 import type { SweepResult } from "../sweeper/sweeper.js";
 import { downloadAndProcess, type SlackFile, type ProcessedFile } from "../files/file-processor.js";
 import { OutboundTsCache } from "./outbound-ts-cache.js";
+import {
+  classifyNoticeError,
+  classifyNoticeResponse,
+  noticeClientOptions,
+  validatedNoticeFetch,
+} from "./slack-notification-receipt.js";
 
 const log = createLogger("slack-gateway");
 
@@ -29,6 +36,7 @@ type ThreadContextHandler = (event: ThreadContextChangedEvent) => void;
 export class SlackGateway {
   private socket: SocketModeClient;
   private web: WebClient;
+  private notificationWeb: WebClient;
   private messageHandler: MessageHandler | null = null;
   private threadStartedHandler: ThreadStartedHandler | null = null;
   private threadContextHandler: ThreadContextHandler | null = null;
@@ -45,9 +53,13 @@ export class SlackGateway {
   /** Slack error from the most recent readChannel failure, so callers can surface the real cause. */
   lastReadError: string | undefined;
 
-  constructor(appToken: string, botToken: string) {
+  constructor(appToken: string, botToken: string, notificationOptions: Pick<WebClientOptions, "fetch"> = {}) {
     this.socket = new SocketModeClient({ appToken });
     this.web = new WebClient(botToken);
+    this.notificationWeb = new WebClient(botToken, {
+      ...noticeClientOptions,
+      fetch: validatedNoticeFetch(notificationOptions.fetch),
+    });
     this.botToken = botToken;
   }
 
@@ -633,6 +645,90 @@ export class SlackGateway {
       return { ok: false, error: "postMessage returned no ts" };
     } catch (err) {
       return { ok: false, error: (err as Error).message };
+    }
+  }
+
+  notificationChannelMatches(homeBase: string, channelId: string): boolean {
+    const input = homeBase.trim();
+    return /^[CDG][A-Z0-9]+$/.test(input)
+      ? input === channelId
+      : this.channelIdCache.get(input.replace(/^#/, "")) === channelId;
+  }
+
+  async resolveNotificationChannel(homeBase: string, gate: NoticeLookupGate): Promise<NoticeDestination> {
+    const input = homeBase.trim();
+    if (!input) return { channelId: null };
+    if (/^[CDG][A-Z0-9]+$/.test(input)) return { channelId: input };
+
+    const name = input.replace(/^#/, "");
+    const cached = this.channelIdCache.get(name);
+    if (cached) return { channelId: cached };
+
+    try {
+      let cursor: string | undefined;
+      const seen = new Set<string>();
+      do {
+        if (!(await gate.check()) || !gate.current()) return { channelId: null };
+        const response = await this.notificationWeb.conversations.list({
+          limit: 1000,
+          cursor,
+          exclude_archived: true,
+          types: "public_channel,private_channel",
+        });
+        if (response.ok !== true) {
+          const outcome = classifyNoticeResponse(response, "");
+          return {
+            channelId: null,
+            ...(outcome.kind === "acknowledged"
+              ? {}
+              : { retryAfterMs: outcome.retryAfterMs, retryBlocked: outcome.retryBlocked }),
+          };
+        }
+        for (const channel of response.channels ?? []) {
+          if (channel.id && channel.name) {
+            this.channelIdCache.set(channel.name, channel.id);
+            this.channelNameCache.set(channel.id, channel.name);
+          }
+        }
+        const found = this.channelIdCache.get(name);
+        if (found) return { channelId: found };
+        cursor = response.response_metadata?.next_cursor || undefined;
+        if (cursor && (seen.has(cursor) || seen.size >= 100)) return { channelId: null };
+        if (cursor) seen.add(cursor);
+      } while (cursor);
+      return { channelId: this.channelIdCache.get(name) ?? null };
+    } catch (error) {
+      const outcome = classifyNoticeError(error, "");
+      return {
+        channelId: null,
+        ...(outcome.kind === "acknowledged"
+          ? {}
+          : { retryAfterMs: outcome.retryAfterMs, retryBlocked: outcome.retryBlocked }),
+      };
+    }
+  }
+
+  async postNotificationReceipt(channelId: string, text: string): Promise<SendResult> {
+    if (!/^[CDG][A-Z0-9]+$/.test(channelId) || !text.trim() || text.length > 3900) {
+      return { kind: "not-accepted", reason: "invalid-state" };
+    }
+    try {
+      const response = await this.notificationWeb.chat.postMessage({
+        channel: channelId,
+        text,
+        mrkdwn: false,
+        parse: "none",
+        link_names: false,
+        unfurl_links: false,
+        unfurl_media: false,
+      });
+      const outcome = classifyNoticeResponse(response, channelId);
+      if (outcome.kind === "acknowledged") {
+        this.outboundTsCache.register(outcome.channelId, outcome.messageTs);
+      }
+      return outcome;
+    } catch (error) {
+      return classifyNoticeError(error, channelId);
     }
   }
 

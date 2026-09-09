@@ -56,6 +56,11 @@ import { MemoryLifecycle } from "./memory/memory-lifecycle.js";
 import { MemoryLifecycleHeartbeat } from "./memory/memory-lifecycle-heartbeat.js";
 import { getLLMRegistry } from "./llm/registry.js";
 import { AdminApi } from "./admin/admin-api.js";
+import { ModelCatalogNotifier } from "./admin/model-catalog-notifier.js";
+import { ModelCatalogOutbox } from "./admin/model-catalog-outbox.js";
+import { ModelCatalogStore } from "./admin/model-catalog-store.js";
+import { ModelCatalogScanner } from "./admin/model-catalog-scanner.js";
+import { discoverProviderModels } from "./admin/model-catalog-discovery.js";
 import { ActivityLogger } from "./activity/activity-logger.js";
 import { runMigrations } from "./migrations/run-migrations.js";
 import { checkFirstBoot } from "./startup/first-boot.js";
@@ -619,6 +624,10 @@ async function main(): Promise<void> {
   await memoryLifecycleHeartbeat.writeOnce();
   memoryLifecycleHeartbeat.start();
 
+  const modelCatalogStore = new ModelCatalogStore(db);
+  const modelCatalogScanner = new ModelCatalogScanner(modelCatalogStore, discoverProviderModels);
+  modelCatalogScanner.start();
+
   // Start Slack adapter
   // Exclude SMS channels — those are handled directly by the SmsAdapter
   const smsChannels = config.sms.lines.map((l) => l.slackChannel).filter(Boolean);
@@ -631,6 +640,10 @@ async function main(): Promise<void> {
       log.error("Slack dispatch failed", { error: String(err), source: item.source.label });
     });
   });
+  dispatcher.setCatalogNotificationDefault(config.explicitDefaultAgent);
+  const modelCatalogOutbox = new ModelCatalogOutbox(db);
+  const modelCatalogNotifier = new ModelCatalogNotifier(modelCatalogOutbox, dispatcher);
+  modelCatalogNotifier.start();
   log.info("Slack adapter connected");
 
   // Audit routing: every agent mirrors non-Slack conversations to their own
@@ -935,6 +948,9 @@ async function main(): Promise<void> {
 
   // Graceful shutdown
   const shutdown = async (signal: string) => {
+    const scannerDrain = modelCatalogScanner.stop();
+    const notifierDrain = modelCatalogNotifier.stop();
+    await Promise.all([scannerDrain, notifierDrain]);
     log.info("Shutdown signal received", { signal });
     sweeper.stop();
     retentionSweeper.stop();
