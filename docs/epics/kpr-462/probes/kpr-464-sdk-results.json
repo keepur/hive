@@ -1,0 +1,108 @@
+{
+  "runtime": {
+    "node": "v24.16.0",
+    "platform": "darwin",
+    "architecture": "arm64",
+    "agents": "1.6.4",
+    "rtcNode": "0.13.33"
+  },
+  "results": [
+    {
+      "test": "direct_stream_context",
+      "metrics": [
+        {
+          "cancelled": true,
+          "requestId": "",
+          "ttftMs": -1,
+          "traceTurnId": "turn-before-run"
+        },
+        {
+          "cancelled": true,
+          "requestId": "",
+          "ttftMs": -1,
+          "traceTurnId": "turn-before-headers"
+        },
+        {
+          "cancelled": true,
+          "requestId": "",
+          "ttftMs": -1,
+          "traceTurnId": "turn-after-headers"
+        },
+        {
+          "cancelled": true,
+          "requestId": "provider-during",
+          "ttftMs": 1,
+          "traceTurnId": "turn-during-text"
+        },
+        {
+          "cancelled": false,
+          "requestId": "provider-during",
+          "ttftMs": 2,
+          "traceTurnId": "turn-overlap-a"
+        },
+        {
+          "cancelled": false,
+          "requestId": "provider-during",
+          "ttftMs": 2,
+          "traceTurnId": "turn-overlap-b"
+        }
+      ]
+    },
+    {
+      "test": "session_speech_id",
+      "speechId": "speech_9cfa689a-c59",
+      "traceTurnId": "turn-auto-1",
+      "handleId": "speech_9cfa689a-c59"
+    },
+    {
+      "test": "handle_specific_interrupt_and_replacement",
+      "created": [
+        "speech_d52b01ca-ab7",
+        "speech_687619f0-980"
+      ],
+      "first": {
+        "id": "speech_d52b01ca-ab7",
+        "interrupted": true
+      },
+      "second": {
+        "id": "speech_687619f0-980",
+        "interrupted": false
+      },
+      "metrics": [
+        {
+          "speechId": "speech_d52b01ca-ab7",
+          "cancelled": true,
+          "traceTurnId": "turn-auto-1"
+        },
+        {
+          "speechId": "speech_687619f0-980",
+          "cancelled": false,
+          "traceTurnId": "turn-auto-2"
+        }
+      ]
+    },
+    {
+      "test": "fake_stt_accepted_caller_turn_order",
+      "order": [
+        {
+          "event": "onUserTurnCompleted",
+          "nonempty": true
+        },
+        {
+          "event": "speech_created",
+          "speechId": "speech_9fdf5651-6ff"
+        }
+      ],
+      "hookBeforeSpeechCreated": true
+    },
+    {
+      "test": "tts_wrapper_context_and_passthrough",
+      "firstFrameIsOriginal": true,
+      "timedMetadataPreserved": true,
+      "ended": true,
+      "metricTraceSynthesisId": "synth-normal",
+      "normalMetricCancelled": false,
+      "preFrameCancelMetricCount": 0
+    }
+  ]
+}
