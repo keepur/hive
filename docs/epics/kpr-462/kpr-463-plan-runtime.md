@@ -1,12 +1,14 @@
 # KPR-463 implementation plan — worker runtime and evidence
 
-This is chunk 2 of the [parent plan](./kpr-463-plan.md). Its Testing Contract, authority, workflow dependency and execution restrictions apply in full. Draft for review; do not deploy or call.
+This is chunk 2 of the [parent plan](./kpr-463-plan.md). Its Testing Contract, authority, authorized dodi-dev workflow substitution and S0–S12 serial schedule apply in full. Draft sequencing revision for review; do not deploy or call.
 
 ## Task 4: Reversible admission gate and instance-local IPC
 
-**Files:** Create `src/voice-worker/admission.ts`, `src/voice-worker/maintenance-ipc.ts`, `src/voice-worker/admission.test.ts`, `src/voice-worker/maintenance-ipc.integration.test.ts`. Modify `src/voice-worker/main.ts` only after Task 1 proof passes.
+**Files:** Reuse `src/voice-worker/admission.ts` and its test from S0; create `src/voice-worker/maintenance-ipc.ts`, `src/voice-worker/maintenance-ipc.integration.test.ts`. Extend admission tests with the new IPC/persistence cases. Modify `src/voice-worker/main.ts` in Task 5/S5.
 
-- [ ] **Step 1:** Implement the synchronous authority below. The JS callback reserves the job before its first await. SDK assignment/launch completion is deliberately not inferred from the returned promise. Reject repeated job IDs within one boot; record duplicate diagnostics without modifying an earlier entry.
+**Schedule:** S4 implements Steps 2–3 and Step 4 diagnostic data, then Step 5 tests, using S3's read-only process adapter. Step 4 consumer rendering is completed in S6 probes/doctor and S7 CLI/lifecycle. Step 5 assertions involving actual lifecycle cleanup/operation records finish in S9; Task 4 is fully complete only then. Step 1 is preserved Task 1 code; its contract below remains binding and is not reimplemented on resume.
+
+- [x] **Step 1:** Implement the synchronous authority below. The JS callback reserves the job before its first await. SDK assignment/launch completion is deliberately not inferred from the returned promise. Reject repeated job IDs within one boot; record duplicate diagnostics without modifying an earlier entry.
 
 ```typescript
 export interface SupervisorRef { pid: number; bootId: string }
@@ -305,7 +307,7 @@ Close/status polling shares the **same** 30-second maintenance deadline. Abort r
 
 - [ ] **Step 4:** Expose diagnostics for unresolved entries in CLI/probe output: job ID, supervisor PID/boot, accepted timestamp/age, phase and observed child PID if available. In particular, `accepted-awaiting-entry` after assignment/prewarm/import failure and `entered-awaiting-completion` after lost acknowledgement remain unresolved until the genuine completion path settles them. SDK job-count zero, assignment timeout, dead child, stale heartbeat or elapsed time **never** clear these records. A planned lifecycle operation defers; this ticket introduces no `--force`, ledger-clear or call-termination flag. An operator can investigate retained state; a separate incident recovery decision is not disguised as a normal update.
 
-- [ ] **Step 5:** Verify and checkpoint this slice.
+- [ ] **Step 5:** Verify and checkpoint the S4 ledger/transport slice; consumer rendering remains assigned to S6/S7. The matrix below also names consumer behavior: assertions that lifecycle sends release, resolves cleanup or clears its operation record are added to `src/deployment/lifecycle.integration.test.ts` and run with Task 9 Step 5 in S9 against the actual Task 8 orchestration. S4 tests the protocol/ledger side of those cases without importing future lifecycle code.
 
 ```bash
 npx vitest run src/voice-worker/admission.test.ts src/voice-worker/maintenance-ipc.integration.test.ts
@@ -326,13 +328,15 @@ Minimum cases: close/release/status happy path; request-after-close rejection; r
 | write, file fsync, close, rename, directory fsync and cleanup failures | pre-rename failure leaves old target intact; temps removed when cleanup succeeds; after-rename fsync failure is uncertain and never acknowledged; all opened descriptors are closed; cleanup error preserves primary error |
 | release and open-status correlation | top-level operationId equals request operation UUID, nested snapshot.operationId is null, and only successful terminal release clears the lifecycle record |
 
-Expected: both Vitest files exit 0 with every case executed. No test calls drain or signals a real worker.
+Expected: both Vitest files exit 0 with every S4 protocol/ledger case executed; the assigned lifecycle/marker cases must also pass in S9 before Task 4 completion. No test calls drain or signals a real worker.
 
 ## Task 5: Wire tracking and immutable boot evidence without altering conversation logic
 
-**Files:** Create `src/voice-worker/job-lifecycle.ts`; modify `main.ts`, `telemetry.ts`, `worker-config.ts`, `src/index.ts`, and related tests.
+**Files:** Reuse `src/voice-worker/job-lifecycle.ts` and its tests from S0; modify `main.ts`, `telemetry.ts`, `worker-config.ts`, `src/index.ts`, and related tests.
 
-- [ ] **Step 1:** Use this complete entry/cleanup envelope in `job-lifecycle.ts`. It registers shutdown tracking before configuration, metadata parsing, Mongo connection or session work. SDK callback concurrency is handled by an explicit cleanup promise; entry return does not imply job completion.
+**Schedule:** S5 executes Steps 2–6 after release/identity helpers (S1), `WorkerConfig.healthPort` (S2), service process adapters (S3) and the mailbox/reporter (S4) exist. Step 1 is preserved Task 1 code. No packaged artifact is needed for the source/SDK-fixture checks at this checkpoint.
+
+- [x] **Step 1:** Use this complete entry/cleanup envelope in `job-lifecycle.ts`. It registers shutdown tracking before configuration, metadata parsing, Mongo connection or session work. SDK callback concurrency is handled by an explicit cleanup promise; entry return does not imply job completion.
 
 ```typescript
 import type { JobContext } from "@livekit/agents";
@@ -434,6 +438,7 @@ Packaged entrypoints require their manifest. Source/developer entrypoints remain
 - [ ] **Step 6:** Verify the wrapper and telemetry boundary before committing.
 
 ```bash
+npm run build
 npx vitest run src/voice-worker/job-lifecycle.test.ts src/voice-worker/main.test.ts src/voice-worker/telemetry.test.ts src/voice-worker/session.test.ts src/voice-worker/sdk-lifecycle.integration.test.ts
 npm run typecheck
 ```
@@ -443,6 +448,8 @@ Minimum assertions: pre-config/metadata/Mongo failure; early cleanup completes o
 ## Task 6: Configuration, no-call health and doctor evidence
 
 **Files:** Create `src/deployment/ports.ts`, `src/deployment/ports.test.ts`, `src/deployment/runtime-probe.ts`, `src/deployment/health.ts`, `src/deployment/health.test.ts`. Modify `src/config.ts`, `src/voice-worker/worker-config.ts`, `src/cli/doctor.ts`, `src/cli/doctor-checks.ts` and tests.
+
+**Schedule:** S2 implements Step 1 plus its ports/worker-config unit cases before Task 5 needs `healthPort`. S6 implements Steps 2–5 plus the local health/doctor/bridge cases in Step 6, after Task 7/S3 supplies `buildServiceEnvironment`, the shared dotenv resolver and OS adapters. S6 builds probe source; real packaged probe execution waits for S8/S9. Add and run Step 6's transaction closed-gate propagation cases in S9, after transaction source and the artifact exist; Task 6 is not fully complete until then.
 
 - [ ] **Step 1:** Resolve the new listener without changing existing ports. Pure helper:
 
@@ -540,10 +547,10 @@ The legacy probe runs from retained candidate tooling **with the captured pilot 
 
 - [ ] **Step 5:** Extend doctor voice output to display installed package identity separately from observed engine/worker identity. Add optional supervisor fields to `VoiceWorkerStatsRow` and preserve unavailable legacy state. Print registration/health and unresolved-maintenance classification without changing the existing doctor policy that only datastore identity failures affect the exit code. Use local probes by default; outbound is explicit via deployment acceptance. Secret values must never appear in fixture snapshots/output.
 
-- [ ] **Step 6:** Verify:
+- [ ] **Step 6:** Verify the S6 local evidence boundary with the command below. The ports/loader subset already checked S2; the separate transaction propagation requirement below is completed in S9.
 
 ```bash
 npx vitest run src/deployment/ports.test.ts src/deployment/health.test.ts src/voice-worker/worker-config.test.ts src/voice-worker/telemetry.test.ts src/cli/doctor-checks.test.ts src/cli/doctor.test.ts src/channels/voice/voice-adapter.test.ts src/channels/voice/voice-adapter.integration.test.ts
 ```
 
-Expected: all pass. Require negative cases for stale prior logs, wrong PID/start time/boot/revision, foreign listener, missing/malformed heartbeat, future timestamp, `/worker` 200 with `/` 503, unknown active-call telemetry, valid token denied, arbitrary 400, disabled voice missing keys, explicit health-port collision, legacy-only fields missing, legacy recovery falsely labeled packaged. With all other enabled-worker evidence healthy, require `packagedHealthy` to return false separately for a persistence-faulted closed gate with null owner, a maintenance-owned closed gate without a persistence fault, missing/stale admission evidence, and a mismatched snapshot supervisor PID/boot. Require true for a fresh corroborated open/null-owner/fault-free snapshot, without imposing an idle-job condition on normal activation. The transaction health fixture must propagate each closed-gate failure into failed activation/checked recovery, never a healthy result. Commit the worker/evidence slice after review and passing tests; proceed to lifecycle chunk.
+Expected: all pass. Require negative cases for stale prior logs, wrong PID/start time/boot/revision, foreign listener, missing/malformed heartbeat, future timestamp, `/worker` 200 with `/` 503, unknown active-call telemetry, valid token denied, arbitrary 400, disabled voice missing keys, explicit health-port collision, legacy-only fields missing, legacy recovery falsely labeled packaged. With all other enabled-worker evidence healthy, require `packagedHealthy` to return false separately for a persistence-faulted closed gate with null owner, a maintenance-owned closed gate without a persistence fault, missing/stale admission evidence, and a mismatched snapshot supervisor PID/boot. Require true for a fresh corroborated open/null-owner/fault-free snapshot, without imposing an idle-job condition on normal activation. In S9, the transaction health fixture must propagate each closed-gate failure into failed activation/checked recovery, never a healthy result. Checkpoint the S6 worker/evidence and Task 3 diagnostic sources after self-review, fresh build and passing local tests; next is S7 lifecycle source integration. This checkpoint does not claim the S8 artifact or S9 integration gates.

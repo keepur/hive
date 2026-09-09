@@ -1,8 +1,8 @@
 # KPR-463 — Packaged engine and voice-worker lifecycle implementation plan
 
-> **For agentic workers:** After this plan passes the child plan-review gate, use the repository's required `/spec-and-implement` workflow, then `dodi-dev:implement` within the dispatched implementation lanes. `/spec-and-implement` is currently unavailable in the supplied runtime. The driver must resolve that operational handoff dependency; do not invent the entrypoint or bypass it. This document authorizes planning only.
+> **For agentic workers:** After this revision passes the child plan-review gate, resume through the dodi-dev implementation/delivery lane using the serial schedule below. The user explicitly authorized dodi-dev to replace the unavailable `/spec-and-implement` entrypoint (authorization record `ac95b136`); that workflow substitution is resolved. It does not establish deployment prerequisites or authorize live calls.
 
-**Status:** DRAFT_READY for review; no readiness label, implementation, deployment, or call is asserted.
+**Status:** DRAFT_READY sequencing revision for review. Task 1 is preserved on the implementation child as recorded below; this revision does not assert readiness, deployment, or call completion.
 
 **Goal:** Ship, install, operate, and recover the enabled LiveKit worker and engine as one instance-owned npm release, then record the required dodi migration evidence.
 
@@ -59,10 +59,11 @@ The code blocks prescribe complete core functions/types and exact replacement bl
 
 ### Commands
 
-Run from the implementing worktree, with disposable test fixtures created by the harness. Do not use operator instance config or Keychain to make tests pass.
+Run this full-contract block only after S9 integration below, from the implementing worktree, with disposable test fixtures created by the harness. Earlier slices use their own bounded commands. Do not use operator instance config or Keychain to make tests pass. Build before any SDK-child test or artifact command so neither can consume stale or absent compiled entries.
 
 ```bash
 npm ci
+npm run bundle
 npx vitest run src/paths.test.ts src/voice-worker/admission.test.ts src/voice-worker/job-lifecycle.test.ts src/deployment/release.test.ts src/deployment/ports.test.ts src/deployment/health.test.ts src/deployment/transaction.test.ts
 npx vitest run src/voice-worker/sdk-lifecycle.integration.test.ts src/voice-worker/maintenance-ipc.integration.test.ts src/deployment/lifecycle.integration.test.ts src/deployment/adoption.integration.test.ts src/channels/voice/voice-adapter.integration.test.ts
 node --test scripts/generate-shrinkwrap.test.mjs scripts/check-bundle-runtime.test.mjs
@@ -141,7 +142,31 @@ No required test group is waived. Live-call conversation/audio E2E is outside KP
 | `CLAUDE.md`, `AGENTS.md`, `docs/epics/kpr-462/kpr-463-operations.md` | supported paths, native prerequisites, adoption/recovery/runbook |
 | `docs/epics/kpr-462/kpr-463-deployment-evidence.md` | sanitized actual delivery evidence; create only during delivery |
 
-Execution order: Task 1 proof first. Then Tasks 2–3 (artifact lane) and Tasks 4–6 (worker/evidence lane) can run in parallel once interfaces are fixed. Tasks 7–10 (lifecycle/CLI) depend on both. One owner edits `main.ts`, `telemetry.ts`, `config.ts`, `build/bundle.ts`, `package.json` and lockfile; integrate those serially with KPR-464/KPR-465. Task 11 regression follows integration; Task 12 operational acceptance follows reviewed delivery and required workflow handoff. No independent scope change is hidden in parallel work.
+### Serial execution schedule and resume checkpoint
+
+Task/Step numbers below remain stable audit IDs, **not numeric execution order**. Execute S0–S12 serially. A split step is complete only after all of its assigned slices pass; record slice completion separately. This schedule changes implementation/check ordering only: every behavior and T1–T9 gate remains required. One owner edits shared `main.ts`, `telemetry.ts`, `config.ts`, `build/bundle.ts`, `package.json` and lockfile; integrate serially with KPR-464/KPR-465.
+
+**Preserved child:** `codex/kpr-463-packaged-voice` at `438115f2788e19c01dc8d7e08a43be17ef3a30bb` in `/Users/mokie/github/hive-kpr463-deliver` contains the six Task 1 files. Its recorded verification is `npm run build` plus the three Task 1 Vitest files: 20 tests passed using Node 24.16.0, npm 11.13.0, macOS ARM64 and Agents 1.6.4. Read-only tree inspection confirms the admission/wrapper/SDK fixture producers exist there; it contains none of `src/deployment/release.ts`, `src/voice-worker/runtime-diagnostic.ts`, `src/deployment/runtime-probe.ts` or `src/deployment/main.ts`. This is reused execution evidence, not a test rerun in this documentation revision. After review and epic-plan publication, merge the revised epic documents into that child before resuming at S1. Preserve its Task 1 commit; do not recreate it or copy product code into the epic planning branch.
+
+| Slice | Requires | Original work to execute in this slice | Verification/checkpoint using available artifacts |
+| --- | --- | --- | --- |
+| S0 | existing child | Reuse Task 1 Steps 1–5, Task 4 Step 1 ledger and Task 5 Step 1 wrapper. Integrate reviewed plan documents into that child. | Confirm preserved commit ancestry and six-file inventory; reuse recorded build/20-test proof. No Task 1 replay for a docs-only merge. |
+| S1 | S0 | Task 2 Step 4 release decoder/identity helpers and only its decoder fixture tests from Step 5. | `npm run typecheck`; `npx vitest run src/deployment/release.test.ts`. Strict decoder fixtures are unit inputs, never a claimed built release. |
+| S2 | S1 | Task 6 Step 1 ports/config/worker-config producer and its port/loader unit cases from Step 6. | `npm run typecheck`; `npx vitest run src/deployment/ports.test.ts src/voice-worker/worker-config.test.ts`. |
+| S3 | S2 | Task 7 Steps 1–2 shared service environment, serializer, process/launchd adapters and basename resolver; their foundation unit cases from Step 5. Keep daemon routing for S7. | `npm run typecheck`; `npx vitest run src/paths.test.ts src/deployment/services.test.ts`. Test-owned definitions/files and injected ServiceIO exercise these boundaries without a built release. |
+| S4 | S3 | Task 4 Steps 2–3 transport plus Step 4 diagnostic data; Step 5 ledger/IPC tests. Reuse Step 1. Consumer display wiring from Step 4 is completed in S6/S7; Step 5 lifecycle/marker assertions finish in S9. | Task 4 Step 5 command plus `npm run typecheck`. Process census uses the available S3 adapter; real worker wiring waits for S5. |
+| S5 | S4 | Task 5 Steps 2–6 supervisor/job wiring, heartbeat and engine identity; reuse Step 1. | Task 5 Step 6 commands, including a fresh `npm run build` before SDK-child tests. S1 identity, S2 healthPort and S4 mailbox now exist. |
+| S6 | S5 | Task 6 Steps 2–5 probe/health/doctor source and Step 6 local unit/integration cases; Task 3 Step 2 offline diagnostic source. Complete Task 4 Step 4 probe/doctor display. | `npm run build`; Task 6 Step 6 command. Build checks both diagnostic sources; actual packaged/native success waits for S8. Transaction closed-gate propagation waits for S9. |
+| S7 | S6 | Task 8 Steps 1–5 operation/artifact/transaction/helper source, then Task 7 Steps 3–4 daemon/install routing and Task 9 Steps 1–4 CLI/wrappers/bootstrap routing. Add Task 8 Step 6 injected transaction unit cases and Task 7/9 CLI/shell shim tests. Complete Task 4 Step 4 lifecycle/CLI display. | `npm run build`; `npx vitest run src/deployment/transaction.test.ts src/cli/daemon.test.ts src/cli/update.test.ts`; `bash service/install.test.sh`; `bash service/deploy.test.sh`. Frozen-helper/actual-packaged lifecycle and adoption cases are created and run in S9. |
+| S8 | S7 | Complete Task 2 Steps 1–3 and remaining Step 5 packaging/generator/guards, then Task 3 Steps 1, 3–4 installer and artifact/retained-smoke harnesses. All entrypoint sources/imports already exist before bundler registration. | Run the complete Task 2 Step 5 and Task 3 Step 4 blocks after implementing both sets of changes. Require real bundle/pack/native/SDK-import markers before this combined artifact checkpoint. |
+| S9 | S8 | Complete Task 4 Step 5 lifecycle/marker assertions, Task 7 Step 5 packaged selector/loader fixture, Task 8 Step 6 lifecycle/failure/preservation integration, Task 6 Step 6 transaction closed-gate propagation, and Task 9 Step 5 bootstrap/adoption integration. | Run full Task 7 Step 5 and Task 9 Step 5 commands against the S8 artifact. Any product/lock/build change first requires rebuild and affected artifact revalidation. No fixture substitutes for the actual helper or packed entrypoints at these boundaries. |
+| S10 | S9 | Task 10 Steps 1–5 operation/recovery documentation, using observed T2 prerequisites. | Review commands against implemented CLI/helper; `git diff --check`. T9 evidence remains pending. |
+| S11 | S10 | Task 11 Steps 1–4 CI/release wiring, full contract, fresh review and final clean candidate. | All Task 11 gates, including Node22 and macOS ARM64/Node24, plus exact clean archive identity. |
+| S12 | S11 | Task 12 Steps 1–7 actual operational acceptance once its real prerequisites are established. | Actual T9 records; no fixture/merge substitutes for migration, and no live call is introduced. |
+
+For S1–S9, checkpoint only the slice's implemented files after its listed checks and worker self-review, then commit through the implementation lane. Full lane review remains the Task 11 pre-PR gate; this schedule adds no separate review gate per slice. Source-only checkpoints do not pass artifact gates or make a release deployable. Add deferred integration cases when their owning slice is reached, rather than committing skipped cases or running a nonexistent future test path. Existing dependency-injected unit fixtures may model a boundary; never generate placeholder production entrypoints, omit a required bundler entry, or relax `readRelease`/pack/native assertions to obtain a pass. The first full bundle/native checkpoint is S8; all commands that consume it are explicitly scheduled at S8 or later. The final Testing Contract is unchanged in scope.
+
+The source import order is release → ports/config → service environment/process adapters → mailbox → worker/engine wiring → health/probes/diagnostic → transaction/helper → CLI/service wrappers. This keeps `services.ts` independent of transaction/CLI/config imports and `health.ts` independent of transaction imports, as required by the existing frozen-helper boundary. The `pkg/deploy.min.js` runtime path is validated by source code written in S7, but the real frozen executable is produced in S8 and exercised in S9. Task 2 cannot bundle `dist/voice-worker/runtime-diagnostic.js`, `dist/deployment/runtime-probe.js` or `dist/deployment/main.js` until those producers and their imports compile. `npm run bundle` performs that build; missing sources remain hard failures.
 
 ## Task 1: Prove pinned SDK admission and accepted-job completion before broad implementation
 
@@ -149,7 +174,7 @@ Execution order: Task 1 proof first. Then Tasks 2–3 (artifact lane) and Tasks 
 - Create: `src/voice-worker/admission.ts`, `job-lifecycle.ts`, their tests, `sdk-lifecycle.integration.test.ts`, `fixtures/sdk-agent.ts` (code contracts in runtime chunk).
 - Read only: installed `@livekit/agents` package, especially `dist/job.js`, `dist/worker.js`, `dist/ipc/job_proc_lazy_main.js` and `dist/ipc/job_proc_executor.js`.
 
-- [ ] **Step 1:** Install the reviewed repository dependencies in this isolated worktree; record the SDK and host versions. At plan-writing time this worktree had no `node_modules`; the primary source review below is not an executed SDK proof.
+- [x] **Step 1:** Install the reviewed repository dependencies in the implementation worktree; record the SDK and host versions. Completed in the preserved S0 child checkpoint. Commands below retain the proof procedure for audit; they are not a request to redo Task 1 during resume.
 
 ```bash
 npm ci
@@ -159,7 +184,7 @@ npm --version
 
 Expected: dependency install exits 0 and SDK version is exactly `1.6.4`; if package exports block `package.json`, resolve the package root using the diagnostic's path walker rather than changing versions.
 
-- [ ] **Step 2:** Implement the admission and cleanup envelope from Tasks 4–5 as small dependency-injected modules. Test the real exported SDK `JobRequest`, not an invented promise contract:
+- [x] **Step 2:** Implement the admission and cleanup envelope from Tasks 4–5 as small dependency-injected modules. Test the real exported SDK `JobRequest`, not an invented promise contract:
 
 ```typescript
 it("accept resolution leaves an accepted-but-unassigned job unresolved", async () => {
@@ -185,15 +210,15 @@ it("accept resolution leaves an accepted-but-unassigned job unresolved", async (
 
 Imports are `it/expect` from Vitest, `JobRequest` from `@livekit/agents`, and `AdmissionLedger` from the new local module. The explicit no-op persistence callback is only for this in-memory proof fixture; production callers must supply Task 4's required durable snapshot callback. No SDK private field is accessed or patched.
 
-- [ ] **Step 3:** Fork the actual installed SDK `dist/ipc/job_proc_lazy_main.js` with the compiled Hive test agent as argv[2]. Drive its existing IPC messages: send `initializeRequest` with `{ loggerOptions: { level: "error", pretty: false } }`; require `initializeResponse`; send `startJobRequest` with a dummy `RunningJobInfo`; require Hive entry acknowledgement; send `shutdownRequest`; require Hive completion acknowledgement, SDK `done`, and process exit. The fixture uses `withJobLifecycle` and `ctx.shutdown`, never `ctx.connect` or `runCallSession`.
+- [x] **Step 3:** Fork the actual installed SDK `dist/ipc/job_proc_lazy_main.js` with the compiled Hive test agent as argv[2]. Drive its existing IPC messages: send `initializeRequest` with `{ loggerOptions: { level: "error", pretty: false } }`; require `initializeResponse`; send `startJobRequest` with a dummy `RunningJobInfo`; require Hive entry acknowledgement; send `shutdownRequest`; require Hive completion acknowledgement, SDK `done`, and process exit. The fixture uses `withJobLifecycle` and `ctx.shutdown`, never `ctx.connect` or `runCallSession`.
 
 Test `RunningJobInfo` contains `job: { id: "job-a", room: { name: "fixture" }, metadata: "{}" }`, `acceptArguments: { identity: "agent-job-a", name: "", metadata: "" }`, `url: "ws://127.0.0.1:1"`, `token: "fixture-token"`, `workerId: "fixture-worker"`; fill SDK-required protobuf defaults using the installed protocol's `Job`/`Room` constructors. Resolve `@livekit/protocol` through the Agents package's own resolver in this test, avoiding a new production direct dependency. Test process IPC is fixture-controlled; no LiveKit server is required.
 
 The fixture's shutdown callback awaits a parent-controlled cleanup release, then signals `cleanup-finished`; the ledger must remain unresolved until that release. Repeat with thrown work before session setup, process exit before Hive entry, and suppressed completion write. The latter two must leave diagnostic unresolved entries even when the SDK process has exited. Test-only subprocess budgets are 15 seconds and must clean up only their own child PIDs on failure.
 
-- [ ] **Step 4:** Add the fake-clock race proof: a request enters before barrier close, stays live beyond 30 seconds, and produces zero SDK-active count during the assignment gap. Assert zero drain/close/signal/bootout/swap calls, same service PIDs and call still alive, and verified `open` acknowledgement from the same boot after abort. After closure, another JobRequest is rejected. A stale or missing release acknowledgement yields `maintenance-unresolved`, never a restored-availability claim. The shutdown fake must model SDK 1.6.4 accurately: drain marks irreversible draining state, and the CLI calls close even if drain times out. Assert this entire path remains untouched during every abortable maintenance failure.
+- [x] **Step 4:** Add the fake-clock race proof: a request enters before barrier close, stays live beyond 30 seconds, and produces zero SDK-active count during the assignment gap. Assert zero drain/close/signal/bootout/swap calls, same service PIDs and call still alive, and verified `open` acknowledgement from the same boot after abort. After closure, another JobRequest is rejected. A stale or missing release acknowledgement yields `maintenance-unresolved`, never a restored-availability claim. The shutdown fake must model SDK 1.6.4 accurately: drain marks irreversible draining state, and the CLI calls close even if drain times out. Assert this entire path remains untouched during every abortable maintenance failure.
 
-- [ ] **Step 5:** Verify the proof and inspect it before permitting broad parallel implementation.
+- [x] **Step 5:** Verify the proof and inspect it before permitting the remaining serial implementation slices.
 
 ```bash
 npm run build
@@ -204,7 +229,7 @@ Expected: all cases pass with the installed SDK. If completion cannot be proved 
 
 **Source findings used:** [JobRequest 1.6.4](https://github.com/livekit/agents-js/blob/%40livekit%2Fagents%401.6.4/agents/src/job.ts) does not await its internal acceptance callback. [Worker 1.6.4](https://github.com/livekit/agents-js/blob/%40livekit%2Fagents%401.6.4/agents/src/worker.ts) records pending assignment separately from active processes; assignment timeout does not settle the pending promise; drain sets persistent state. [SDK child](https://github.com/livekit/agents-js/blob/%40livekit%2Fagents%401.6.4/agents/src/ipc/job_proc_lazy_main.ts) awaits entry and later runs registered shutdown callbacks concurrently before exit. These findings dictate the proof rather than certify it.
 
-**Checkpoint commit after verification, in the implementation lane only:**
+**Completed checkpoint:** `438115f2788e19c01dc8d7e08a43be17ef3a30bb`. Original commit commands are retained for audit only; resume preserves this commit instead of repeating them:
 
 ```bash
 git add src/voice-worker/admission.ts src/voice-worker/admission.test.ts src/voice-worker/job-lifecycle.ts src/voice-worker/job-lifecycle.test.ts src/voice-worker/sdk-lifecycle.integration.test.ts src/voice-worker/fixtures/sdk-agent.ts
@@ -214,6 +239,8 @@ git commit -m "feat: track voice admission and job completion for maintenance"
 ## Task 2: Package a reproducible worker release
 
 **Files:** `package.json`, `package-lock.json`, `.gitignore`, `scripts/generate-shrinkwrap.mjs`, `scripts/generate-shrinkwrap.test.mjs`, `build/bundle.ts`, `src/deployment/release.ts`, `src/deployment/release.test.ts`, `scripts/check-bundle-pack.mjs`, `.github/workflows/publish.yml`.
+
+**Schedule:** S1 implements Step 4 plus its decoder unit cases from Step 5. Steps 1–3 and the remaining Step 5 run in S8 together with Task 3's installation/harness completion. Do not register new bundle entries or require a full pack during S1. The decoder remains strict throughout.
 
 - [ ] **Step 1:** Assert this worktree has no repository-root `npm-shrinkwrap.json` before any npm dependency command; remove only a known generated leftover from an earlier packaging attempt. Move these exact six entries from devDependencies to dependencies, preserve all other selected versions, then regenerate the repository lock with the same npm version used for release validation:
 
@@ -310,7 +337,7 @@ if (mode === "--pack") {
 
 Change `scripts/check-bundle-pack.mjs` to invoke this script with `--pack --dry-run --json`, and Task 3's artifact harness to invoke it with `--pack --json --pack-destination <scratch>`. Keep their existing npm array/object JSON parsing. In `.github/workflows/publish.yml`, build/validate first, pack once through this command, parse and retain its exact archive filename/digest, and publish that validated archive with `npm publish <absolute-tgz> --access public`; preserve publication authorization and token handling. Task 11 and the operations runbook must use this same source packaging entrypoint. Registry downloads such as `npm pack @keepur/hive@<version>` are unaffected. npm automatically includes the staged root shrinkwrap; add it to `PACKAGE_ENTRIES` and required pack assertions. These choices follow [npm shrinkwrap precedence](https://docs.npmjs.com/cli/v11/configuring-npm/npm-shrinkwrap-json/) and [npm packaging lifecycle](https://docs.npmjs.com/cli/v11/using-npm/scripts/).
 
-- [ ] **Step 3:** In `build/bundle.ts`, add the six package names to `external` and these named entries to the existing shared build: `voice-worker: dist/voice-worker/main.js`, `voice-worker-diagnostic: dist/voice-worker/runtime-diagnostic.js`, `runtime-probe: dist/deployment/runtime-probe.js`. Keep existing server/CLI/MCP bundles and externalizations.
+- [ ] **Step 3:** In S8, after S5–S7 have supplied every entrypoint and import, update `build/bundle.ts`: add the six package names to `external` and these named entries to the existing shared build: `voice-worker: dist/voice-worker/main.js`, `voice-worker-diagnostic: dist/voice-worker/runtime-diagnostic.js`, `runtime-probe: dist/deployment/runtime-probe.js`. Keep existing server/CLI/MCP bundles and externalizations.
 
 Build the orchestration helper separately with `entryPoints: { deploy: "dist/deployment/main.js" }`, existing Node/ESM/minification settings, and **no third-party externals**. Its import graph is restricted to `node:*`, bundled YAML parsing and `src/deployment/{operation,transaction,artifact,services,health,release,ports}`; it must never import `config.ts`, MongoDB, SDKs or the CLI module. Runtime/vendor probes run in explicit child diagnostics. Reject a non-`node:` external in this helper's esbuild metafile. This produces one frozen JS file that survives `.hive` replacement without copying or borrowing a dependency tree.
 
@@ -391,7 +418,7 @@ export type BootIdentity = ReturnType<typeof bootIdentity>;
 
 Also compare all three dependency maps in `readRelease` using `isDeepStrictEqual`, as in the generator, before accepting an artifact; this closes the forged-manifest/lock-root mismatch path before npm runs. `readRelease` is a strict packaged-release decoder. Separate legacy classification returns unavailable fields; it never synthesizes a Release from the installed candidate.
 
-- [ ] **Step 5:** Extend `scripts/check-bundle-pack.mjs` required files with worker, both diagnostic helpers, deploy helper, manifest and shrinkwrap. Preserve all MCP/ABI requirements, exclusions and the 10 MB compressed failure threshold. Add `readRelease`/manifest fixture tests for missing file, external symlink, bad digest, unknown schema, dirty migration, mismatched package/version/dependency maps. Add `scripts/generate-shrinkwrap.test.mjs` with real npm subprocesses against a disposable source-package fixture and two locally packed versions of a tiny dependency. Run the actual generator and packaging command: fixture bundle → assert no root shrinkwrap → update package/lock to the second dependency using `npm install --package-lock-only --ignore-scripts` → `npm install --ignore-scripts` → assert the second version is installed and package-lock remains authoritative → assert packing the stale bundle fails → rebuild its manifest → repack → extract and compare published shrinkwrap bytes/digest with the new package-lock. The fixture's build runs the same `--check-source` and manifest-hash path; separately assert the actual repository `npm run bundle` leaves no root shrinkwrap. Test malformed lock/maps, accidental root shrinkwrap rejection, direct source prepack rejection, packlist preservation, packing failure and dry-run cleanup. Inspect only fixture roots and never publish these packages. Append this Node test to `check:bundle` before the pack guard. Verify and commit the artifact slice only after passing:
+- [ ] **Step 5:** Extend `scripts/check-bundle-pack.mjs` required files with worker, both diagnostic helpers, deploy helper, manifest and shrinkwrap. Preserve all MCP/ABI requirements, exclusions and the 10 MB compressed failure threshold. Add `readRelease`/manifest fixture tests for missing file, external symlink, bad digest, unknown schema, dirty migration, mismatched package/version/dependency maps. Add `scripts/generate-shrinkwrap.test.mjs` with real npm subprocesses against a disposable source-package fixture and two locally packed versions of a tiny dependency. Run the actual generator and packaging command: fixture bundle → assert no root shrinkwrap → update package/lock to the second dependency using `npm install --package-lock-only --ignore-scripts` → `npm install --ignore-scripts` → assert the second version is installed and package-lock remains authoritative → assert packing the stale bundle fails → rebuild its manifest → repack → extract and compare published shrinkwrap bytes/digest with the new package-lock. The fixture's build runs the same `--check-source` and manifest-hash path; separately assert the actual repository `npm run bundle` leaves no root shrinkwrap. Test malformed lock/maps, accidental root shrinkwrap rejection, direct source prepack rejection, packlist preservation, packing failure and dry-run cleanup. Inspect only fixture roots and never publish these packages. Append this Node test to `check:bundle` before the pack guard. Run this full block in S8 after both packaging and Task 3 installer/harness changes are implemented; the combined artifact checkpoint requires this block and Task 3 Step 4 to pass before commit:
 
 ```bash
 npm run bundle
@@ -406,6 +433,8 @@ Expected: all exit 0, worker assets appear in real pack listing and no forbidden
 ## Task 3: Fresh production installation and native/SDK artifact acceptance
 
 **Files:** `src/setup/populate-engine.ts`, `src/setup/populate-engine.test.ts`, `src/voice-worker/runtime-diagnostic.ts`, `scripts/check-artifact-install.mjs`, `scripts/check-bundle-runtime.mjs`, `scripts/check-bundle-runtime.test.mjs`, `package.json`.
+
+**Schedule:** Create Step 2's real diagnostic source in S6 and verify compilation with `npm run build`; do not invoke its offline runtime mode before a complete package exists. Steps 1, 3–4 run in S8 together with Task 2's packaging completion, after Task 8/S7 supplies the extraction/transaction implementation and all helper imports. The complete S8 checks below remain mandatory before the artifact checkpoint.
 
 - [ ] **Step 1:** Add `npm-shrinkwrap.json` to `PACKAGE_ENTRIES`. Replace `ensureEngineDeps`'s node_modules-exists shortcut with strict artifact validation followed by complete `npm ci --omit=dev --no-audit --no-fund --no-progress` on every explicit resume/install attempt. Never run this repair against a loaded active release during update; stage in `.hive.next`. A complete install marker can be diagnostic, but is not permission to skip revalidation after an interrupted attempt.
 
@@ -496,4 +525,4 @@ npx vitest run src/setup/populate-engine.test.ts
 
 Expected: real artifact install/load/import markers and all tests pass. A native prerequisite failure names the failed package/runtime stage and blocks T2; it is not skipped. On the implementation host record whether this was Node 24/macOS ARM64 or a supplementary platform.
 
-**Checkpoint:** commit only the reviewed, verified artifact/install files. Continue with [Tasks 4–6](./kpr-463-plan-runtime.md) and [Tasks 7–12](./kpr-463-plan-lifecycle.md); this chunk alone cannot be declared deployable.
+**Checkpoint:** after both Task 2 Step 5 and Task 3 Step 4 blocks pass, commit the reviewed S8 packaging/install/harness files. Runtime and lifecycle sources were prerequisites, not next tasks. Continue with S9 packaged lifecycle/adoption integration in [Tasks 7–9](./kpr-463-plan-lifecycle.md), then S10–S12. Passing this artifact checkpoint alone does not establish deployment acceptance.
