@@ -124,12 +124,13 @@ No required test group is waived. Live-call conversation/audio E2E is outside KP
 | `scripts/generate-shrinkwrap.mjs` + `.test.mjs`, `build/bundle.ts`, `package.json`, `package-lock.json`, `.gitignore` | pinned production packaging, scratch-only generated shrinkwrap, development-lock regression and release manifest |
 | `src/voice-worker/runtime-diagnostic.ts`, `scripts/check-artifact-install.mjs` | offline native and packaged SDK-import acceptance |
 | `src/voice-worker/admission.ts` + `.test.ts` | synchronous admission/accepted ledger state machine |
-| `src/voice-worker/maintenance-ipc.ts` + `.integration.test.ts` | private local mailbox protocol and boot/operation ownership |
+| `src/voice-worker/maintenance-ipc.ts` + `.integration.test.ts` | bundle-safe shared mailbox protocol/client and supervisor transport; boot/operation ownership |
 | `src/voice-worker/job-lifecycle.ts` + `.test.ts` | entry and post-cleanup completion envelope |
 | `src/voice-worker/sdk-lifecycle.integration.test.ts`, `src/voice-worker/fixtures/sdk-agent.ts` | real pinned SDK acceptance and child lifecycle proof, no calls |
 | `src/voice-worker/main.ts`, `worker-config.ts`, `telemetry.ts` and existing tests | wire gate, lazy job imports, port and immutable supervisor identity |
 | `src/deployment/ports.ts`, `src/config.ts` and tests | worker health port validation alongside resolved engine ports |
 | `src/paths.ts`, `src/paths.test.ts` | shared resolveDotenvPath basename correction and alternate-config dotenv regression (Task 7) |
+| `src/logging/logger.ts` (reuse; no source edit) | existing dependency-free `createLogger` for helper/shared-module diagnostics |
 | `src/deployment/runtime-probe.ts`, `health.ts` and tests | config/auth/registration/dependency evidence, separate acceptance profiles |
 | `src/deployment/services.ts` + tests | service descriptions, XML and launchd/process ownership adapters |
 | `src/deployment/operation.ts`, `transaction.ts`, `artifact.ts` + tests | lock/marker/frozen helper, paired transaction, extraction/install/rotation |
@@ -166,7 +167,7 @@ Task/Step numbers below remain stable audit IDs, **not numeric execution order**
 
 For S1–S9, checkpoint only the slice's implemented files after its listed checks and worker self-review, then commit through the implementation lane. Full lane review remains the Task 11 pre-PR gate; this schedule adds no separate review gate per slice. Source-only checkpoints do not pass artifact gates or make a release deployable. Add deferred integration cases when their owning slice is reached, rather than committing skipped cases or running a nonexistent future test path. Existing dependency-injected unit fixtures may model a boundary; never generate placeholder production entrypoints, omit a required bundler entry, or relax `readRelease`/pack/native assertions to obtain a pass. The first full bundle/native checkpoint is S8; all commands that consume it are explicitly scheduled at S8 or later. The final Testing Contract is unchanged in scope.
 
-The source import order is release → ports/config → service environment/process adapters → mailbox → worker/engine wiring → health/probes/diagnostic → transaction/helper → CLI/service wrappers. This keeps `services.ts` independent of transaction/CLI/config imports and `health.ts` independent of transaction imports, as required by the existing frozen-helper boundary. The `pkg/deploy.min.js` runtime path is validated by source code written in S7, but the real frozen executable is produced in S8 and exercised in S9. Task 2 cannot bundle `dist/voice-worker/runtime-diagnostic.js`, `dist/deployment/runtime-probe.js` or `dist/deployment/main.js` until those producers and their imports compile. `npm run bundle` performs that build; missing sources remain hard failures.
+The source import order is release → ports/config → service environment/process adapters → mailbox → worker/engine wiring → health/probes/diagnostic → transaction/helper → CLI/service wrappers. This keeps `services.ts` independent of transaction/CLI/config imports and `health.ts` independent of transaction imports, as required by the existing frozen-helper boundary. The shared `requestMaintenance` remains in Task 4/S4's `maintenance-ipc.ts`, reusing S0's import-free admission module; existing `paths.ts` and `logging/logger.ts` are the other allowed shared helper dependencies. Task 7/S3 owns the path-selector changes, and Task 8/S7 consumes the same client through injected S3 process checks. No file, test or slice is split or moved: S4 owns client/protocol tests, S8 owns the complete helper graph/builtin-external build check, and S9 owns actual frozen-helper lifecycle/adoption execution. The `pkg/deploy.min.js` runtime path is validated by source code written in S7, but the real frozen executable is produced in S8 and exercised in S9. Task 2 cannot bundle `dist/voice-worker/runtime-diagnostic.js`, `dist/deployment/runtime-probe.js` or `dist/deployment/main.js` until those producers and their imports compile. `npm run bundle` performs that build; missing sources remain hard failures.
 
 ## Task 1: Prove pinned SDK admission and accepted-job completion before broad implementation
 
@@ -339,7 +340,20 @@ Change `scripts/check-bundle-pack.mjs` to invoke this script with `--pack --dry-
 
 - [ ] **Step 3:** In S8, after S5–S7 have supplied every entrypoint and import, update `build/bundle.ts`: add the six package names to `external` and these named entries to the existing shared build: `voice-worker: dist/voice-worker/main.js`, `voice-worker-diagnostic: dist/voice-worker/runtime-diagnostic.js`, `runtime-probe: dist/deployment/runtime-probe.js`. Keep existing server/CLI/MCP bundles and externalizations.
 
-Build the orchestration helper separately with `entryPoints: { deploy: "dist/deployment/main.js" }`, existing Node/ESM/minification settings, and **no third-party externals**. Its import graph is restricted to `node:*`, bundled YAML parsing and `src/deployment/{operation,transaction,artifact,services,health,release,ports}`; it must never import `config.ts`, MongoDB, SDKs or the CLI module. Runtime/vendor probes run in explicit child diagnostics. Reject a non-`node:` external in this helper's esbuild metafile. This produces one frozen JS file that survives `.hive` replacement without copying or borrowing a dependency tree.
+Build the orchestration helper separately with `entryPoints: { deploy: "dist/deployment/main.js" }`, existing Node/ESM/minification settings, `external: []`, `metafile: true`, no code splitting, and **no third-party externals**. Its complete runtime import closure has this explicit allowlist, expressed as source paths (the build checks their compiled `dist/` equivalents):
+
+| Allowed source/package | Boundary and producer |
+| --- | --- |
+| `src/deployment/{main,operation,transaction,artifact,services,health,release,ports}.ts` | existing orchestration modules: release S1, ports S2, services S3, health S6, remaining helper source S7; `services` cannot import transaction/CLI/config, and `health` cannot import transaction/config/probe entries |
+| `src/voice-worker/maintenance-ipc.ts`, `src/voice-worker/admission.ts` | one shared `requestMaintenance`/wire protocol/atomic mailbox implementation from Task 4/S4 and its S0 pure ledger dependency; mailbox imports only builtins, admission and the logger, with process checks supplied as callbacks |
+| `src/paths.ts` | existing builtin-only selector helpers, corrected in Task 7/S3; reuse `resolveHiveHome`, `resolveConfigFile` and `resolveDotenvPath` as needed, passing the selected home explicitly; never use its module-level derived package/data paths to locate the frozen helper's target |
+| `src/logging/logger.ts` | existing import-free `createLogger`; only sanitized classifications/allowed evidence are logged |
+| `yaml` | bundle the resolved package's own transitive parser files; no second third-party package is allowed by this exception |
+| `node:*` | Node builtins only; no runtime dependency-tree lookup |
+
+Keep shared mailbox module initialization inert: importing it cannot start polling, create state, inspect services, or read config/secrets; those operations begin only in explicit client/supervisor functions. Do not duplicate its protocol or client in `deployment/`. Runtime/config/vendor/native probes remain explicit child diagnostics chosen by release path; the helper must never import `config.ts`, worker config/session/telemetry/main, runtime-probe/runtime-diagnostic entries, MongoDB, SDKs or any CLI module, including through a transitive edge. Services and helper identity planning reuse the shared selectors and bundled non-secret YAML parsing without importing `src/cli/single-instance-env.ts` or its callers.
+
+In this helper build only, canonicalize builtin specifiers using `isBuiltin` from `node:module` in an esbuild `onResolve` hook: if builtin, return `{ path: specifier.startsWith("node:") ? specifier : "node:" + specifier, external: true }`; otherwise let normal resolution proceed. The installed YAML parser uses bare `process`/`buffer`, so normalize them without changing that dependency or loosening the external rule. Use `node:module` in the helper's `createRequire` banner too. Check every helper metafile input against the canonical compiled-file allowlist or the resolved YAML package root, and check external imports in both input and output records; reject anything outside the allowlist or any external not starting `node:`. Unresolved/computed runtime module loading is forbidden in the helper; it cannot evade this check through `createRequire` or a dynamic import. Run this guard as part of S8's `npm run bundle`, retaining the existing S9 frozen-helper tests. This produces one frozen JS file that survives `.hive` replacement without copying or borrowing a dependency tree.
 
 At the start of bundling, execute `node scripts/generate-shrinkwrap.mjs --check-source`; at the end emit `pkg/release.json` from the reviewed development lock, without writing a repository-root shrinkwrap:
 
@@ -428,7 +442,7 @@ node scripts/check-bundle-pack.mjs
 npx vitest run src/deployment/release.test.ts
 ```
 
-Expected: all exit 0, worker assets appear in real pack listing and no forbidden paths appear. Final Task 11 runs all existing guards and native acceptance.
+Expected: all exit 0, the helper's complete graph matches Step 3's allowlist with only `node:` externals, worker assets appear in real pack listing and no forbidden paths appear. Final Task 11 runs all existing guards and native acceptance.
 
 ## Task 3: Fresh production installation and native/SDK artifact acceptance
 
