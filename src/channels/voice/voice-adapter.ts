@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash, timingSafeEqual, randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { createLogger } from "../../logging/logger.js";
 import { buildVoiceSystemPrompt } from "../../agents/prompt-builder.js";
 import { renderConversationPrompt, extractLatestUserMessage } from "./conversation-prompt.js";
@@ -11,12 +12,28 @@ import {
 } from "./openai-translator.js";
 import type { AgentRegistry } from "../../agents/agent-registry.js";
 import type { MemoryManager } from "../../memory/memory-manager.js";
-import type { AgentManager, SpawnTurnStreamCallback, TurnContext, TurnResult } from "../../agents/agent-manager.js";
+import {
+  AgentStoppedError,
+  type AgentManager,
+  type SpawnTurnStreamCallback,
+  type TurnContext,
+  type TurnResult,
+} from "../../agents/agent-manager.js";
 import type { Dispatcher } from "../../channels/dispatcher.js";
 import type { WorkItem } from "../../types/work-item.js";
 import { config } from "../../config.js";
 import { ProviderCircuitOpenError } from "../../agents/provider-circuit-breaker.js";
 import { VOICE_OUTAGE_SPOKEN_NOTICE } from "../../outage/outage-notices.js";
+import { VoiceRequestCancelledError, checkVoiceRequest } from "../../agents/voice-request-cancellation.js";
+import {
+  createVoiceTraceWriter,
+  measure,
+  parseVoiceTrace,
+  voiceDiagnosticEvent,
+  type AttemptOutcome,
+  type EnginePayload,
+  type VoiceErrorClass,
+} from "../../voice/voice-trace.js";
 
 const log = createLogger("voice-adapter");
 
@@ -235,15 +252,6 @@ export class VoiceAdapter {
     agentConfig: NonNullable<ReturnType<AgentRegistry["get"]>>,
   ): Promise<void> {
     const callId = request.call?.id ?? randomUUID();
-    if (!this.sessions.has(callId)) {
-      this.sessions.set(callId, {
-        callId,
-        agentId,
-        startedAt: new Date(),
-      });
-      log.info("Voice call session started", { callId, agentId });
-    }
-
     // KPR-220 Phase 8/9: voice always routes through spawnTurnViaAgentManager;
     // the inline direct-`query()` fallback and the legacy perTurnSpawn.voice
     // flag have both been retired.
@@ -275,357 +283,678 @@ export class VoiceAdapter {
     callId: string,
   ): Promise<void> {
     const agentManager = this.agentManager!;
-    const completionId = `chatcmpl-${randomUUID()}`;
-    const startedAt = Date.now();
+    const parsedTrace = parseVoiceTrace(request.metadata);
+    const completionId = `chatcmpl-${parsedTrace.turnId}`;
+    const startedAt = performance.now();
     const isStreaming = request.stream !== false;
     const threadId = `voice:${callId}`;
     const callMeta = request.call?.metadata as Record<string, string> | undefined;
     const model = agentConfig.model;
-
-    // KPR-322 E2: abort the in-flight spawn when the client disconnects
-    // pre-completion (LiveKit barge-in cancels the bridge's HTTP request;
-    // a Vapi hang-up benefits identically). Registered BEFORE any await —
-    // `close` is not replayed for late listeners, and the prompt-build /
-    // session-store lookups below are real suspension points. `close` also
-    // fires after a normal `end()` — `writableEnded` distinguishes premature
-    // closes. All later response writes are suppressed via `clientGone`.
+    const traceWriter = createVoiceTraceWriter(log);
+    const requestAbort = new AbortController();
     let clientGone = res.destroyed === true;
-    res.on("close", () => {
+    let writeFailed = false;
+    let headersSent = false;
+    let sentStatus: number | undefined;
+    let firstTokenMs: number | undefined;
+    let responseTextLength = 0;
+    let responseCompleteMs: number | undefined;
+    let pendingResponseWrites = 0;
+    const responseWriteWaiters = new Set<() => void>();
+    let engineAttemptSeq = 0;
+    let requestOutcome: AttemptOutcome = "incomplete";
+    let requestErrorClass: VoiceErrorClass | null = null;
+
+    const emitEngine = (payload: EnginePayload, attemptSeq: number | null = null): void => {
+      traceWriter.write(
+        voiceDiagnosticEvent(
+          {
+            component: "voice-engine",
+            callId,
+            workerBootId: parsedTrace.workerBootId,
+            turnId: parsedTrace.turnId,
+            engineAttemptSeq: attemptSeq,
+          },
+          payload,
+        ),
+      );
+    };
+    const latchWriteFailure = (): void => {
+      if (writeFailed) return;
+      writeFailed = true;
+      requestErrorClass = "midstream_error";
+      requestAbort.abort();
+    };
+    const trackResponseWrite = (): ((error?: Error | null) => void) => {
+      pendingResponseWrites += 1;
+      let settled = false;
+      return (error?: Error | null) => {
+        if (settled) return;
+        settled = true;
+        pendingResponseWrites -= 1;
+        if (error) latchWriteFailure();
+        if (pendingResponseWrites === 0) {
+          for (const waiter of [...responseWriteWaiters]) waiter();
+          responseWriteWaiters.clear();
+        }
+      };
+    };
+    const settleResponseWrites = async (timeoutMs = 250): Promise<boolean> => {
+      if (pendingResponseWrites === 0) return true;
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          responseWriteWaiters.delete(finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, timeoutMs);
+        responseWriteWaiters.add(finish);
+        if (pendingResponseWrites === 0) finish();
+      });
+      return pendingResponseWrites === 0;
+    };
+    const onResponseError = (): void => latchWriteFailure();
+    const onFinish = (): void => {
+      responseCompleteMs ??= performance.now() - startedAt;
+    };
+    const onClose = (): void => {
       if (res.writableEnded) return;
       clientGone = true;
+      requestAbort.abort();
+      emitEngine({ event: "engine_client_closed" });
+    };
+    res.on("close", onClose);
+    res.on("error", onResponseError);
+    res.on("finish", onFinish);
+    if (clientGone) requestAbort.abort();
+
+    const sendHeaders = (status: number, headers: Record<string, string>): boolean => {
+      if (clientGone || res.destroyed || res.writableEnded || writeFailed) return false;
+      res.writeHead(status, headers);
+      headersSent = true;
+      sentStatus = status;
+      return true;
+    };
+    const writeChunk = (chunk: string, contentLength: number): boolean => {
+      if (clientGone || res.destroyed || res.writableEnded || writeFailed) return false;
+      const callback = trackResponseWrite();
       try {
-        const abortedInFlight = agentManager.abortThread(agentId, threadId);
-        log.info("Voice client disconnected mid-turn", { callId, agentId, abortedInFlight });
-      } catch (err) {
-        // Throw-safety (review round 1 B2): a synchronous throw in an HTTP
-        // event listener is an uncaughtException — index.ts registers only
-        // an unhandledRejection handler (:878) — and would crash the engine
-        // mid-Vapi-coexistence. Log and swallow; the socket is gone anyway.
-        log.error("abort-on-disconnect failed", { callId, agentId, error: String(err) });
+        const acceptedWithoutBackpressure = res.write(chunk, callback);
+        if (contentLength > 0) {
+          responseTextLength += contentLength;
+          if (firstTokenMs === undefined) {
+            firstTokenMs = performance.now() - startedAt;
+            emitEngine(
+              {
+                event: "engine_first_text",
+                textLength: contentLength,
+                firstTextMs: measure(firstTokenMs, "not_reached"),
+              },
+              engineAttemptSeq || null,
+            );
+          }
+        }
+        return acceptedWithoutBackpressure;
+      } catch (error) {
+        callback();
+        latchWriteFailure();
+        throw error;
       }
-    });
-
-    // Voice-specific system prompt — omits tool summaries / delegate
-    // descriptions, adds call goal/context. AgentRunner consumes via
-    // TurnContext.systemPromptOverride.
-    const promptBuildStartedAt = Date.now(); // KPR-323 C1: T0→T1
-    const systemPrompt = await buildVoiceSystemPrompt(agentConfig, this.memoryManager, {
-      goal: callMeta?.goal,
-      context: callMeta?.context,
-    });
-    const promptBuildMs = Date.now() - promptBuildStartedAt;
-
-    const sessionStore = agentManager.getSessionStore();
-    const sessionLookupStartedAt = Date.now(); // KPR-323 C1: T0→T1
-    const storedRef = await sessionStore.get(agentId, threadId);
-    const sessionLookupMs = Date.now() - sessionLookupStartedAt;
-
-    // KPR-467: carry both prompt forms and the stored resume candidate to
-    // admission. Only the manager knows whether this turn uses a pinned
-    // lease, a compatible resume, or a fresh route after a registry reload.
-    const voicePrompt = {
-      latestUserMessage: extractLatestUserMessage(request.messages),
-      fullConversation: renderConversationPrompt(request.messages),
     };
-    const effectiveResume = voicePrompt.latestUserMessage ? storedRef?.sessionId : undefined;
-    const safePrompt = effectiveResume ? voicePrompt.latestUserMessage : voicePrompt.fullConversation;
-
-    // Synthesize a WorkItem. ChannelKind="voice" was added in Step 1 of this
-    // ticket so this compiles.
-    const workItem: WorkItem = {
-      id: callId,
-      text: safePrompt,
-      source: { kind: "voice", id: callId, label: `voice:${callId}` },
-      sender: callId,
-      threadId,
-      timestamp: new Date(),
-      meta: { callId, ...(callMeta ?? {}) },
+    const endResponse = (chunk?: string): boolean => {
+      if (clientGone || res.destroyed || res.writableEnded || writeFailed) return false;
+      const callback = trackResponseWrite();
+      try {
+        const done = () => {
+          responseCompleteMs ??= performance.now() - startedAt;
+          callback();
+        };
+        if (chunk === undefined) res.end(done);
+        else res.end(chunk, done);
+        return true;
+      } catch (error) {
+        callback();
+        latchWriteFailure();
+        throw error;
+      }
     };
 
-    let firstTokenMs: number | undefined;
-    let headersSent = false;
-    const onStream: SpawnTurnStreamCallback | undefined = isStreaming
-      ? (chunk: string) => {
-          // chunk is the pre-extracted text-delta string (StreamCallback shape
-          // = `(chunk: string) => void`). Defensive empty-skip mirrors the
-          // legacy inline loop's behavior.
-          if (!chunk || clientGone) return;
-          if (!headersSent) {
-            res.writeHead(200, {
+    emitEngine({ event: "engine_received", correlation: parsedTrace.correlation });
+    if (parsedTrace.correlation === "invalid") {
+      traceWriter.write(
+        voiceDiagnosticEvent(
+          { component: "voice-engine", callId, turnId: parsedTrace.turnId },
+          { event: "diagnostic_gap", reason: "correlation_missing", count: 1 },
+        ),
+      );
+    }
+
+    let promptBuildMs: number | undefined;
+    let sessionLookupMs: number | undefined;
+    let continuityAttempted = false;
+    let outerRetryFired = false;
+    let finalResult: TurnResult | undefined;
+
+    try {
+      if (!this.sessions.has(callId)) {
+        this.sessions.set(callId, { callId, agentId, startedAt: new Date() });
+        log.info("Voice call session started", { callId, agentId });
+      }
+
+      // Voice-specific system prompt — omits tool summaries / delegate
+      // descriptions, adds call goal/context. AgentRunner consumes via
+      // TurnContext.systemPromptOverride.
+      const promptBuildStartedAt = performance.now(); // KPR-323 C1: T0→T1
+      const systemPrompt = await buildVoiceSystemPrompt(agentConfig, this.memoryManager, {
+        goal: callMeta?.goal,
+        context: callMeta?.context,
+      });
+      promptBuildMs = performance.now() - promptBuildStartedAt;
+      checkVoiceRequest(requestAbort.signal);
+
+      const sessionStore = agentManager.getSessionStore();
+      const sessionLookupStartedAt = performance.now(); // KPR-323 C1: T0→T1
+      const storedRef = await sessionStore.get(agentId, threadId);
+      sessionLookupMs = performance.now() - sessionLookupStartedAt;
+      checkVoiceRequest(requestAbort.signal);
+
+      // KPR-467: carry both prompt forms and the stored resume candidate to
+      // admission. Only the manager knows whether this turn uses a pinned
+      // lease, a compatible resume, or a fresh route after a registry reload.
+      const voicePrompt = {
+        latestUserMessage: extractLatestUserMessage(request.messages),
+        fullConversation: renderConversationPrompt(request.messages),
+      };
+      const effectiveResume = voicePrompt.latestUserMessage ? storedRef?.sessionId : undefined;
+      const safePrompt = effectiveResume ? voicePrompt.latestUserMessage : voicePrompt.fullConversation;
+
+      // Synthesize a WorkItem. ChannelKind="voice" was added in Step 1 of this
+      // ticket so this compiles.
+      const workItem: WorkItem = {
+        id: callId,
+        text: safePrompt,
+        source: { kind: "voice", id: callId, label: `voice:${callId}` },
+        sender: callId,
+        threadId,
+        timestamp: new Date(),
+        meta: { callId, ...(callMeta ?? {}) },
+      };
+
+      const onStream: SpawnTurnStreamCallback | undefined = isStreaming
+        ? (chunk: string) => {
+            // chunk is the pre-extracted text-delta string (StreamCallback shape
+            // = `(chunk: string) => void`). Defensive empty-skip mirrors the
+            // legacy inline loop's behavior.
+            if (!chunk || clientGone || requestAbort.signal.aborted) return;
+            if (!headersSent) {
+              if (
+                !sendHeaders(200, {
+                  "Content-Type": "text/event-stream",
+                  "Cache-Control": "no-cache",
+                  Connection: "keep-alive",
+                })
+              )
+                return;
+            }
+            writeChunk(formatSSETextChunk(completionId, chunk, model), chunk.length);
+          }
+        : undefined;
+
+      const ctx: TurnContext = {
+        agentId,
+        sessionId: effectiveResume,
+        sessionProvider: effectiveResume ? storedRef?.provider : undefined,
+        voicePrompt,
+        channelId: callId,
+        threadId,
+        workItem,
+        channel: "voice",
+        systemPromptOverride: systemPrompt,
+        voiceRequestSignal: requestAbort.signal,
+      };
+
+      let hasAdmittedContinuity = false;
+      type RunFailure = {
+        ok: false;
+        reason: string;
+        circuitOpen?: boolean;
+        bytesSent: boolean;
+        cancelled?: boolean;
+        stopped?: boolean;
+        voiceLifetimeSignal?: AbortSignal;
+      };
+      type RunOutcome =
+        | {
+            ok: true;
+            result: TurnResult;
+            bytesSent: boolean;
+            selectedContinuity: "fresh" | "resume" | "warm" | null;
+          }
+        | RunFailure;
+      const getVoiceStopError = (signal?: AbortSignal): AgentStoppedError | undefined =>
+        signal?.aborted && signal.reason instanceof AgentStoppedError ? signal.reason : undefined;
+      const runOnce = async (
+        baseCtx: TurnContext,
+        continuity: "fresh" | "resume" | "full_transcript",
+      ): Promise<RunOutcome> => {
+        engineAttemptSeq += 1;
+        const attemptSeq = engineAttemptSeq;
+        const attemptStartedAt = performance.now();
+        let launchAdmission: "fresh" | "resume" | null = null;
+        let selectedContinuity: "fresh" | "resume" | "warm" | null = null;
+        let voiceLifetimeSignal: AbortSignal | undefined;
+        let attemptResult: TurnResult | undefined;
+        let attemptFailure: RunFailure | undefined;
+        hasAdmittedContinuity = false;
+        emitEngine({ event: "engine_attempt_started", continuity }, attemptSeq);
+        const spawnCtx: TurnContext = {
+          ...baseCtx,
+          onVoiceLaunchAdmission: (admission) => {
+            launchAdmission = admission;
+            hasAdmittedContinuity ||= admission === "resume";
+          },
+          onVoiceAdmission: (admission) => {
+            selectedContinuity = admission;
+            hasAdmittedContinuity ||= admission === "warm" || admission === "resume";
+          },
+          onVoiceLifetimeAdmission: (signal) => {
+            voiceLifetimeSignal = signal;
+          },
+        };
+        try {
+          checkVoiceRequest(requestAbort.signal);
+          // KPR-223: route through dispatcher when wired (applies taskLedger +
+          // audit log; dedup intentionally skipped — see Dispatcher.routeVoiceTurn).
+          // Fall back to direct spawnTurn for unit-test wiring without dispatcher.
+          const result = this.dispatcher
+            ? await this.dispatcher.routeVoiceTurn(spawnCtx, onStream)
+            : await agentManager.spawnTurn(spawnCtx, onStream);
+          voiceLifetimeSignal = result.voiceLifetimeSignal ?? voiceLifetimeSignal;
+          attemptResult = result;
+          if (writeFailed) {
+            attemptFailure = {
+              ok: false,
+              reason: "Response write failed",
+              bytesSent: headersSent,
+              cancelled: false,
+              voiceLifetimeSignal,
+            };
+            return attemptFailure;
+          }
+          if (result.errors.length > 0) {
+            const stoppedError = getVoiceStopError(voiceLifetimeSignal);
+            attemptFailure = {
+              ok: false,
+              reason: stoppedError ? String(stoppedError) : result.errors[0]!,
+              bytesSent: headersSent,
+              cancelled: requestAbort.signal.aborted,
+              stopped: stoppedError !== undefined,
+              voiceLifetimeSignal,
+            };
+            return attemptFailure;
+          }
+          return { ok: true, result, bytesSent: headersSent, selectedContinuity };
+        } catch (err) {
+          const stoppedError = getVoiceStopError(voiceLifetimeSignal);
+          attemptFailure = {
+            ok: false,
+            reason: String(stoppedError ?? err),
+            // KPR-307: detected here (instanceof survives — same process) so the
+            // failure block below can speak an honest completion, not a 500.
+            circuitOpen: err instanceof ProviderCircuitOpenError,
+            bytesSent: headersSent,
+            cancelled: err instanceof VoiceRequestCancelledError,
+            stopped: err instanceof AgentStoppedError || stoppedError !== undefined,
+            voiceLifetimeSignal,
+          };
+          return attemptFailure;
+        } finally {
+          const stoppedError = getVoiceStopError(voiceLifetimeSignal);
+          const attemptOutcome: AttemptOutcome = writeFailed
+            ? "failed"
+            : attemptFailure
+              ? attemptFailure.cancelled
+                ? "cancelled"
+                : "failed"
+              : attemptResult?.aborted
+                ? "cancelled"
+                : "completed";
+          const errorClass: VoiceErrorClass | null = writeFailed
+            ? "midstream_error"
+            : attemptFailure
+              ? attemptFailure.circuitOpen
+                ? "llm_provider_failed"
+                : isAuthError(attemptFailure.reason)
+                  ? "engine_auth"
+                  : "spawn_failed"
+              : null;
+          emitEngine(
+            {
+              event: "engine_attempt_terminal",
+              continuity,
+              launchAdmission,
+              selectedContinuity,
+              warm: attemptResult?.warmPath ?? selectedContinuity === "warm",
+              toolCount: attemptResult?.toolCalls,
+              toolMs: attemptResult?.toolMs,
+              toolAckInjected:
+                attemptResult?.toolAckInjected === undefined ? undefined : attemptResult.toolAckInjected > 0,
+              outcome: attemptOutcome,
+              errorClass,
+              durationMs: measure(performance.now() - attemptStartedAt, "not_observed"),
+              lockWaitMs: measure(attemptResult?.stageTimings?.lockWaitMs, "not_observed"),
+              spawnPrepMs: measure(attemptResult?.stageTimings?.spawnPrepMs, "not_observed"),
+              initToFirstTokenMs: measure(attemptResult?.stageTimings?.initToFirstTokenMs, "not_observed"),
+              firstTextMs: measure(firstTokenMs, "not_reached"),
+              stopped: stoppedError !== undefined || attemptFailure?.stopped === true,
+            },
+            attemptSeq,
+          );
+        }
+      };
+
+      if (clientGone) {
+        requestOutcome = writeFailed ? "failed" : "cancelled";
+        log.info("Voice turn skipped — client disconnected before spawn", { callId, agentId });
+        return;
+      }
+
+      checkVoiceRequest(requestAbort.signal);
+      let outcome = await runOnce(ctx, effectiveResume ? "resume" : "fresh");
+      continuityAttempted = hasAdmittedContinuity;
+      if (!outcome.ok) {
+        const stoppedError = getVoiceStopError(outcome.voiceLifetimeSignal);
+        if (stoppedError) outcome = { ...outcome, stopped: true, reason: String(stoppedError) };
+      }
+
+      // Outer retry — admitted lease/resume failed before any bytes hit the wire. Restart with
+      // full transcript and no resume id. Mirrors voice-adapter.ts:320-329 from
+      // the legacy path. Catches cases spawnTurn's inner auth-retry doesn't
+      // cover (stale id without auth-error pattern, etc.).
+      //
+      // KPR-324 semantics note: `bytesSent` (= headersSent) now flips true on a
+      // hive-injected tool-start ack too, not just model text — the ack goes
+      // through this same `onStream`/SSE path. That is intentional: once the
+      // caller has HEARD the ack, replaying the turn would double-speak it, so
+      // an ack-only turn is correctly treated as "already on the wire" and is
+      // not retried here.
+      if (
+        !outcome.ok &&
+        !outcome.circuitOpen &&
+        !outcome.cancelled &&
+        !outcome.stopped &&
+        !getVoiceStopError(outcome.voiceLifetimeSignal) &&
+        hasAdmittedContinuity &&
+        !outcome.bytesSent &&
+        !clientGone &&
+        !requestAbort.signal.aborted
+      ) {
+        log.warn("Voice spawnTurn resume failed, retrying as turn-1", {
+          callId,
+          reason: outcome.reason,
+        });
+        const fullPrompt = renderConversationPrompt(request.messages);
+        const retryWorkItem: WorkItem = { ...workItem, text: fullPrompt };
+        const retryCtx: TurnContext = {
+          ...ctx,
+          sessionId: undefined,
+          sessionProvider: undefined,
+          workItem: retryWorkItem,
+        };
+        const stoppedBeforeRetry = getVoiceStopError(outcome.voiceLifetimeSignal);
+        if (stoppedBeforeRetry) {
+          outcome = { ...outcome, stopped: true, reason: String(stoppedBeforeRetry) };
+        } else if (!requestAbort.signal.aborted && !clientGone) {
+          outerRetryFired = true;
+          outcome = await runOnce(retryCtx, "full_transcript");
+        }
+      }
+      if (!outcome.ok) {
+        const stoppedError = getVoiceStopError(outcome.voiceLifetimeSignal);
+        if (stoppedError) outcome = { ...outcome, stopped: true, reason: String(stoppedError) };
+      }
+
+      // E2: never write into a dead socket — the turn (aborted or completed)
+      // ends silently; next turn's resume either works or trips the outer
+      // full-transcript retry (recoverable by construction, spec §7).
+      if (clientGone || requestAbort.signal.aborted) {
+        requestOutcome = writeFailed ? "failed" : "cancelled";
+        log.info("Voice turn ended after client disconnect — response suppressed", {
+          callId,
+          agentId,
+          ok: outcome.ok,
+          aborted: outcome.ok ? (outcome.result.aborted ?? false) : undefined,
+        });
+        return;
+      }
+
+      if (!outcome.ok) {
+        requestOutcome = "failed";
+        if (outcome.circuitOpen) {
+          // KPR-307 §5-1b: honest SPOKEN completion — today's baseline is a
+          // generic 500 "Internal error" (only auth/budget get 503s), and both
+          // a bare 500 and a 503 render as dead air to Vapi. ⚠ Confirm Vapi
+          // renders a normal completion better than a 500/503 during rollout.
+          log.warn("Voice turn fast-failed — provider circuit open, speaking outage notice", {
+            callId,
+            agentId,
+          });
+          requestErrorClass = "llm_provider_failed";
+          if (isStreaming) {
+            if (
+              outcome.bytesSent ||
+              sendHeaders(200, {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                Connection: "keep-alive",
+              })
+            ) {
+              writeChunk(
+                formatSSETextChunk(completionId, VOICE_OUTAGE_SPOKEN_NOTICE, model),
+                VOICE_OUTAGE_SPOKEN_NOTICE.length,
+              );
+              writeChunk(formatSSEDone(completionId, model), 0);
+              endResponse();
+            }
+          } else {
+            const body = JSON.stringify(formatNonStreamingResponse(completionId, VOICE_OUTAGE_SPOKEN_NOTICE, model));
+            responseTextLength = VOICE_OUTAGE_SPOKEN_NOTICE.length;
+            if (sendHeaders(200, { "Content-Type": "application/json" })) endResponse(body);
+          }
+          return;
+        }
+        if (isAuthError(outcome.reason)) {
+          requestErrorClass = "engine_auth";
+          log.error("Voice spawnTurn failed — OAuth credentials unavailable", {
+            callId,
+            agentId,
+            reason: outcome.reason,
+          });
+          if (!outcome.bytesSent) {
+            if (sendHeaders(503, { "Content-Type": "application/json" })) {
+              endResponse(JSON.stringify({ error: "Voice unavailable" }));
+            }
+          } else {
+            writeChunk(formatSSEDone(completionId, model, "error"), 0);
+            endResponse();
+          }
+          return;
+        }
+        if (outcome.reason.includes("Spawn budget exceeded")) {
+          requestErrorClass = "budget_saturated";
+          log.error("Voice spawnTurn rejected — spawn budget exceeded", {
+            callId,
+            agentId,
+            reason: outcome.reason,
+          });
+          if (!outcome.bytesSent) {
+            if (sendHeaders(503, { "Content-Type": "application/json" })) {
+              endResponse(JSON.stringify({ error: "Voice temporarily unavailable" }));
+            }
+          } else {
+            writeChunk(formatSSEDone(completionId, model, "error"), 0);
+            endResponse();
+          }
+          return;
+        }
+        log.error("Voice spawnTurn failed", {
+          callId,
+          agentId,
+          reason: outcome.reason,
+          bytesSent: outcome.bytesSent,
+        });
+        requestErrorClass = writeFailed ? "midstream_error" : "spawn_failed";
+        if (!outcome.bytesSent) {
+          if (sendHeaders(500, { "Content-Type": "application/json" })) {
+            endResponse(JSON.stringify({ error: "Internal error" }));
+          }
+        } else {
+          writeChunk(formatSSEDone(completionId, model, "error"), 0);
+          endResponse();
+        }
+        return;
+      }
+
+      const result = outcome.result;
+      finalResult = result;
+      requestOutcome = result.aborted ? "cancelled" : "completed";
+
+      // Success — finalize the response shape.
+      if (isStreaming) {
+        if (!headersSent) {
+          // Resume produced no streamed text (degenerate: e.g. zero-content
+          // turn). Emit the standard SSE close anyway so Vapi ends cleanly.
+          if (
+            !sendHeaders(200, {
               "Content-Type": "text/event-stream",
               "Cache-Control": "no-cache",
               Connection: "keep-alive",
-            });
-            headersSent = true;
-            firstTokenMs = Date.now() - startedAt;
+            })
+          )
+            return;
+        }
+        writeChunk(formatSSEDone(completionId, model), 0);
+        endResponse();
+      } else {
+        const body = JSON.stringify(formatNonStreamingResponse(completionId, result.finalMessage, model));
+        responseTextLength = result.finalMessage.length;
+        if (sendHeaders(200, { "Content-Type": "application/json" })) endResponse(body);
+      }
+
+      // Telemetry parity with KPR-207 baseline (voice-adapter.ts:370-379).
+      // Admission, including an active lease without a store row, is the
+      // continuity source for both returned and thrown failures.
+      // sdkSessionResumed = "we attempted continuity AND the spawn succeeded
+      // without the outer-retry kicking in" — NOT `newSessionId === effectiveResume`,
+      // because the SDK rotates session ids post-compaction, which would
+      // systematically under-count successful resumes versus the baseline.
+      // The `!outerRetryFired` clause matches the legacy adapter's semantic
+      // exactly: when retry fires, the original resume failed, so this counts
+      // as a non-resumed turn even if the retry succeeded.
+      log.info("Voice turn complete", {
+        callId,
+        agentId,
+        // Engine text emission, including a tool hold phrase. This is not an
+        // audio or caller-receipt timestamp.
+        firstTokenMs,
+        schemaVersion: 2,
+        turnId: parsedTrace.turnId,
+        totalMs: performance.now() - startedAt,
+        mode: isStreaming ? "streaming" : "non-streaming",
+        sdkSessionResumeAttempted: continuityAttempted,
+        sdkSessionResumed: outcome.selectedContinuity === "resume" && !outerRetryFired,
+        routedVia: "agentManager",
+        // KPR-323 C1: stage decomposition (adapter-side stamps + coordinator/
+        // runner stamps carried on TurnResult). Log-only; all durations —
+        // no content, no numbers-of-humans (repo redaction posture).
+        promptBuildMs,
+        sessionLookupMs,
+        ...(result.stageTimings ?? {}),
+        // KPR-324 C5d/S4: tool observability for T-gates and 325 pause
+        // attribution. Counts + durations + server-name summary only — the
+        // existing redaction posture (tool NAMES, never args, never content,
+        // never the ack phrase text).
+        toolCalls: result.toolCalls,
+        toolMs: result.toolMs,
+        toolSummary: result.toolSummary ?? "none",
+        toolAckInjected: result.toolAckInjected,
+        // KPR-323 C2: warm-lease markers (false/absent until Task 5 lands).
+        warmPath: result.warmPath ?? false,
+        ...(result.warmTurnSeq !== undefined ? { warmTurnSeq: result.warmTurnSeq } : {}),
+      });
+    } catch (err) {
+      if (writeFailed) {
+        requestOutcome = "failed";
+        requestErrorClass = "midstream_error";
+      } else if (err instanceof VoiceRequestCancelledError || requestAbort.signal.aborted) {
+        requestOutcome = "cancelled";
+      } else {
+        requestOutcome = "failed";
+        requestErrorClass = isAuthError(err) ? "engine_auth" : "spawn_failed";
+      }
+      if (!clientGone && !res.destroyed && !res.writableEnded && !writeFailed) {
+        try {
+          if (!headersSent) {
+            if (sendHeaders(500, { "Content-Type": "application/json" })) {
+              endResponse(JSON.stringify({ error: "Internal error" }));
+            }
+          } else {
+            writeChunk(formatSSEDone(completionId, model, "error"), 0);
+            endResponse();
           }
-          res.write(formatSSETextChunk(completionId, chunk, model));
+        } catch {
+          latchWriteFailure();
         }
-      : undefined;
-
-    const ctx: TurnContext = {
-      agentId,
-      sessionId: effectiveResume,
-      sessionProvider: effectiveResume ? storedRef?.provider : undefined,
-      voicePrompt,
-      channelId: callId,
-      threadId,
-      workItem,
-      channel: "voice",
-      systemPromptOverride: systemPrompt,
-    };
-
-    let hasAdmittedContinuity = false;
-    const runOnce = async (
-      spawnCtx: TurnContext,
-    ): Promise<
-      | { ok: true; result: TurnResult; bytesSent: boolean }
-      | { ok: false; reason: string; circuitOpen?: boolean; bytesSent: boolean }
-    > => {
-      hasAdmittedContinuity = false;
-      spawnCtx = {
-        ...spawnCtx,
-        onVoiceAdmission: (continuity) => {
-          hasAdmittedContinuity = continuity === "warm" || continuity === "resume";
+      }
+      if (!(err instanceof VoiceRequestCancelledError)) {
+        log.error("Voice spawnTurn failed", { callId, agentId, reason: String(err), bytesSent: headersSent });
+      }
+    } finally {
+      const responseWritesSettled = await settleResponseWrites();
+      if (writeFailed) {
+        requestOutcome = "failed";
+        requestErrorClass = "midstream_error";
+      } else if (!responseWritesSettled) {
+        requestOutcome = "incomplete";
+      }
+      if (writeFailed && !res.destroyed) {
+        try {
+          res.destroy();
+        } catch {
+          // A test double may omit destroy; the write failure is already latched.
+        }
+      }
+      emitEngine(
+        {
+          event: "engine_terminal",
+          ...(headersSent && sentStatus !== undefined ? { status: sentStatus } : {}),
+          textLength: responseTextLength,
+          outcome: requestOutcome,
+          errorClass: requestErrorClass,
+          durationMs: measure(performance.now() - startedAt, "not_observed"),
+          promptBuildMs: measure(promptBuildMs, "not_reached"),
+          sessionLookupMs: measure(sessionLookupMs, "not_reached"),
+          firstTextMs: measure(firstTokenMs, "not_reached"),
+          responseCompleteMs: measure(responseCompleteMs, "not_observed"),
+          clientGone,
+          correlation: parsedTrace.correlation,
+          continuityAttempted,
+          warm: finalResult?.warmPath ?? false,
+          toolCount: finalResult?.toolCalls,
+          toolMs: finalResult?.toolMs,
+          toolAckInjected: finalResult?.toolAckInjected === undefined ? undefined : finalResult.toolAckInjected > 0,
+          ...(finalResult?.finalMessage === "" ? { generatedAudio: "unknown" as const } : {}),
         },
-      };
-      try {
-        // KPR-223: route through dispatcher when wired (applies taskLedger +
-        // audit log; dedup intentionally skipped — see Dispatcher.routeVoiceTurn).
-        // Fall back to direct spawnTurn for unit-test wiring without dispatcher.
-        const result = this.dispatcher
-          ? await this.dispatcher.routeVoiceTurn(spawnCtx, onStream)
-          : await agentManager.spawnTurn(spawnCtx, onStream);
-        if (result.errors.length > 0) {
-          return { ok: false, reason: result.errors[0]!, bytesSent: headersSent };
-        }
-        return { ok: true, result, bytesSent: headersSent };
-      } catch (err) {
-        return {
-          ok: false,
-          reason: String(err),
-          // KPR-307: detected here (instanceof survives — same process) so the
-          // failure block below can speak an honest completion, not a 500.
-          circuitOpen: err instanceof ProviderCircuitOpenError,
-          bytesSent: headersSent,
-        };
-      }
-    };
-
-    if (clientGone) {
-      log.info("Voice turn skipped — client disconnected before spawn", { callId, agentId });
-      return;
+        engineAttemptSeq || null,
+      );
+      res.off("close", onClose);
+      res.off("error", onResponseError);
+      res.off("finish", onFinish);
+      await traceWriter.settleWrites();
     }
-
-    let outcome = await runOnce(ctx);
-    const continuityAttempted = hasAdmittedContinuity;
-    let outerRetryFired = false;
-
-    // Outer retry — admitted lease/resume failed before any bytes hit the wire. Restart with
-    // full transcript and no resume id. Mirrors voice-adapter.ts:320-329 from
-    // the legacy path. Catches cases spawnTurn's inner auth-retry doesn't
-    // cover (stale id without auth-error pattern, etc.).
-    //
-    // KPR-324 semantics note: `bytesSent` (= headersSent) now flips true on a
-    // hive-injected tool-start ack too, not just model text — the ack goes
-    // through this same `onStream`/SSE path. That is intentional: once the
-    // caller has HEARD the ack, replaying the turn would double-speak it, so
-    // an ack-only turn is correctly treated as "already on the wire" and is
-    // not retried here.
-    if (!outcome.ok && !outcome.circuitOpen && hasAdmittedContinuity && !outcome.bytesSent && !clientGone) {
-      log.warn("Voice spawnTurn resume failed, retrying as turn-1", {
-        callId,
-        reason: outcome.reason,
-      });
-      outerRetryFired = true;
-      const fullPrompt = renderConversationPrompt(request.messages);
-      const retryWorkItem: WorkItem = { ...workItem, text: fullPrompt };
-      const retryCtx: TurnContext = {
-        ...ctx,
-        sessionId: undefined,
-        sessionProvider: undefined,
-        workItem: retryWorkItem,
-      };
-      outcome = await runOnce(retryCtx);
-    }
-
-    // E2: never write into a dead socket — the turn (aborted or completed)
-    // ends silently; next turn's resume either works or trips the outer
-    // full-transcript retry (recoverable by construction, spec §7).
-    if (clientGone) {
-      log.info("Voice turn ended after client disconnect — response suppressed", {
-        callId,
-        agentId,
-        ok: outcome.ok,
-        aborted: outcome.ok ? (outcome.result.aborted ?? false) : undefined,
-      });
-      return;
-    }
-
-    if (!outcome.ok) {
-      if (outcome.circuitOpen) {
-        // KPR-307 §5-1b: honest SPOKEN completion — today's baseline is a
-        // generic 500 "Internal error" (only auth/budget get 503s), and both
-        // a bare 500 and a 503 render as dead air to Vapi. ⚠ Confirm Vapi
-        // renders a normal completion better than a 500/503 during rollout.
-        log.warn("Voice turn fast-failed — provider circuit open, speaking outage notice", {
-          callId,
-          agentId,
-        });
-        this.endWithSpokenText(res, VOICE_OUTAGE_SPOKEN_NOTICE, isStreaming, outcome.bytesSent, completionId, model);
-        return;
-      }
-      if (isAuthError(outcome.reason)) {
-        log.error("Voice spawnTurn failed — OAuth credentials unavailable", {
-          callId,
-          agentId,
-          reason: outcome.reason,
-        });
-        this.endWithError(res, 503, "Voice unavailable", outcome.bytesSent, completionId, model);
-        return;
-      }
-      if (outcome.reason.includes("Spawn budget exceeded")) {
-        log.error("Voice spawnTurn rejected — spawn budget exceeded", {
-          callId,
-          agentId,
-          reason: outcome.reason,
-        });
-        this.endWithError(res, 503, "Voice temporarily unavailable", outcome.bytesSent, completionId, model);
-        return;
-      }
-      log.error("Voice spawnTurn failed", {
-        callId,
-        agentId,
-        reason: outcome.reason,
-        bytesSent: outcome.bytesSent,
-      });
-      this.endWithError(res, 500, "Internal error", outcome.bytesSent, completionId, model);
-      return;
-    }
-
-    const result = outcome.result;
-
-    // Success — finalize the response shape.
-    if (isStreaming) {
-      if (!headersSent) {
-        // Resume produced no streamed text (degenerate: e.g. zero-content
-        // turn). Emit the standard SSE close anyway so Vapi ends cleanly.
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-        });
-        headersSent = true;
-      }
-      res.write(formatSSEDone(completionId, model));
-      res.end();
-    } else {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(formatNonStreamingResponse(completionId, result.finalMessage, model)));
-    }
-
-    // Telemetry parity with KPR-207 baseline (voice-adapter.ts:370-379).
-    // Admission, including an active lease without a store row, is the
-    // continuity source for both returned and thrown failures.
-    // sdkSessionResumed = "we attempted continuity AND the spawn succeeded
-    // without the outer-retry kicking in" — NOT `newSessionId === effectiveResume`,
-    // because the SDK rotates session ids post-compaction, which would
-    // systematically under-count successful resumes versus the baseline.
-    // The `!outerRetryFired` clause matches the legacy adapter's semantic
-    // exactly: when retry fires, the original resume failed, so this counts
-    // as a non-resumed turn even if the retry succeeded.
-    log.info("Voice turn complete", {
-      callId,
-      agentId,
-      // KPR-324: on an ack turn, firstTokenMs now measures time-to-FIRST-
-      // AUDIO (model text OR a hive-injected ack, whichever the caller hears
-      // first via onStream) — not necessarily time-to-model-text anymore.
-      // stageTimings.initToFirstTokenMs (below) is a separate, SDK-side stamp
-      // that still measures time-to-first-model-text specifically and
-      // includes toolMs; the two intentionally diverge on ack turns. Read
-      // both, not just one, when interpreting a T-gate row.
-      firstTokenMs,
-      totalMs: Date.now() - startedAt,
-      mode: isStreaming ? "streaming" : "non-streaming",
-      sdkSessionResumeAttempted: continuityAttempted,
-      sdkSessionResumed: continuityAttempted && outcome.ok && !outerRetryFired,
-      routedVia: "agentManager",
-      // KPR-323 C1: stage decomposition (adapter-side stamps + coordinator/
-      // runner stamps carried on TurnResult). Log-only; all durations —
-      // no content, no numbers-of-humans (repo redaction posture).
-      promptBuildMs,
-      sessionLookupMs,
-      ...(result.stageTimings ?? {}),
-      // KPR-324 C5d/S4: tool observability for T-gates and 325 pause
-      // attribution. Counts + durations + server-name summary only — the
-      // existing redaction posture (tool NAMES, never args, never content,
-      // never the ack phrase text).
-      toolCalls: result.toolCalls,
-      toolMs: result.toolMs,
-      toolSummary: result.toolSummary ?? "none",
-      toolAckInjected: result.toolAckInjected,
-      // KPR-323 C2: warm-lease markers (false/absent until Task 5 lands).
-      warmPath: result.warmPath ?? false,
-      ...(result.warmTurnSeq !== undefined ? { warmTurnSeq: result.warmTurnSeq } : {}),
-    });
-  }
-
-  /**
-   * KPR-219: end the response with an error sentinel. Branches between
-   * `writeHead`+`end` for the no-bytes-sent case (clean HTTP error) and an
-   * SSE error close for the bytes-already-sent case (best we can do
-   * mid-stream). Net-new helper extracted to avoid duplicating the branch
-   * across the three error paths in `spawnTurnViaAgentManager`.
-   */
-  private endWithError(
-    res: ServerResponse,
-    status: number,
-    message: string,
-    bytesSent: boolean,
-    completionId: string,
-    model: string,
-  ): void {
-    if (!bytesSent) {
-      res.writeHead(status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: message }));
-      return;
-    }
-    if (!res.writableEnded) {
-      res.write(formatSSEDone(completionId, model, "error"));
-      res.end();
-    }
-  }
-
-  /**
-   * KPR-307: end the turn with a normal 200 completion carrying spoken text.
-   * Streaming: emit one SSE text chunk + the standard done frame (headers
-   * lazily if no bytes were sent yet). Non-streaming: standard JSON body.
-   */
-  private endWithSpokenText(
-    res: ServerResponse,
-    text: string,
-    isStreaming: boolean,
-    bytesSent: boolean,
-    completionId: string,
-    model: string,
-  ): void {
-    if (isStreaming) {
-      if (!bytesSent) {
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-        });
-      }
-      if (!res.writableEnded) {
-        res.write(formatSSETextChunk(completionId, text, model));
-        res.write(formatSSEDone(completionId, model));
-        res.end();
-      }
-      return;
-    }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(formatNonStreamingResponse(completionId, text, model)));
   }
 
   /**

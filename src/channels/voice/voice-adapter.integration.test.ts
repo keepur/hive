@@ -12,15 +12,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { request as httpRequest, type ClientRequest, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
+import { randomUUID } from "node:crypto";
 
-vi.mock("../../logging/logger.js", () => ({
-  createLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }),
+const mockLog = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+  writeTracked: vi.fn(
+    (_level: string, _msg: string, _data: Record<string, unknown> | undefined, callback: (result: string) => void) =>
+      callback("acknowledged"),
+  ),
+  trackedSinkSnapshot: vi.fn(() => ({ sinkErrors: 0 })),
 }));
+vi.mock("../../logging/logger.js", () => ({ createLogger: () => mockLog }));
 
 // Stub the SDK — the per-turn-via-AgentManager path doesn't reach `query()`,
 // but the import at the top of voice-adapter.ts does.
@@ -196,6 +201,12 @@ function echoTurnResult(text: string, aborted = false): TurnResult {
   };
 }
 
+function engineRows(event?: string): Array<Record<string, unknown>> {
+  return mockLog.writeTracked.mock.calls
+    .map((call) => call[2] as Record<string, unknown>)
+    .filter((row) => row?.kind === "voice_diagnostic" && (!event || row.event === event));
+}
+
 function beginStreamingChat(
   port: number,
   body: Record<string, unknown>,
@@ -271,7 +282,7 @@ describe("VoiceAdapter integration (KPR-219)", () => {
   async function startAdapterWithHangingSpawn(opts: {
     abortThread: (agentId: string, threadId: string) => unknown;
     resolveSpawnOnDestroy?: boolean;
-  }): Promise<{ port: number; spawnFinished: Promise<void> }> {
+  }): Promise<{ port: number; spawnFinished: Promise<void>; requestAborted: Promise<void> }> {
     let releaseHang!: () => void;
     const hang = new Promise<void>((r) => {
       releaseHang = r;
@@ -280,20 +291,20 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     const spawnFinished = new Promise<void>((r) => {
       spawnFinishedResolve = r;
     });
-
-    const abortThread = (agentId: string, threadId: string): boolean => {
-      try {
-        return Boolean(opts.abortThread(agentId, threadId));
-      } finally {
-        // Unblock the hanging spawn after abort is attempted (including
-        // when abortThread throws — clientGone is already true).
-        releaseHang();
-      }
-    };
+    let requestAbortedResolve!: () => void;
+    const requestAborted = new Promise<void>((r) => {
+      requestAbortedResolve = r;
+    });
 
     const setup = makeAdapter({
-      spawn: async (_ctx, onStream) => {
+      spawn: async (ctx, onStream) => {
         onStream?.("first ");
+        const cancelled = () => {
+          requestAbortedResolve();
+          releaseHang();
+        };
+        ctx.voiceRequestSignal?.addEventListener("abort", cancelled, { once: true });
+        if (ctx.voiceRequestSignal?.aborted) cancelled();
         try {
           await hang;
           return echoTurnResult("first ", true);
@@ -301,7 +312,7 @@ describe("VoiceAdapter integration (KPR-219)", () => {
           setImmediate(spawnFinishedResolve);
         }
       },
-      abortThread,
+      abortThread: opts.abortThread,
       bridgeToken: E2_BRIDGE_TOKEN,
     });
 
@@ -313,7 +324,7 @@ describe("VoiceAdapter integration (KPR-219)", () => {
         sock.on("close", () => releaseHang());
       });
     }
-    return { port: p, spawnFinished };
+    return { port: p, spawnFinished, requestAborted };
   }
 
   async function startAdapterWithHangingSessionStore(opts: {
@@ -400,6 +411,89 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     expect(ctx.systemPromptOverride).toBe("voice-prompt:say hi:");
     expect(ctx.threadId).toBe("voice:call-int-1");
     expect(ctx.channel).toBe("voice");
+  });
+
+  it("validates trace metadata, preserves the worker turn id, and never copies metadata into prompts or work items", async () => {
+    const workerBootId = randomUUID();
+    const turnId = randomUUID();
+    const secretSentinel = "TRACE-SECRET-MUST-NOT-LEAK";
+    const setup = makeAdapter({ spawn: echoSpawn(), bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p } = await startAdapter(setup);
+
+    const res = await postChatCompletion(p, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: {
+        ...workerShapedBody("call-trace-valid"),
+        metadata: { voiceTrace: { schemaVersion: 2, workerBootId, turnId } },
+        ignoredTraceField: secretSentinel,
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.chunks.join("")).toContain(`chatcmpl-${turnId}`);
+    const ctx = setup.captured[0]!.ctx;
+    expect(JSON.stringify({ prompt: ctx.systemPromptOverride, item: ctx.workItem })).not.toContain(secretSentinel);
+    const received = engineRows("engine_received");
+    const terminal = engineRows("engine_terminal");
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({ workerBootId, turnId, correlation: "worker" });
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]).toMatchObject({ workerBootId, turnId, outcome: "completed", engineAttemptSeq: 1 });
+  });
+
+  it.each([
+    ["missing", undefined, "legacy"],
+    ["malformed", { voiceTrace: { schemaVersion: 2, workerBootId: "bad", turnId: "also-bad" } }, "invalid"],
+    [
+      "oversized",
+      { voiceTrace: { schemaVersion: 2, workerBootId: randomUUID(), turnId: randomUUID(), raw: "x".repeat(10_000) } },
+      "invalid",
+    ],
+  ])("uses a fresh bounded trace for %s metadata", async (_label, metadata, correlation) => {
+    const setup = makeAdapter({ spawn: echoSpawn(), bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p } = await startAdapter(setup);
+    const res = await postChatCompletion(p, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: { ...workerShapedBody(`call-trace-${correlation}`), ...(metadata ? { metadata } : {}) },
+    });
+    expect(res.status).toBe(200);
+    expect(engineRows("engine_received")).toHaveLength(1);
+    expect(engineRows("engine_received")[0]).toMatchObject({ correlation, workerBootId: null });
+    expect(String(engineRows())).not.toContain("x".repeat(100));
+    expect(engineRows("engine_terminal")).toHaveLength(1);
+    if (correlation === "invalid") expect(engineRows("diagnostic_gap")).toHaveLength(1);
+  });
+
+  it("emits two attempt terminals and one request terminal for the real adapter outer retry", async () => {
+    let calls = 0;
+    const setup = makeAdapter({
+      storedSessionId: "resume-me",
+      bridgeToken: E2_BRIDGE_TOKEN,
+      spawn: async (ctx, onStream) => {
+        calls += 1;
+        ctx.onVoiceLaunchAdmission?.(calls === 1 ? "resume" : "fresh");
+        if (calls === 1) return { ...echoTurnResult(""), errors: ["resumed initialization failed"] };
+        ctx.onVoiceAdmission?.("fresh");
+        onStream?.("replacement");
+        return echoTurnResult("replacement");
+      },
+    });
+    const { port: p } = await startAdapter(setup);
+    const res = await postChatCompletion(p, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: workerShapedBody("call-outer-retry"),
+    });
+    expect(res.status).toBe(200);
+    expect(res.chunks.join("")).toContain("replacement");
+    expect(setup.captured).toHaveLength(2);
+    expect(setup.captured[1]!.ctx.sessionId).toBeUndefined();
+    const attempts = engineRows("engine_attempt_terminal");
+    expect(attempts).toHaveLength(2);
+    expect(attempts.map((row) => row.engineAttemptSeq)).toEqual([1, 2]);
+    expect(attempts[0]).toMatchObject({ launchAdmission: "resume", selectedContinuity: null, outcome: "failed" });
+    expect(attempts[1]).toMatchObject({ launchAdmission: "fresh", selectedContinuity: "fresh", outcome: "completed" });
+    expect(new Set(attempts.map((row) => row.turnId)).size).toBe(1);
+    expect(engineRows("engine_terminal")).toHaveLength(1);
   });
 
   it("second turn (resume from session-store) — latest-user-message prompt", async () => {
@@ -590,24 +684,17 @@ describe("VoiceAdapter integration (KPR-219)", () => {
   });
 
   it("aborts the in-flight spawn and suppresses writes when the client disconnects mid-stream (KPR-322 E2)", async () => {
-    let sawAbort!: () => void;
-    const abortSignal = new Promise<void>((r) => {
-      sawAbort = r;
-    });
-    const abortThread = vi.fn((_agentId: string, _threadId: string) => {
-      sawAbort();
-      return true;
-    });
-    const { port: p, spawnFinished } = await startAdapterWithHangingSpawn({ abortThread });
+    const abortThread = vi.fn();
+    const { port: p, spawnFinished, requestAborted } = await startAdapterWithHangingSpawn({ abortThread });
 
     const req = beginStreamingChat(p, workerShapedBody("call-e2"));
     await req.firstChunk();
     const disconnectAt = Date.now();
     req.destroySocket();
 
-    await abortSignal;
+    await requestAborted;
     expect(Date.now() - disconnectAt).toBeLessThanOrEqual(100);
-    expect(abortThread).toHaveBeenCalledWith("mokie", "voice:call-e2");
+    expect(abortThread).not.toHaveBeenCalled();
     await spawnFinished;
   });
 
@@ -636,7 +723,7 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
-  it("close listener is throw-safe when abortThread throws (KPR-322 review B2)", async () => {
+  it("does not reach the legacy thread-wide abort callback when a request closes", async () => {
     const abortThread = vi.fn(() => {
       throw new Error("boom");
     });
@@ -648,6 +735,6 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     await req.firstChunk();
     req.destroySocket();
     await spawnFinished;
-    expect(abortThread).toHaveBeenCalled();
+    expect(abortThread).not.toHaveBeenCalled();
   });
 });

@@ -233,7 +233,7 @@ type SdkPayload = {
   errorClass?: VoiceErrorClass | null;
 };
 
-type EnginePayload = {
+export type EnginePayload = {
   event:
     | "engine_received"
     | "engine_attempt_started"
@@ -247,11 +247,25 @@ type EnginePayload = {
   selectedContinuity?: "fresh" | "resume" | "warm" | null;
   warm?: boolean;
   toolCount?: number;
+  toolMs?: number;
+  toolAckInjected?: boolean;
   textLength?: number;
   outcome?: AttemptOutcome;
   errorClass?: VoiceErrorClass | null;
   admissionMs?: Measure;
   firstTextMs?: Measure;
+  durationMs?: Measure;
+  promptBuildMs?: Measure;
+  sessionLookupMs?: Measure;
+  lockWaitMs?: Measure;
+  spawnPrepMs?: Measure;
+  initToFirstTokenMs?: Measure;
+  responseCompleteMs?: Measure;
+  clientGone?: boolean;
+  correlation?: ParsedTrace["correlation"];
+  continuityAttempted?: boolean;
+  stopped?: boolean;
+  generatedAudio?: "unknown";
 };
 
 type GapPayload = {

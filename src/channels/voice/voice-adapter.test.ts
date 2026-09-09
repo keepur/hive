@@ -7,6 +7,7 @@ import type { TurnContext, TurnResult } from "../../agents/agent-manager.js";
 import { ProviderCircuitOpenError } from "../../agents/provider-circuit-breaker.js";
 import { VOICE_OUTAGE_SPOKEN_NOTICE } from "../../outage/outage-notices.js";
 import { VOICE_TOOL_ACK_PHRASES } from "../../agents/voice-tool-ack.js";
+import { buildVoiceSystemPrompt } from "../../agents/prompt-builder.js";
 
 // ---------------------------------------------------------------------------
 // Mocks shared across the file
@@ -17,6 +18,11 @@ const mockLog = vi.hoisted(() => ({
   warn: vi.fn(),
   error: vi.fn(),
   debug: vi.fn(),
+  writeTracked: vi.fn(
+    (_level: string, _msg: string, _data: Record<string, unknown> | undefined, callback: (result: string) => void) =>
+      callback("acknowledged"),
+  ),
+  trackedSinkSnapshot: vi.fn(() => ({ sinkErrors: 0 })),
 }));
 vi.mock("../../logging/logger.js", () => ({
   createLogger: () => mockLog,
@@ -149,14 +155,28 @@ class MockServerResponse extends EventEmitter {
     if (headers) Object.assign(this.headers, headers);
     this.headersSent = true;
   });
-  write = vi.fn((chunk: string) => {
+  write = vi.fn((chunk: string, callback?: (error?: Error | null) => void) => {
     this.written.push(chunk);
+    callback?.();
     return true;
   });
-  end = vi.fn((chunk?: string) => {
-    if (chunk) this.written.push(chunk);
+  end = vi.fn((chunkOrCallback?: string | (() => void), callback?: () => void) => {
+    if (typeof chunkOrCallback === "string") this.written.push(chunkOrCallback);
     this.writableEnded = true;
+    if (typeof chunkOrCallback === "function") chunkOrCallback();
+    else callback?.();
   });
+  destroy = vi.fn(() => {
+    this.destroyed = true;
+    this.emit("close");
+    return this;
+  });
+}
+
+function engineTraceRows(event: string): Array<Record<string, unknown>> {
+  return mockLog.writeTracked.mock.calls
+    .map((call) => call[2] as Record<string, unknown>)
+    .filter((row) => row?.event === event);
 }
 
 function makeRequest(overrides: Partial<OpenAIChatRequest> = {}): OpenAIChatRequest {
@@ -297,6 +317,32 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("terminalizes prompt construction failure before any engine attempt", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    vi.mocked(buildVoiceSystemPrompt).mockRejectedValueOnce(new Error("prompt fixture failed"));
+    await callHandle(adapter, makeRequest(), res);
+    expect(am.spawnTurn).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(500);
+    expect(engineTraceRows("engine_attempt_terminal")).toHaveLength(0);
+    expect(engineTraceRows("engine_terminal")).toHaveLength(1);
+    expect(engineTraceRows("engine_terminal")[0]).toMatchObject({ outcome: "failed", engineAttemptSeq: null });
+  });
+
+  it("terminalizes session lookup failure before any engine attempt", async () => {
+    const am = makeAgentManager();
+    am.sessionStoreGet.mockRejectedValueOnce(new Error("lookup fixture failed"));
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    await callHandle(adapter, makeRequest(), res);
+    expect(am.spawnTurn).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(500);
+    expect(engineTraceRows("engine_attempt_terminal")).toHaveLength(0);
+    expect(engineTraceRows("engine_terminal")).toHaveLength(1);
+    expect(engineTraceRows("engine_terminal")[0]).toMatchObject({ outcome: "failed", engineAttemptSeq: null });
   });
 
   it("invokes spawnTurn with TurnContext shape: agentId, channelId=callId, threadId=voice:callId, channel=voice", async () => {
@@ -555,6 +601,111 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     expect(res.writableEnded).toBe(true);
   });
 
+  it("treats write(false) as accepted backpressure and completes the request trace", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    res.write.mockImplementation((chunk: string, callback?: (error?: Error | null) => void) => {
+      res.written.push(chunk);
+      callback?.();
+      return false;
+    });
+    am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+      am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.("fresh");
+      onStream?.("backpressured");
+      return {
+        finalMessage: "backpressured",
+        newSessionId: "s1",
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          contextWindow: 1,
+          costUsd: 0,
+          durationMs: 1,
+        },
+        errors: [],
+      };
+    });
+    await callHandle(adapter, makeRequest({ stream: true }), res);
+    expect(res.written.join("")).toContain("backpressured");
+    expect(engineTraceRows("engine_terminal")).toHaveLength(1);
+    expect(engineTraceRows("engine_terminal")[0]).toMatchObject({ outcome: "completed" });
+  });
+
+  it("latches a throwing stream write even when the provider swallows the callback error", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    res.write.mockImplementation(() => {
+      throw new Error("socket write exploded");
+    });
+    am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+      am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.("fresh");
+      try {
+        onStream?.("lost text");
+      } catch {
+        // Warm/provider consumers are allowed to contain an onStream throw.
+      }
+      return {
+        finalMessage: "lost text",
+        newSessionId: "s1",
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          contextWindow: 1,
+          costUsd: 0,
+          durationMs: 1,
+        },
+        errors: [],
+      };
+    });
+    await callHandle(adapter, makeRequest({ stream: true }), res);
+    expect(res.destroy).toHaveBeenCalledTimes(1);
+    expect(engineTraceRows("engine_attempt_terminal")).toHaveLength(1);
+    expect(engineTraceRows("engine_terminal")).toHaveLength(1);
+    expect(engineTraceRows("engine_terminal")[0]).toMatchObject({ outcome: "failed", errorClass: "midstream_error" });
+  });
+
+  it("latches an asynchronous response write callback failure before the request terminal", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    res.write.mockImplementation((chunk: string, callback?: (error?: Error | null) => void) => {
+      res.written.push(chunk);
+      setImmediate(() => callback?.(new Error("async socket failure")));
+      return true;
+    });
+    am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+      am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.("fresh");
+      onStream?.("accepted then failed");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      return {
+        finalMessage: "accepted then failed",
+        newSessionId: "s1",
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          contextWindow: 1,
+          costUsd: 0,
+          durationMs: 1,
+        },
+        errors: [],
+      };
+    });
+    await callHandle(adapter, makeRequest({ stream: true }), res);
+    expect(engineTraceRows("engine_terminal")).toHaveLength(1);
+    expect(engineTraceRows("engine_terminal")[0]).toMatchObject({ outcome: "failed", errorClass: "midstream_error" });
+  });
+
   it("non-streaming path: TurnResult.finalMessage rendered via formatNonStreamingResponse", async () => {
     const am = makeAgentManager({ finalMessage: "the final answer" });
     const adapter = makeVoiceAdapter(am);
@@ -568,6 +719,20 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     const body = JSON.parse(res.written.join(""));
     expect(body.choices[0].message.content).toBe("the final answer");
     expect(body.choices[0].message.role).toBe("assistant");
+  });
+
+  it("terminalizes a no-content success with an unknown audio outcome", async () => {
+    const am = makeAgentManager({ finalMessage: "" });
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    await callHandle(adapter, makeRequest({ stream: true }), res);
+    expect(res.written.join("")).toContain("[DONE]");
+    expect(engineTraceRows("engine_terminal")).toHaveLength(1);
+    expect(engineTraceRows("engine_terminal")[0]).toMatchObject({
+      outcome: "completed",
+      generatedAudio: "unknown",
+      firstTextMs: { value: null, reason: "not_reached" },
+    });
   });
 
   it("outer retry: when first spawnTurn errors with sessionId set and no bytes sent, retries with full transcript and stripped sessionId", async () => {
@@ -1051,7 +1216,8 @@ describe("E2 abort-on-disconnect (KPR-322)", () => {
 
     await callHandle(adapter, req, res);
 
-    expect(am.abortThread).toHaveBeenCalledWith("mokie", "voice:call-abc-123");
+    expect(am.abortThread).not.toHaveBeenCalled();
+    expect(am.calls[0]!.ctx.voiceRequestSignal?.aborted).toBe(true);
     expect(am.spawnTurn).toHaveBeenCalledTimes(1);
     expect(res.written).toEqual([]);
     expect(res.writableEnded).toBe(false);
@@ -1087,7 +1253,8 @@ describe("E2 abort-on-disconnect (KPR-322)", () => {
 
     await expect(callHandle(adapter, req, res)).resolves.toBeUndefined();
 
-    expect(am.abortThread).toHaveBeenCalledWith("mokie", "voice:call-abc-123");
+    expect(am.abortThread).not.toHaveBeenCalled();
+    expect(am.calls[0]!.ctx.voiceRequestSignal?.aborted).toBe(true);
     const joined = res.written.join("");
     expect(joined).toContain('"content":"before "');
     expect(joined).not.toContain("after");
