@@ -1351,7 +1351,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
     ),
     tool(
       "verify_path",
-      "Check that an absolute filesystem path exists and is a directory. General-purpose path-validation utility — currently has no in-repo caller, since the workflow it originally served (the agent-builder seed skill's software-engineer workshop verification) was removed in KPR-435.",
+      "Check that an absolute filesystem path exists and is a directory. General-purpose path-validation utility for confirming a filesystem path before it's used elsewhere.",
       {
         path: z
           .string()

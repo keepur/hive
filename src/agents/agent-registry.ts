@@ -314,11 +314,17 @@ export class AgentRegistry {
       // AgentConfig entirely. A pre-existing doc may still carry either field
       // (raw Mongo doc, not the typed agentConfig) — log so the operator
       // notices and cleans up via admin_agent_update, but never evict for it.
+      // `archetype: ""` is excluded from this check: it was the pre-KPR-435
+      // documented "explicit clear" convention (agent_update's old empty-
+      // string-clears semantics), not a stray value — a doc cleared that way
+      // before this ticket shipped (e.g. Jasper on dodi, 2026-09-05) must not
+      // log a false "retired fields" alarm on every reload.
       const rawDoc = doc as unknown as Record<string, unknown>;
-      if (rawDoc.archetype != null || rawDoc.archetypeConfig != null) {
+      const rawArchetype = typeof rawDoc.archetype === "string" && rawDoc.archetype.length > 0 ? rawDoc.archetype : undefined;
+      if (rawArchetype != null || rawDoc.archetypeConfig != null) {
         log.error("Agent doc carries retired archetype/archetypeConfig fields — ignoring (KPR-435)", {
           id: agentConfig.id,
-          archetype: rawDoc.archetype,
+          archetype: rawArchetype,
         });
       }
       // KPR-324 C7: strip the test fixture from any non-pilot def.

@@ -358,6 +358,27 @@ describe("KPR-435 — AgentRegistry fail-soft strips retired code-task/archetype
     expect(registry.get("clean-agent")).toBeDefined();
     expect(errorLines(cap.lines)).toHaveLength(0);
   });
+
+  it("logs nothing for archetype: '' — the pre-KPR-435 explicit-clear convention, not a stray value", async () => {
+    // A doc cleared via the OLD agent_update empty-string-clears semantics
+    // (e.g. Jasper on dodi, cleared 2026-09-05, before this ticket shipped)
+    // must not trip the retired-fields alarm on every reload.
+    const def = {
+      ...makeDefinition({ _id: "empty-string-archetype" }),
+      archetype: "",
+    } as unknown as AgentDefinition;
+
+    const registry = new AgentRegistry(makeFakeCollection([def]));
+    const cap = captureStderr();
+    try {
+      await registry.load();
+    } finally {
+      cap.restore();
+    }
+
+    expect(registry.get("empty-string-archetype")).toBeDefined();
+    expect(errorLines(cap.lines)).toHaveLength(0);
+  });
 });
 
 describe("keyword matching", () => {
