@@ -228,6 +228,17 @@ export const OPS_EVIDENCE_MAX = 4;
  * into a stored document through the very schema that IS the redaction
  * boundary. 200 reuses `OPS_ID_MAX_LENGTH` and covers every key this
  * producer's own rows declare.
+ *
+ * ⚠ The reuse is ADJACENCY, not derivation: the two are equal today by
+ * judgement and either may move without the other.
+ *
+ * ⚠ And this is an ENGINE-WIDE ceiling on every producer, including a foreign
+ * one whose row this code does not contain. KPR-458 D12 assigns the
+ * `maxLength` column to the producer; KPR-454 narrows it — a legitimate engine
+ * bound, but a real divergence from the contract as a foreign author reads it.
+ * A producer needing more does not raise its own `maxLength` (clamped, and
+ * reported by `auditReasonRow`); it asks for this constant to move, which is an
+ * engine change with a review attached.
  */
 export const OPS_DETAIL_STRING_MAX = 200;
 
@@ -318,7 +329,15 @@ export interface ToolErrorSignals {
 const TEXT_RULES: ReadonlyArray<readonly [RegExp, ToolErrorToken]> = [
   [/\binterrupted before a result\b/i, "interrupted"], // KPR-438 background-subagent signature
   [/\b(timed? ?out|deadline exceeded|etimedout)\b/i, "timeout"],
-  [/\b(econnrefused|econnreset|enotfound|socket hang up|fetch failed|server (is )?unavailable|transport closed)\b/i, "transport-unavailable"],
+  // `connection closed` is load-bearing: on ANY transport close the SDK
+  // rejects EVERY in-flight request with `McpError.fromError(
+  // ErrorCode.ConnectionClosed, "Connection closed")` (protocol.js:263),
+  // message `MCP error -32000: Connection closed` — the stdio-server-died /
+  // in-process-server-crashed case this token exists for (verified against the
+  // installed SDK). Matched as TEXT, deliberately not code-mapped: protocol.js
+  // :334 throws the same -32000 for `Request was cancelled`, so a code map
+  // would conflate a cancellation with a transport fault.
+  [/\b(econnrefused|econnreset|enotfound|socket hang up|fetch failed|server (is )?unavailable|transport closed|connection closed)\b/i, "transport-unavailable"],
   [/\b(not found|no such (tool|file|resource)|unknown tool|enoent)\b/i, "not-found"],
   [/\b(invalid (input|argument|parameter|schema)|validation failed|bad request|missing required)\b/i, "invalid-input"],
   [/\b(permission denied|forbidden|unauthorized|not authorized|eacces|access denied)\b/i, "permission-denied"],
@@ -357,6 +376,7 @@ Three things live here and the separation between the first two is the kill swit
 
 - `HIVE_RUNTIME_REASONS` is the **code-resident** table. It is the *write* direction (the boot upsert's source) and the enable gate's input, and nothing else.
 - The accept path resolves a row from the **collection**, via the map `init()` loads back — never from this constant. That is what makes `enabled: false` + restart a working kill switch, and what lets a row this code does not contain (a second reason added later as data, or an out-of-engine producer's) take effect at the next boot with no engine change (AC16).
+- `auditReasonRow` is the **diagnostic** half, and it exists because `compileDetailSchema` normalizes a data-sourced row three ways — an over-ceiling `maxLength` (clamped), an unrecognized `spec.type` (falls through to boolean), an unbounded key **name** — each of which fails *closed* but leaves the operator only the generic rejection counter, which D9 reserves for a mis-integrated **producer**. A conforming foreign row declaring `maxLength: 400` would otherwise have every over-200 publish rejected and counted as if the producer were malformed, in the one subsystem whose stated posture is "logged and counted, never silent". It is pure and decides nothing; the gate throws on its output for the code-resident half, and chunk 3's `loadReasons` loop warns and counts on it for the data-sourced half. `compileDetailSchema`'s behaviour is **unchanged** — the clamp asymmetry is correct and stays.
 - `assertReasonTableLegal` is a **pure precondition over the code-resident table**, evaluated before any I/O and pinned by a unit test — so a violation is a development-time throw, never an operational boot fault, and it is untouched by D10's rule that `init()`'s I/O is non-fatal to boot. **Its one call site is the `OpsPublisher` constructor** (chunk 3, Task 4, Step 3), *not* `upsertReasons` and *not* `init()`: chunk 4 constructs the publisher outside its `try { await init() } catch`, so the gate stays D10's one **loud** failure mode instead of degrading into the same warn-and-unset posture as a Mongo blip.
 
 ```typescript
@@ -437,6 +457,44 @@ export const HIVE_RUNTIME_REASONS: readonly OpsReason[] = [
 ];
 
 /**
+ * D4: the bound on a detail KEY NAME. Deliberately NOT `OPS_TOKEN_RE` — that
+ * is lowercase-hyphen and would reject this producer's own `errorSig`,
+ * `workItemId` and `durationMs`. A key name rides into every stored document
+ * for its reason, so an unbounded one is the hole `maxLength` closes for
+ * values, still open from the other side.
+ */
+const DETAIL_KEY_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+
+/**
+ * The three normalizations `compileDetailSchema` performs SILENTLY on a
+ * data-sourced row, returned as anomaly strings. PURE — decides nothing.
+ * `assertReasonTableLegal` throws on its output (code-resident half, a
+ * development-time defect); chunk 3's `loadReasons` warns and counts on it
+ * (data-sourced half, where refusing the row would let one operator row disable
+ * publishing). All three already fail CLOSED, so this is strictly diagnostic:
+ * it separates "this row declares something the engine narrows" from "the
+ * producer is mis-integrated", which the bare `rejected` counter cannot.
+ */
+export function auditReasonRow(row: OpsReason): string[] {
+  const anomalies: string[] = [];
+  for (const spec of row.detailKeys) {
+    const id = `${row.producer}:${row.reasonId} key ${JSON.stringify(spec.key)}`;
+    if (!DETAIL_KEY_NAME_RE.test(spec.key)) {
+      anomalies.push(`${id}: key NAME fails ${String(DETAIL_KEY_NAME_RE)}`);
+    }
+    if (spec.type !== "string" && spec.type !== "number" && spec.type !== "boolean") {
+      // compileDetailSchema's if/else chain has no default arm, so a foreign
+      // "date" or a typo'd "String" silently compiles to z.boolean().
+      anomalies.push(`${id}: unrecognized type ${JSON.stringify(spec.type)} — compiled as boolean`);
+    }
+    if (spec.type === "string" && spec.maxLength !== undefined && spec.maxLength > OPS_DETAIL_STRING_MAX) {
+      anomalies.push(`${id}: declares maxLength ${spec.maxLength}, clamped to ${OPS_DETAIL_STRING_MAX}`);
+    }
+  }
+  return anomalies;
+}
+
+/**
  * D4's enable gate, as a PURE precondition over the code-resident table.
  * Evaluated before any I/O; a violation is a development-time throw, never an
  * operational boot fault. `informational` reasons are exempt (no clearing
@@ -457,6 +515,12 @@ export function assertReasonTableLegal(rows: readonly OpsReason[]): void {
         `ops reason table: ${row.reasonId}'s remediationTemplate is empty or exceeds ${OPS_REMEDIATION_MAX} ` +
           `(D4: required, no default, "a bounded parameterised string")`,
       );
+    }
+    // The three silent normalizations, LOUD for the code-resident half. A
+    // developer fixes these before deploy, so there is no reason to let the
+    // table ship with a key name or a type the compiler will quietly reshape.
+    for (const anomaly of auditReasonRow(row)) {
+      throw new Error(`ops reason table: ${anomaly}`);
     }
     // C13: the allow-list IS the redaction boundary, so a string key with no
     // declared bound is a development-time defect and refuses loudly here.
@@ -662,6 +726,15 @@ describe("classifyToolError (KPR-454 D6)", () => {
     expect(classifyToolError("weird vendor failure #7719", { mcpErrorCode: -32001 })).toBe("timeout");
   });
 
+  it("classifies an MCP transport death (-32000 ConnectionClosed) as transport-unavailable", () => {
+    // The SDK rejects every in-flight request with this exact message when a
+    // transport dies. -32000 is deliberately NOT code-mapped — the same code
+    // carries `Request was cancelled` — so the TEXT is what must fire, and a
+    // cancellation stays honestly unclassified.
+    expect(classifyToolError("MCP error -32000: Connection closed")).toBe("transport-unavailable");
+    expect(classifyToolError("MCP error -32000: Request was cancelled")).toBe("unclassified");
+  });
+
   it("an unmapped JSON-RPC code falls through to the text rules, never to a guess", () => {
     expect(classifyToolError("ECONNREFUSED 127.0.0.1:1", { mcpErrorCode: -32603 })).toBe("transport-unavailable");
     expect(classifyToolError("weird vendor failure #7719", { mcpErrorCode: -32603 })).toBe("unclassified");
@@ -680,8 +753,13 @@ describe("classifyToolError (KPR-454 D6)", () => {
   // Round 1 caught the earlier form (`expect(secretish).not.toContain(token)`)
   // encoding the second, which is FALSE of the artifact and passed only on its
   // fixture: any message containing "timeout" classifies as "timeout" and does
-  // contain it. Referential identity is the form true of every input.
-  it("returns a member of the closed set by reference, so no input byte can ride out (C13)", () => {
+  // contain it. Set membership is the form true of every input.
+  //
+  // The `.some(t => t === token)` spelling is VALUE equality on string
+  // primitives — exactly as strong as the `toContain` above it, not stronger.
+  // It is written this way for readability with the per-input message, and no
+  // "by reference" claim is being made or relied on.
+  it("returns a member of the closed nine-value set, so no input byte can ride out (C13)", () => {
     for (const input of [
       "auth failed for sk-ant-api03-DEADBEEF at /Users/mokie/.env",
       "operation timed out after 600000ms",     // the fixture the old form got wrong
@@ -770,13 +848,14 @@ describe("admissibleIdOrUndefined (KPR-454 D6, AC3)", () => {
 import { describe, it, expect } from "vitest";
 import {
   assertReasonTableLegal,
+  auditReasonRow,
   compileDetailSchema,
   HIVE_RUNTIME_REASONS,
   REASON_TOOL_FAILED,
   REASON_TOOL_RECOVERED,
 } from "./reasons.js";
 import { OPS_DETAIL_STRING_MAX } from "./ids.js";
-import type { OpsReason } from "./types.js";
+import type { DetailKeySpec, OpsReason } from "./types.js";
 
 describe("HIVE_RUNTIME_REASONS + assertReasonTableLegal (KPR-454 D5, AC10)", () => {
   it("the shipped table is legal", () => {
@@ -810,6 +889,28 @@ describe("HIVE_RUNTIME_REASONS + assertReasonTableLegal (KPR-454 D5, AC10)", () 
 
   it("refuses an over-long remediationTemplate (D4: a BOUNDED parameterised string)", () => {
     expect(() => assertReasonTableLegal(patch({ remediationTemplate: "x".repeat(501) }))).toThrow(/remediationTemplate/);
+  });
+
+  it("refuses the two silent normalizations the compiler would otherwise perform", () => {
+    // An unrecognized type falls through compileDetailSchema's if/else chain to
+    // z.boolean(); an unbounded key NAME rides into every stored document for
+    // the reason. Both fail closed at publish time, so this gate is what makes
+    // them fail LOUDLY where a developer can still fix them.
+    const badType = patch({ detailKeys: [{ key: "when", type: "date" } as unknown as DetailKeySpec] });
+    expect(() => assertReasonTableLegal(badType)).toThrow(/unrecognized type/);
+    const badName = patch({ detailKeys: [{ key: "a".repeat(80), type: "string", maxLength: 40 }] });
+    expect(() => assertReasonTableLegal(badName)).toThrow(/key NAME/);
+  });
+
+  it("auditReasonRow reports and decides nothing — the operator-inserted row's path", () => {
+    // The data-sourced half never reaches the gate: `loadReasons()` compiles
+    // whatever `ops_reasons` holds. This is what chunk 3's loop warns on, so
+    // an over-ceiling declaration is attributable to the ROW rather than
+    // spending the mis-integrated-producer counter.
+    const row = { ...HIVE_RUNTIME_REASONS[1], detailKeys: [{ key: "x", type: "string", maxLength: 400 }] };
+    expect(auditReasonRow(row)).toHaveLength(1);
+    expect(auditReasonRow(row)[0]).toMatch(new RegExp(`clamped to ${OPS_DETAIL_STRING_MAX}`));
+    for (const shipped of HIVE_RUNTIME_REASONS) expect(auditReasonRow(shipped), shipped.reasonId).toEqual([]);
   });
 
   it("upserts the clearing reason FIRST (D5 write order is load-bearing)", () => {
@@ -920,7 +1021,15 @@ describe("the D5 filter grammar (KPR-454 AC5, C7)", () => {
     }
   });
 
-  it("the six are exactly the OpsFilter key space — no seventh term exists", () => {
+  it("TERMS enumerates the six the D5 grammar declares (a literal, not a derivation)", () => {
+    // ⚠ Scope, stated rather than overclaimed by the title. This catches a term
+    // silently dropped from TERMS (which would leave the discrimination loop
+    // covering five while still passing). It does NOT catch a seventh term added
+    // to BOTH `OpsFilter` and `matchesFilter` — nothing here reads the type or
+    // the evaluator. Closing that would mean exporting a runtime term list from
+    // match.ts and driving `matchesFilter` off it: declined, since it
+    // restructures an evaluator round 2 confirmed correct, to guard an addition
+    // that is itself a deliberate contract change (C7 fixes the six).
     expect(TERMS.map((t) => t.term).sort()).toEqual([
       "class", "producer", "reasonId", "retry", "subjectKind", "waiting",
     ]);

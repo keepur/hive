@@ -10,7 +10,7 @@ Some criteria are already covered by earlier tasks (AC4 by Task 1, AC12/AC11/AC8
 
 **Files:**
 - Create: `src/ops/acceptance.integration.test.ts`
-- Modify: `src/ops/capture-points.integration.test.ts` — **export** the runner/scaffold harness Task 5 builds (see "The shared lane harness" below)
+- Imports (does not modify) `src/ops/testing/lane-harness.ts`, the plain module Task 5 creates — see "The shared lane harness" below
 
 Structure the file as sixteen `describe` blocks named `AC1 (C1, C4) — …` through `AC16 (C16) — …`, in order. Every one of the sixteen is a real `describe` containing at least one real `it`; where a criterion's mechanism lives in another file this block holds a **reference case** that asserts something here, never a bare comment.
 
@@ -24,20 +24,36 @@ Structure the file as sixteen `describe` blocks named `AC1 (C1, C4) — …` thr
 
 **4. Counting reads is `fakeDb.operations`** — the log at `obligations/testing/fake-db.ts:73`, filtered by collection and operation name. Both "the resolver's read count is unchanged across the recovery" and "no database access at all" are assertions over this array, not over a spy.
 
-**5. The repository-scan idiom** (`globSync` from `tinyglobby`, `root = fileURLToPath(new URL("../..", import.meta.url))`, `readFileSync`) is stated once in **chunk 1, Task 1, Step 5**. Import it the same way there; both scans in this file (AC7, AC15) use it, and neither redefines `root`.
+**5. The repository-scan idiom** (`globSync` from `tinyglobby`, `root = fileURLToPath(new URL("../../", import.meta.url))`, `readFileSync`) is stated once in **chunk 1, Task 1, Step 5** — including that `root` ends with a slash, so every read here is `` `${root}${file}` `` and never `` `${root}/${file}` ``. Import it the same way there; both scans in this file (AC7, AC15) use it, and neither redefines `root`.
 
-**6. The shared lane harness.** AC8, AC11 and AC12 need a real `AgentRunner` hook set and a real `ToolBridge` — the harness Task 5 builds inside `src/ops/capture-points.integration.test.ts`, which currently exports nothing. **Task 5 must export it** (`export function buildClaudeLaneHarness(...)` / `export function buildLaneBHarness(...)`, or a single `export const laneHarness = {...}`), and this file imports it. A Vitest test file exporting helpers is ordinary; the alternative — reconstructing a byte-identical `RunResult` twice — is exactly the duplication that lets the two copies drift.
+**6. The shared lane harness lives in a PLAIN MODULE, `src/ops/testing/lane-harness.ts`.** AC8, AC11 and AC12 need a real `AgentRunner` hook set and a real `ToolBridge`; Task 5 builds `buildClaudeLaneHarness(...)` and `buildLaneBHarness(...)` there (chunk 4, Files), and **both** this file and `capture-points.integration.test.ts` import from it. Neither test file imports the other.
+
+⚠ **Do not "simplify" this by exporting from `capture-points.integration.test.ts`.** Measured on this tree (vitest 4.1.11): a consumer importing a `.test.ts` **re-registers that file's suites and file-scope hooks into the importer** — a probe showed the helper's own case running in both files, 3 tests across 2 files. Task 5's `beforeEach`/`vi.mock` would go active for this file's cases and the capture-point suite would run twice under different fixtures. The repository has **zero** cross-`.test.ts` imports, the established pattern is a plain module (`src/obligations/testing/{fake-db,harness,refusals}.ts`), and a plain module additionally gets `tsc --noEmit` coverage that `.test.ts` files do not. The point the earlier draft was right about stands: reconstructing a byte-identical `RunResult` baseline twice is the duplication that lets the two copies drift — one module, two importers.
 
 **7. Two module-scope constants**, declared once at the top of the file rather than inside any `describe` — a `const` inside one `describe` is invisible to the others, and three of these blocks are in different `describe`s:
 
 ```typescript
-const root = fileURLToPath(new URL("../..", import.meta.url));   // chunk 1 Step 5's idiom
-const opsSources = globSync("src/ops/**/*.ts", { cwd: root })    // the src/ops non-test sources
-  .filter((f) => !f.endsWith(".test.ts"))
-  .map((f) => readFileSync(`${root}/${f}`, "utf8"));
+const root = fileURLToPath(new URL("../../", import.meta.url)); // chunk 1 Step 5's idiom — ENDS WITH A SLASH
+const opsSources = globSync("src/ops/**/*.ts", { cwd: root })
+  // The PRODUCER's own sources: not the tests, and not the test doubles. The
+  // `src/ops/testing/` exclusion is load-bearing, not tidiness — AC7 forbids
+  // `dispatcher`/`agent-manager` and AC15 forbids `costUsd`/`tool_response`
+  // in every file this list holds, and `lane-harness.ts` legitimately
+  // constructs RunResult baselines mentioning them while driving real runner
+  // machinery. Without the exclusion a correct harness fails a criterion it
+  // was never about. (These scans constrain COMMENT text too — a bare word
+  // written into a doc comment anywhere under `src/ops/**` trips them; chunk 3's
+  // `stripGeneration` example is the first instance, which is why it uses a
+  // neutral producer.)
+  .filter((f) => !f.endsWith(".test.ts") && !f.replace(/\\/g, "/").startsWith("src/ops/testing/"))
+  .map((f) => readFileSync(`${root}${f}`, "utf8"));
 ```
 
 `opsSources` is read by AC2 (`ops_notifications`), AC7 (turn-spawn) and AC15 (`costUsd` / `tool_response` / `durationMs`).
+
+**8. Per-test isolation.** A fresh `FakeDb` **and** a fresh `OpsPublisher` in `beforeEach`, and `__resetOpsPublisherForTests()` in `afterEach`. Roughly ten assertions below use a bare `findOne({})` with no filter and no sort, and many read absolute counter values (`rejected === 0`, `recoverySuperseded === 1`) rather than deltas — a document or a counter carried over from a prior case makes those pass or fail for the wrong reason, and `findOne({})` in particular will happily return a predecessor's row.
+
+**9. The three drive helpers, named here because every table below uses them and none introduces them:** `failOnTurnWith({ workItemId, threadId, … })` drives one Claude-lane tool failure on a turn whose `WorkItemContext` is built exactly as `agent-manager.ts:1951-1958` does (it carries all 28 AC3 admit rows); `driveFailure(tool)` and `driveSuccess(tool)` are the bare failure/success pair AC9's interleavings are written in. Define all three once at module scope beside the constants above.
 
 - [ ] **Step 1:** AC1–AC3 — the envelope, the zero-match fact, and reject-versus-omit.
 
@@ -158,6 +174,14 @@ describe("AC3 (C5) — rejections", () => {
   ])("rejects and counts: %s", async (_label) => {
     const before = publisher.getSnapshot().rejected;
     // …attempt the publish…
+    // ⚠ THE BARRIER IS REQUIRED HERE, and this is the one sketch in the file
+    // where omitting it makes the test PASS rather than fail. Both assertions
+    // below read state the DRAINER produces — the rejection is counted inside
+    // accept(), which runs on the drain — so read before the drain, the count
+    // assertion is vacuously true (nothing has been inserted yet either way)
+    // and the counter assertion flakes. Harness contract item 1 states the
+    // global rule; this is the sketch that gets copied.
+    await publisher.__drainForTests();
     expect(await db.collection("ops_events").countDocuments({})).toBe(0);
     expect(publisher.getSnapshot().rejected).toBe(before + 1);
   });
@@ -179,6 +203,7 @@ describe("AC3 (C5) — the OMIT path, pinned against the reject path", () => {
   ])("publishes normally with the key OMITTED: %s", async (_label, bad) => {
     const before = publisher.getSnapshot();
     // …failure on a turn whose workItemId and threadId are `bad`…
+    await publisher.__drainForTests();   // required — see the reject block above
     const doc = await db.collection("ops_events").findOne({});
     expect(doc!.detail).not.toHaveProperty("workItemId");
     expect(doc!.detail).not.toHaveProperty("threadId");
@@ -302,7 +327,7 @@ it("match evaluation performs NO I/O", async () => {
   //      returns its result and `fakeDb.operations` gains no entry;
   //  (b) match.ts imports nothing from mongodb or from ./store.js — the
   //      durable half, which survives a refactor that stops exercising (a).
-  const source = readFileSync(`${root}/src/ops/match.ts`, "utf8");
+  const source = readFileSync(`${root}src/ops/match.ts`, "utf8");
   expect(source).not.toMatch(/from "mongodb"|from "\.\/store\.js"/);
 });
 
@@ -362,7 +387,7 @@ it("no code path in this diff spawns a turn", () => {
 
 - [ ] **Step 3:** AC8–AC10 — containment, the epoch rule, and clearing legality. These three carry the driven scenarios.
 
-**AC8 (C15) — negative-verify, both faults, both lanes.** Driven here through the harness Task 5 exports (harness contract item 6) — `import { buildClaudeLaneHarness, buildLaneBHarness } from "./capture-points.integration.test.js"`. Do not rebuild a `RunResult` fixture in this file: two copies of a byte-comparison baseline drift, and the drift is invisible because both sides move together.
+**AC8 (C15) — negative-verify, both faults, both lanes.** Driven here through Task 5's plain-module harness (harness contract item 6) — `import { buildClaudeLaneHarness, buildLaneBHarness } from "./testing/lane-harness.js"`. Do not rebuild a `RunResult` fixture in this file: two copies of a byte-comparison baseline drift, and the drift is invisible because both sides move together.
 
 ```typescript
 it("a throwing publisher leaves a Claude-lane RunResult byte-identical", async () => { /* … */ });
@@ -407,27 +432,36 @@ it("R1 · F · R2 — the superseded recovery is dropped, not published", async 
   //                 entry CREATED at openSeq 8, dedupeKey K1
   //           R2 -> entry.openSeq (8) !== job.openSeq (7) -> DROP
   //
-  // CONSTRUCTION — the mechanism, not "hold the drainer" in prose. Both
-  // recovery jobs must be minted while the entry still carries openSeq 7, and
-  // the drainer must not reach R2 until F3 has re-opened the family. Use the
-  // fake's pause (harness contract item 3):
+  // CONSTRUCTION — the mechanism, not "hold the drainer" in prose, and NOT
+  // the sequence an earlier draft offered. Two things it got wrong, both
+  // fatal: R2 cannot be minted after R1's accept has run (the map holds
+  // nothing for the family — R1's accept ran `open.delete`, and F3's
+  // `open.set` runs only AFTER `await this.accept(...)` returns — so
+  // `enqueueRecoveryIfOpen` hits `if (!entry) return`, `recoverySuperseded`
+  // stays 0, and three of the four assertions fail in a way that looks like a
+  // code bug); and "enqueue R2 directly" is unbuildable, because `enqueue` is
+  // private and chunk 3 ships only `__drainForTests`/`__openEntryForTests`, so
+  // an implementer chasing green adds a stale-job injector or weakens the
+  // assertions.
   //
-  //   const gate = fakeDb.pause("ops_events", "insertOne");   // stall inside R1's accept
-  //   driveSuccess("Bash");            // R1 minted at openSeq 7, enqueued
-  //   driveSuccess("Bash");            // R2 minted at openSeq 7 — the map still holds it
-  //   await gate.reached;              // drainer is inside R1's insert
-  //   driveFailure("Bash");            // F3 queued BEHIND R2… so instead:
+  // THE SEQUENCE THAT WORKS (harness contract item 3):
   //
-  // ⚠ The queue is FIFO and the drainer serial, so R2 must be enqueued AFTER
-  // F3 to reproduce D8's order while still carrying openSeq 7. The workable
-  // sequence: drain R1 fully (entry removed), drain F3 fully (entry recreated
-  // at openSeq 8), then enqueue R2 directly with the STALE openSeq 7 via
-  // `publisher.enqueueRecoveryIfOpen`'s job shape — i.e. capture the job R2
-  // would have been by calling `driveSuccess` while the pause holds F3's
-  // insert, so R2's map read sees openSeq 7 and its drain sees openSeq 8.
-  // Whichever shape the implementer lands on, the invariant to reproduce is
-  // exactly: a queued recovery job whose `openSeq` is 7 drained against a map
-  // entry whose `openSeq` is 8. State the achieved sequence in a comment.
+  //   const gate = fakeDb.pause("ops_events", "insertOne");
+  //   driveSuccess("Bash");    // R1 dequeued, stalls inside accept; entry still openSeq 7
+  //   await gate.reached;      // the drainer is INSIDE R1's insert
+  //   driveFailure("Bash");    // F3 queued
+  //   driveSuccess("Bash");    // R2 minted at openSeq 7 (R1 has not deleted yet), queued behind F3
+  //   gate.release();
+  //   await publisher.__drainForTests();
+  //
+  // The drain then runs R1 (accept, entry deleted) -> F3 (generation 1, entry
+  // recreated at openSeq 8) -> R2 (7 !== 8 => superseded, live entry survives)
+  // — D8's exact narrative, with R2 both minted at 7 and drained after F3.
+  //
+  // The pause is what makes it deterministic; chunk 3's Step 6 sibling case
+  // achieves the same state synchronously, relying on the recovery accept path
+  // having no await before `insertOne`. Either is correct; this one does not
+  // depend on that property, which is why AC9 uses it.
   //
   // Four assertions, one per harm the identity check prevents:
   expect(clearingFactsNaming("K0")).toHaveLength(1);      // not two; no second clearing fact for the dead key
@@ -443,10 +477,12 @@ it("R1 · F · R2 — the superseded recovery is dropped, not published", async 
 it("a recovery job whose publish faults leaves the family open, so the next success re-enqueues", async () => { /* … */ });
 
 it("a success with no open condition performs no database access at all", async () => {
-  // Two forms, and both are worth having: against the throwing-db variant
-  // (nothing throws ⇒ nothing was touched), and against the COUNTING fake
-  // (`fakeDb.operations.length` unchanged across the success ⇒ nothing was
-  // touched, and this one localises the failure if it ever regresses).
+  // Two forms, and both are worth having: with the fake armed via
+  // `armThrowOnEveryAccess()` AFTER init() (nothing throws ⇒ nothing was
+  // touched — chunk 3 Step 1; there is no `throwingDb()`, a publisher over one
+  // cannot be constructed), and against the `operations` log
+  // (`fakeDb.operations.length` unchanged across the success, which localises
+  // the failure if it ever regresses).
 });
 ```
 **Negative-verify (required):** change the drainer's identity test from `entry.openSeq !== job.openSeq` to a bare `this.open.has(job.family)` membership test and confirm the `R1 · F · R2` case fails. Restore.
@@ -469,7 +505,7 @@ it("the boot gate refuses to leave tool-failed enabled if no registered row clea
 
 - [ ] **Step 4:** AC11–AC16.
 
-**AC11 (lane parity)** — Task 5 already specifies the mechanism case **including** the `applyNameAndCapEdges` truncation variant (chunk 4, Step 5), so this block does not re-specify it. It carries one real `it` that imports Task 5's exported harness and asserts the criterion here, so the sixteen-`describe` map is complete:
+**AC11 (lane parity)** — Task 5 already specifies the mechanism case **including** the `applyNameAndCapEdges` truncation variant (chunk 4, Step 5), so this block does not re-specify it. It carries one real `it` that imports Task 5's harness from `./testing/lane-harness.js` and asserts the criterion here, so the sixteen-`describe` map is complete:
 
 ```typescript
 it("AC11 — the same tool name yields one subject.id on both lanes, long names included", async () => {
@@ -480,7 +516,7 @@ it("AC11 — the same tool name yields one subject.id on both lanes, long names 
 });
 ```
 
-**AC12 (abort discipline)** — same shape: three real `it`s here, driven through the exported harness, not prose references.
+**AC12 (abort discipline)** — same shape: three real `it`s here, driven through `./testing/lane-harness.js`, not prose references.
 
 ```typescript
 it("AC12 — own-abort publishes nothing on EITHER lane", async () => { /* wasAborted; opts.signal.aborted */ });
@@ -507,12 +543,32 @@ it("both observer registrations occur AFTER the archetype try/catch closes", () 
   // chunk 4, Task 5, Step 5 states why: registration is straight-line
   // assignment of two array literals and cannot throw, and a vi.mock factory
   // throw kills the module import (taking AgentRunner with it), so no runtime
-  // drive can observe the deny-all matcher surviving. Extract buildHooks's
-  // body from src/agents/agent-runner.ts and assert the index of
-  // `hooks.PostToolUseFailure =` and of `hooks.PostToolUse =` each exceed the
-  // index of the archetype try/catch's closing brace. Fails the moment either
-  // assignment moves inside the try — which is the property, stated as
-  // something the test can actually see.
+  // drive can observe the deny-all matcher surviving.
+  //
+  // ⚠ Anchor on a LITERAL, not on "the closing brace" — a brace has no stable
+  // textual form and an implementer left to find one invents an anchor that
+  // reads green regardless. The deny-all arm's permissionDecisionReason string
+  // is confirmed to occur only inside the archetype catch (agent-runner.ts:1966).
+  const src = readFileSync(`${root}src/agents/agent-runner.ts`, "utf8");
+  const catchArm = src.indexOf("All tool calls blocked until the archetype is fixed.");
+  expect(catchArm).toBeGreaterThan(0);
+  for (const assignment of ["hooks.PostToolUseFailure =", "hooks.PostToolUse ="]) {
+    expect(src.indexOf(assignment), assignment).toBeGreaterThan(catchArm);
+    // …and at buildHooks's own statement indentation, which is what separates
+    // "after the catch" from "inside it but textually later".
+    expect(src).toContain(`\n    ${assignment}`);
+  }
+});
+
+it("AC13 — src/ops/publisher.ts exposes no .start(-spelled method", () => {
+  // boot-order.test.ts's (d) case scans index.ts, so it guards the CALL site
+  // only; this is the other half of the same sentence. ⚠ Match a METHOD
+  // DECLARATION, not the bare word: publisher.ts's own init() doc comment
+  // contains the string ".start(" while stating that no such method exists,
+  // so a `/\bstart\s*\(/` scan would fail against correct code.
+  expect(readFileSync(`${root}src/ops/publisher.ts`, "utf8")).not.toMatch(
+    /^\s*(public |private |protected )?(async )?start\s*\(/m,
+  );
 });
 ```
 
@@ -520,7 +576,7 @@ it("both observer registrations occur AFTER the archetype try/catch closes", () 
 
 ```typescript
 it("CLAUDE.md documents all three collections with their key, index and TTL posture", () => {
-  const md = readFileSync(`${root}/CLAUDE.md`, "utf8");
+  const md = readFileSync(`${root}CLAUDE.md`, "utf8");
   for (const name of ["ops_events", "ops_subscriptions", "ops_reasons"]) {
     expect(md).toContain(name);
   }
@@ -613,7 +669,7 @@ it("producer and reasonId are validated by the D2 pattern bound, never against a
   // producer's own code-resident rows — never in a validator.
   const validators = ["src/ops/publisher.ts", "src/ops/ids.ts", "src/ops/match.ts"];
   for (const f of validators) {
-    expect(readFileSync(`${root}/${f}`, "utf8"), `${f} hardcodes a producer`).not.toContain("hive-runtime");
+    expect(readFileSync(`${root}${f}`, "utf8"), `${f} hardcodes a producer`).not.toContain("hive-runtime");
   }
   // Note the exception this list encodes: `publisher.ts` IMPORTS
   // HIVE_RUNTIME_REASONS (for the boot upsert and the constructor gate) but

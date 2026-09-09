@@ -27,16 +27,19 @@ Requirements (the Testing Contract's Harness Requirements, restated as an interf
 - `updateOne(filter, { $set, $setOnInsert }, { upsert })`.
 - `createIndex(spec, options)` — resolves by default; programmable to reject with a supplied error (needed for the TTL-conflict and index-fault cases).
 - A `failNext` / `failAll` switch per operation, so an insert fault, a read fault and a registry-upsert fault are each drivable independently.
-- A **fully-throwing** variant, `throwingDb()`, whose every property access throws — used to prove the match evaluator performs no I/O (AC5) and that a dead database cannot alter a turn (AC8).
+- An **armed-to-throw** mode, `armThrowOnEveryAccess()`, described in its own bullet below. There is deliberately **no** `throwingDb()` factory.
 
-Four further capabilities chunk 5 depends on and the list above did not promise. **All four already exist in `src/obligations/testing/fake-db.ts` — copy, do not invent**; line numbers so the implementer reads the working version first:
+Four further capabilities chunk 5 depends on and the list above did not promise. Line numbers so the implementer reads the working version in `src/obligations/testing/fake-db.ts` first — but **read the scoping on each bullet before copying**: two of the four are deliberate divergences from that file, and copying it wholesale reproduces exactly the defect the fourth bullet calls load-bearing.
 
-- **`pause(collection, operation, when?, after?) → { reached: Promise<void>; release(): void }`** (`:118`). AC9's `R1 · F · R2` has no other way to hold the drainer at a known point and release it; without it an implementer substitutes a call-order mock, which cannot observe the map at all.
-- **An `operations` log** — `readonly operations: Array<{collection, operation, context}>` (`:73`), pushed on every call (`:82`), filterable (`:156`). The read-counting surface behind chunk 5's "the resolver's read count is unchanged across the recovery" and "a success with no open condition performs no database access", **and** behind chunk 2's deferred call-order assertion on `upsertReasons`.
-- **`countDocuments(filter)`** (`:271`) — used throughout chunk 5 in place of `find().toArray().length`.
-- **`_id` minted with the real `new ObjectId()`**, the double's `sort` using the **same `String(...)` comparison `isMoreRecent` uses**. ⚠ Load-bearing, not hygiene: D8's `(publishedAt, _id)` tie-break rests on the driver's per-process incrementing counter, and a double minting `"1"…"10"` inverts lexicographically at n ≥ 10 — so the tie-break test would pass or fail for a reason unrelated to the resolver.
+- **`pause(collection, operation, when?, after?) → { reached: Promise<void>; release(): void }`** (`:118`) — **copy, do not invent.** AC9's `R1 · F · R2` has no other way to hold the drainer at a known point and release it; without it an implementer substitutes a call-order mock, which cannot observe the map at all.
+- **An `operations` log** — `readonly operations: Array<{collection, operation, context}>` (`:73`), pushed on every call (`:82`), filterable (`:156`) — **copy, do not invent.** The read-counting surface behind chunk 5's "the resolver's read count is unchanged across the recovery" and "a success with no open condition performs no database access", **and** behind chunk 2's deferred call-order assertion on `upsertReasons`.
+- **`countDocuments(filter)`** (`:271`) — **copy, do not invent.** Used throughout chunk 5 in place of `find().toArray().length`.
+- **`_id` minted with the real `new ObjectId()`**, the double's `sort` using the **same `String(...)` comparison `isMoreRecent` uses**. ⚠ **DELIBERATE DIVERGENCE — do NOT copy this one.** `obligations/testing/fake-db.ts` mints `` `${this.name}/${++this.counter}` `` (`:281`, `:291`), a counter string, and that is precisely the shape whose lexicographic inversion at n ≥ 10 (`"…/10" < "…/9"`) would make D8's `(publishedAt, _id)` tie-break test pass or fail for a reason unrelated to the resolver. The real driver mints a per-process incrementing `ObjectId`, and the tie-break rests on that; the double must too.
+- **`findOne(filter, { sort })` must HONOUR `sort`.** ⚠ **Second deliberate divergence — do NOT copy.** That file's `findOne` (`:236-238`) ignores `options` entirely and returns the first insertion-order match. This producer's epoch resolver issues `findOne(filter, { sort: { publishedAt: -1, _id: -1 } })` on both reads, so a sort-ignoring double would return the OLDEST matching event and the whole epoch mechanism would be tested against the wrong document. Implement the compound descending sort with the same `String(...)` `_id` comparison, and reuse that file's `find().sort()` cursor logic as the model.
 
 Follow `src/obligations/testing/fake-db.ts` and `src/db/db-identity.integration.test.ts` for conventions; do not introduce a new mocking library.
+
+**The armed-to-throw mode, replacing `throwingDb()`.** A `Db` whose every property access throws is **not constructible for either of its two named consumers**: `OpsStore`'s constructor calls `db.collection()` three times, so `new OpsPublisher(throwingDb, …)` throws before any assertion runs; and both AC5's "match evaluation performs no I/O" and AC9's "a success with no open condition performs no database access" need a **wired** publisher, which needs a successful `init()`. The workable shape is one live `FakeDb` with a switch — `armThrowOnEveryAccess(): void`, after which any collection access throws. Arm it after `await publisher.init()`, drive the publish or the success, and assert on both surfaces: nothing thrown, and `operations` gained no entry over the window. It proves a claim about the STEADY state, which is the only state the claim was ever about.
 
 - [ ] **Step 2:** Create `src/ops/store.ts` — collections, indexes, registry upsert + read-back, subscription load.
 
@@ -51,7 +54,7 @@ import {
   type OpsReason,
   type OpsSubscription,
 } from "./types.js";
-import { compileDetailSchema } from "./reasons.js";
+import { auditReasonRow, compileDetailSchema } from "./reasons.js";
 import type { z } from "zod";
 
 const log = createLogger("ops-store");
@@ -182,13 +185,26 @@ export class OpsStore {
    * data, or an out-of-engine producer's (D4, AC16) — take effect at the next
    * boot with no engine change. There is NO periodic reload: the map is built
    * once, in init(), so restart is the lever.
+   *
+   * The per-row `auditReasonRow` call is the DIAGNOSTIC half of the data-
+   * sourced path (reasons.ts). `compileDetailSchema` normalizes three things
+   * silently — an over-ceiling maxLength, an unrecognized type, an unbounded
+   * key NAME — all failing closed, so behaviour is contract-conformant either
+   * way; without this loop the operator's only signal is the generic rejection
+   * counter, which D9 reserves for a mis-integrated PRODUCER. Warn and count,
+   * never refuse: refusing would let one operator row disable publishing.
    */
-  async loadReasons(): Promise<Map<string, LoadedReason>> {
+  async loadReasons(): Promise<{ map: Map<string, LoadedReason>; anomalies: number }> {
     const map = new Map<string, LoadedReason>();
+    let anomalies = 0;
     for (const row of await this.reasons.find({}).toArray()) {
+      for (const anomaly of auditReasonRow(row)) {
+        anomalies += 1;
+        log.warn("ops reason row normalized — the row declares something this engine narrows", { anomaly });
+      }
       map.set(`${row.producer}:${row.reasonId}`, { row, detailSchema: compileDetailSchema(row.detailKeys) });
     }
-    return map;
+    return { map, anomalies };
   }
 
   /** D9: refreshed on a 60 s timer and on SIGUSR1. A fault leaves the previous set in place. */
@@ -254,9 +270,12 @@ const SHUTDOWN_DRAIN_MS = 2000;
 /** D9: stated AND delegated by the spec; adopted as written. */
 const SUBSCRIPTION_RELOAD_MS = 60_000;
 
-// EXPORTED: `__openEntryForTests` returns it from a public method on an
-// exported class and the repo compiles with `declaration: true`, so a private
-// name in a public signature is TS4053 and would fail `npm run build`.
+// EXPORTED so a test can name the return type of `__openEntryForTests`.
+// (NOT because omitting `export` would fail the build: TS4053 covers a name
+// imported from another module that cannot be named, not a same-file local
+// declaration — with `export` removed, `tsc --declaration` emits cleanly and
+// writes an unexported `interface OpenCondition` into publisher.d.ts.
+// Reproduced round 2; the earlier comment asserted the opposite.)
 export interface OpenCondition {
   /**
    * D8: a process-wide monotonic integer assigned by the drainer at the
@@ -288,6 +307,8 @@ export interface OpsPublisherCounters {
   recoverySuperseded: number;
   epochResolveFaults: number;
   indexFailures: number;
+  /** Data-sourced registry rows this engine normalized (reasons.ts auditReasonRow). */
+  reasonRowAnomalies: number;
   subscriptionReloadFaults: number;
   drainDropped: number;
 }
@@ -305,7 +326,7 @@ export class OpsPublisher {
   private readonly counters: OpsPublisherCounters = {
     published: 0, rejected: 0, publishFaults: 0, queueOverflow: 0, idOmitted: 0,
     recoveryCoalesced: 0, recoverySuperseded: 0, epochResolveFaults: 0,
-    indexFailures: 0, subscriptionReloadFaults: 0, drainDropped: 0,
+    indexFailures: 0, reasonRowAnomalies: 0, subscriptionReloadFaults: 0, drainDropped: 0,
   };
 
   constructor(db: Db, retentionDays: number) {
@@ -336,7 +357,9 @@ export class OpsPublisher {
   async init(): Promise<void> {
     this.counters.indexFailures = await this.store.ensureIndexes();
     await this.store.upsertReasons(HIVE_RUNTIME_REASONS);
-    this.reasons = await this.store.loadReasons();
+    const loaded = await this.store.loadReasons();
+    this.reasons = loaded.map;
+    this.counters.reasonRowAnomalies = loaded.anomalies;
     await this.reloadSubscriptions();
     // unref()'d: an ops-diagnostics timer must never be the thing holding the
     // process open (the outage-replay-processor.ts:44 precedent).
@@ -346,6 +369,7 @@ export class OpsPublisher {
       reasons: this.reasons.size,
       subscriptions: this.subscriptions.length,
       indexFailures: this.counters.indexFailures,
+      reasonRowAnomalies: this.counters.reasonRowAnomalies,
     });
   }
 
@@ -383,8 +407,9 @@ export class OpsPublisher {
     // ⚠ ACCEPTED RESIDUAL, stated rather than fixed. On deadline expiry an
     // in-flight `runJob` may still be awaiting Mongo; it is not in `queue`, so
     // `drainDropped` misses it, and its insert can land after index.ts closes
-    // the client — throwing inside runJob's own try, caught by drain(), counted
-    // as a `publishFault`. Contained and honest; awaiting the in-flight drain
+    // the client — throwing out of runJob (which has no try of its own) into
+    // drain()'s catch, counted as a `publishFault`. Contained and honest;
+    // awaiting the in-flight drain
     // promise past the deadline would reintroduce the unbounded shutdown stall
     // SHUTDOWN_DRAIN_MS exists to prevent.
   }
@@ -402,6 +427,11 @@ export class OpsPublisher {
   // ── Test-only surface (`__`-prefixed, the __resetOpsPublisherForTests
   // precedent). Both exist because the acceptance suite otherwise cannot make
   // an assertion that can fail. Neither has, or may acquire, a caller.
+  //
+  // Every existing `*ForTests` seam in this tree is a module-level FUNCTION;
+  // these two are the first class MEMBERS to use the convention. Deliberate,
+  // not an oversight: the state they expose (`queue`/`draining`, `open`) is
+  // instance-private, so no module-level function can reach it.
   /**
    * THE DRAIN BARRIER. `enqueue()` is synchronous and fires `void this.drain()`,
    * so a test that publishes and immediately reads Mongo races the drainer —
@@ -729,7 +759,8 @@ export function familyOf(input: Pick<OpsPublishInput, "producer" | "subject" | "
  * `generation` is a decimal integer, colon-free by its own bounds, so
  * `lastIndexOf(":")` always finds the separator before it and the family is
  * components 0..n-2 whatever n is (`subject.id = "a:b"` ⇒
- * `hive-runtime:tool:a:b:tool-failed`). Do NOT "harden" this into a bounded
+ * `acme:tool:a:b:tool-failed` — a neutral producer on purpose; this file must
+ * contain no producer literal, AC16). Do NOT "harden" this into a bounded
  * split taking the first three components from the left — the family is not
  * components 0..2, so that change is a regression, not a fix.
  */
@@ -822,10 +853,13 @@ export interface ToolFailureObservation {
 /**
  * SYNCHRONOUS, NON-THROWING, returns void (D9). It composes the input,
  * enqueues one job and returns; the turn never awaits it and never sees a
- * fault. Precisely: `enqueue()` fires `void this.drain()`, which reaches its
- * first `await` only after the registry lookup, bounds checks, zod parse and
- * `evaluateMatches` — so those run synchronously on the turn thread. All four
- * are pure, in-memory and microsecond-scale, which is why this is stated
+ * fault. Precisely: `enqueue()` fires `void this.drain()`, which on the FAILURE
+ * path reaches its first `await` only after the registry lookup, the bounds
+ * checks and the zod parse — so those three run synchronously on the turn
+ * thread. `evaluateMatches` does NOT: it is accept-path step 6, after
+ * `await this.resolveGeneration(...)` at step 5. (On a RECOVERY publish
+ * `generation` is 0 with no await, so there the match does run synchronously
+ * too.) All are pure, in-memory and microsecond-scale, which is why this is stated
  * rather than fixed with a `queueMicrotask` kick. Chosen over an
  * unawaited promise on four counts: the failure path performs two indexed
  * reads and a write, which under a storm would open unbounded concurrent
@@ -932,6 +966,7 @@ Minimum assertions (the acceptance suite in chunk 5 adds the AC-numbered cases; 
 - `init()` issues the two upserts in the shipped order — assert against the fake db's `operations` log, filtered to `ops_reasons`/`updateOne`, that `tool-recovered`'s `_id` precedes `tool-failed`'s. This is the **call-order** half of D5's load-bearing write order; chunk 2's `reasons.test.ts` pins only the array order and cannot see a writer that sorts or parallelises.
 - `init()` with every `createIndex` rejecting still completes and `getSnapshot().indexFailures` equals the number of indexes; `init()` with the registry **upsert** rejecting **throws** (so `index.ts` leaves the publisher unset).
 - `init()` with the registry **read-back** (`loadReasons`) rejecting also **throws**. D5/D10 name this fault separately: a read-back fault that merely warned would leave a **wired** publisher over an **empty** reason map, and C5 would then fail closed on every publish — spending `rejected`, D9's mis-integrated-producer signal, on a Mongo outage. Assert the throw **and** `getSnapshot().rejected === 0`.
+- A registry row an operator inserted with `maxLength: 400` (or an unrecognized `type`, or an over-long key name) **loads and publishes**, with `getSnapshot().reasonRowAnomalies` incremented once per anomaly and one warn line each — never a rejection, and never counted against `rejected`. That separation is the whole point of chunk 2's `auditReasonRow`: the generic rejection counter is D9's mis-integrated-**producer** signal and must not be spent on an operator's legitimately-narrower row.
 - The D5 enable gate is **not** inside `init()`'s failure surface — constructing an `OpsPublisher` evaluates it. (Chunk 2's `reasons.test.ts` drives the gate's logic; here assert only that a legal table constructs cleanly.)
 
 *Accept path and epoch.*
@@ -943,11 +978,26 @@ Minimum assertions (the acceptance suite in chunk 5 adds the AC-numbered cases; 
 *Recovery and the `openSeq` identity — the ticket's central invariant.* This chunk implements `openSeq`, so this chunk tests it. Chunk 5's AC9 owns the full `R1 · F · R2` interleaving and its negative-verify; these are the unit-level decomposition, without which Task 4 commits the mechanism with no coverage at all:
 
 - **Entry absent** ⇒ `recoveryCoalesced` increments, **nothing is published**, the map is **not written** (`__openEntryForTests(family)` still `undefined`, `operations` log shows no `ops_events` insert).
-- **Entry present under a DIFFERENT `openSeq`** ⇒ `recoverySuperseded` increments, nothing is published, and **the entry survives** with its own `openSeq` intact. Drive it by draining a first failure, forcing a recovery job carrying that entry's `openSeq`, then draining a second failure that re-opens the family at a fresh `openSeq` before the recovery runs.
+- **Entry present under a DIFFERENT `openSeq`** ⇒ `recoverySuperseded` increments, nothing is published, and **the entry survives** with its own `openSeq` intact.
+
+  ⚠ **The obvious recipe cannot produce this state, and the reason is the repeat rule stated 400 lines above.** "Drain a first failure, then drain a second failure to re-open at a fresh `openSeq`" does not work: `runJob`'s failure branch is `if (!this.open.has(family))`, so a second failure on a live family leaves the entry at the **same** `openSeq`. A fresh `openSeq` requires an intervening **accepted recovery** — and the only recovery available is the job under test.
+
+  **The construction that does work.** After F1 has fully drained (entry at `openSeq` 1), run this as **one synchronous block**:
+
+  ```typescript
+  observeToolSuccess({ tool: "Bash", lane: "claude" });  // R1 minted at openSeq 1
+  observeToolFailure({ tool: "Bash", /* … */ });         // F2 queued behind R1
+  observeToolSuccess({ tool: "Bash", lane: "claude" });  // R2 minted — STILL openSeq 1
+  await publisher.__drainForTests();
+  ```
+
+  The load-bearing scheduling fact, **checked against this chunk's own `drain()`/`runJob`/`accept` before being written down**: `enqueue()` calls `void this.drain()` synchronously, `drain()` runs synchronously into `runJob(R1)`, and on a **recovery** `accept()` reaches **no await at all** before `insertOne` — step 5's `await this.resolveGeneration(...)` is skipped because `input.clears !== undefined` (a clearing publish's generation is fixed at 0). So the drainer parks inside R1's `insertOne` and returns control to the synchronous caller with `open.delete(family)` **not yet run**. F2's `enqueue` then sees `draining === true` and only queues; R2's `enqueueRecoveryIfOpen` still reads the openSeq-1 entry and mints its job against it. When the microtask queue resumes: R1 accepts and deletes, F2 publishes at `generation` 1 and re-opens the family at `openSeq` **2**, and R2 finds `entry.openSeq (2) !== job.openSeq (1)` — superseded, live entry intact.
+
+  ⚠ **That parking depends on the recovery accept path having no earlier await.** If a later edit introduces one, this recipe silently degenerates into the coalesced case. The construction that does not depend on it is chunk 5's AC9 shape — `pause("ops_events", "insertOne")` plus `await gate.reached` to hold the drainer explicitly. Either is acceptable; state in a comment which one the file uses and what it observed.
 - **Entry present under the SAME `openSeq`** ⇒ one `tool-recovered` with `clears`, `clearsFamily`, `waiting: "nobody"`, `generation: 0`, and the entry removed **after** the accept, not before.
 - A recovery job whose **publish faults** leaves the family open (`__openEntryForTests` still returns it), so the next success re-enqueues.
 - Drive at least the last two **through `observeToolSuccess` and the singleton**, not by calling `enqueueRecoveryIfOpen` directly — that is the only way `waiting: "nobody"` and `evidence: []` are pinned on the production path, and `src/ops/observe.ts` otherwise ships in this commit with zero coverage.
-- A success with no open condition performs **no** database access (throwing-db variant, plus the counting fake's `operations` log empty).
+- A success with no open condition performs **no** database access — arm the live fake with `armThrowOnEveryAccess()` **after** `init()` (Step 1: there is no `throwingDb()`; a publisher over one cannot be constructed, let alone initialized), drive the success, and assert both that nothing threw and that the `operations` log gained no entry.
 
 > The negative-verify for the identity check — swap `entry.openSeq === job.openSeq` for a bare `this.open.has(job.family)` and confirm the `R1 · F · R2` case fails on `recoverySuperseded` and on the surviving-entry assertion — is specified in **chunk 5, Task 7, Step 3 (AC9)** and is run there. It is named here because this is the chunk whose code it mutates.
 

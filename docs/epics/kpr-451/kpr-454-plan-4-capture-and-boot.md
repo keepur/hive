@@ -16,7 +16,12 @@ Two placement rules in this chunk are correctness constraints, not style points,
 - Modify: `src/agents/provider-adapters/turn-assembly.ts:96-158` (interface), `:244` (primary return), `:327` (nested return)
 - Modify: `src/agents/provider-adapters/turn-scaffold.ts:186-196`
 - Modify: `src/agents/provider-adapters/tool-bridge.ts:49-67` (options), `:318-359` (`wrap`)
+- Create: `src/ops/testing/lane-harness.ts`
 - Create: `src/ops/capture-points.integration.test.ts`
+
+⚠ **The two lane harnesses live in a plain module, `src/ops/testing/lane-harness.ts` — NOT exported from a `.test.ts`.** Chunk 5's AC8/AC11/AC12 drive a real `AgentRunner` hook set and a real `ToolBridge` through the same construction this task builds, and an earlier draft had `capture-points.integration.test.ts` export them. That is wrong on measurement, not on taste: under vitest 4.1.11 a consumer importing a `.test.ts` **re-registers that file's suites and file-scope hooks into the importer**, so this task's `beforeEach`/`vi.mock` would become active for the acceptance file's cases and this suite would run twice under different fixtures. The repository has **zero** cross-`.test.ts` imports; the established pattern is a plain module (`src/obligations/testing/{fake-db,harness,refusals}.ts`), which this plan already follows for `src/ops/testing/fake-db.ts`. A plain module also gets `tsc --noEmit` coverage, which `.test.ts` files do not.
+
+Put `buildClaudeLaneHarness(...)` and `buildLaneBHarness(...)` there; **both** `capture-points.integration.test.ts` and `acceptance.integration.test.ts` import from it, and neither imports the other.
 
 - [ ] **Step 1:** Add the two matchers to `buildHooks`, outside the archetype `try`.
 
@@ -150,7 +155,7 @@ In `turn-scaffold.ts:186-196`, inside the `new ToolBridge({…})` literal, after
 
 - [ ] **Step 4:** Add the two observe calls inside `wrap()`.
 
-Replace `tool-bridge.ts:346-357` (the `const t0` block through the closing brace of the `catch`) with:
+Replace `tool-bridge.ts:347-356` — from `const t0 = Date.now();` through the `catch` arm's closing brace (`:346` closes the `signal.aborted` guard and `:357` closes `execute`; verified at this tree) — with:
 
 ```typescript
         const t0 = Date.now();
@@ -221,13 +226,15 @@ Four things are deliberately **not** published from this method, and each for it
 
 Import at the top of `tool-bridge.ts`: `import { observeToolFailure, observeToolSuccess } from "../../ops/observe.js";`
 
-- [ ] **Step 5:** Write `src/ops/capture-points.integration.test.ts`.
+- [ ] **Step 5:** Write `src/ops/testing/lane-harness.ts` and `src/ops/capture-points.integration.test.ts`.
+
+Build the two harnesses in the plain module first (see the ⚠ note under **Files**), then write this suite against them. ⚠ `src/ops/testing/**` is **excluded** from chunk 5's AC7/AC15 source scans over `src/ops/**` — deliberately, because a lane harness legitimately constructs `RunResult` baselines mentioning `costUsd` and drives runner machinery; those scans constrain the producer's own sources, not its test doubles. Chunk 5's `opsSources` carries the exclusion.
 
 Minimum assertions:
 
-- **Hook placement, direction 1 (AC13) — a thrown archetype must not disarm the observers.** This one is a **real drive**, and the harness already exists: `agent-runner.test.ts:3283`, `it("buildHooks installs deny-all when preToolUseHooks throws (fail-closed)")`, registers a throwing archetype, builds a runner with `makeRunner({ soul, systemPrompt, archetype, archetypeConfig })` and reads `(runner as any).buildHooks()`. Copy that construction rather than assuming the private-method seam and the runner shape — Step 5 silently depended on both. Assert the returned map carries the deny-all `PreToolUse` matcher **and** both `PostToolUseFailure` and `PostToolUse`.
+- **Hook placement, direction 1 (AC13) — a thrown archetype must not disarm the observers.** This one is a **real drive**, and the harness already exists: `agent-runner.test.ts:3283`, `it("buildHooks installs deny-all when preToolUseHooks throws (fail-closed)")`, registers a throwing archetype, builds a runner with `makeRunner({ soul, systemPrompt, archetype, archetypeConfig })` and reads `(runner as any).buildHooks()`. Copy that construction into `lane-harness.ts` rather than assuming the private-method seam and the runner shape — an earlier draft silently depended on both. Assert the returned map carries the deny-all `PreToolUse` matcher **and** both `PostToolUseFailure` and `PostToolUse`.
 
-- **Hook placement, direction 2 (AC13) — a broken observer must not disarm the deny-all matcher. Asserted STRUCTURALLY, because it has no realizable runtime failure mode.** Registration of the two observers is straight-line assignment of two array literals; it cannot throw. And the only way to *make* it throw — a `vi.mock` factory for `../ops/observe.js` that throws — kills the module import, taking `AgentRunner` with it, so the test cannot then assert anything about the hook map at all. The property is therefore asserted where it actually lives, in the source: extract `buildHooks`'s body from `src/agents/agent-runner.ts` and assert that both `hooks.PostToolUseFailure =` and `hooks.PostToolUse =` occur **after the closing brace of the archetype `try`/`catch`**. That is the placement rule the criterion is really about, it fails the moment someone moves either assignment inside the `try`, and unlike a thrown-registration drive it is a claim the test can actually see.
+- **Hook placement, direction 2 (AC13) — a broken observer must not disarm the deny-all matcher. Asserted STRUCTURALLY, because it has no realizable runtime failure mode.** Registration of the two observers is straight-line assignment of two array literals; it cannot throw. And the only way to *make* it throw — a `vi.mock` factory for `../ops/observe.js` that throws — kills the module import, taking `AgentRunner` with it, so the test cannot then assert anything about the hook map at all. The property is therefore asserted where it actually lives, in the source: read `src/agents/agent-runner.ts` and assert that `indexOf("hooks.PostToolUseFailure =")` and `indexOf("hooks.PostToolUse =")` both **exceed** `indexOf("All tool calls blocked until the archetype is fixed.")` — the deny-all arm's `permissionDecisionReason` literal at `:1966`, which is confirmed to occur only inside the archetype catch. Anchor on that literal, not on "the closing brace of the try/catch": a brace has no stable textual form to search for, and an implementer left to find one will invent an anchor that reads green regardless. Add a second assertion that both lines are at the function's own indentation (they are top-level statements of `buildHooks`, four spaces), which is what distinguishes "after the catch" from "inside it but textually later". That is the placement rule the criterion is really about, it fails the moment someone moves either assignment inside the `try`, and unlike a thrown-registration drive it is a claim the test can actually see.
 - **Empty return:** both matchers' callbacks resolve to `{}` — deep-equal, no `hookSpecificOutput`.
 - **Own-abort (AC12):** with `runner.abort()` already called, `PostToolUseFailure` publishes nothing; with `signal.aborted` set, Lane B's catch publishes nothing.
 - **Foreign interrupt (AC12):** `is_interrupt: true` with the runner not aborted publishes `errorSig: "interrupted"`.
@@ -268,7 +275,16 @@ Classes to enumerate, one run each:
 
 **Class 6 is the class AC12 turns on, and it is not optional.** AC12 requires "a guardrail deny publishes nothing" **with no lane qualification**, but the only deny assertion in Step 5 is Lane B's `{behavior: "deny"}`, which returns at `tool-bridge.ts:341` *before* `t0` and therefore provably publishes nothing. The Claude lane is the one with a real fail-closed gate, and whether the CLI fires `PostToolUseFailure` for a call it denied at `PreToolUse` is **unverified**: this plan's only suppression on that hook is `wasAborted`, which a denied call does not set. If it fires, **every archetype denial mints a `tool-failed` row** — policy working, recorded as breakage — and AC12 is violated on exactly the lane that matters.
 
-**The remedy if it fires**, decided here so the probe's outcome does not become a design question at the keyboard: add a deny-suppression to the `PostToolUseFailure` matcher keyed on the SDK's own denial marker on that input (a `permission`-shaped `error`/reason field — record the exact shape the probe observes), and extend Step 5's guardrail-deny assertion to the Claude lane. Do **not** suppress by inferring "this looks like a policy message" from `failure.error` text — that is a C12 inference, and this producer's whole discipline is that outcome is published, never inferred. If it does not fire, record that and leave the matcher as written.
+**⚠ There is no per-call denial field on `PostToolUseFailureHookInput`, so the probe must record more than one fact.** Read from the installed `sdk.d.ts` at 0.3.258: `PostToolUseFailureHookInput` (`:2446-2457`) is `BaseHookInput & { hook_event_name, tool_name, tool_input, tool_use_id, error: string, is_interrupt?, duration_ms? }`, and `BaseHookInput` (`:167`) adds only `session_id`, `transcript_path`, `cwd`, `prompt_id?`, `permission_mode?`, `agent_id?`, `agent_type?`, `effort?`. `permission_mode` is session-level and constant on this fleet, so it cannot discriminate a denied call from an executed one, and `error` is free text, which the next paragraph forbids using. An earlier draft pre-decided a remedy "keyed on the SDK's own denial marker on that input" — that marker does not exist, and an implementer obeying it would make a design call at the keyboard, which is exactly what round 1 removed from the sibling assertion.
+
+**So the probe records THREE facts for class 6, not one:** (i) does `PostToolUseFailure` fire for a `PreToolUse`-denied call, (ii) does `PermissionDenied` fire for it, and (iii) **in what order**. `PermissionDenied` is a first-class hook event (`HOOK_EVENTS` `:854`, `HookEvent` union) and `PermissionDeniedHookInput` (`:2277-2284`) carries `tool_use_id` and `reason`, both verified at this tree.
+
+**The remedy if class 6 fires**, in order of preference:
+
+1. **Id-keyed suppression, if and only if the probe observes `PermissionDenied` firing BEFORE `PostToolUseFailure` for the same `tool_use_id`.** Register a third matcher recording denied `tool_use_id`s into a per-runner `Set`, and have `PostToolUseFailure` return early on membership. Structural, not text-inferred. The ordering is **unverified** and fact (iii) is what decides it — a `PermissionDenied` that fires after, or not at all, makes this unbuildable.
+2. **If neither structural discriminator exists** — no `PermissionDenied`, or the wrong order — the ticket **demotes to the spec lane** under this plan's own Verification Rule 3 (a testing-exposed spec/plan mismatch is not reinterpreted here). AC12's Claude-lane clause needs a decision the design does not contain, and inventing one in an implementation lane is the failure mode this paragraph exists to prevent.
+
+Do **not**, under either branch, suppress by inferring "this looks like a policy message" from `failure.error` text — that is a C12 inference, and this producer's whole discipline is that outcome is published, never inferred. If class 6 does not fire at all, record that and leave the matcher as written.
 
 Record, in the implementation report, a table of class → fired/did-not-fire, plus `node -p "require('@anthropic-ai/claude-agent-sdk/package.json').version"`.
 
@@ -285,7 +301,7 @@ npm run check:bundle
 `check:bundle` matters here specifically: `ProviderTurnAssembly` is re-exported from `provider-abi.ts`, so the new field enters the `pkg/types/` d.ts closure that KPR-407's tracer and `scripts/check-bundle-strings.mjs` guard. A field name or doc comment carrying a forbidden business string would fail there rather than in `npm run check`. Non-obvious but worth knowing: this commit is **not** untypechecked despite the absence of a bare `npm run typecheck` above — `check:bundle` → `bundle` → `build` → `tsc`.
 
 ```bash
-git add src/agents/agent-runner.ts src/agents/provider-adapters/turn-assembly.ts src/agents/provider-adapters/turn-scaffold.ts src/agents/provider-adapters/tool-bridge.ts src/ops/capture-points.integration.test.ts
+git add src/agents/agent-runner.ts src/agents/provider-adapters/turn-assembly.ts src/agents/provider-adapters/turn-scaffold.ts src/agents/provider-adapters/tool-bridge.ts src/ops/testing/lane-harness.ts src/ops/capture-points.integration.test.ts
 git commit -m "feat(KPR-454): capture points on both lanes; agentId through the Lane B assembly
 
 D2: PostToolUseFailure (failure) and PostToolUse (recovery) matchers in
@@ -437,7 +453,7 @@ Expected: all pass.
 
 **Why that target and not "just below the marker".** `(b)` bounds `Math.max(wiringOffsets) < Math.min(surfaceOffsets)`, and its offsets are **named surfaces**, not the marker — the marker is a comment the test never reads. The earliest named surface is `await bgTaskManager.start()` at `index.ts:492`, while the marker sits at `:474`, so relocating to "just below the marker" leaves both new anchors at roughly offset 14 998 against a `minSurface` of 15 408 and `(b)` **PASSES** — the mutation never crosses the boundary the check enforces. Round 1 verified both the passing case and the two failing targets. Placing the block after `scanOrphans()` puts `maxWiring` past `bgTaskManager.start()`'s offset and `(b)` trips.
 
-(That this mutation does not also fail `(a)` or `(c)` is expected: `(a)` is presence-only, and `(c)` bounds by the latest wiring anchor, which moves with the block.)
+**The mutation fails BOTH `(b)` and `(c)`; `(a)` is presence-only and stays green.** Predict both, or the second red test reads as a mis-applied mutation and invites an implementer to "fix" it by adding `bgTaskManager` to `(c)`'s allowlist — the one list whose comment demands a reviewed classification decision. `(c)` flags matches **before** `wiringStart`, and `wiringStart` is `Math.max(...)` over the wiring anchors including the two new ones, so moving the block down past `bgTaskManager` pulls `bgTaskManager.start(` and `bgTaskManager.scanOrphans(` into the swept region. Verified by running it: above the marker `(c)`'s offenders are `[]`; after `scanOrphans()` they are `["bgTaskManager.start(", "bgTaskManager.scanOrphans("]`.
 
 - [ ] **Step 7:** Commit.
 

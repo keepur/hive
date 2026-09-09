@@ -168,7 +168,7 @@ export function waitingFor(id?: string): Waiting {
 Three notes for the implementer:
 
 1. **`Waiting` crosses as a type-only import.** `import type { Waiting } from "../ops/types.js"` is erased at compile time, so this adds no runtime edge from `src/outage/` into the new ops module and no import cycle. The one runtime dependency stays ops → outage. Do not change it to a value import; do not re-declare `Waiting` here (two declarations is the drift this whole task removes).
-2. **`WorkItem` is already imported** at the top of the file (`import type { WorkItem, ChannelKind } from "../types/work-item.js";` at `:6`) — leave that line exactly where it is and **do not add anything beside it**. The `Waiting` import is already inside the Step 3 replacement fence above, at its own position within the replaced `:8-26` range; adding a second copy next to the `WorkItem` line yields two identical type imports and an ESLint duplicate-import error.
+2. **`WorkItem` is already imported** at the top of the file (`import type { WorkItem, ChannelKind } from "../types/work-item.js";` at `:6`) — leave that line exactly where it is and **do not add anything beside it**. The `Waiting` import is already inside the Step 3 replacement fence above, at its own position within the replaced `:8-26` range; adding a second copy next to the `WorkItem` line yields two declarations of the same type import, which is exactly the drift this task removes. Note the reason precisely: it is **not** a lint failure. `eslint.config.js` loads `@eslint/js` recommended + `typescript-eslint` recommended + `eslint-config-prettier` and no import plugin, and `no-duplicate-imports` is not in `eslint:recommended` — verified at this tree. A duplicate import here would pass `npm run lint` silently, which is why the instruction is stated rather than delegated to a rule.
 3. **Task 1 does not typecheck, by design, and Step 6 says so.** Chunk 2 (Task 2) creates `src/ops/types.ts`; until it lands, `import type { Waiting } from "../ops/types.js"` is unresolved and `npm run typecheck` **fails**. That is the accepted ordering, and the alternative — reaching forward and creating `src/ops/types.ts` from inside Task 1 — is rejected because it splits one file's authorship across two commits. Task 1's gate is the Vitest command only (Step 6); the first green `npm run typecheck` in this plan is **chunk 2, Task 2, Step 6**. Do not invert the commits: the pinning tests must exist before the source moves.
 
 - [ ] **Step 4:** Extend `src/outage/outage-notices.test.ts` with the `waitingFor` and `sourceOfId` coverage AC4 requires.
@@ -240,13 +240,17 @@ import { policyFor, policyForId, sourceOfId, waitingFor, /* …existing… */ } 
 **The repository-scan idiom, stated once here and referenced from chunk 5.** Three tests in this plan scan source text (this one, and chunk 5's AC7 and AC15 scans). All three use the same two lines, and chunk 5 references this block rather than restating them:
 
 ```typescript
-import { globSync } from "tinyglobby";          // already a dependency; used by src/skills/loader.ts
+import { globSync } from "tinyglobby";          // already a dependency; used by src/agents/provider-adapters/builtin-executor.ts
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 
-// `import.meta.url` is `<repo>/src/<dir>/<file>.test.ts`, so "../.." is the
-// repository root for any test one directory below `src/`.
-const root = fileURLToPath(new URL("../..", import.meta.url));
+// `import.meta.url` is `<repo>/src/<dir>/<file>.test.ts`, so "../../" is the
+// repository root for any test one directory below `src/`. ⚠ The value ENDS
+// WITH A SLASH (`fileURLToPath` on a directory URL; measured at this tree), so
+// every use below is `${root}${file}` and never `${root}/${file}` — the latter
+// yields a `//` mid-path. Harmless on POSIX, but this idiom is reused twice in
+// chunk 5 and once more here, so it is written correctly once.
+const root = fileURLToPath(new URL("../../", import.meta.url));
 ```
 
 ```typescript
@@ -265,7 +269,7 @@ import { globSync } from "tinyglobby";
  */
 describe("one reserved-prefix predicate (KPR-454 AC4, C6)", () => {
   // The shared idiom, hoisted to describe scope so both cases read it.
-  const root = fileURLToPath(new URL("../..", import.meta.url));
+  const root = fileURLToPath(new URL("../../", import.meta.url)); // trailing slash — see the shared idiom above
   const RESERVED = ["sched:", "callback:", "event:", "team-", "worker:"];
 
   // Deliberate, reviewed classifications. Adding to this list is a decision,
@@ -308,7 +312,7 @@ describe("one reserved-prefix predicate (KPR-454 AC4, C6)", () => {
 
     const offenders: string[] = [];
     for (const file of files) {
-      const source = readFileSync(`${root}/${file}`, "utf8");
+      const source = readFileSync(`${root}${file}`, "utf8");
       for (const literal of RESERVED) {
         // `.startsWith("<prefix>")` in any receiver shape. No `g` flag: the
         // regex is used for a single `.test()` per file, and `g` would make
@@ -337,7 +341,7 @@ describe("one reserved-prefix predicate (KPR-454 AC4, C6)", () => {
     // `root` as defined in the shared idiom above.
     for (const entry of ALLOWLIST) {
       if (entry.literal === "*") continue;
-      const source = readFileSync(`${root}/${entry.file}`, "utf8");
+      const source = readFileSync(`${root}${entry.file}`, "utf8");
       expect(source, `stale allowlist entry: ${entry.file} no longer contains startsWith("${entry.literal}")`).toContain(
         `startsWith("${entry.literal}")`,
       );
@@ -364,10 +368,13 @@ Expected: all pass.
 **Negative-verify (required):** change `["sched:", "cron"]` to `["sched:", "callback"]` in `SOURCE_PREFIXES` and re-run
 `npx vitest run src/outage/outage-notices.test.ts src/channels/deadline-continuation.test.ts`.
 
-Three cases must fail:
+**Four** cases must fail — predict all four, because under verify discipline an implementer compares observed against predicted and an under-listed prediction reads as an unexplained extra failure:
 1. Step 1's table row `["sched:agent-a:daily digest:1725465600000", "skip"]`;
 2. the pre-existing `it("skips cron turns (sched: prefix — re-fires by design)")` at `outage-notices.test.ts:30`;
-3. `deadline-continuation.test.ts:94`, `expect(policyFor(item("sched:x#dl1"))).toBe("skip")`.
+3. `deadline-continuation.test.ts:94`, `expect(policyFor(item("sched:x#dl1"))).toBe("skip")`;
+4. Step 4's `it("classifies all six buckets")` — `expect(sourceOfId("sched:a:b:1")).toBe("cron")` now returns `"callback"`.
+
+Two Step 4 cases deliberately stay **green** under this mutation and that is not a defect: `waitingFor("sched:a:b:1")` is `"nobody"` under both `cron` and `callback` (`WAITING_BY_SOURCE` agrees on the two), and the `policyForId`/`waitingFor` same-bucket case reads `sourceOfId`'s answer on both sides, so it stays consistent by construction. That is exactly why it is asserted against literal maps rather than against the production `Record`s.
 
 **Why this mutation crosses the boundary and the obvious one does not.** `POLICY_BY_SOURCE.cron === "skip"` while `POLICY_BY_SOURCE.callback === "silent"`, so re-bucketing `sched:` changes `policyFor`'s observable output and every pre-refactor pin above trips. The mutation round 1 replaced — `["team-", "agent"]` → `["team-", "worker"]` — does **not**: `POLICY_BY_SOURCE.agent === POLICY_BY_SOURCE.worker === "silent"`, so `policyFor` is byte-identical under it and the whole pre-refactor suite stays green. (It would still fail the new `waitingFor` case, but a negative-verify whose job is to prove the *behaviour-preservation* pins are live must move a value those pins can see.) Restore after each.
 
