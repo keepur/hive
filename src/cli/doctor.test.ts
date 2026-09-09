@@ -421,6 +421,16 @@ describe("renderVoiceWorkerSection (KPR-322)", () => {
     expect(lines.join("\n")).not.toMatch(/heartbeat stale/);
   });
 
+  it("preserves legacy supervisor heartbeat unavailability and flags packaged staleness", () => {
+    const legacy: string[] = [];
+    renderVoiceWorkerSection(fullRow, (line) => legacy.push(line), "keepur");
+    expect(legacy.join("\n")).toContain("supervisor-heartbeat=legacy/unavailable");
+
+    const stale: string[] = [];
+    renderVoiceWorkerSection({ ...fullRow, supervisorStaleSeconds: 61 }, (line) => stale.push(line), "keepur");
+    expect(stale.join("\n")).toContain("packaged supervisor heartbeat stale");
+  });
+
   it("warns when sipTrunkId is empty", () => {
     const lines: string[] = [];
     renderVoiceWorkerSection(fullRow, (l) => lines.push(l), "keepur", "");
@@ -437,6 +447,55 @@ describe("renderVoiceWorkerSection (KPR-322)", () => {
     const lines: string[] = [];
     renderVoiceWorkerSection(fullRow, (l) => lines.push(l), "keepur");
     expect(lines.join("\n")).not.toContain("sipTrunkId is not set");
+  });
+
+  it("renders installed and observed identities separately with local health and unresolved maintenance", () => {
+    const lines: string[] = [];
+    const release = {
+      schemaVersion: 1 as const,
+      packageVersion: "1.2.3",
+      sourceRevision: "a".repeat(40),
+      sourceDirty: false,
+      dependencyLockSha256: "b".repeat(64),
+      voiceWorker: { path: "pkg/voice-worker.min.js" as const, admissionProtocol: 1 as const },
+    };
+    const sourceWorker = {
+      component: "voice-worker" as const,
+      pid: 7001,
+      bootId: "11111111-1111-4111-8111-111111111111",
+      startedAt: "2026-09-09T00:00:00.000Z",
+      release: {
+        classification: "source/unavailable" as const,
+        packageVersion: null,
+        sourceRevision: null,
+        sourceDirty: null,
+        dependencyLockSha256: null,
+      },
+    };
+    renderVoiceWorkerSection(
+      fullRow,
+      (line) => lines.push(line),
+      "keepur",
+      "ST_x",
+      {
+        installed: release,
+        engine: null,
+        worker: sourceWorker,
+      },
+      {
+        health: "healthy",
+        registration: "registered",
+        maintenanceClassification: "worker-registered",
+        unresolved: [{ jobId: "job-a", acceptedAt: 0, phase: "accepted-awaiting-entry" }],
+      },
+    );
+    const output = lines.join("\n");
+    expect(output).toContain("installed: packaged 1.2.3");
+    expect(output).toContain("observed engine: legacy/unavailable");
+    expect(output).toContain("observed worker: source/unavailable");
+    expect(output).toContain("registration=registered health=healthy maintenance=worker-registered");
+    expect(output).toContain("unresolved job=job-a phase=accepted-awaiting-entry");
+    expect(output).not.toContain("must-not-leak");
   });
 });
 

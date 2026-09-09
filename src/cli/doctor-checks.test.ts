@@ -11,6 +11,8 @@ import {
   modelRouterModeLine,
   llmSidecarLine,
   renderProviderPluginsSection,
+  localVoiceRuntimeForDoctor,
+  runtimeIdentitiesForDoctor,
 } from "./doctor-checks.js";
 
 // execFileSync and fetch are mocked per-test via vi.mock for subprocess checks.
@@ -379,6 +381,38 @@ describe("voiceWorkerStatsForDoctor (KPR-322)", () => {
     expect(mongoMocks.findOne).toHaveBeenCalledWith({ kind: "voice_worker_stats" });
   });
 
+  it("maps a valid packaged supervisor identity without substituting installed identity", async () => {
+    const identity = {
+      component: "voice-worker",
+      pid: 7001,
+      bootId: "11111111-1111-4111-8111-111111111111",
+      startedAt: "2026-09-09T00:00:00.000Z",
+      release: {
+        schemaVersion: 1,
+        packageVersion: "1.2.3",
+        sourceRevision: "a".repeat(40),
+        sourceDirty: false,
+        dependencyLockSha256: "b".repeat(64),
+        voiceWorker: { path: "pkg/voice-worker.min.js", admissionProtocol: 1 },
+      },
+    };
+    mongoMocks.findOne.mockResolvedValue({
+      kind: "voice_worker_stats",
+      supervisorIdentity: identity,
+      supervisorUpdatedAt: new Date(Date.now() - 5_000),
+    });
+    const row = await voiceWorkerStatsForDoctor("mongodb://x", "hive_test");
+    expect(row?.supervisorIdentity).toEqual(identity);
+    expect(row?.supervisorStaleSeconds).toBeGreaterThanOrEqual(4);
+  });
+
+  it("preserves malformed legacy supervisor identity as unavailable", async () => {
+    mongoMocks.findOne.mockResolvedValue({ kind: "voice_worker_stats", supervisorIdentity: { pid: 1 } });
+    const row = await voiceWorkerStatsForDoctor("mongodb://x", "hive_test");
+    expect(row?.supervisorIdentity).toBeNull();
+    expect(row?.supervisorStaleSeconds).toBeNull();
+  });
+
   it("defaults missing fields to 0 / null", async () => {
     mongoMocks.findOne.mockResolvedValue({ kind: "voice_worker_stats" });
     const row = await voiceWorkerStatsForDoctor("mongodb://x", "hive_test");
@@ -412,6 +446,77 @@ describe("voiceWorkerStatsForDoctor (KPR-322)", () => {
     expect(row).not.toBeNull();
     expect(row!.staleSeconds).toBeNull();
     expect(row!.activeCalls).toBe(1);
+  });
+});
+
+describe("voice runtime identity/probe doctor adapters", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "doctor-voice-runtime-"));
+    execMock.mockReset();
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("distinguishes source observation from unavailable installed release", () => {
+    const state = join(root, ".hive-state");
+    mkdirSync(join(state, "runtime"), { recursive: true });
+    const source = {
+      component: "engine",
+      pid: 7001,
+      bootId: "11111111-1111-4111-8111-111111111111",
+      startedAt: "2026-09-09T00:00:00.000Z",
+      release: {
+        classification: "source/unavailable",
+        packageVersion: null,
+        sourceRevision: null,
+        sourceDirty: null,
+        dependencyLockSha256: null,
+      },
+    };
+    writeFileSync(join(state, "runtime", "engine.json"), JSON.stringify(source));
+    expect(runtimeIdentitiesForDoctor(join(root, ".hive"), state)).toEqual({
+      installed: null,
+      engine: source,
+      worker: null,
+    });
+  });
+
+  it("runs the local packaged worker probe with only the shared service environment", () => {
+    const engineRoot = join(root, ".hive");
+    mkdirSync(join(engineRoot, "pkg"), { recursive: true });
+    writeFileSync(join(engineRoot, "pkg", "runtime-probe.min.js"), "fixture");
+    execMock.mockReturnValueOnce(
+      JSON.stringify({
+        ok: true,
+        classification: "worker-registered",
+        maintenanceClassification: "admission-open",
+        socketOwned: true,
+        sdk: { rootStatus: 200, agentName: "hive-voice" },
+        status: { snapshot: { unresolved: [{ jobId: "j1", acceptedAt: 1, phase: "accepted-awaiting-entry" }] } },
+      }) as never,
+    );
+    const result = localVoiceRuntimeForDoctor({
+      engineRoot,
+      hiveHome: root,
+      configPath: join(root, "hive.yaml"),
+      home: join(root, "home"),
+      pathEnv: "/usr/bin:/bin",
+      environment: { VOICE_PORT: "4567", LIVEKIT_API_SECRET: "must-not-leak" },
+    });
+    expect(result).toMatchObject({
+      health: "healthy",
+      registration: "registered",
+      maintenanceClassification: "admission-open",
+    });
+    const options = execMock.mock.calls[0]![2] as { env: Record<string, string> };
+    expect(options.env).toEqual({
+      HIVE_HOME: root,
+      HIVE_CONFIG: join(root, "hive.yaml"),
+      HOME: join(root, "home"),
+      PATH: "/usr/bin:/bin",
+      VOICE_PORT: "4567",
+    });
+    expect(JSON.stringify(options.env)).not.toContain("must-not-leak");
   });
 });
 

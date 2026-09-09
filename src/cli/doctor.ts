@@ -8,6 +8,8 @@ import {
   type PrefixCacheStatsRow,
   type SpawnCoordinatorRow,
   type VoiceWorkerStatsRow,
+  type DoctorRuntimeIdentities,
+  type DoctorVoiceRuntimeProbe,
   type CircuitBreakerRow,
   type OutageQueueStats,
   type MemoryLifecycleRow,
@@ -34,6 +36,8 @@ import {
   slackAuthOk,
   spawnCoordinatorStatsForDoctor,
   voiceWorkerStatsForDoctor,
+  runtimeIdentitiesForDoctor,
+  localVoiceRuntimeForDoctor,
   resourceEnvelopesForDoctor,
   memoryLifecycleStatsForDoctor,
   modelRouterModeLine,
@@ -42,7 +46,8 @@ import {
   renderProviderPluginsSection,
 } from "./doctor-checks.js";
 import { describeLimitSource } from "../agents/resource-tiers.js";
-import { engineDir, hiveHome } from "../paths.js";
+import { engineDir, hiveHome, hiveStateDir, resolveConfigFile } from "../paths.js";
+import type { BootIdentity, Release } from "../deployment/release.js";
 
 type HiveConfig = typeof import("../config.js").config;
 
@@ -168,8 +173,31 @@ export function renderVoiceWorkerSection(
   emit: (line: string) => void = console.log,
   instanceId = "<id>",
   sipTrunkId?: string,
+  identities?: DoctorRuntimeIdentities,
+  localProbe?: DoctorVoiceRuntimeProbe,
 ): void {
   emit("\nVoice worker (LiveKit)");
+  const releaseLine = (release: Release | null | undefined): string =>
+    release
+      ? `packaged ${release.packageVersion} revision=${release.sourceRevision} lock=${release.dependencyLockSha256}`
+      : "legacy/unavailable";
+  const observedLine = (identity: BootIdentity | null | undefined): string => {
+    if (!identity) return "legacy/unavailable";
+    if ("classification" in identity.release) return identity.release.classification;
+    return `packaged ${identity.release.packageVersion} revision=${identity.release.sourceRevision} pid=${identity.pid} boot=${identity.bootId}`;
+  };
+  emit(`  installed: ${releaseLine(identities?.installed)}`);
+  emit(`  observed engine: ${observedLine(identities?.engine)}`);
+  emit(`  observed worker: ${observedLine(identities?.worker ?? row?.supervisorIdentity)}`);
+  emit(
+    `  registration=${localProbe?.registration ?? "unavailable"} health=${localProbe?.health ?? "unavailable"} maintenance=${localProbe?.maintenanceClassification ?? "legacy/unavailable"}`,
+  );
+  for (const unresolved of localProbe?.unresolved ?? []) {
+    const child = unresolved.childPid === undefined ? "unassigned" : `child=${unresolved.childPid}`;
+    emit(
+      `    unresolved job=${unresolved.jobId} phase=${unresolved.phase} accepted=${new Date(unresolved.acceptedAt).toISOString()} ${child}`,
+    );
+  }
   // Epic-integration review round 1 (mechanical): warn when livekit is
   // enabled but no outbound SIP trunk id is configured — outbound calls
   // will fail at dispatch. Informational only, never affects allPassed
@@ -189,6 +217,9 @@ export function renderVoiceWorkerSection(
   emit(
     `  active=${row.activeCalls} started=${row.callsStarted} completed=${row.callsCompleted} cell-defaults=${defaults} (heartbeat ${stale})`,
   );
+  emit(
+    `  supervisor-heartbeat=${row.supervisorStaleSeconds === undefined || row.supervisorStaleSeconds === null ? "legacy/unavailable" : `${row.supervisorStaleSeconds}s ago`}`,
+  );
   if (row.lastError) {
     emit(`    last error: ${row.lastError}`);
   }
@@ -196,6 +227,13 @@ export function renderVoiceWorkerSection(
     emit(
       `  ⚠ heartbeat stale — worker down or wedged (launchctl kickstart -k gui/$(id -u)/com.hive.${instanceId}.voice-worker)`,
     );
+  }
+  if (
+    row.supervisorStaleSeconds !== undefined &&
+    row.supervisorStaleSeconds !== null &&
+    row.supervisorStaleSeconds > 60
+  ) {
+    emit("  ⚠ packaged supervisor heartbeat stale");
   }
 }
 
@@ -801,7 +839,22 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // (the worker isn't expected to run).
     if (config.voice.livekit.enabled) {
       const voiceWorkerStats = await voiceWorkerStatsForDoctor(config.mongo.uri, config.mongo.dbName);
-      renderVoiceWorkerSection(voiceWorkerStats, console.log, config.instance.id, config.voice.livekit.sipTrunkId);
+      const runtimeIdentities = runtimeIdentitiesForDoctor(engineDir, hiveStateDir);
+      const localVoiceProbe = localVoiceRuntimeForDoctor({
+        engineRoot: engineDir,
+        hiveHome,
+        configPath: resolveConfigFile(hiveHome),
+        home: process.env.HOME ?? hiveHome,
+        pathEnv: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+      });
+      renderVoiceWorkerSection(
+        voiceWorkerStats,
+        console.log,
+        config.instance.id,
+        config.voice.livekit.sipTrunkId,
+        runtimeIdentities,
+        localVoiceProbe,
+      );
     }
     // KPR-433 D5 (N1 review fix): effective Claude-lane envelopes —
     // informational only, NEVER contributes to allPassed (KPR-296 canon).
