@@ -119,9 +119,9 @@ In `turn-assembly.ts`, inside the `ProviderTurnAssembly` interface, beside `memo
   agentId?: string;
 ```
 
-In `assembleProviderTurn`'s return (`:244`), add `agentId: input.config.id,` beside `instructions`.
+In `assembleProviderTurn`'s return (`:244`), add `agentId: input.config.id,` beside `instructions`. That return **is** the assembly object, so "beside `instructions`" is unambiguous.
 
-In `buildNestedDelegateAssembly`'s return (`:327`), add `agentId: input.config.id,` — the **parent's** slug, matching the Claude lane's treatment of subagents in D2.
+In `buildNestedDelegateAssembly`'s return (`:327`), the shape is **different and the field goes one level in**. That return is `{ assembly: { … }, maxTurns }`, so `agentId: input.config.id,` belongs **inside the `assembly:` object literal that opens at `:328`**, beside `instructions` / `datetimeInTurnInput` / `memoryInTurnInput` — not at the top level of the returned object, where it would be a stray property on a `{assembly, maxTurns}` wrapper that `ProviderTurnAssembly` never sees. The value `input.config.id` is correct here: it is the **parent's** slug, matching the Claude lane's treatment of subagents in D2.
 
 - [ ] **Step 3:** Forward it into the bridge.
 
@@ -190,6 +190,19 @@ Replace `tool-bridge.ts:346-357` (the `const t0` block through the closing brace
               workItemId: this.opts.workItemContext?.workItemId,
               threadId: this.opts.workItemContext?.threadId,
               durationMs: Date.now() - t0,
+              // D6's "the bridge's own TOOL_CALL_TIMEOUT_MS path", supplied as
+              // the typed signal it actually arrives as. That constant is
+              // handed to the MCP SDK as RequestOptions.timeout (:235, :245,
+              // :283), and the SDK rejects with a JSON-RPC McpError whose
+              // numeric `.code` is -32001 — which classifyToolError maps to
+              // `timeout` ahead of any text test. Read defensively: `err` is
+              // `unknown` and most throws here carry no `code` at all.
+              signals: {
+                mcpErrorCode:
+                  typeof (err as { code?: unknown })?.code === "number"
+                    ? ((err as { code: number }).code)
+                    : undefined,
+              },
             });
           }
           // Mirrors the KPR-122 in-process structured-error invariant.
@@ -212,7 +225,9 @@ Import at the top of `tool-bridge.ts`: `import { observeToolFailure, observeTool
 
 Minimum assertions:
 
-- **Hook placement (AC13, structural):** build a runner whose archetype `preToolUseHooks` throws; assert the returned hook map carries the deny-all `PreToolUse` matcher **and** both `PostToolUseFailure` and `PostToolUse`. Then make `observeToolFailure`'s module throw at registration time and assert the deny-all matcher is still installed.
+- **Hook placement, direction 1 (AC13) — a thrown archetype must not disarm the observers.** This one is a **real drive**, and the harness already exists: `agent-runner.test.ts:3283`, `it("buildHooks installs deny-all when preToolUseHooks throws (fail-closed)")`, registers a throwing archetype, builds a runner with `makeRunner({ soul, systemPrompt, archetype, archetypeConfig })` and reads `(runner as any).buildHooks()`. Copy that construction rather than assuming the private-method seam and the runner shape — Step 5 silently depended on both. Assert the returned map carries the deny-all `PreToolUse` matcher **and** both `PostToolUseFailure` and `PostToolUse`.
+
+- **Hook placement, direction 2 (AC13) — a broken observer must not disarm the deny-all matcher. Asserted STRUCTURALLY, because it has no realizable runtime failure mode.** Registration of the two observers is straight-line assignment of two array literals; it cannot throw. And the only way to *make* it throw — a `vi.mock` factory for `../ops/observe.js` that throws — kills the module import, taking `AgentRunner` with it, so the test cannot then assert anything about the hook map at all. The property is therefore asserted where it actually lives, in the source: extract `buildHooks`'s body from `src/agents/agent-runner.ts` and assert that both `hooks.PostToolUseFailure =` and `hooks.PostToolUse =` occur **after the closing brace of the archetype `try`/`catch`**. That is the placement rule the criterion is really about, it fails the moment someone moves either assignment inside the `try`, and unlike a thrown-registration drive it is a claim the test can actually see.
 - **Empty return:** both matchers' callbacks resolve to `{}` — deep-equal, no `hookSpecificOutput`.
 - **Own-abort (AC12):** with `runner.abort()` already called, `PostToolUseFailure` publishes nothing; with `signal.aborted` set, Lane B's catch publishes nothing.
 - **Foreign interrupt (AC12):** `is_interrupt: true` with the runner not aborted publishes `errorSig: "interrupted"`.
@@ -223,7 +238,7 @@ Minimum assertions:
 
 - [ ] **Step 6:** Run the `PostToolUseFailure` failure-class probe (`⚠ Verify at implementation`).
 
-Write `scripts/probe-posttooluse-failure.ts` (scratch, **not** committed unless the implementer judges it worth keeping beside `scripts/repro-bg-subagent-mcp.ts`; if kept, add it to that directory with a header comment naming this ticket).
+Write `scripts/probe-posttooluse-failure.ts` (scratch, **not** committed unless the implementer judges it worth keeping beside `scripts/repro-bg-subagent-mcp.ts`; if kept, add it to that directory with a header comment naming this ticket). Leaving it untracked is safe: `scripts/` is outside `tsconfig.include`, outside `eslint src/ setup/` and outside the prettier globs, so a scratch file there cannot fail Task 6's `npm run check`.
 
 ```typescript
 // Probes WHICH Claude-lane failure classes fire PostToolUseFailure.
@@ -249,6 +264,11 @@ Classes to enumerate, one run each:
 | 3 | Stdio-server fault | an `mcpServers` stdio entry pointing at a command that exits immediately |
 | 4 | Builtin throw | `Read` on a nonexistent absolute path; `Bash` on a command exiting nonzero |
 | 5 | KPR-438-style interrupt | the delegating-subagent shape from `scripts/repro-bg-subagent-mcp.ts` (note that script's own caveat: it does **not** reliably reproduce, so treat a null result as inconclusive, not as "does not fire") |
+| 6 | **Claude-lane `PreToolUse` DENY** | a `PreToolUse` matcher returning `permissionDecision: "deny"` — i.e. what the archetype gate and the fail-closed deny-all arm actually produce |
+
+**Class 6 is the class AC12 turns on, and it is not optional.** AC12 requires "a guardrail deny publishes nothing" **with no lane qualification**, but the only deny assertion in Step 5 is Lane B's `{behavior: "deny"}`, which returns at `tool-bridge.ts:341` *before* `t0` and therefore provably publishes nothing. The Claude lane is the one with a real fail-closed gate, and whether the CLI fires `PostToolUseFailure` for a call it denied at `PreToolUse` is **unverified**: this plan's only suppression on that hook is `wasAborted`, which a denied call does not set. If it fires, **every archetype denial mints a `tool-failed` row** — policy working, recorded as breakage — and AC12 is violated on exactly the lane that matters.
+
+**The remedy if it fires**, decided here so the probe's outcome does not become a design question at the keyboard: add a deny-suppression to the `PostToolUseFailure` matcher keyed on the SDK's own denial marker on that input (a `permission`-shaped `error`/reason field — record the exact shape the probe observes), and extend Step 5's guardrail-deny assertion to the Claude lane. Do **not** suppress by inferring "this looks like a policy message" from `failure.error` text — that is a C12 inference, and this producer's whole discipline is that outcome is published, never inferred. If it does not fire, record that and leave the matcher as written.
 
 Record, in the implementation report, a table of class → fired/did-not-fire, plus `node -p "require('@anthropic-ai/claude-agent-sdk/package.json').version"`.
 
@@ -262,7 +282,7 @@ npx vitest run src/ops/capture-points.integration.test.ts
 npx vitest run src/agents/agent-runner.test.ts src/agents/provider-adapters/tool-bridge.test.ts src/agents/provider-adapters/turn-assembly.test.ts src/agents/provider-adapters/turn-scaffold.test.ts
 npm run check:bundle
 ```
-`check:bundle` matters here specifically: `ProviderTurnAssembly` is re-exported from `provider-abi.ts`, so the new field enters the `pkg/types/` d.ts closure that KPR-407's tracer and `scripts/check-bundle-strings.mjs` guard. A field name or doc comment carrying a forbidden business string would fail there rather than in `npm run check`.
+`check:bundle` matters here specifically: `ProviderTurnAssembly` is re-exported from `provider-abi.ts`, so the new field enters the `pkg/types/` d.ts closure that KPR-407's tracer and `scripts/check-bundle-strings.mjs` guard. A field name or doc comment carrying a forbidden business string would fail there rather than in `npm run check`. Non-obvious but worth knowing: this commit is **not** untypechecked despite the absence of a bare `npm run typecheck` above — `check:bundle` → `bundle` → `build` → `tsc`.
 
 ```bash
 git add src/agents/agent-runner.ts src/agents/provider-adapters/turn-assembly.ts src/agents/provider-adapters/turn-scaffold.ts src/agents/provider-adapters/tool-bridge.ts src/ops/capture-points.integration.test.ts
@@ -317,7 +337,13 @@ Insert immediately before the `// ── Spawn-capable boundary (KPR-394, restat
   try {
     await opsPublisher.init();
     setOpsPublisher(opsPublisher);
-    log.info("Ops publisher wired (KPR-454)", opsPublisher.getSnapshot());
+    // No getSnapshot() argument. Chunk 3 documents that method as having "no
+    // caller in this diff, deliberately" (the KPR-220 spawn-coordinator
+    // precedent) and D10 invariant (a) agrees; a boot log would be that
+    // caller. It would also carry no information — every counter is zero at
+    // this instant, since nothing has published yet. init() already logs the
+    // three facts worth having (reasons, subscriptions, indexFailures).
+    log.info("Ops publisher wired (KPR-454)");
   } catch (err) {
     log.error("Ops publisher init failed — tool-failure publishing is OFF this boot", { error: String(err) });
   }
@@ -352,6 +378,11 @@ At `index.ts:575`, add one line to the existing handler's body. Do **not** add a
 
 In the `shutdown` function, add `await opsPublisher.stop();` immediately after `await obligations.stop();`. That places it before `slackAdapter.stop()` and `mongoClient.close()`, the KPR-456 ordering — `stop()` clears the reload timer and stops accepting first, then drains within `SHUTDOWN_DRAIN_MS`.
 
+Two properties this and Step 2 rely on, both true under chunk 3 but stated nowhere until now:
+
+- **`stop()` is safe on a publisher whose `init()` threw.** The local `const opsPublisher` exists whether or not `setOpsPublisher` ran, so shutdown calls `stop()` on it either way. `stop()` touches only `stopping`, `reloadTimer` (possibly `undefined`) and `queue` (empty, since an unset singleton means no observe call ever enqueued) — no store access, no throw.
+- **The SIGUSR1 `void opsPublisher.reloadSubscriptions()` cannot produce an unhandled rejection.** `reloadSubscriptions` catches its own fault, warns and counts, so the promise it returns never rejects; the bare `void` is correct rather than a swallowed error.
+
 - [ ] **Step 4:** Extend `src/boot-order.test.ts` — **all three lists**.
 
 Add to `(a)`'s presence pass, after `offsetOf("dispatcher.setMeetingAckEnabled(config.meetingWorkers.ackEnabled)");`:
@@ -365,15 +396,18 @@ Add to `(a)`'s presence pass, after `offsetOf("dispatcher.setMeetingAckEnabled(c
 
 Add the same two `offsetOf(...)` entries to `(b)`'s `wiringOffsets` array and to `(c)`'s `wiringStart` `Math.max(...)` set. All three, not one — `(b)` is what fails if the wiring moves below the marker, and `(c)`'s superset sweep must be bounded by the **latest** wiring anchor or a surface introduced between two wiring calls passes green.
 
-Add one `it` documenting the no-`.start(` property, so a later refactor has to argue with it:
+Add one `it` documenting the no-`.start(` property, so a later refactor has to argue with it. It goes **inside the first `describe`** — the one that defines `codeOnly` and `offsetOf` — not into the KPR-456 block, which has its own scope.
+
+The title says what the assertion can actually see. `codeOnly` is `index.ts`, so this case guards `index.ts`'s call sites; it says nothing about what `src/ops/publisher.ts` exports, and a `start()` added there with no `index.ts` caller would pass it. That is the right guard for `(c)`'s allowlist, which is also about `index.ts` — but the earlier title ("the ops publisher exposes no `.start(`-spelled method") claimed the stronger property and was therefore false of the test:
 
 ```typescript
-  it("(d) the ops publisher exposes no .start(-spelled method (KPR-454 AC13)", () => {
+  it("(d) index.ts never calls opsPublisher.start( — (c)'s allowlist needs no entry (KPR-454 AC13)", () => {
     // The drainer is demand-driven and the subscription-reload timer is armed
-    // inside init(), so (c)'s allowlist needs no entry for the publisher. A
-    // later refactor introducing `opsPublisher.start(` must either place it
-    // AFTER the wiring anchors or add it to that allowlist under the
-    // reviewed-classification discipline the list's own comment demands.
+    // inside init(), so there is no start() to call and (c)'s allowlist needs
+    // no publisher entry. A later refactor introducing `opsPublisher.start(`
+    // in index.ts must either place it AFTER the wiring anchors or add it to
+    // that allowlist under the reviewed-classification discipline the list's
+    // own comment demands. Scope: this scans index.ts, not src/ops/.
     expect(codeOnly).not.toContain("opsPublisher.start(");
   });
 ```
@@ -399,7 +433,11 @@ SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npm run chec
 ```
 Expected: all pass.
 
-Negative-verify (required): move the `opsPublisher` block from above the boundary marker to just below it, re-run `src/boot-order.test.ts`, and confirm `(b)` fails. Restore.
+**Negative-verify (required):** move the `opsPublisher` block from above the boundary marker to **immediately after `await bgTaskManager.scanOrphans();`** (or, equivalently, after `scheduler.start();`), re-run `src/boot-order.test.ts`, and confirm `(b)` fails. Restore.
+
+**Why that target and not "just below the marker".** `(b)` bounds `Math.max(wiringOffsets) < Math.min(surfaceOffsets)`, and its offsets are **named surfaces**, not the marker — the marker is a comment the test never reads. The earliest named surface is `await bgTaskManager.start()` at `index.ts:492`, while the marker sits at `:474`, so relocating to "just below the marker" leaves both new anchors at roughly offset 14 998 against a `minSurface` of 15 408 and `(b)` **PASSES** — the mutation never crosses the boundary the check enforces. Round 1 verified both the passing case and the two failing targets. Placing the block after `scanOrphans()` puts `maxWiring` past `bgTaskManager.start()`'s offset and `(b)` trips.
+
+(That this mutation does not also fail `(a)` or `(c)` is expected: `(a)` is presence-only, and `(c)` bounds by the latest wiring anchor, which moves with the block.)
 
 - [ ] **Step 7:** Commit.
 

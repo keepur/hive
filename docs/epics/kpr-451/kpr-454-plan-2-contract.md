@@ -6,12 +6,12 @@ Implements design **D1**, **D4**, **D5**, **D6** (types, registry rows, error to
 
 ### Task 2: Types, reason registry, error tokens, id bound
 
-**Files:**
-- Create: `src/ops/types.ts`
-- Create: `src/ops/reasons.ts`
-- Create: `src/ops/error-tokens.ts`
-- Create: `src/ops/ids.ts`
-- Create: `src/ops/match.ts`
+**Files** (listed in the order the steps below create them — that order carries the real dependency: `reasons.ts` imports `OPS_TOKEN_RE`, `OPS_DETAIL_STRING_MAX` and `OPS_REMEDIATION_MAX` from `ids.ts`, so `ids.ts` must exist first):
+- Create: `src/ops/types.ts` (Step 1)
+- Create: `src/ops/ids.ts` (Step 2)
+- Create: `src/ops/error-tokens.ts` (Step 3)
+- Create: `src/ops/reasons.ts` (Step 4)
+- Create: `src/ops/match.ts` (Step 5)
 
 - [ ] **Step 1:** Create `src/ops/types.ts`.
 
@@ -25,8 +25,10 @@ This is the D2 envelope, stated once. Nothing else in the repository may re-decl
  * vocabularies, the reason-registry document and the subscription document.
  * It imports nothing but types and performs no I/O, so it is safe to import
  * from `src/outage/outage-notices.ts` (type-only) without creating a runtime
- * cycle.
+ * cycle. The `mongodb` import below is `import type` for exactly that reason:
+ * it is erased at compile time and adds no runtime edge.
  */
+import type { ObjectId } from "mongodb";
 
 /** D3: who can clear it, and by what act. */
 export type OpsClass = "integrity" | "resource" | "judgment" | "informational";
@@ -58,8 +60,16 @@ export type OpsDetail = Record<string, string | number | boolean>;
 
 /** The stored document. D9 step 8's complete key set — nothing else is ever written. */
 export interface OpsEvent {
-  /** Server-assigned. The producer never supplies it; the Node driver mints it client-side at insert. */
-  _id?: unknown;
+  /**
+   * Server-assigned; the producer never supplies it, the Node driver mints it
+   * client-side at insert. ⚠ `ObjectId`, not `unknown`, and not cosmetic:
+   * `insertOne` resolves `OptionalUnlessRequiredId` through `InferIdType`,
+   * which maps `_id?: unknown` onto `ObjectId`, and `unknown` is not
+   * assignable to it — so chunk 3's `this.store.events.insertOne(doc)` FAILS
+   * `tsc` (reproduced in-tree, round 1, tsc 6.0.3 / mongodb 7.6.0). Dropping
+   * the field is not the fix: `isMoreRecent`'s `String(a._id)` needs it.
+   */
+  _id?: ObjectId;
   schemaVersion: number;
   publishedAt: Date;
   producer: string;
@@ -84,7 +94,14 @@ export interface OpsEvent {
 export interface DetailKeySpec {
   key: string;
   type: "string" | "number" | "boolean";
-  /** Strings only. Required for `type: "string"`. */
+  /**
+   * Strings only. Required for `type: "string"` — ENFORCED, not merely
+   * documented, because the allow-list IS the C13 redaction boundary and an
+   * unbounded string key admits an unbounded stored field. Two enforcement
+   * points: `assertReasonTableLegal` (code-resident half, a loud development
+   * throw) and `compileDetailSchema` (data-sourced half, clamped at
+   * `OPS_DETAIL_STRING_MAX`).
+   */
   maxLength?: number;
   /** Absent ⇒ required. */
   optional?: boolean;
@@ -152,23 +169,25 @@ export const OPS_REASONS_COLLECTION = "ops_reasons";
 
 - [ ] **Step 2:** Create `src/ops/ids.ts` — the D6 bounds.
 
-Three distinct bounds live here and must not be conflated; the difference between them is a decided part of the design, not an implementation detail.
+Four distinct bounds live here and must not be conflated; each acts at a different point and breaches differently, which is why they are four constants rather than one. The difference is a decided part of the design, not an implementation detail.
 
 | Bound | Applies to | On breach |
 | --- | --- | --- |
 | `^[a-z][a-z0-9-]{0,39}$` | `producer`, `reasonId`, `subject.kind`, `evidence[].kind` | **reject + count** at accept (C5) |
 | length 1–200 | `subject.id`, `evidence[].id` | **reject + count** at accept — never truncated (D4: truncation silently merges two tools into one condition) |
 | `^[A-Za-z0-9_.:#+@-]{1,200}$` | `detail.workItemId`, `detail.threadId`, `evidence[].id` **at the capture point** | **omit + count `idOmitted`** — never reject (D6) |
+| `OPS_DETAIL_STRING_MAX = 200` | every `detail` string value, via the schema the row's `detailKeys` compiles to | **reject + count** at accept, as any schema failure — and the ceiling is applied to the *row itself*, so an unbounded or over-large `maxLength` cannot widen it |
 
 ```typescript
 /**
- * KPR-454 D4/D6: the three bounds, and why they differ.
+ * KPR-454 D4/D6: the four bounds, and why they differ.
  *
  * The token bound and the length bound are ACCEPT-PATH validation: a breach
  * is a mis-integrated producer, so it rejects and increments the rejection
  * counter (C5), never truncates.
  *
- * `isAdmissibleId` is a CAPTURE-POINT bound and behaves the opposite way: a
+ * `admissibleIdOrUndefined` is a CAPTURE-POINT bound and behaves the opposite
+ * way: a
  * breach OMITS the key. Three independent paths put text this producer did
  * not author into `detail.workItemId` / `detail.threadId` / `evidence[].id` —
  * the ws/app channel accepts a client-supplied WorkItem id and threadId
@@ -198,6 +217,22 @@ export const OPS_ID_MAX_LENGTH = 200;
 
 /** D2: at most 4 references per event. This producer never emits more than one. */
 export const OPS_EVIDENCE_MAX = 4;
+
+/**
+ * D6/C13: the hard ceiling on any string value admitted into `detail`, and
+ * the default when a row declares no `maxLength`. A ceiling rather than a
+ * default because `detailKeys` may arrive as DATA — `loadReasons()` compiles
+ * whatever `ops_reasons` holds, including a row this engine's code does not
+ * contain (D4, AC16) — so `{key:"x", type:"string"}` with no bound, or one
+ * declaring `maxLength: 1_000_000`, would otherwise put an unbounded string
+ * into a stored document through the very schema that IS the redaction
+ * boundary. 200 reuses `OPS_ID_MAX_LENGTH` and covers every key this
+ * producer's own rows declare.
+ */
+export const OPS_DETAIL_STRING_MAX = 200;
+
+/** D4: a remediation template is "a bounded parameterised string" — the bound. */
+export const OPS_REMEDIATION_MAX = 500;
 
 /** D6: the capture-point admissibility bound for externally-authored ids. */
 export const ADMISSIBLE_ID_RE = /^[A-Za-z0-9_.:#+@-]{1,200}$/;
@@ -249,15 +284,31 @@ export const TOOL_ERROR_TOKENS = [
 
 export type ToolErrorToken = (typeof TOOL_ERROR_TOKENS)[number];
 
-/** Typed signals the caller can supply. Read FIRST, before any text test. */
+/**
+ * Typed signals the caller can supply. Read FIRST, before any text test.
+ *
+ * ⚠ EXACTLY TWO, and both are POPULATED BY THIS DIFF. D6 names four candidate
+ * signals ("an MCP error class, an HTTP status where one is carried, the SDK's
+ * `is_interrupt`, the bridge's own TOOL_CALL_TIMEOUT_MS path"); two have no
+ * source at either capture point here, and a declared-but-never-populated
+ * field is a surface whose unit tests report coverage the runtime lacks
+ * (round-1 finding). `isInterrupt` comes from the Claude lane's
+ * `PostToolUseFailure.is_interrupt`; `mcpErrorCode` from a thrown `McpError`'s
+ * numeric `.code` at the Lane B site — which is ALSO how "the bridge's own
+ * TOOL_CALL_TIMEOUT_MS path" arrives, since that value is handed to the MCP
+ * SDK as `RequestOptions.timeout` (tool-bridge.ts:235/:245/:283) and the SDK
+ * rejects with JSON-RPC `-32001`, mapped below. A separate `timedOut?:
+ * boolean` would be a second name for the same fact with no independent
+ * source. `httpStatus` is DEFERRED: neither lane holds a status at its
+ * capture point (the Claude lane sees text, Lane B an `errorText(err)`
+ * message); a provider adapter that later carries one adds the field, its
+ * mapping and its call site together. The rule: a signal is declared when a
+ * caller in the same diff supplies it, never in anticipation.
+ */
 export interface ToolErrorSignals {
-  /** SDK PostToolUseFailure.is_interrupt, or Lane B's own interrupt determination. */
+  /** SDK PostToolUseFailure.is_interrupt. */
   isInterrupt?: boolean;
-  /** HTTP status where the failure carried one. */
-  httpStatus?: number;
-  /** True when the failure came from the bridge's own TOOL_CALL_TIMEOUT_MS path. */
-  timedOut?: boolean;
-  /** An MCP JSON-RPC error code where one is carried. */
+  /** A JSON-RPC error code from a thrown MCP error, where one is carried. */
   mcpErrorCode?: number;
 }
 
@@ -284,16 +335,11 @@ const TEXT_RULES: ReadonlyArray<readonly [RegExp, ToolErrorToken]> = [
 export function classifyToolError(message: string, signals: ToolErrorSignals = {}): ToolErrorToken {
   // 1. Typed signals first — they are facts, the text is an inference.
   if (signals.isInterrupt) return "interrupted";
-  if (signals.timedOut) return "timeout";
-  if (signals.httpStatus !== undefined) {
-    if (signals.httpStatus === 408 || signals.httpStatus === 504) return "timeout";
-    if (signals.httpStatus === 429) return "rate-limited";
-    if (signals.httpStatus === 401 || signals.httpStatus === 403) return "permission-denied";
-    if (signals.httpStatus === 404) return "not-found";
-    if (signals.httpStatus === 400 || signals.httpStatus === 422) return "invalid-input";
-    if (signals.httpStatus >= 500) return "upstream-error";
-  }
-  // MCP JSON-RPC reserved codes: -32602 invalid params, -32601 method not found.
+  // MCP JSON-RPC codes: -32001 is the SDK's own request timeout (this is how
+  // the bridge's TOOL_CALL_TIMEOUT_MS surfaces, D6), -32602 invalid params,
+  // -32601 method not found. Anything else falls through to the text rules
+  // rather than being guessed at.
+  if (signals.mcpErrorCode === -32001) return "timeout";
   if (signals.mcpErrorCode === -32602) return "invalid-input";
   if (signals.mcpErrorCode === -32601) return "not-found";
 
@@ -311,12 +357,12 @@ Three things live here and the separation between the first two is the kill swit
 
 - `HIVE_RUNTIME_REASONS` is the **code-resident** table. It is the *write* direction (the boot upsert's source) and the enable gate's input, and nothing else.
 - The accept path resolves a row from the **collection**, via the map `init()` loads back — never from this constant. That is what makes `enabled: false` + restart a working kill switch, and what lets a row this code does not contain (a second reason added later as data, or an out-of-engine producer's) take effect at the next boot with no engine change (AC16).
-- `assertReasonTableLegal` is a **pure precondition over the code-resident table**, evaluated before any I/O and pinned by a unit test — so a violation is a development-time throw, never an operational boot fault, and it is untouched by D10's rule that `init()`'s I/O is non-fatal to boot.
+- `assertReasonTableLegal` is a **pure precondition over the code-resident table**, evaluated before any I/O and pinned by a unit test — so a violation is a development-time throw, never an operational boot fault, and it is untouched by D10's rule that `init()`'s I/O is non-fatal to boot. **Its one call site is the `OpsPublisher` constructor** (chunk 3, Task 4, Step 3), *not* `upsertReasons` and *not* `init()`: chunk 4 constructs the publisher outside its `try { await init() } catch`, so the gate stays D10's one **loud** failure mode instead of degrading into the same warn-and-unset posture as a Mongo blip.
 
 ```typescript
 import { z } from "zod";
 import type { DetailKeySpec, OpsReason } from "./types.js";
-import { OPS_TOKEN_RE } from "./ids.js";
+import { OPS_DETAIL_STRING_MAX, OPS_REMEDIATION_MAX, OPS_TOKEN_RE } from "./ids.js";
 
 /** D1: the engine itself, reporting what it observed. A bounded token, never an enum member. */
 export const HIVE_RUNTIME_PRODUCER = "hive-runtime";
@@ -406,8 +452,25 @@ export function assertReasonTableLegal(rows: readonly OpsReason[]): void {
     if (!OPS_TOKEN_RE.test(row.producer) || !OPS_TOKEN_RE.test(row.reasonId)) {
       throw new Error(`ops reason table: unbounded token in ${row.producer}:${row.reasonId}`);
     }
-    if (row.remediationTemplate.length === 0) {
-      throw new Error(`ops reason table: ${row.reasonId} has no remediationTemplate (D4: required, no default)`);
+    if (row.remediationTemplate.length === 0 || row.remediationTemplate.length > OPS_REMEDIATION_MAX) {
+      throw new Error(
+        `ops reason table: ${row.reasonId}'s remediationTemplate is empty or exceeds ${OPS_REMEDIATION_MAX} ` +
+          `(D4: required, no default, "a bounded parameterised string")`,
+      );
+    }
+    // C13: the allow-list IS the redaction boundary, so a string key with no
+    // declared bound is a development-time defect and refuses loudly here.
+    // The DATA-sourced half is handled differently and deliberately — see
+    // compileDetailSchema below.
+    for (const spec of row.detailKeys) {
+      if (spec.type !== "string") continue;
+      const id = `${row.producer}:${row.reasonId} key "${spec.key}"`;
+      if (spec.maxLength === undefined) {
+        throw new Error(`ops reason table: ${id} is type "string" with no maxLength (D4: required)`);
+      }
+      if (spec.maxLength < 1 || spec.maxLength > OPS_DETAIL_STRING_MAX) {
+        throw new Error(`ops reason table: ${id} declares maxLength ${spec.maxLength}, outside 1..${OPS_DETAIL_STRING_MAX}`);
+      }
     }
     for (const cleared of row.clearsReasonIds ?? []) {
       if (!ids.has(`${row.producer}:${cleared}`)) {
@@ -438,15 +501,27 @@ export function assertReasonTableLegal(rows: readonly OpsReason[]): void {
  *
  * Strict: an unknown key, a wrong scalar type, an over-length value or a
  * non-scalar all fail, and the accept path rejects + counts (C5, C13).
+ *
+ * ⚠ THE DATA-SOURCED HALF, decided explicitly. `assertReasonTableLegal` guards
+ * only the CODE-RESIDENT table; this compiles whatever `loadReasons()` read
+ * out of `ops_reasons`, including a row no engine code contains (D4, AC16),
+ * so it cannot rely on the gate having run. It therefore never trusts
+ * `spec.maxLength`: a string key is ALWAYS bounded at
+ * `Math.min(spec.maxLength ?? OPS_DETAIL_STRING_MAX, OPS_DETAIL_STRING_MAX)`.
+ * The two halves fail differently on purpose — a code-resident defect is loud
+ * because a developer fixes it before deploy, a data-sourced one is clamped
+ * because refusing the row would let one operator (or foreign-producer) row
+ * disable publishing, and C13 requires that nothing unbounded is STORED, not
+ * that the row be rejected. The clamp bounds the SCHEMA, never a value: an
+ * over-length value still fails and the publish is rejected and counted (D4
+ * forbids truncating).
  */
 export function compileDetailSchema(keys: readonly DetailKeySpec[]): z.ZodType<Record<string, unknown>> {
   const shape: Record<string, z.ZodTypeAny> = {};
   for (const spec of keys) {
     let field: z.ZodTypeAny;
     if (spec.type === "string") {
-      let s = z.string();
-      if (spec.maxLength !== undefined) s = s.max(spec.maxLength);
-      field = s;
+      field = z.string().max(Math.min(spec.maxLength ?? OPS_DETAIL_STRING_MAX, OPS_DETAIL_STRING_MAX));
     } else if (spec.type === "number") {
       field = z.number().finite();
     } else {
@@ -477,12 +552,28 @@ import type { OpsEvent, OpsFilter, OpsSubscription } from "./types.js";
 export function matchesFilter(event: Pick<OpsEvent, "producer" | "reasonId" | "class" | "waiting" | "retry" | "subject">, filter: OpsFilter): boolean {
   // An absent field matches everything; a present field matches when the
   // event's value is IN the list; present fields are ANDed.
-  if (filter.producer && !filter.producer.includes(event.producer)) return false;
-  if (filter.reasonId && !filter.reasonId.includes(event.reasonId)) return false;
-  if (filter.class && !filter.class.includes(event.class)) return false;
-  if (filter.waiting && !filter.waiting.includes(event.waiting)) return false;
-  if (filter.retry && !filter.retry.includes(event.retry)) return false;
-  if (filter.subjectKind && !filter.subjectKind.includes(event.subject.kind)) return false;
+  //
+  // `term()` is not tidiness. A subscription is a DATA row read out of Mongo
+  // and `OpsFilter` is a compile-time claim about it, not a runtime guarantee:
+  // a row carrying `{ producer: { $ne: "…" } }` makes a bare
+  // `filter.producer.includes(…)` THROW, and that throw escapes the pure
+  // evaluator into the accept path where the drainer's catch counts it as a
+  // publishFault — so one malformed row would suppress publishing for every
+  // event. A non-array term value is therefore not a list, cannot be
+  // satisfied, and yields no match: fail-closed on SELECTION (nobody is
+  // notified) rather than fail-open or fail-loud. Unknown keys (`$or` and
+  // friends) are simply not read — ignored, never interpreted (C7).
+  const term = <T extends string>(values: readonly T[] | undefined, actual: string): boolean => {
+    if (values === undefined) return true;
+    if (!Array.isArray(values)) return false;
+    return (values as readonly string[]).includes(actual);
+  };
+  if (!term(filter.producer, event.producer)) return false;
+  if (!term(filter.reasonId, event.reasonId)) return false;
+  if (!term(filter.class, event.class)) return false;
+  if (!term(filter.waiting, event.waiting)) return false;
+  if (!term(filter.retry, event.retry)) return false;
+  if (!term(filter.subjectKind, event.subject.kind)) return false;
   return true;
 }
 
@@ -508,7 +599,8 @@ export function evaluateMatches(
 - [ ] **Step 6:** Verify the module compiles and the gate is armed.
 
 Run: `npm run typecheck`
-Expected: clean. (`src/outage/outage-notices.ts`'s `import type { Waiting }` from Task 1 now resolves.)
+
+**This is the first green `npm run typecheck` in the plan, and that is by design.** Task 1 (chunk 1, Step 6) deliberately did not run it and stated that it would FAIL until this step: `src/outage/outage-notices.ts` carries `import type { Waiting } from "../ops/types.js"` from Task 1, and `src/ops/types.ts` only exists as of Step 1 above. Expected here: clean — that import now resolves, and `Collection<OpsEvent>.insertOne` will compile in chunk 3 because `_id` is declared `ObjectId` rather than `unknown` (Step 1's ⚠ note).
 
 - [ ] **Step 7:** Commit.
 
@@ -535,27 +627,44 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Create: `src/ops/reasons.test.ts`
 - Create: `src/ops/match.test.ts`
 
+All four fences below are **complete new-file payloads**: each opens with its own `vitest` import and the imports of the unit under test, matching chunk 1 Step 5's fence. Copy them whole; do not assume an ambient `describe`/`expect`.
+
 - [ ] **Step 1:** `src/ops/error-tokens.test.ts` — totality, closure, and the C13 negative.
 
-Minimum assertions:
-
 ```typescript
+import { describe, it, expect } from "vitest";
+import { classifyToolError, TOOL_ERROR_TOKENS } from "./error-tokens.js";
+
 describe("classifyToolError (KPR-454 D6)", () => {
   it("is total and closed over TOOL_ERROR_TOKENS", () => {
     const inputs = ["", "x", "ETIMEDOUT", "The tool call was interrupted before a result was received",
       "ECONNREFUSED 127.0.0.1:27017", "no such file", "invalid input: expected string",
-      "permission denied", "429 Too Many Requests", "502 Bad Gateway", " ￿", "a".repeat(10_000)];
+      "permission denied", "429 Too Many Requests", "502 Bad Gateway", "\x00\uFFFF", "a".repeat(10_000)];
     for (const input of inputs) {
       expect(TOOL_ERROR_TOKENS as readonly string[]).toContain(classifyToolError(input));
     }
   });
 
+  // ONLY the two signals this diff actually populates are exercised. There is
+  // no `timedOut` and no `httpStatus` case, because there is no `timedOut` and
+  // no `httpStatus` field — see the ⚠ note on ToolErrorSignals. A test for a
+  // signal no capture point supplies reports coverage the runtime lacks.
   it("reads typed signals before any text test", () => {
     // is_interrupt wins even over a timeout-shaped message.
     expect(classifyToolError("operation timed out", { isInterrupt: true })).toBe("interrupted");
-    expect(classifyToolError("something", { timedOut: true })).toBe("timeout");
-    expect(classifyToolError("something", { httpStatus: 429 })).toBe("rate-limited");
     expect(classifyToolError("something", { mcpErrorCode: -32602 })).toBe("invalid-input");
+    expect(classifyToolError("something", { mcpErrorCode: -32601 })).toBe("not-found");
+  });
+
+  it("maps the MCP SDK's own request timeout (-32001) — the bridge's TOOL_CALL_TIMEOUT_MS path", () => {
+    // The message carries no timeout wording, so only the typed code can
+    // produce this answer — a signal test, not a text test in disguise.
+    expect(classifyToolError("weird vendor failure #7719", { mcpErrorCode: -32001 })).toBe("timeout");
+  });
+
+  it("an unmapped JSON-RPC code falls through to the text rules, never to a guess", () => {
+    expect(classifyToolError("ECONNREFUSED 127.0.0.1:1", { mcpErrorCode: -32603 })).toBe("transport-unavailable");
+    expect(classifyToolError("weird vendor failure #7719", { mcpErrorCode: -32603 })).toBe("unclassified");
   });
 
   it("detects the KPR-438 background-subagent signature", () => {
@@ -566,24 +675,38 @@ describe("classifyToolError (KPR-454 D6)", () => {
     expect(classifyToolError("weird vendor failure #7719")).toBe("unclassified");
   });
 
-  // AC6: no substring of the input can reach a stored field, BY CONSTRUCTION.
-  it("never returns any substring of its input (C13)", () => {
-    const secretish = "auth failed for sk-ant-api03-DEADBEEF at /Users/mokie/.env";
-    const token = classifyToolError(secretish);
-    expect(TOOL_ERROR_TOKENS as readonly string[]).toContain(token);
-    expect(secretish).not.toContain(token.length > 3 ? token : " ");
-    // Stronger form: the token is drawn from a constant array, so it cannot
-    // carry input bytes regardless of the message.
-    expect(TOOL_ERROR_TOKENS.some((t) => t === token)).toBe(true);
+  // AC6, by construction. ⚠ The property is "the returned value is one of the
+  // nine constants", NOT "the input does not contain the returned value".
+  // Round 1 caught the earlier form (`expect(secretish).not.toContain(token)`)
+  // encoding the second, which is FALSE of the artifact and passed only on its
+  // fixture: any message containing "timeout" classifies as "timeout" and does
+  // contain it. Referential identity is the form true of every input.
+  it("returns a member of the closed set by reference, so no input byte can ride out (C13)", () => {
+    for (const input of [
+      "auth failed for sk-ant-api03-DEADBEEF at /Users/mokie/.env",
+      "operation timed out after 600000ms",     // the fixture the old form got wrong
+      "Bearer eyJhbGciOi… rate limit exceeded", // secret-shaped AND rule-matching
+      "",
+    ]) {
+      const token = classifyToolError(input);
+      expect(TOOL_ERROR_TOKENS.some((t) => t === token), input).toBe(true);
+      // Bounded by the longest token, so it is not a truncation or a hash either.
+      expect(token.length).toBeLessThanOrEqual(Math.max(...TOOL_ERROR_TOKENS.map((t) => t.length)));
+    }
   });
 });
 ```
+
+The end-to-end half of AC6 — that no fragment of the message reaches the **stored document** — is chunk 5's, asserted against `JSON.stringify` of the inserted row. This file pins only the classifier's own closure, which is what makes that end-to-end property true by construction rather than by a scrub pass.
 
 - [ ] **Step 2:** `src/ops/ids.test.ts` — the **admit** path and the **omit** path, one case per shape in the design's two tables.
 
 This is the criterion AC3 calls out specifically: the omit path is only correct if the population it excludes is the population D6 enumerates. Drive one case per row.
 
 ```typescript
+import { describe, it, expect } from "vitest";
+import { admissibleIdOrUndefined } from "./ids.js";
+
 describe("admissibleIdOrUndefined (KPR-454 D6, AC3)", () => {
   it("admits every engine-minted work-item id shape", () => {
     for (const id of [
@@ -644,6 +767,17 @@ describe("admissibleIdOrUndefined (KPR-454 D6, AC3)", () => {
 - [ ] **Step 3:** `src/ops/reasons.test.ts` — the gate, the write order, and the schema compiler.
 
 ```typescript
+import { describe, it, expect } from "vitest";
+import {
+  assertReasonTableLegal,
+  compileDetailSchema,
+  HIVE_RUNTIME_REASONS,
+  REASON_TOOL_FAILED,
+  REASON_TOOL_RECOVERED,
+} from "./reasons.js";
+import { OPS_DETAIL_STRING_MAX } from "./ids.js";
+import type { OpsReason } from "./types.js";
+
 describe("HIVE_RUNTIME_REASONS + assertReasonTableLegal (KPR-454 D5, AC10)", () => {
   it("the shipped table is legal", () => {
     expect(() => assertReasonTableLegal(HIVE_RUNTIME_REASONS)).not.toThrow();
@@ -659,7 +793,30 @@ describe("HIVE_RUNTIME_REASONS + assertReasonTableLegal (KPR-454 D5, AC10)", () 
     expect(() => assertReasonTableLegal(rows)).toThrow(/unregistered reason/);
   });
 
+  // The code-resident half of the C13 allow-list bound, three mutations of
+  // the shipped table (`patch` replaces the tool-failed row).
+  const patch = (over: Partial<OpsReason>) =>
+    HIVE_RUNTIME_REASONS.map((r) => (r.reasonId === REASON_TOOL_FAILED ? { ...r, ...over } : r));
+
+  it("refuses a string detail key with no maxLength (the allow-list IS the redaction boundary)", () => {
+    const rows = patch({ detailKeys: [{ key: "loose", type: "string" }] });
+    expect(() => assertReasonTableLegal(rows)).toThrow(/no maxLength/);
+  });
+
+  it("refuses a maxLength above the ceiling", () => {
+    const rows = patch({ detailKeys: [{ key: "huge", type: "string", maxLength: 1_000_000 }] });
+    expect(() => assertReasonTableLegal(rows)).toThrow(new RegExp(`outside 1\\.\\.${OPS_DETAIL_STRING_MAX}`));
+  });
+
+  it("refuses an over-long remediationTemplate (D4: a BOUNDED parameterised string)", () => {
+    expect(() => assertReasonTableLegal(patch({ remediationTemplate: "x".repeat(501) }))).toThrow(/remediationTemplate/);
+  });
+
   it("upserts the clearing reason FIRST (D5 write order is load-bearing)", () => {
+    // Array order only. The CALL order — that `upsertReasons` actually issues
+    // the writes in this order rather than sorting or parallelising them — is
+    // pinned separately in chunk 3's publisher.integration.test.ts against the
+    // fake db's `operations` log, because this assertion cannot see it.
     expect(HIVE_RUNTIME_REASONS[0].reasonId).toBe(REASON_TOOL_RECOVERED);
     expect(HIVE_RUNTIME_REASONS[1].reasonId).toBe(REASON_TOOL_FAILED);
   });
@@ -698,32 +855,122 @@ describe("compileDetailSchema (KPR-454 D6, AC3)", () => {
     expect(schema.safeParse({ errorSig: "timeout", lane: "claude" }).success).toBe(false);
     expect(schema.safeParse({ tool: "Bash", errorSig: "timeout", lane: "claude" }).success).toBe(true);
   });
+
+  // The DATA-SOURCED half of the C13 boundary: `loadReasons()` compiles rows
+  // straight out of `ops_reasons` without ever running the gate above, so the
+  // compiler itself must bound a string key. Both mutations below are rows an
+  // operator (or AC16's foreign producer) can insert directly.
+  it("bounds a string key that declares NO maxLength, at the ceiling", () => {
+    const s = compileDetailSchema([{ key: "x", type: "string" }]);
+    expect(s.safeParse({ x: "a".repeat(OPS_DETAIL_STRING_MAX) }).success).toBe(true);
+    expect(s.safeParse({ x: "a".repeat(OPS_DETAIL_STRING_MAX + 1) }).success).toBe(false);
+  });
+
+  it("clamps a maxLength that exceeds the ceiling rather than honouring it", () => {
+    const s = compileDetailSchema([{ key: "x", type: "string", maxLength: 1_000_000 }]);
+    expect(s.safeParse({ x: "a".repeat(OPS_DETAIL_STRING_MAX + 1) }).success).toBe(false);
+  });
 });
 ```
+
+Both of the last two cases trip on the obvious regression: reverting `compileDetailSchema`'s string arm to `if (spec.maxLength !== undefined) s = s.max(spec.maxLength)` makes the first accept a 100 kB string and the second accept a 1 MB one, which is precisely the unbounded stored field C13 forbids.
 
 - [ ] **Step 4:** `src/ops/match.test.ts` — the grammar, enumerated.
 
+This is the **only** place C7/AC5's "exactly six terms, no operator, negation, wildcard or nesting" is pinned — chunk 5's AC5 block delegates the enumeration here — so it is a running payload, not a sketch. (Round 1: the earlier version was four comment-only `it` bodies plus an undeclared `event` — a file that would not run and, once made to run, would pass vacuously.)
+
 ```typescript
+import { describe, it, expect } from "vitest";
+import { evaluateMatches, matchesFilter } from "./match.js";
+import type { OpsFilter, OpsSubscription } from "./types.js";
+
+const EVENT = {
+  producer: "hive-runtime", reasonId: "tool-failed", class: "resource",
+  waiting: "human-now", retry: "transient", subject: { kind: "tool", id: "Bash" },
+} as const;
+
+/** The six terms, each with a value that MATCHES `EVENT` and one that does not. */
+const TERMS: ReadonlyArray<{ term: keyof OpsFilter; hit: OpsFilter; miss: OpsFilter }> = [
+  { term: "producer", hit: { producer: ["hive-runtime"] }, miss: { producer: ["florist"] } },
+  { term: "reasonId", hit: { reasonId: ["tool-failed"] }, miss: { reasonId: ["tool-recovered"] } },
+  { term: "class", hit: { class: ["resource"] }, miss: { class: ["informational"] } },
+  { term: "waiting", hit: { waiting: ["human-now"] }, miss: { waiting: ["nobody"] } },
+  { term: "retry", hit: { retry: ["transient"] }, miss: { retry: ["deterministic"] } },
+  { term: "subjectKind", hit: { subjectKind: ["tool"] }, miss: { subjectKind: ["provider"] } },
+];
+
+function sub(id: string, filter: OpsFilter, enabled = true): OpsSubscription {
+  return {
+    _id: id, subscriberId: "nobody", subscriberKind: "test", enabled, filter,
+    transport: { adapterId: "none", target: "none" },
+  };
+}
+
 describe("the D5 filter grammar (KPR-454 AC5, C7)", () => {
-  it("an absent field matches everything", () => { /* {} matches any event */ });
-  it("a present field matches on set membership", () => { /* … */ });
-  it("present fields are ANDed", () => { /* one mismatch ⇒ false */ });
-  it("a disabled subscription never matches", () => { /* … */ });
-  it("zero matches returns [] and is not an error", () => {
-    expect(evaluateMatches(event, [])).toEqual([]);
+  it("an absent field matches everything", () => {
+    expect(matchesFilter(EVENT, {})).toBe(true);
   });
-  it("supports exactly six filter terms and no more", () => {
-    // Structural: the OpsFilter keys are the six, and matchesFilter reads
-    // each of them. Enumerated so a seventh term, an operator, a negation, a
-    // wildcard or a nested clause fails this test rather than shipping.
-    const terms = ["producer", "reasonId", "class", "waiting", "retry", "subjectKind"];
-    for (const term of terms) { /* build a filter with only that term and assert it discriminates */ }
-    // and: a filter carrying an unknown/operator-shaped key is ignored, never
-    // interpreted — assert `matchesFilter(e, { $or: [...] } as any)` is true
-    // (i.e. the unknown key is not a term), never an operator evaluation.
+
+  it("every one of the six terms discriminates, in both directions", () => {
+    // A term DROPPED from matchesFilter's body makes its `miss` case return
+    // true and fails right here — that is what makes this loop able to fail.
+    for (const { term, hit, miss } of TERMS) {
+      expect(matchesFilter(EVENT, hit), `${term} hit`).toBe(true);
+      expect(matchesFilter(EVENT, miss), `${term} miss`).toBe(false);
+    }
+  });
+
+  it("the six are exactly the OpsFilter key space — no seventh term exists", () => {
+    expect(TERMS.map((t) => t.term).sort()).toEqual([
+      "class", "producer", "reasonId", "retry", "subjectKind", "waiting",
+    ]);
+  });
+
+  it("present fields are ANDed — one mismatch is enough", () => {
+    expect(matchesFilter(EVENT, { producer: ["hive-runtime"], reasonId: ["tool-failed"] })).toBe(true);
+    expect(matchesFilter(EVENT, { producer: ["hive-runtime"], reasonId: ["tool-recovered"] })).toBe(false);
+    // ...and there is no OR: two values in ONE term is membership, which is
+    // the only disjunction the grammar has.
+    expect(matchesFilter(EVENT, { reasonId: ["tool-recovered", "tool-failed"] })).toBe(true);
+  });
+
+  it("an empty list matches nothing — it is membership, not 'unset'", () => {
+    expect(matchesFilter(EVENT, { producer: [] })).toBe(false);
+  });
+
+  it("an operator-shaped key is IGNORED, never interpreted", () => {
+    // C7: a subscription row is data, and data shaped like a query operator
+    // must not become one. `$or` is not a term, so the filter is empty.
+    expect(matchesFilter(EVENT, { $or: [{ producer: ["florist"] }] } as unknown as OpsFilter)).toBe(true);
+    // A present term whose value is not a list cannot be satisfied. This line
+    // FAILS LOUDLY (TypeError, not a wrong boolean) against the unguarded
+    // `filter.producer.includes(…)` form — which is why the guard exists.
+    expect(matchesFilter(EVENT, { producer: { $ne: "hive-runtime" } } as unknown as OpsFilter)).toBe(false);
+  });
+
+  it("no wildcard, no regex, no prefix semantics — values compare by equality only", () => {
+    expect(matchesFilter(EVENT, { producer: ["hive-*"] })).toBe(false);
+    expect(matchesFilter(EVENT, { producer: ["hive"] })).toBe(false);
+    expect(matchesFilter(EVENT, { subjectKind: ["TOOL"] })).toBe(false); // case-sensitive
+  });
+
+  it("a disabled subscription never matches", () => {
+    expect(evaluateMatches(EVENT, [sub("s1", {}, false)])).toEqual([]);
+  });
+
+  it("returns matched ids in registration order", () => {
+    const subs = [sub("a", {}), sub("b", { reasonId: ["tool-recovered"] }), sub("c", { producer: ["hive-runtime"] })];
+    expect(evaluateMatches(EVENT, subs)).toEqual(["a", "c"]);
+  });
+
+  it("zero matches returns [] and is not an error", () => {
+    expect(evaluateMatches(EVENT, [])).toEqual([]);
+    expect(evaluateMatches(EVENT, [sub("x", { producer: ["florist"] })])).toEqual([]);
   });
 });
 ```
+
+`matchesFilter`'s parameter is `Pick<OpsEvent, …>`, so the `EVENT` literal above must be assignable to it — declare it `as const` and let inference do the rest rather than casting.
 
 - [ ] **Step 5:** Verify.
 

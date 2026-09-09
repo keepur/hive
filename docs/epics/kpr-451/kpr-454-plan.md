@@ -31,7 +31,7 @@ Each chunk file is under 1,000 lines. Code fences carry complete new-file payloa
 - `src/ops/types.ts` — envelope, vocabularies, subscription/reason document shapes, `Waiting`, publish-input types. No I/O, no Mongo import beyond types.
 - `src/ops/reasons.ts` — the two code-resident `hive-runtime` rows, `DetailKeySpec`, the D4 enable gate as a pure precondition, and the detail-schema builder that compiles a row's `detailKeys` into a cached zod object.
 - `src/ops/error-tokens.ts` — the exported total `classifyToolError` over the closed nine-value set.
-- `src/ops/ids.ts` — `isAdmissibleId` (the `^[A-Za-z0-9_.:#+@-]{1,200}$` capture-point bound) and the `subject`/`evidence` bound constants.
+- `src/ops/ids.ts` — `admissibleIdOrUndefined` and `ADMISSIBLE_ID_RE` (the `^[A-Za-z0-9_.:#+@-]{1,200}$` capture-point bound), `isOpsToken`/`OPS_TOKEN_RE`, and the four bound constants (`OPS_ID_MAX_LENGTH`, `OPS_EVIDENCE_MAX`, `OPS_DETAIL_STRING_MAX`, `OPS_REMEDIATION_MAX`).
 - `src/ops/store.ts` — collection handles, `init()` index creation (individually contained), reason upsert + read-back, subscription load.
 - `src/ops/match.ts` — the pure, I/O-free D5 conjunction evaluator.
 - `src/ops/publisher.ts` — `OpsPublisher`: queue, drainer, accept path, epoch resolver, open-condition map, counters, `getSnapshot()`, `init()`/`stop()`/`reloadSubscriptions()`.
@@ -55,10 +55,10 @@ Each chunk file is under 1,000 lines. Code fences carry complete new-file payloa
 - `src/ops/ids.test.ts`
 - `src/ops/reasons.test.ts`
 - `src/ops/match.test.ts`
-- `src/ops/testing/fake-db.ts` — in-memory Mongo double (query/sort/limit over the five reads this producer performs) plus a throwing-handle variant for AC5/AC8.
+- `src/ops/testing/fake-db.ts` — in-memory Mongo double (query/sort/limit over the five reads this producer performs), a throwing-handle variant for AC5/AC8, and the four `src/obligations/testing/fake-db.ts` capabilities chunk 5 depends on: `pause`, the `operations` log, `countDocuments`, and real-`ObjectId` `_id` minting.
 - `src/ops/publisher.integration.test.ts`
-- `src/ops/acceptance.integration.test.ts` — AC1–AC16 as named cases.
-- `src/ops/capture-points.integration.test.ts` — lane parity, abort discipline, containment negative-verify.
+- `src/ops/acceptance.integration.test.ts` — AC1–AC16 as named cases, sixteen `describe`s each carrying at least one real `it`.
+- `src/ops/capture-points.integration.test.ts` — lane parity, abort discipline, containment negative-verify; **exports** its two lane harnesses for the acceptance suite.
 - `src/outage/outage-notices.test.ts` — extended if it exists, created if not (see Task 1 Step 1).
 - `src/ops/single-prefix-predicate.test.ts` — AC4's repository-wide scan.
 
@@ -68,7 +68,7 @@ The spec (Assumptions, `⚠ Delegated`) fixes the behaviour on breach and leaves
 
 | Constant | Value | Reasoning |
 | --- | --- | --- |
-| `OPEN_CONDITION_MAP_CAP` (D8) | `2000` | The key space is one entry per *distinct failing tool*, i.e. bounded by the installed tool inventory rather than by traffic: a maximal hive runs on the order of 20 MCP servers × ~15 tools plus builtins — low hundreds. 2000 is therefore ~5× the realistic ceiling, so eviction is unreachable in normal operation and the cap functions as a leak bound, not an operating limit. Each entry is `{openSeq, dedupeKey, firstFailureAt}` keyed by a family string ≈ 150 bytes ⇒ ~300 KB at full cap. Breach evicts oldest-first and costs one delayed epoch boundary (D8's cap paragraph), the same bound as the restart residual. |
+| `OPEN_CONDITION_MAP_CAP` (D8) | `2000` | The key space is one entry per *distinct failing tool*, i.e. bounded by the installed tool inventory rather than by traffic: a maximal hive runs on the order of 20 MCP servers × ~15 tools plus builtins — low hundreds. 2000 is therefore ~5× the realistic ceiling, so eviction is unreachable in normal operation and the cap functions as a leak bound, not an operating limit. Each entry is `{openSeq, dedupeKey, firstFailureAt}` keyed by a family string — ≈ 250–350 bytes once the key and the Map's own overhead are counted, so ~600 KB at full cap (immaterial to the choice either way). Breach evicts oldest-first and costs one delayed epoch boundary (D8's cap paragraph), the same bound as the restart residual. |
 | `PUBLISH_QUEUE_DEPTH` (D9) | `1000` | A drain is two indexed reads plus one insert against a local `mongod` — single-digit milliseconds. 1000 jobs therefore represents roughly 3–8 seconds of drain, which is the right absorption window for the failure storm this queue exists to survive (a broken MCP server failing across every concurrent turn), while bounding memory to ~1000 × ~300 bytes ≈ 300 KB. Going deeper buys little: everything past the first failure of a family is, by construction, a restatement whose condition is already recorded, so the marginal rows preserved are the least informative ones. Overflow drops **oldest** and increments `queueOverflow` — the newest failures are the ones a responder needs. |
 | `SHUTDOWN_DRAIN_MS` (D10) | `2000` | Shutdown already awaits Slack and Mongo; the ops queue must not add a visible stall to a `launchctl kickstart`. At the measured per-job cost, 2 s clears several hundred jobs — more than a healthy queue ever holds — and a queue deeper than that at shutdown means a storm was in progress, where the marginal rows are again restatements. On timeout the remainder is dropped and counted as `drainDropped`. |
 
@@ -78,17 +78,17 @@ One further value is stated *and* delegated by the spec and is adopted as writte
 
 Both are executable steps in this plan, not notes. Neither blocks merge; both must be **run** and their outcome recorded in the implementation report.
 
-1. **Which Claude-lane failure classes fire `PostToolUseFailure`** — Task 5, Step 6. Probed through the SDK's **bundled** binary via `query()` from inside the repo (`npx tsx`), never PATH `claude` (CLAUDE.md's gotcha: PATH `claude` is a different binary, and the fleet floats `^0.3.258` so deployed instances resolve higher than this lockfile). A class that does not fire is left **uncaptured**, never inferred from a `PostToolUse` `tool_response` (C12/AC15).
-2. **TTL index-conflict error shape after a retention change** — Task 4, Step 7. `createIndex({publishedAt: 1}, {expireAfterSeconds})` against an existing index with a different value must be confirmed to surface as `IndexOptionsConflict` on the deployed driver, and the contained warning text must name the operator remedy (drop the index or `collMod`, then restart).
+1. **Which Claude-lane failure classes fire `PostToolUseFailure`** — Task 5, Step 6. Probed through the SDK's **bundled** binary via `query()` from inside the repo (`npx tsx`), never PATH `claude` (CLAUDE.md's gotcha: PATH `claude` is a different binary, and the fleet floats `^0.3.258` so deployed instances resolve higher than this lockfile). A class that does not fire is left **uncaptured**, never inferred from a `PostToolUse` `tool_response` (C12/AC15). **Six classes, not five:** class 6 is a Claude-lane `PreToolUse` **deny**, and it is the one AC12 turns on — if `PostToolUseFailure` fires for a denied call, every archetype denial mints a `tool-failed` row and AC12 is violated on the only lane with a real fail-closed gate. Task 5 Step 6 states the remedy if it fires.
+2. **TTL index-conflict error shape after a retention change** — Task 4, Step 7. `createIndex({publishedAt: 1}, {expireAfterSeconds})` against an existing index with a different value must be confirmed to surface as `IndexOptionsConflict` on the deployed driver, and the contained warning text must name the operator remedy (drop the index or `collMod`, then restart). If `mongosh`/`mongod` is unavailable, this is **deferred and recorded, not skipped** — its only product is the accuracy of one warning string (Task 4 Step 7).
 
 ## Testing Contract
 
 ### Required Test Groups
 
 - Unit: **required**
-  - Scope: `classifyToolError`; `isAdmissibleId`; the reason table and its D4 enable gate; the `detailKeys`→zod compiler; `sourceOfId` / `policyForId` / `policyFor` / `waitingFor`; the D5 match evaluator; `dedupeKey`/`clearsFamily` derivation; the epoch comparison's `(publishedAt, _id)` total order.
+  - Scope: `classifyToolError`; `admissibleIdOrUndefined`; the reason table and its D4 enable gate; the `detailKeys`→zod compiler; `sourceOfId` / `policyForId` / `policyFor` / `waitingFor`; the D5 match evaluator; `dedupeKey`/`clearsFamily` derivation; the epoch comparison's `(publishedAt, _id)` total order.
   - Reason: every one of these is a pure total function whose *closure* is the correctness property — the classifier must never emit a non-token, the id bound must admit exactly the enumerated population, the enable gate must refuse a development-time defect, and the prefix projections must be exhaustive. None is happy-path CRUD.
-  - Minimum assertions: `classifyToolError` is total and its output is drawn only from the nine-value set, including for a credential-shaped and a path-shaped message; no substring of the input appears in the returned token. `isAdmissibleId` admits one case per shape in the design's two id tables — `imessage:<apple-id-email>` and `sms:<line>:+1555…` named explicitly — and rejects the two `sched:`/`scheduler:` shapes carrying a multi-word label, a space-bearing value and an over-length value. The enable gate throws when a `class: resource` row is enabled with no registered clearer. `detailKeys` compilation rejects an undeclared key, a wrong scalar type, a non-scalar and an over-length value. All six `sourceOfId` buckets are pinned; `policyFor`'s pre-refactor output is pinned per prefix; `team-` ⇒ `waiting: "agent"` explicitly. The match evaluator implements exactly the D5 conjunction and no operator, negation, wildcard or nesting.
+  - Minimum assertions: `classifyToolError` is total and its output is drawn only from the nine-value set, including for a credential-shaped and a path-shaped message; the returned value is a member of the closed constant array **by reference** (the checkable form of "no input byte rides out" — the converse, "the input does not contain the token", is false of the artifact). `admissibleIdOrUndefined` admits one case per shape in the design's two id tables — `imessage:<apple-id-email>` and `sms:<line>:+1555…` named explicitly — and rejects the two `sched:`/`scheduler:` shapes carrying a multi-word label, a space-bearing value and an over-length value. The enable gate throws when a `class: resource` row is enabled with no registered clearer, when a `type: "string"` detail key declares no `maxLength`, and when a `remediationTemplate` is empty or over-bound. `detailKeys` compilation rejects an undeclared key, a wrong scalar type, a non-scalar and an over-length value, and bounds a string key that arrived as **data** with no declared `maxLength`. All six `sourceOfId` buckets are pinned; `policyFor`'s pre-refactor output is pinned per prefix; both `policyForId` and `waitingFor` are asserted against literal maps, with `team-` ⇒ `waiting: "agent"` explicitly. The match evaluator implements exactly the D5 conjunction — all six terms discriminating in both directions — and no operator, negation, wildcard or nesting.
 
 - Integration: **required**
   - Scope: the publisher assembled over an in-memory Mongo double — accept path end to end, epoch resolution across the two indexed reads, open-condition map lifecycle, queue overflow and drain, `init()` fault postures, subscription reload; plus both capture points driven against a real `AgentRunner` hook set and a real `ToolBridge`.
@@ -143,7 +143,9 @@ Run from the child implementation worktree on Node 22 or 24 (CLAUDE.md: dev mode
 
 ### Harness Requirements
 
-- `src/ops/testing/fake-db.ts` — the in-memory Mongo double described under Integration above, plus (a) a `createIndex` that can be programmed to reject per call, (b) an `insertOne` that can be programmed to reject, and (c) a fully-throwing variant used to prove the match evaluator performs no I/O (AC5) and that a dead database cannot alter a turn (AC8).
+- `src/ops/testing/fake-db.ts` — the in-memory Mongo double described under Integration above, plus (a) a `createIndex` that can be programmed to reject per call, (b) an `insertOne` that can be programmed to reject, (c) a fully-throwing variant used to prove the match evaluator performs no I/O (AC5) and that a dead database cannot alter a turn (AC8), (d) `pause(collection, operation)` returning `{reached, release}` — AC9's only construction, (e) an `operations` log, the read-counting surface for AC9's "no epoch reads on a recovery" and AC5's "no database access", (f) `countDocuments`, and (g) `_id` minted with the **real** `new ObjectId()` and sorted with the same `String(...)` comparison `isMoreRecent` uses, since D8's tie-break depends on it. (d)–(g) all exist in `src/obligations/testing/fake-db.ts` (`:118`, `:73`/`:82`/`:156`, `:271`) — copy them; chunk 3 Task 4 Step 1 carries the citations.
+- `OpsPublisher.__drainForTests()` and `OpsPublisher.__openEntryForTests(family)` — the two test-only members chunk 3 defines. The first is the **drain barrier** every publish→assert boundary in chunks 3 and 5 awaits (enqueue is synchronous and fires `void this.drain()`, so ~40 acceptance assertions are otherwise racing the drainer); the second is the only read of an open-condition entry, which AC9's live-entry assertion needs.
+- `src/ops/capture-points.integration.test.ts` **exports** its Claude-lane and Lane B harnesses so `acceptance.integration.test.ts` can drive AC8/AC11/AC12 through the same construction rather than a second copy of a byte-comparison baseline.
 - No live MongoDB, no Slack token, no Anthropic API key for any test in this plan. `npm run check` needs the three Slack env stubs above (`reference_npm_check_env_stubs`).
 - The `PostToolUseFailure` probe (Task 5 Step 6) needs a working Anthropic **subscription** session — the repo's normal dev auth. It is a manual verification step, not a Vitest case, and it must not be added to CI.
 
@@ -156,7 +158,13 @@ Run from the child implementation worktree on Node 22 or 24 (CLAUDE.md: dev mode
 - Missing harness is not a skip reason; set it up (Task 4 Step 1) or report a concrete blocker.
 - If a test failure exposes an implementation issue, fix the implementation, not the test.
 - If testing exposes a spec or plan mismatch, demote the ticket to the spec lane rather than reinterpreting the spec here.
-- Negative-verify is required where the plan says so (AC4's pre-refactor pins, AC8's throwing publisher, AC9's `R1 · F · R2`): revert the source change, confirm the test fails, restore.
+- Negative-verify is required at four points, and **each names the mutation, the tests that must fail, and why the mutation crosses the boundary that test guards** — a mutation nobody has confirmed crosses a boundary is not evidence:
+  1. **AC4's pre-refactor pins** (chunk 1 Step 6) — `["sched:", "cron"]` → `["sched:", "callback"]`, failing the Step 1 table row, `outage-notices.test.ts:30` and `deadline-continuation.test.ts:94`. (Not `team-`→`worker`: both map to `silent`, so `policyFor` is unchanged and every pin stays green.)
+  2. **AC8's containment** (chunk 4 Step 5) — remove the `try` from `observeToolFailure`; the Lane B case fails.
+  3. **AC9's `R1 · F · R2`** (chunk 5 Step 3) — replace the drainer's `entry.openSeq === job.openSeq` identity test with a bare `this.open.has(family)`; three of the four assertions fail.
+  4. **AC13's boot order** (chunk 4 Step 6) — relocate the publisher block below `await bgTaskManager.scanOrphans();`, failing `(b)`. (Not "just below the boundary marker": `(b)` bounds against named surfaces, the earliest of which is `bgTaskManager.start()` at `:492`, so a block at `:474` still passes.)
+
+  Restore after each.
 
 ---
 

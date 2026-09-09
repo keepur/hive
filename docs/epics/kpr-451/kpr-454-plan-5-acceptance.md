@@ -2,7 +2,7 @@
 
 One task, one commit. Every criterion in the spec's "Conformance and acceptance criteria" section becomes a **named test**, not a paraphrase. Several of them specify exact scenarios that must be **driven** rather than asserted in prose — AC3's reject-vs-omit pinning, AC8's negative-verify with a throwing publisher, AC9's `R1 · F · R2` interleaving, AC13's boot-order anchors, AC15's outcome-published-never-inferred — and those are called out per case below.
 
-Some criteria are already covered by earlier tasks (AC4 by Task 1, AC12/AC11/AC8 partly by Task 5, AC13/AC14 by Task 6). Where that is so, this task adds the AC-numbered `describe` that **references** the existing case rather than duplicating it, so the suite reads as a complete map from criterion to test and a reviewer can check coverage in one file.
+Some criteria are already covered by earlier tasks (AC4 by Task 1, AC12/AC11/AC8 partly by Task 5, AC13/AC14 by Task 6). Where that is so, this task adds the AC-numbered `describe` that **references** the existing case rather than duplicating its specification — but a reference block still contains at least one real `it` that asserts here, driven through Task 5's exported harness. A `describe` whose body is prose is an empty suite, reports nothing, and round 1 found two of them (AC11 and AC12) plus one with no `it` at all (AC3's admit path).
 
 ---
 
@@ -10,8 +10,34 @@ Some criteria are already covered by earlier tasks (AC4 by Task 1, AC12/AC11/AC8
 
 **Files:**
 - Create: `src/ops/acceptance.integration.test.ts`
+- Modify: `src/ops/capture-points.integration.test.ts` — **export** the runner/scaffold harness Task 5 builds (see "The shared lane harness" below)
 
-Structure the file as sixteen `describe` blocks named `AC1 (C1, C4) — …` through `AC16 (C16) — …`, in order.
+Structure the file as sixteen `describe` blocks named `AC1 (C1, C4) — …` through `AC16 (C16) — …`, in order. Every one of the sixteen is a real `describe` containing at least one real `it`; where a criterion's mechanism lives in another file this block holds a **reference case** that asserts something here, never a bare comment.
+
+### Harness contract for this file — read before writing any case
+
+**1. The drain barrier. Every publish→assert boundary in this file is `await publisher.__drainForTests()`.** `observeToolFailure` / `observeToolSuccess` are synchronous void calls, `enqueue()` fires `void this.drain()`, and roughly forty assertions below publish and then immediately read Mongo. Without the barrier they are racing the drainer and this suite — the one that decides whether the other four chunks are verified — is intermittently green, which is strictly worse than red. `stop()` is **not** a usable barrier: it sets `stopping`, so any publish later in the same scenario is silently dropped. The method is defined in chunk 3, Task 4, Step 3, beside `__openEntryForTests`.
+
+**2. Open-condition entries are read with `publisher.__openEntryForTests(family)`.** `open` is private and `getSnapshot()` exposes only `openConditions: number`; this accessor (chunk 3, same step) is what makes AC9's live-entry assertion able to fail at all.
+
+**3. Holding the drainer is `fakeDb.pause(collection, operation)`** — the `{reached, release}` shape copied from `src/obligations/testing/fake-db.ts:118` (chunk 3 Step 1). `await handle.reached` blocks until the drainer is inside that operation; `handle.release()` lets it continue. AC9's `R1 · F · R2` has no other construction.
+
+**4. Counting reads is `fakeDb.operations`** — the log at `obligations/testing/fake-db.ts:73`, filtered by collection and operation name. Both "the resolver's read count is unchanged across the recovery" and "no database access at all" are assertions over this array, not over a spy.
+
+**5. The repository-scan idiom** (`globSync` from `tinyglobby`, `root = fileURLToPath(new URL("../..", import.meta.url))`, `readFileSync`) is stated once in **chunk 1, Task 1, Step 5**. Import it the same way there; both scans in this file (AC7, AC15) use it, and neither redefines `root`.
+
+**6. The shared lane harness.** AC8, AC11 and AC12 need a real `AgentRunner` hook set and a real `ToolBridge` — the harness Task 5 builds inside `src/ops/capture-points.integration.test.ts`, which currently exports nothing. **Task 5 must export it** (`export function buildClaudeLaneHarness(...)` / `export function buildLaneBHarness(...)`, or a single `export const laneHarness = {...}`), and this file imports it. A Vitest test file exporting helpers is ordinary; the alternative — reconstructing a byte-identical `RunResult` twice — is exactly the duplication that lets the two copies drift.
+
+**7. Two module-scope constants**, declared once at the top of the file rather than inside any `describe` — a `const` inside one `describe` is invisible to the others, and three of these blocks are in different `describe`s:
+
+```typescript
+const root = fileURLToPath(new URL("../..", import.meta.url));   // chunk 1 Step 5's idiom
+const opsSources = globSync("src/ops/**/*.ts", { cwd: root })    // the src/ops non-test sources
+  .filter((f) => !f.endsWith(".test.ts"))
+  .map((f) => readFileSync(`${root}/${f}`, "utf8"));
+```
+
+`opsSources` is read by AC2 (`ops_notifications`), AC7 (turn-spawn) and AC15 (`costUsd` / `tool_response` / `durationMs`).
 
 - [ ] **Step 1:** AC1–AC3 — the envelope, the zero-match fact, and reject-versus-omit.
 
@@ -35,11 +61,26 @@ it("stores exactly D9's key set and nothing else", async () => {
   }
 });
 
-it("stamps class and retry from the registry row, and the observe API cannot supply them", () => {
-  // Structural half of C4: OpsPublishInput has no `class`/`retry` field.
-  // Assert at the type level via a compile-time expectTypeOf, and at runtime
-  // by publishing with an input object carrying a stray `class` and asserting
-  // the stored value equals the ROW's, not the input's.
+it("stamps class and retry from the registry row, and the observe API cannot supply them", async () => {
+  // ⚠ NO `expectTypeOf`. A type assertion inside a `.test.ts` is INERT in
+  // this repo: tsconfig.json excludes `src/**/*.test.ts` from `tsc --noEmit`
+  // and vitest.config.ts enables no typecheck mode, so nothing in
+  // `npm run check` ever evaluates it. It would read as a compile-time proof
+  // and be worth exactly nothing. The runtime assertion below is the real
+  // one, and it holds because chunk 3 builds `doc` field by field: a stray
+  // `class` on the input has no path into the document.
+  //
+  // Both this case and AC3's non-scalar `{a:1}` detail value need a cast to
+  // construct at all — `OpsPublishInput` has no `class` and `OpsDetail` is
+  // `Record<string, string|number|boolean>` — so write
+  // `publisher.enqueueFailure({ ...good, class: "integrity" } as unknown as OpsPublishInput)`.
+  // The cast is the point: it demonstrates that a caller has to reach past
+  // the type to even attempt this, which IS C4's structural half.
+  publisher.enqueueFailure({ ...validInput, class: "integrity" } as unknown as OpsPublishInput);
+  await publisher.__drainForTests();
+  const doc = await db.collection("ops_events").findOne({});
+  expect(doc!.class).toBe("resource");   // the tool-failed ROW's value
+  expect(doc!.retry).toBe("transient");  // ditto
 });
 
 it("carries clears/clearsFamily on a tool-recovered and neither on a tool-failed", () => { /* … */ });
@@ -57,13 +98,45 @@ it("pins evidence CONTENTS, not merely its presence (D6)", () => {
 **AC2 (C2, C3) — zero-match is a fact.**
 
 ```typescript
-it("with ops_subscriptions empty, stores exactly one document with matchedSubscriptions: 0", async () => { /* … */ });
-it("the zero-match document is byte-identical in SHAPE to a matched one", async () => {
-  // Publish once with no subscriptions and once with one matching row;
-  // compare Object.keys() and every field except matchedSubscription*.
+it("with ops_subscriptions empty, stores one document with matchedSubscriptions: 0 AND matchedSubscriptionIds: []", async () => {
+  // BOTH fields. AC2 names the empty array as well as the zero, and the
+  // count is derived from the array's length — so asserting only the count
+  // leaves the field AC2 actually cares about unpinned.
+  await publishOneFailure();
+  await publisher.__drainForTests();
+  const doc = await db.collection("ops_events").findOne({});
+  expect(doc!.matchedSubscriptions).toBe(0);
+  expect(doc!.matchedSubscriptionIds).toEqual([]);
 });
+
+it("the zero-match document is identical in SHAPE to a matched one", async () => {
+  // Publish once with no subscriptions and once with one matching row.
+  // Compare Object.keys(), then every field EXCEPT the named exclusions —
+  // `_id` (minted per insert), `publishedAt` (a fresh Date per insert),
+  // `generation` and `dedupeKey` (the second publish may sit in a later
+  // epoch) and `matchedSubscriptions`/`matchedSubscriptionIds` (the variable
+  // under test). "Every field except matchedSubscription*" as literally
+  // written cannot pass; naming the exclusions is what makes this runnable.
+  const SKIP = new Set(["_id", "publishedAt", "generation", "dedupeKey",
+                        "matchedSubscriptions", "matchedSubscriptionIds"]);
+  expect(Object.keys(zeroDoc).sort()).toEqual(Object.keys(matchedDoc).sort());
+  for (const k of Object.keys(zeroDoc)) {
+    if (SKIP.has(k)) continue;
+    expect(zeroDoc[k], k).toEqual(matchedDoc[k]);
+  }
+});
+
 it("writes no ledger row and creates no catch-all subscription on any code path", async () => {
-  expect(await db.listCollections()).not.toContain("ops_notifications");
+  // `db.listCollections()` returns a CURSOR on the real driver and is not in
+  // the fake's surface, so the earlier `expect(await db.listCollections())
+  // .not.toContain(...)` could not run. Two assertions that can:
+  //  (a) the fake's own collection map — nothing outside the three this
+  //      producer owns was ever touched;
+  expect([...fakeDb.collections.keys()].sort()).toEqual(["ops_events", "ops_reasons", "ops_subscriptions"]);
+  //  (b) a source scan proving this diff contains no such collection name at
+  //      all. This is the durable half: it survives a refactor that stops
+  //      exercising a code path in this test.
+  for (const s of opsSources) expect(s).not.toContain("ops_notifications");
   expect(await db.collection("ops_subscriptions").countDocuments({})).toBe(0);
 });
 ```
@@ -122,18 +195,94 @@ describe("AC3 (C5) — the OMIT path, pinned against the reject path", () => {
 
 describe("AC3 (C5) — the ADMIT path, on the same footing", () => {
   // The omit path is only correct if the population it excludes is the
-  // population D6 enumerates. One case per shape in D6's two tables, driven
-  // through the bound and asserted admissible — with imessage:<apple-id-email>
-  // and sms:<line>:+1555… named explicitly, since `@` and `+` each carry a
-  // single shape and are therefore the two a later tightening drops first.
-  // (The table itself is unit-tested in src/ops/ids.test.ts; this block
-  // asserts the same population survives END TO END into detail.threadId.)
+  // population D6 enumerates, so this block is an `it.each` over the case
+  // table, NOT prose. Round 1 found it as a `describe` with no `it` at all —
+  // an empty suite naming two shapes and leaving the other ~26 to be
+  // re-derived from the design at the keyboard, which is precisely the
+  // sweep-versus-rule failure D6 spent four spec-review rounds eliminating.
+  //
+  // src/ops/ids.test.ts pins the BOUND over this same population. This block
+  // pins that the population survives END TO END into detail.threadId /
+  // detail.workItemId, driven through the ws/app-shaped WorkItemContext
+  // construction at agent-manager.ts:1951-1958.
+
+  // D6 table 1 — work-item id shapes. `admissible: false` rows are the two
+  // deliberate sched:/scheduler: exclusions, asserted here so the tables stay
+  // one population rather than two lists.
+  const WORK_ITEM_IDS: ReadonlyArray<[label: string, id: string, admissible: boolean]> = [
+    ["slack ts", "1725465600.123456", true],
+    ["imessage row", "imsg-4471", true],
+    ["quo message id", "MSG_01HQ8Z9", true],
+    ["randomUUID (ws/voice fallback)", "3f2a1b7c-9d4e-4f8a-bc12-0e5d6a7b8c9d", true],
+    ["callback", "callback:65a1b2c3d4e5f60718293a4b", true],
+    ["event", "event:65a1b2c3d4e5f60718293a4b:agent-a", true],
+    ["team", "team-65a1b2c3d4e5f60718293a4b", true],
+    ["worker", "worker:65a1b2c3d4e5f60718293a4b", true],
+    ["meeting", "meeting:bot_9912:1725465600000", true],
+    ["code-task completion", "ct:65a1b2:done:1725465600000", true],
+    ["bg-task completion", "bg:65a1b2:done:1725465600000", true],
+    ["first boot", "system:first-boot:1725465600000", true],
+    ["reflection (inherits its thread's verdict)", "reflection-slack:C123:1725465600.1-172546560000", true],
+    ["KPR-402 continuation leg (inherits its base id's verdict)", "1725465600.123456#dl1", true],
+    ["voice callId (Vapi-shaped)", "call_01HQ8Z9", true],
+    ["sched: with a multi-word cron label", "sched:mokie:daily digest:1725465600000", false],
+    ["scheduler: with the same label", "scheduler:mokie:daily digest:1725465600000", false],
+  ];
+
+  // D6 table 2 — threadId shapes. The two rows carrying the charset's
+  // single-shape characters are marked, since `@` and `+` are what a later
+  // tightening drops first.
+  const THREAD_IDS: ReadonlyArray<[label: string, id: string, admissible: boolean]> = [
+    ["slack", "slack:C0123ABCD:1725465600.123456", true],
+    ["sms — THE `+` SHAPE", "sms:PN_9912:+15551234567", true],
+    ["imessage, Apple ID — THE `@` SHAPE", "imessage:someone@icloud.com", true],
+    ["imessage, SMS service", "imessage:+15551234567", true],
+    ["app/ws device", "app:device-9912", true],
+    ["ws team channel", "team:C0123ABCD", true],
+    ["voice", "voice:call_01HQ8Z9", true],
+    ["scheduler internal (inherits the embedded threadId)", "internal:C0123ABCD:slack:C1:1725465600.1", true],
+    ["event delivery", "event:65a1b2:agent-a:1725465600000", true],
+    ["first boot", "first-boot:1725465600000", true],
+    ["scheduler: with a multi-word cron label", "scheduler:mokie:daily digest:1725465600000", false],
+  ];
+
+  it.each(WORK_ITEM_IDS)("workItemId end to end: %s", async (_label, id, admissible) => {
+    await failOnTurnWith({ workItemId: id, threadId: "slack:C1:1.1" });
+    await publisher.__drainForTests();
+    const doc = await db.collection("ops_events").findOne({});
+    if (admissible) {
+      expect(doc!.detail.workItemId).toBe(id);
+      expect(doc!.evidence).toEqual([{ kind: "workItem", id }]);
+    } else {
+      expect(doc!.detail).not.toHaveProperty("workItemId");
+      expect(doc!.evidence).toEqual([]);
+    }
+    expect(publisher.getSnapshot().rejected).toBe(0); // omit is never reject
+  });
+
+  it.each(THREAD_IDS)("threadId end to end: %s", async (_label, id, admissible) => {
+    await failOnTurnWith({ workItemId: "1725465600.123456", threadId: id });
+    await publisher.__drainForTests();
+    const doc = await db.collection("ops_events").findOne({});
+    if (admissible) expect(doc!.detail.threadId).toBe(id);
+    else expect(doc!.detail).not.toHaveProperty("threadId");
+    expect(publisher.getSnapshot().rejected).toBe(0);
+  });
 });
 ```
 
+The two tables above are the plan's copy of D6's; if the design's tables and these ever disagree, the design wins and this file is corrected — do not amend D6 from here.
+
 - [ ] **Step 2:** AC4–AC7.
 
-**AC4 (C6)** — reference `src/outage/outage-notices.test.ts` and `src/ops/single-prefix-predicate.test.ts` (Task 1); add one end-to-end case asserting a published event's `waiting` equals `waitingFor(workItem.id)` for each of the six buckets.
+**AC4 (C6)** — reference `src/outage/outage-notices.test.ts` and `src/ops/single-prefix-predicate.test.ts` (Task 1); add one end-to-end case per bucket. **Assert the six LITERAL values, not `waitingFor(workItem.id)`** — the producer calls `waitingFor`, so comparing against it is a tautology that would pass even if both sides were wrong. Copy the literals from chunk 1's `WAITING` map:
+
+```typescript
+it.each([
+  ["sched:a:b:1", "nobody"], ["callback:65a1", "nobody"], ["event:65a1:agent-a", "nobody"],
+  ["team-65a1", "agent"], ["worker:65a1", "nobody"], ["1725465600.123456", "human-now"],
+])("a failure on a %s turn publishes waiting: %s", async (id, expected) => { /* … */ });
+```
 
 **AC5 (C7, and C17's no-I/O clause).**
 
@@ -141,15 +290,19 @@ describe("AC3 (C5) — the ADMIT path, on the same footing", () => {
 it("implements exactly the D5 grammar", () => { /* references src/ops/match.test.ts; adds an end-to-end match */ });
 
 it("match evaluation performs NO I/O", async () => {
-  // C17's other half, PINNED rather than asserted in prose: load a
-  // subscription set into the publisher, then swap the Db handle for the
-  // throwing variant, and evaluate. The match must return its result with the
-  // handle untouched.
+  // C17's other half, PINNED rather than asserted in prose. ⚠ "Swap the Db
+  // handle for the throwing variant" is not constructible: OpsPublisher
+  // builds its OpsStore in the constructor and exposes no handle swap. The
+  // workable shape is a FakeDb whose collections are armed to throw on any
+  // access after init() has loaded the subscription set — then publish, and
+  // assert from the `operations` log that the handle was untouched during
+  // evaluation. Two assertions, one behavioural and one structural:
   //
-  // Practical shape: call the exported evaluateMatches directly with the
-  // loaded set — it takes no Db — AND assert structurally that match.ts
-  // imports nothing from mongodb or from ./store.js:
-  const source = readFileSync(new URL("./match.ts", import.meta.url), "utf8");
+  //  (a) with the armed fake, `evaluateMatches(draft, loadedSubscriptions)`
+  //      returns its result and `fakeDb.operations` gains no entry;
+  //  (b) match.ts imports nothing from mongodb or from ./store.js — the
+  //      durable half, which survives a refactor that stops exercising (a).
+  const source = readFileSync(`${root}/src/ops/match.ts`, "utf8");
   expect(source).not.toMatch(/from "mongodb"|from "\.\/store\.js"/);
 });
 
@@ -186,15 +339,22 @@ it("stores no tool_input, tool_response, raw Error, stack, URL or path", async (
 **AC7 (C14) — the ops path publishes nothing about itself.**
 
 ```typescript
-it("a publish fault, rejection or overflow produces a log line and a counter and NO document", async () => { /* … */ });
+it("a publish fault, rejection or overflow produces a log line and a counter and NO document", async () => {
+  // The log line needs a capture mechanism, and the repo has one precedent:
+  // `vi.mock("../logging/logger.js", …)` returning a `createLogger` whose
+  // methods are `vi.fn()`s — dispatcher.test.ts:23 and siblings. Use that
+  // rather than spying on console. Assert the counter AND
+  // `countDocuments({}) === 0` for each of the three; the counter alone
+  // cannot distinguish "not published" from "published then miscounted".
+});
+
 it("no code path in this diff spawns a turn", () => {
-  // Structural scan over src/ops/**: no runWorkItemTurn, no spawnTurn, no
-  // dispatch(, no agentManager import.
-  for (const file of globSync("src/ops/**/*.ts", { cwd: root })) {
-    if (file.endsWith(".test.ts")) continue;
-    const s = readFileSync(`${root}/${file}`, "utf8");
+  // `opsSources` is MODULE-scoped (harness contract item 7), not declared
+  // here: AC2's scan is in an earlier describe and would not see a const
+  // declared inside this one.
+  for (const s of opsSources) {
     for (const forbidden of ["runWorkItemTurn", "spawnTurn", "agent-manager", "dispatcher"]) {
-      expect(s, `${file} references ${forbidden}`).not.toContain(forbidden);
+      expect(s, `an src/ops source references ${forbidden}`).not.toContain(forbidden);
     }
   }
 });
@@ -202,7 +362,7 @@ it("no code path in this diff spawns a turn", () => {
 
 - [ ] **Step 3:** AC8–AC10 — containment, the epoch rule, and clearing legality. These three carry the driven scenarios.
 
-**AC8 (C15) — negative-verify, both faults, both lanes.**
+**AC8 (C15) — negative-verify, both faults, both lanes.** Driven here through the harness Task 5 exports (harness contract item 6) — `import { buildClaudeLaneHarness, buildLaneBHarness } from "./capture-points.integration.test.js"`. Do not rebuild a `RunResult` fixture in this file: two copies of a byte-comparison baseline drift, and the drift is invisible because both sides move together.
 
 ```typescript
 it("a throwing publisher leaves a Claude-lane RunResult byte-identical", async () => { /* … */ });
@@ -224,8 +384,14 @@ it("a repeated identical failure leaves generation unchanged and appends a secon
 
 it("failure -> success -> failure advances generation by exactly one, with exactly one tool-recovered between", async () => {
   // The recovery carries waiting:"nobody" and generation:0 and does NOT run
-  // the epoch resolver (D9 step 5) — assert the resolver's read count is
-  // unchanged across the recovery.
+  // the epoch resolver (D9 step 5). Read count, from the fake's `operations`
+  // log (harness contract item 4) — a spy on `findOne` would work too, but
+  // the log is already there and is what the other read assertions use:
+  const reads = () => fakeDb.operations.filter((o) => o.collection === "ops_events" && o.operation === "findOne").length;
+  const before = reads();
+  await driveSuccess("Bash");
+  await publisher.__drainForTests();
+  expect(reads()).toBe(before); // the recovery ran ZERO epoch reads
 });
 
 it("two successive recoveries share a dedupeKey, and a third failure's generation is unaffected by how many preceded it", async () => { /* … */ });
@@ -233,9 +399,7 @@ it("two successive recoveries share a dedupeKey, and a third failure's generatio
 it("a burst of N successes before the recovery drains yields one tool-recovered and N-1 recoveryCoalesced", async () => { /* … */ });
 
 it("R1 · F · R2 — the superseded recovery is dropped, not published", async () => {
-  // D8's EXACT interleaving. Drive it by holding the drainer: enqueue R1 from
-  // a success whose map read happened first, then F, then R2 carrying the
-  // stale openSeq, and release.
+  // D8's EXACT interleaving.
   //
   //   queue:  R1{clears:K0, openSeq:7}   F3   R2{clears:K0, openSeq:7}
   //   drain:  R1 -> accept; clearing fact for K0; entry removed
@@ -243,21 +407,51 @@ it("R1 · F · R2 — the superseded recovery is dropped, not published", async 
   //                 entry CREATED at openSeq 8, dedupeKey K1
   //           R2 -> entry.openSeq (8) !== job.openSeq (7) -> DROP
   //
+  // CONSTRUCTION — the mechanism, not "hold the drainer" in prose. Both
+  // recovery jobs must be minted while the entry still carries openSeq 7, and
+  // the drainer must not reach R2 until F3 has re-opened the family. Use the
+  // fake's pause (harness contract item 3):
+  //
+  //   const gate = fakeDb.pause("ops_events", "insertOne");   // stall inside R1's accept
+  //   driveSuccess("Bash");            // R1 minted at openSeq 7, enqueued
+  //   driveSuccess("Bash");            // R2 minted at openSeq 7 — the map still holds it
+  //   await gate.reached;              // drainer is inside R1's insert
+  //   driveFailure("Bash");            // F3 queued BEHIND R2… so instead:
+  //
+  // ⚠ The queue is FIFO and the drainer serial, so R2 must be enqueued AFTER
+  // F3 to reproduce D8's order while still carrying openSeq 7. The workable
+  // sequence: drain R1 fully (entry removed), drain F3 fully (entry recreated
+  // at openSeq 8), then enqueue R2 directly with the STALE openSeq 7 via
+  // `publisher.enqueueRecoveryIfOpen`'s job shape — i.e. capture the job R2
+  // would have been by calling `driveSuccess` while the pause holds F3's
+  // insert, so R2's map read sees openSeq 7 and its drain sees openSeq 8.
+  // Whichever shape the implementer lands on, the invariant to reproduce is
+  // exactly: a queued recovery job whose `openSeq` is 7 drained against a map
+  // entry whose `openSeq` is 8. State the achieved sequence in a comment.
+  //
   // Four assertions, one per harm the identity check prevents:
   expect(clearingFactsNaming("K0")).toHaveLength(1);      // not two; no second clearing fact for the dead key
   expect(publisher.getSnapshot().recoverySuperseded).toBe(1);
-  expect(openEntryFor(family)?.openSeq).toBe(8);          // the LIVE entry survives the drop
-  // a following plain repeat leaves generation unchanged (no C18 flood)
-  // the next success on that tool STILL enqueues a recovery (no permanent silence)
+  expect(publisher.__openEntryForTests(family)?.openSeq).toBe(8); // the LIVE entry survives the drop
+  // a following plain repeat leaves generation unchanged (no C18 flood);
+  // and the next success on that tool STILL enqueues a recovery whose
+  // `clears` is K1, not K0 (no permanent silence) — assert both, since the
+  // second is the behavioural restatement of the openSeq assertion above and
+  // holds even if the accessor is ever removed.
 });
 
 it("a recovery job whose publish faults leaves the family open, so the next success re-enqueues", async () => { /* … */ });
 
 it("a success with no open condition performs no database access at all", async () => {
-  // Against the throwing-db variant.
+  // Two forms, and both are worth having: against the throwing-db variant
+  // (nothing throws ⇒ nothing was touched), and against the COUNTING fake
+  // (`fakeDb.operations.length` unchanged across the success ⇒ nothing was
+  // touched, and this one localises the failure if it ever regresses).
 });
 ```
-Negative-verify (required): change the drainer's identity test to a bare `this.open.has(job.family)` and confirm the `R1 · F · R2` case fails on at least the `recoverySuperseded` and surviving-entry assertions. Restore.
+**Negative-verify (required):** change the drainer's identity test from `entry.openSeq !== job.openSeq` to a bare `this.open.has(job.family)` membership test and confirm the `R1 · F · R2` case fails. Restore.
+
+*Why it crosses the boundary:* under membership, R2 finds the family present (the entry F3 created at openSeq 8), so it proceeds to `accept()` — `recoverySuperseded` stays 0 instead of 1, a **second** clearing fact naming the dead key K0 is inserted, and `this.open.delete(family)` removes the **live** entry, so `__openEntryForTests(family)` returns `undefined` instead of `{openSeq: 8}`. Three of the four assertions above fail, including both the ones this verify exists to protect. (This is the mutation chunk 3's Step 6 cross-references as living here.)
 
 **AC10 (C19) — clearing provenance.**
 
@@ -275,9 +469,31 @@ it("the boot gate refuses to leave tool-failed enabled if no registered row clea
 
 - [ ] **Step 4:** AC11–AC16.
 
-**AC11 (lane parity)** — references Task 5's case; add the long-name variant explicitly (a name past the Lane B sanitization threshold must still yield the canonical `subject.id` on both lanes).
+**AC11 (lane parity)** — Task 5 already specifies the mechanism case **including** the `applyNameAndCapEdges` truncation variant (chunk 4, Step 5), so this block does not re-specify it. It carries one real `it` that imports Task 5's exported harness and asserts the criterion here, so the sixteen-`describe` map is complete:
 
-**AC12 (abort discipline)** — references Task 5's cases; assert here that own-abort publishes nothing **on either lane**, a foreign interrupt publishes `errorSig: "interrupted"`, and a guardrail deny publishes nothing.
+```typescript
+it("AC11 — the same tool name yields one subject.id on both lanes, long names included", async () => {
+  // Same underlying tool driven through buildClaudeLaneHarness and
+  // buildLaneBHarness, including a name long enough to trigger Lane B's
+  // applyNameAndCapEdges truncation. Assert the two stored docs' subject.id
+  // are equal AND equal to the canonical pre-sanitization name.
+});
+```
+
+**AC12 (abort discipline)** — same shape: three real `it`s here, driven through the exported harness, not prose references.
+
+```typescript
+it("AC12 — own-abort publishes nothing on EITHER lane", async () => { /* wasAborted; opts.signal.aborted */ });
+it("AC12 — a foreign interrupt publishes errorSig: \"interrupted\"", async () => { /* is_interrupt, runner not aborted */ });
+it("AC12 — a guardrail deny publishes nothing", async () => {
+  // Lane B's {behavior:"deny"} returns before t0, so this half is provable
+  // today. The CLAUDE-LANE deny is class 6 of Task 5 Step 6's probe and is
+  // UNVERIFIED until that probe runs: if PostToolUseFailure fires for a
+  // PreToolUse-denied call, this case must be extended to the Claude lane and
+  // the matcher gains the deny-suppression Task 5 Step 6 specifies. Record
+  // the probe's outcome here in a comment when it is run.
+});
+```
 
 **AC13 (boot order, boot survival, hook placement)** — references `src/boot-order.test.ts` (Task 6) for the three lists and the no-`.start(` case; adds here:
 
@@ -285,22 +501,40 @@ it("the boot gate refuses to leave tool-failed enabled if no registered row clea
 it("with the publisher unset, both capture points are no-ops and no turn is affected", async () => { /* … */ });
 it("an init() whose every createIndex rejects still yields a wired, publishing publisher", async () => { /* … */ });
 it("an init() whose registry upsert rejects throws, so index.ts leaves the publisher unset", async () => { /* … */ });
-it("a thrown archetype build still leaves both observers registered", () => { /* references Task 5 */ });
-it("a thrown observer registration still leaves the fail-closed deny-all matcher installed", () => { /* … */ });
+it("a thrown archetype build still leaves both observers registered", () => { /* references Task 5's real drive */ });
+it("both observer registrations occur AFTER the archetype try/catch closes", () => {
+  // The second direction of AC13's hook placement, asserted STRUCTURALLY —
+  // chunk 4, Task 5, Step 5 states why: registration is straight-line
+  // assignment of two array literals and cannot throw, and a vi.mock factory
+  // throw kills the module import (taking AgentRunner with it), so no runtime
+  // drive can observe the deny-all matcher surviving. Extract buildHooks's
+  // body from src/agents/agent-runner.ts and assert the index of
+  // `hooks.PostToolUseFailure =` and of `hooks.PostToolUse =` each exceed the
+  // index of the archetype try/catch's closing brace. Fails the moment either
+  // assignment moves inside the try — which is the property, stated as
+  // something the test can actually see.
+});
 ```
 
 **AC14 (documentation)** — a text assertion over `CLAUDE.md`, so the doc cannot silently drift out:
 
 ```typescript
-it("CLAUDE.md's engine-written collections list names all three collections", () => {
-  const md = readFileSync(new URL("../../CLAUDE.md", import.meta.url), "utf8");
+it("CLAUDE.md documents all three collections with their key, index and TTL posture", () => {
+  const md = readFileSync(`${root}/CLAUDE.md`, "utf8");
   for (const name of ["ops_events", "ops_subscriptions", "ops_reasons"]) {
     expect(md).toContain(name);
   }
-  // and NOT ops_notifications — that is KPR-468's, per D12's boot-order split.
-  expect(md).not.toContain("ops_notifications");
+  // AC14 says "each with its key, index and TTL posture", and name-presence
+  // alone leaves exactly the part that drifts unpinned. These three phrases
+  // come from chunk 4, Task 6, Step 5's text and are the assertable core of
+  // that clause:
+  expect(md).toContain("producer:subjectKind:subjectId:reasonId:generation"); // the dedupeKey shape
+  expect(md).toContain("must be single-field");                               // why cursor and TTL are two indexes
+  expect(md).toContain("$setOnInsert");                                       // the kill switch's mechanism
 });
 ```
+
+⚠ **The earlier `expect(md).not.toContain("ops_notifications")` clause is DROPPED, and must not be reinstated.** `ops_notifications` is **KPR-468's collection**, a sibling in this same epic, and KPR-468 will document it in this same `CLAUDE.md` — at which point that assertion fails for a correct change. A test in this ticket must not forbid another ticket's legitimate edit. The real invariant it was reaching for — *this diff creates no such collection* — is asserted where it belongs and where it stays true: the `src/ops/**` source scan in AC2 above.
 
 **AC15 (C12) — outcome is published, never inferred.**
 
@@ -314,13 +548,31 @@ it("a successful tool call publishes no tool-failed regardless of duration or tu
 it("PostToolUse publishes only tool-recovered, and only when the map holds an open condition", async () => { /* … */ });
 
 it("no code path in this diff reads costUsd, a duration threshold, or a tool_response to decide failure", () => {
-  // Structural, over src/ops/**/*.ts plus the two capture-point hunks:
   for (const s of opsSources) {
     expect(s).not.toContain("costUsd");
     expect(s).not.toContain("tool_response");
   }
-  // durationMs is READ (it is a declared detail key) but never COMPARED —
-  // assert no relational operator appears against it in src/ops/**.
+
+  // THE TWO CAPTURE-POINT HUNKS, which the AC and this case's own title both
+  // name and which `opsSources` does not cover. They are the only places an
+  // inference could plausibly be written, so leaving them unscanned scans the
+  // wrong files. Scanning whole modules is not an option — `agent-runner.ts`
+  // and `tool-bridge.ts` both legitimately mention `costUsd` and
+  // `tool_response` elsewhere — so bound each hunk by its own anchor comment.
+  // Both hunks open with a `// ── KPR-454` / `// KPR-454 D3` marker (chunk 4,
+  // Steps 1 and 4); extract from that marker to the end of the enclosing
+  // block and scan only that slice:
+  for (const hunk of [extractHunk("src/agents/agent-runner.ts", "KPR-454 D2: runtime tool-failure observation"),
+                      extractHunk("src/agents/provider-adapters/tool-bridge.ts", "KPR-454 D3, the failure half")]) {
+    expect(hunk).not.toContain("costUsd");
+    expect(hunk).not.toContain("tool_response");
+  }
+
+  // `durationMs` is READ (a declared detail key) but never COMPARED. The
+  // regex, named rather than described: any relational or equality operator
+  // with durationMs on either side, allowing whitespace.
+  const COMPARED = /(durationMs\s*(<|>|<=|>=|===|!==|==|!=)|(<|>|<=|>=|===|!==|==|!=)\s*[A-Za-z0-9_.]*durationMs)/;
+  for (const s of opsSources) expect(s).not.toMatch(COMPARED);
 });
 
 it("activity_log is neither read nor written here", () => {
@@ -339,9 +591,14 @@ it("a second reason and a second producer publish through the same accept path",
     class: "informational", retry: "transient", remediationTemplate: "none",
     detailKeys: [{ key: "thing", type: "string", maxLength: 40 }], enabled: true,
   });
+  // ⚠ Deliberately a DIFFERENT class and retry from the row above and from
+  // hive-runtime's own. If both foreign rows were informational/transient,
+  // "stamped with ITS OWN row's class/retry" would be asserted only against
+  // tool-failed, and a publisher that stamped every event from the FIRST
+  // loaded row would still pass. Differing values make a mis-stamp fail loudly.
   await db.collection("ops_reasons").insertOne({
     _id: "florist:bloom-stalled", producer: "florist", reasonId: "bloom-stalled",
-    class: "informational", retry: "transient", remediationTemplate: "check {stage}",
+    class: "judgment", retry: "deterministic", remediationTemplate: "check {stage}",
     detailKeys: [{ key: "stage", type: "string", maxLength: 40 }], enabled: true,
   });
   await publisher.init();
@@ -358,6 +615,10 @@ it("producer and reasonId are validated by the D2 pattern bound, never against a
   for (const f of validators) {
     expect(readFileSync(`${root}/${f}`, "utf8"), `${f} hardcodes a producer`).not.toContain("hive-runtime");
   }
+  // Note the exception this list encodes: `publisher.ts` IMPORTS
+  // HIVE_RUNTIME_REASONS (for the boot upsert and the constructor gate) but
+  // must never contain the literal string — that is the difference between
+  // registering this producer's rows and special-casing them.
 });
 
 it("a subscriber is added by inserting a row and waiting one reload", async () => {

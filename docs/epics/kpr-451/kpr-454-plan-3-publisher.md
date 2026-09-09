@@ -21,13 +21,20 @@ Read D8 in full before writing `drain()`. Three things in it are decided against
 Requirements (the Testing Contract's Harness Requirements, restated as an interface):
 
 - Collections keyed by name; documents held in insertion order in an array.
-- `insertOne(doc)` — mints a client-side `ObjectId` if `_id` is absent (this matters: D8's `(publishedAt, _id)` tie-break rests on the driver's per-process incrementing counter, so the double must mint monotonically-increasing ids in insertion order, exactly as the real driver does).
+- `insertOne(doc)` — mints an `_id` if absent (see the fourth bullet below: it must be a real `ObjectId`).
 - `findOne(filter, { sort })` — supports equality on nested paths (`"subject.kind"`), and `sort` on `{ publishedAt: -1, _id: -1 }`.
 - `find(filter).sort(s).limit(n).toArray()`.
 - `updateOne(filter, { $set, $setOnInsert }, { upsert })`.
 - `createIndex(spec, options)` — resolves by default; programmable to reject with a supplied error (needed for the TTL-conflict and index-fault cases).
 - A `failNext` / `failAll` switch per operation, so an insert fault, a read fault and a registry-upsert fault are each drivable independently.
 - A **fully-throwing** variant, `throwingDb()`, whose every property access throws — used to prove the match evaluator performs no I/O (AC5) and that a dead database cannot alter a turn (AC8).
+
+Four further capabilities chunk 5 depends on and the list above did not promise. **All four already exist in `src/obligations/testing/fake-db.ts` — copy, do not invent**; line numbers so the implementer reads the working version first:
+
+- **`pause(collection, operation, when?, after?) → { reached: Promise<void>; release(): void }`** (`:118`). AC9's `R1 · F · R2` has no other way to hold the drainer at a known point and release it; without it an implementer substitutes a call-order mock, which cannot observe the map at all.
+- **An `operations` log** — `readonly operations: Array<{collection, operation, context}>` (`:73`), pushed on every call (`:82`), filterable (`:156`). The read-counting surface behind chunk 5's "the resolver's read count is unchanged across the recovery" and "a success with no open condition performs no database access", **and** behind chunk 2's deferred call-order assertion on `upsertReasons`.
+- **`countDocuments(filter)`** (`:271`) — used throughout chunk 5 in place of `find().toArray().length`.
+- **`_id` minted with the real `new ObjectId()`**, the double's `sort` using the **same `String(...)` comparison `isMoreRecent` uses**. ⚠ Load-bearing, not hygiene: D8's `(publishedAt, _id)` tie-break rests on the driver's per-process incrementing counter, and a double minting `"1"…"10"` inverts lexicographically at n ≥ 10 — so the tie-break test would pass or fail for a reason unrelated to the resolver.
 
 Follow `src/obligations/testing/fake-db.ts` and `src/db/db-identity.integration.test.ts` for conventions; do not introduce a new mocking library.
 
@@ -44,7 +51,7 @@ import {
   type OpsReason,
   type OpsSubscription,
 } from "./types.js";
-import { assertReasonTableLegal, compileDetailSchema } from "./reasons.js";
+import { compileDetailSchema } from "./reasons.js";
 import type { z } from "zod";
 
 const log = createLogger("ops-store");
@@ -151,7 +158,13 @@ export class OpsStore {
    * actually a Mongo outage.
    */
   async upsertReasons(rows: readonly OpsReason[]): Promise<void> {
-    assertReasonTableLegal(rows); // pure precondition, no I/O — throws only in development
+    // ⚠ `assertReasonTableLegal` is deliberately NOT called here. It runs in
+    // the OpsPublisher CONSTRUCTOR, which chunk 4 executes OUTSIDE its
+    // `try { await opsPublisher.init() } catch`. Called from here it would sit
+    // inside that catch, and D10's one loud failure mode would degrade to the
+    // warn-and-unset posture of a Mongo outage — an unclearable-reason table,
+    // a development defect, indistinguishable in the log from a database blip.
+    // D5: the gate is "untouched by D10's rule that init()'s I/O is non-fatal".
     for (const row of rows) {
       const { enabled, ...rest } = row;
       await this.reasons.updateOne(
@@ -194,7 +207,7 @@ import type { Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import { OpsStore, type LoadedReason } from "./store.js";
 import { evaluateMatches } from "./match.js";
-import { HIVE_RUNTIME_REASONS } from "./reasons.js";
+import { assertReasonTableLegal, HIVE_RUNTIME_REASONS } from "./reasons.js";
 import {
   OPS_SCHEMA_VERSION,
   type OpsEvent,
@@ -216,9 +229,11 @@ const log = createLogger("ops-publisher");
  * D8. One entry per DISTINCT FAILING TOOL, so the key space is bounded by the
  * installed tool inventory (low hundreds on a maximal hive), not by traffic.
  * 2000 is ~5x that ceiling: eviction is unreachable in normal operation and
- * this is a leak bound rather than an operating limit. ~150 bytes/entry ⇒
- * ~300 KB at full cap. Breach evicts oldest-first and costs one delayed epoch
- * boundary — the restart residual's exact shape and bound.
+ * this is a leak bound rather than an operating limit. Roughly 250-350 bytes
+ * per entry once the family-string key and the V8 Map overhead are counted,
+ * so ~600 KB at full cap — immaterial to the choice either way. Breach evicts
+ * oldest-first and costs one delayed epoch boundary — the restart residual's
+ * exact shape and bound.
  */
 const OPEN_CONDITION_MAP_CAP = 2000;
 /**
@@ -239,7 +254,10 @@ const SHUTDOWN_DRAIN_MS = 2000;
 /** D9: stated AND delegated by the spec; adopted as written. */
 const SUBSCRIPTION_RELOAD_MS = 60_000;
 
-interface OpenCondition {
+// EXPORTED: `__openEntryForTests` returns it from a public method on an
+// exported class and the repo compiles with `declaration: true`, so a private
+// name in a public signature is TS4053 and would fail `npm run build`.
+export interface OpenCondition {
   /**
    * D8: a process-wide monotonic integer assigned by the drainer at the
    * moment it CREATES an entry — never reused, never re-assigned to an
@@ -291,6 +309,14 @@ export class OpsPublisher {
   };
 
   constructor(db: Db, retentionDays: number) {
+    // D5/D10: THE one loud failure mode, here rather than in init() on
+    // purpose. A pure precondition over the code-resident table with no I/O,
+    // so it runs before any await; and index.ts constructs the publisher
+    // OUTSIDE the try wrapping init(), so a violation is an unhandled boot
+    // throw — loud, immediate, unconfusable with a Mongo outage. Inside
+    // init() that catch would swallow it into "init failed", the exact
+    // degradation D10 forbids. Development-only: the shipped table passes.
+    assertReasonTableLegal(HIVE_RUNTIME_REASONS);
     this.store = new OpsStore(db, retentionDays);
   }
 
@@ -354,6 +380,13 @@ export class OpsPublisher {
       log.warn("Ops publish queue not drained within the shutdown bound — dropping", { dropped: this.queue.length });
       this.queue.length = 0;
     }
+    // ⚠ ACCEPTED RESIDUAL, stated rather than fixed. On deadline expiry an
+    // in-flight `runJob` may still be awaiting Mongo; it is not in `queue`, so
+    // `drainDropped` misses it, and its insert can land after index.ts closes
+    // the client — throwing inside runJob's own try, caught by drain(), counted
+    // as a `publishFault`. Contained and honest; awaiting the in-flight drain
+    // promise past the deadline would reintroduce the unbounded shutdown stall
+    // SHUTDOWN_DRAIN_MS exists to prevent.
   }
 
   /** D10 invariant (a). No caller in this diff, deliberately — the KPR-220 spawn-coordinator precedent. */
@@ -364,6 +397,33 @@ export class OpsPublisher {
       openConditions: this.open.size,
       subscriptions: this.subscriptions.length,
     };
+  }
+
+  // ── Test-only surface (`__`-prefixed, the __resetOpsPublisherForTests
+  // precedent). Both exist because the acceptance suite otherwise cannot make
+  // an assertion that can fail. Neither has, or may acquire, a caller.
+  /**
+   * THE DRAIN BARRIER. `enqueue()` is synchronous and fires `void this.drain()`,
+   * so a test that publishes and immediately reads Mongo races the drainer —
+   * ~40 acceptance assertions do exactly that; without this they are
+   * intermittently green, worse than red, since the suite that decides whether
+   * the other four chunks are verified would report coverage it lacks.
+   * `stop()` cannot be the barrier mid-scenario: it sets `stopping`, so every
+   * later `enqueue` silently no-ops.
+   */
+  async __drainForTests(): Promise<void> {
+    while (this.queue.length > 0 || this.draining) await new Promise((r) => setTimeout(r, 1));
+  }
+
+  /**
+   * One open-condition entry, as a copy. `open` is private and getSnapshot()
+   * exposes only `openConditions: number`, so AC9's central assertion — that
+   * the LIVE entry survives a superseded recovery's drop, the worst of D8's
+   * three harms (permanent silence) — has nothing to read without it.
+   */
+  __openEntryForTests(family: string): Readonly<OpenCondition> | undefined {
+    const entry = this.open.get(family);
+    return entry ? { ...entry } : undefined;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -546,6 +606,17 @@ export class OpsPublisher {
     //    whose answer is never used. A clearing publish carries generation 0
     //    always: this producer declares no advance rule for its clearing
     //    reason, and D2's rule for a reason with none is that it holds at 0.
+    //
+    //    The gate `input.clears === undefined` is a PROXY for D9's words ("on
+    //    a failure publish"), not a restatement. For this producer they are
+    //    exactly equivalent — only `tool-recovered` carries `clears` — and
+    //    step 4 has already refused any `clears` outside the row's own
+    //    `clearsReasonIds`, so a row reaching here with `clears` set is
+    //    provably a registered clearing publish. Keying off
+    //    `loaded.row.clearsReasonIds` instead reads the REASON rather than the
+    //    event and is the right form for a future producer whose reason may or
+    //    may not clear per publish. Noted so the equivalence is checked, not
+    //    assumed.
     const family = familyOf(input);
     const generation = input.clears === undefined ? await this.resolveGeneration(family, input) : 0;
     // THEN, and only then, the key — D2's formula embeds the epoch, so the key
@@ -558,7 +629,16 @@ export class OpsPublisher {
     const draft = { producer: input.producer, reasonId: input.reasonId, class: cls, retry, waiting: input.waiting, subject: input.subject };
     const matchedSubscriptionIds = evaluateMatches(draft, this.subscriptions);
 
-    // 7. The two server-owned envelope fields.
+    // 7. Built FIELD BY FIELD, every composite value REBUILT as a literal
+    //    rather than stored by reference. `subject` and `evidence` are
+    //    caller-supplied objects: passing them through would carry any extra
+    //    property the caller hung on them into the document — silently, past
+    //    the allow-list and past AC1's key-set assertion, which inspects the
+    //    top level only. D9 step 2 requires `evidence` validated "as
+    //    {kind, id} references only"; this is the C13 surface. Unreachable
+    //    from this producer's own observe* calls, but the accept path is the
+    //    fail-closed gate AC16 drives with a FOREIGN producer's row.
+    //    (`detail` is already rebuilt by zod's strict parse, same reason.)
     const doc: OpsEvent = {
       schemaVersion: OPS_SCHEMA_VERSION,
       publishedAt: new Date(),
@@ -567,11 +647,12 @@ export class OpsPublisher {
       class: cls,
       retry,
       waiting: input.waiting,
-      subject: input.subject,
+      subject: { kind: input.subject.kind, id: input.subject.id },
       generation,
       dedupeKey,
       detail: detail.data as OpsEvent["detail"],
-      evidence: input.evidence, // ALWAYS present, [] when empty — never omitted
+      // ALWAYS present, [] when empty — never omitted.
+      evidence: input.evidence.map((ref) => ({ kind: ref.kind, id: ref.id })),
       matchedSubscriptions: matchedSubscriptionIds.length,
       matchedSubscriptionIds,
       ...(input.clears !== undefined ? { clears: input.clears, clearsFamily } : {}),
@@ -643,6 +724,15 @@ export function familyOf(input: Pick<OpsPublishInput, "producer" | "subject" | "
   return `${input.producer}:${input.subject.kind}:${input.subject.id}:${input.reasonId}`;
 }
 
+/**
+ * RIGHT-ANCHORED, and safe for ANY subject.id including a colon-bearing one:
+ * `generation` is a decimal integer, colon-free by its own bounds, so
+ * `lastIndexOf(":")` always finds the separator before it and the family is
+ * components 0..n-2 whatever n is (`subject.id = "a:b"` ⇒
+ * `hive-runtime:tool:a:b:tool-failed`). Do NOT "harden" this into a bounded
+ * split taking the first three components from the left — the family is not
+ * components 0..2, so that change is a regression, not a fix.
+ */
 export function stripGeneration(dedupeKey: string): string {
   return dedupeKey.slice(0, dedupeKey.lastIndexOf(":"));
 }
@@ -652,6 +742,13 @@ export function generationOfDedupeKey(dedupeKey: string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+/**
+ * Also RIGHT-ANCHORED, same reason: `reasonId` is an OPS_TOKEN_RE token and
+ * `generation` a decimal integer, both colon-free by their own bounds, so the
+ * second component from the right is the reasonId regardless of how many
+ * colons `subject.id` contributes. `>= 5` is a MINIMUM-arity check on the
+ * formula, not an exact one — more parts still resolve correctly.
+ */
 export function reasonIdOfDedupeKey(dedupeKey: string): string | undefined {
   const parts = dedupeKey.split(":");
   return parts.length >= 5 ? parts[parts.length - 2] : undefined;
@@ -665,7 +762,7 @@ function isMoreRecent(a: OpsEvent, b: OpsEvent): boolean {
 }
 ```
 
-⚠ **`reasonIdOfDedupeKey` and `stripGeneration` need a colon-safety note in review.** `subject.id` for this producer is `mcp__<server>__<tool>` or a builtin name, neither of which contains a colon, so splitting on `:` is unambiguous here. That is a property of *this* producer's subject ids, not of the formula. If a later producer mints colon-bearing subject ids, both helpers must move to a bounded split (first three components from the left, last one from the right) rather than a naive `split(":")`. Record this as a code comment on both helpers.
+⚠ **Colon safety — the true property, which is stronger than the one an earlier draft asserted.** Both helpers are already **right-anchored** (`stripGeneration` slices at `lastIndexOf(":")`; `reasonIdOfDedupeKey` reads `parts[parts.length - 2]`), and a `dedupeKey`'s two trailing components are `reasonId` — an `OPS_TOKEN_RE` token — and `generation`, a decimal integer, both **colon-free by their own bounds**. So the right anchor is unambiguous **regardless of `subject.id`**, not merely for this producer's colon-free tool names (verified: `subject.id = "a:b"` ⇒ family `hive-runtime:tool:a:b:tool-failed`, reasonId `tool-failed`). **Do not add a bounded split, now or later:** the earlier prescription ("first three components from the left, last one from the right") would *break* `stripGeneration`, whose answer is components `0..n−2`, not `0..2`. The comments on both helpers record the property and the prohibition.
 
 - [ ] **Step 4:** Create `src/ops/publisher-singleton.ts`.
 
@@ -723,8 +820,13 @@ export interface ToolFailureObservation {
 }
 
 /**
- * SYNCHRONOUS, NON-THROWING, returns void (D9). It enqueues one job and
- * returns; the turn never awaits it and never sees a fault. Chosen over an
+ * SYNCHRONOUS, NON-THROWING, returns void (D9). It composes the input,
+ * enqueues one job and returns; the turn never awaits it and never sees a
+ * fault. Precisely: `enqueue()` fires `void this.drain()`, which reaches its
+ * first `await` only after the registry lookup, bounds checks, zod parse and
+ * `evaluateMatches` — so those run synchronously on the turn thread. All four
+ * are pure, in-memory and microsecond-scale, which is why this is stated
+ * rather than fixed with a `queueMicrotask` kick. Chosen over an
  * unawaited promise on four counts: the failure path performs two indexed
  * reads and a write, which under a storm would open unbounded concurrent
  * Mongo work from inside a turn; the drainer serializes per-family epoch
@@ -821,17 +923,35 @@ export function observeToolSuccess(obs: { tool: string; lane: CaptureLane }): vo
 
 - [ ] **Step 6:** Write `src/ops/publisher.integration.test.ts` against the fake db.
 
+Every publish→assert boundary in this file uses `await publisher.__drainForTests()` as its barrier — see the drain-barrier note on that method. A bare `await` on the observe call proves nothing: `enqueueFailure` is synchronous and returns before the drainer has run.
+
 Minimum assertions (the acceptance suite in chunk 5 adds the AC-numbered cases; these are the mechanism-level ones):
 
-- `init()` upserts both rows in the shipped order and does **not** overwrite an operator-set `enabled: false` on a second `init()`.
-- `init()` with every `createIndex` rejecting still completes and `getSnapshot().indexFailures` equals the number of indexes.
-- `init()` with the registry upsert rejecting **throws** (so `index.ts` leaves the publisher unset).
+*Boot and registry.*
+- `init()` upserts both rows and does **not** overwrite an operator-set `enabled: false` on a second `init()`.
+- `init()` issues the two upserts in the shipped order — assert against the fake db's `operations` log, filtered to `ops_reasons`/`updateOne`, that `tool-recovered`'s `_id` precedes `tool-failed`'s. This is the **call-order** half of D5's load-bearing write order; chunk 2's `reasons.test.ts` pins only the array order and cannot see a writer that sorts or parallelises.
+- `init()` with every `createIndex` rejecting still completes and `getSnapshot().indexFailures` equals the number of indexes; `init()` with the registry **upsert** rejecting **throws** (so `index.ts` leaves the publisher unset).
+- `init()` with the registry **read-back** (`loadReasons`) rejecting also **throws**. D5/D10 name this fault separately: a read-back fault that merely warned would leave a **wired** publisher over an **empty** reason map, and C5 would then fail closed on every publish — spending `rejected`, D9's mis-integrated-producer signal, on a Mongo outage. Assert the throw **and** `getSnapshot().rejected === 0`.
+- The D5 enable gate is **not** inside `init()`'s failure surface — constructing an `OpsPublisher` evaluates it. (Chunk 2's `reasons.test.ts` drives the gate's logic; here assert only that a legal table constructs cleanly.)
+
+*Accept path and epoch.*
 - A failure publish stores exactly one document with `generation: 0`, `dedupeKey` = `hive-runtime:tool:<tool>:tool-failed:0`, and creates one open-condition entry.
 - A repeat leaves `generation` and the entry untouched and appends a second document.
-- A success with no open condition performs **no** database access (assert against the throwing-db variant).
-- A success with an open condition publishes one `tool-recovered` with `clears`, `clearsFamily`, `waiting: "nobody"`, `generation: 0`, and removes the entry.
-- The epoch resolver's `(publishedAt, _id)` tie-break: two documents with the identical `publishedAt`, the clearing one inserted second, resolves to +1.
+- The epoch resolver's `(publishedAt, _id)` tie-break: two documents with the identical `publishedAt`, the clearing one inserted second, resolves to +1. (This is the assertion that depends on the harness minting **real** `ObjectId`s — see Step 1's fourth bullet.)
 - A resolver fault falls back to the open-condition entry's generation, and to `0` with no entry.
+
+*Recovery and the `openSeq` identity — the ticket's central invariant.* This chunk implements `openSeq`, so this chunk tests it. Chunk 5's AC9 owns the full `R1 · F · R2` interleaving and its negative-verify; these are the unit-level decomposition, without which Task 4 commits the mechanism with no coverage at all:
+
+- **Entry absent** ⇒ `recoveryCoalesced` increments, **nothing is published**, the map is **not written** (`__openEntryForTests(family)` still `undefined`, `operations` log shows no `ops_events` insert).
+- **Entry present under a DIFFERENT `openSeq`** ⇒ `recoverySuperseded` increments, nothing is published, and **the entry survives** with its own `openSeq` intact. Drive it by draining a first failure, forcing a recovery job carrying that entry's `openSeq`, then draining a second failure that re-opens the family at a fresh `openSeq` before the recovery runs.
+- **Entry present under the SAME `openSeq`** ⇒ one `tool-recovered` with `clears`, `clearsFamily`, `waiting: "nobody"`, `generation: 0`, and the entry removed **after** the accept, not before.
+- A recovery job whose **publish faults** leaves the family open (`__openEntryForTests` still returns it), so the next success re-enqueues.
+- Drive at least the last two **through `observeToolSuccess` and the singleton**, not by calling `enqueueRecoveryIfOpen` directly — that is the only way `waiting: "nobody"` and `evidence: []` are pinned on the production path, and `src/ops/observe.ts` otherwise ships in this commit with zero coverage.
+- A success with no open condition performs **no** database access (throwing-db variant, plus the counting fake's `operations` log empty).
+
+> The negative-verify for the identity check — swap `entry.openSeq === job.openSeq` for a bare `this.open.has(job.family)` and confirm the `R1 · F · R2` case fails on `recoverySuperseded` and on the surviving-entry assertion — is specified in **chunk 5, Task 7, Step 3 (AC9)** and is run there. It is named here because this is the chunk whose code it mutates.
+
+*Queue, map and shutdown.*
 - Queue overflow drops the **oldest** and increments `queueOverflow`.
 - `stop()` clears the timer, drains within the bound, and drops+counts a queue it cannot drain.
 - The map cap evicts oldest-first at `OPEN_CONDITION_MAP_CAP`.
@@ -851,13 +971,17 @@ mongosh --quiet --eval '
 ```
 Expected: `codeName=IndexOptionsConflict`. Record the actual `codeName`/`code` in the implementation report. If it differs on the deployed driver, adjust the `remedy` string in `ensureIndexes` so the warning names the observed shape; do **not** add a code-specific branch — the containment is already uniform, and this step's only product is the accuracy of the operator-facing text.
 
+**If `mongosh` or a local `mongod` is unavailable**, this probe is **deferred, not skipped, and it does not block the commit.** The index says both `⚠ Verify at implementation` items "must be **run**"; the accurate reading is run *or* record the unavailability, since neither changes behaviour — this one's only product is the accuracy of one warning string. Record `mongosh unavailable — remedy text unverified` in the implementation report, leave the `remedy` string as written (it names the remedy in prose, not a code), and carry it as an open verification on the ticket. Do **not** substitute a test against the fake db: its `createIndex` is programmable, so that would confirm only that the plan's fixture matches the plan's expectation.
+
 - [ ] **Step 8:** Verify and commit.
 
 Run:
 ```
 npx vitest run src/ops/publisher.integration.test.ts
 npm run typecheck && npm run lint
+npx prettier --check src/ops/store.ts src/ops/publisher.ts src/ops/publisher-singleton.ts src/ops/observe.ts src/ops/testing/fake-db.ts src/ops/publisher.integration.test.ts
 ```
+The `prettier --check` line is not redundant with `npm run lint`: `eslint-config-prettier` disables every formatting rule, so ESLint is blind to formatting and this commit could otherwise land unformatted and only fail three tasks later at Task 7's `npm run check`. (`npm run format` fixes what it reports.)
 
 ```bash
 git add src/ops/store.ts src/ops/publisher.ts src/ops/publisher-singleton.ts src/ops/observe.ts src/ops/testing/fake-db.ts src/ops/publisher.integration.test.ts

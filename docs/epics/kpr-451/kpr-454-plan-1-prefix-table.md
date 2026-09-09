@@ -43,7 +43,7 @@ The existing `src/outage/outage-notices.test.ts` already covers the five prefixe
   });
 ```
 
-Note the last row deliberately: `scheduled:` is **not** `sched:` — it must fall through to `notify`. A refactor that turned the ordered chain into an unordered `Object.keys` scan with a `startsWith` over a map could reorder and mis-hit; this row is what catches that.
+Note the last row deliberately: `scheduled:` is **not** `sched:` — it must fall through to `notify`. Be precise about what it does and does not prove. `"scheduled:".startsWith("sched:")` is **false under every iteration order** (index 5 is `u`, not `:`), so no reordering of the table can make this row mis-hit; the round-1 review corrected the earlier justification, which claimed otherwise. What the row genuinely pins is **fallthrough for a colon-bearing non-reserved id** — that a value whose head resembles a reserved prefix still reaches the `human` bucket — which is the case a "strip everything before the first colon and look it up" rewrite would break. The real ordering contract stated on `SOURCE_PREFIXES` ("a longer prefix sharing a head with a shorter one must precede it") is, plainly, **unexercised today**: the five reserved prefixes are mutually non-prefixing, so no case in this file can distinguish an ordered scan from an unordered one. It is stated as contract for the prefix someone adds later, not as a property this table's tests verify.
 
 - [ ] **Step 2:** Verify the pin is green against the **unmodified** source.
 
@@ -86,10 +86,13 @@ export type WorkItemSource = "cron" | "callback" | "event" | "agent" | "worker" 
 
 /**
  * THE prefix table. Ordered: the first matching prefix wins, so a longer
- * prefix that shares a head with a shorter one must precede it. (None do
- * today — the five are mutually non-prefixing — but the order is contract,
- * not incidental, and `scheduled:` must NOT hit the `sched:` row's bucket by
- * accident of iteration.) Per-arm rationale lives on the row it explains.
+ * prefix that shares a head with a shorter one must precede it. None do
+ * today — the five are mutually non-prefixing — so this ordering rule is
+ * currently UNEXERCISED by any test, and it is stated as contract for the
+ * prefix someone adds later rather than as a verified property. (It is NOT
+ * what keeps `scheduled:` out of the `sched:` bucket: `"scheduled:"` fails
+ * `startsWith("sched:")` outright, at index 5.) Per-arm rationale lives on
+ * the row it explains.
  */
 const SOURCE_PREFIXES: ReadonlyArray<readonly [string, WorkItemSource]> = [
   ["sched:", "cron"], // cron re-fires at the next match — queueing would double-run
@@ -165,8 +168,8 @@ export function waitingFor(id?: string): Waiting {
 Three notes for the implementer:
 
 1. **`Waiting` crosses as a type-only import.** `import type { Waiting } from "../ops/types.js"` is erased at compile time, so this adds no runtime edge from `src/outage/` into the new ops module and no import cycle. The one runtime dependency stays ops → outage. Do not change it to a value import; do not re-declare `Waiting` here (two declarations is the drift this whole task removes).
-2. **`WorkItem` is already imported** at the top of the file (`import type { WorkItem, ChannelKind } from "../types/work-item.js";`) — keep that line where it is and add the `Waiting` import beside it.
-3. Chunk 2 (Task 2) creates `src/ops/types.ts`. If you execute Task 1 first, as ordered, TypeScript will not resolve the import until Task 2 lands. Create `src/ops/types.ts` with at minimum the `Waiting` union as the *first* edit of Task 2, or land Task 1's typecheck at the end of Task 2 — either is fine, but do not invert the commits: the pinning tests must exist before the source moves.
+2. **`WorkItem` is already imported** at the top of the file (`import type { WorkItem, ChannelKind } from "../types/work-item.js";` at `:6`) — leave that line exactly where it is and **do not add anything beside it**. The `Waiting` import is already inside the Step 3 replacement fence above, at its own position within the replaced `:8-26` range; adding a second copy next to the `WorkItem` line yields two identical type imports and an ESLint duplicate-import error.
+3. **Task 1 does not typecheck, by design, and Step 6 says so.** Chunk 2 (Task 2) creates `src/ops/types.ts`; until it lands, `import type { Waiting } from "../ops/types.js"` is unresolved and `npm run typecheck` **fails**. That is the accepted ordering, and the alternative — reaching forward and creating `src/ops/types.ts` from inside Task 1 — is rejected because it splits one file's authorship across two commits. Task 1's gate is the Vitest command only (Step 6); the first green `npm run typecheck` in this plan is **chunk 2, Task 2, Step 6**. Do not invert the commits: the pinning tests must exist before the source moves.
 
 - [ ] **Step 4:** Extend `src/outage/outage-notices.test.ts` with the `waitingFor` and `sourceOfId` coverage AC4 requires.
 
@@ -195,15 +198,23 @@ describe("sourceOfId / waitingFor (KPR-454 D7, AC4)", () => {
   });
 
   it("policyForId and waitingFor project from the same bucket", () => {
-    // Not a tautology: it fails if either projection ever acquires a private
-    // prefix test instead of reading sourceOfId.
+    // Not a tautology: it fails if EITHER projection ever acquires a private
+    // prefix test instead of reading sourceOfId. Both are asserted against
+    // LITERAL maps declared here, never against the production Records — an
+    // assertion that read WAITING_BY_SOURCE would be a tautology, and round 1
+    // caught this case asserting `policyForId` only while its title and
+    // comment claimed `waitingFor` too. `waiting` is the half AC4 actually
+    // adds, so it is the half that must be asserted.
+    const POLICY = {
+      cron: "skip", callback: "silent", event: "silent", agent: "silent", worker: "silent", human: "notify",
+    } as const;
+    const WAITING = {
+      cron: "nobody", callback: "nobody", event: "nobody", agent: "agent", worker: "nobody", human: "human-now",
+    } as const;
     for (const id of ["sched:x", "callback:x", "event:x", "team-x", "worker:x", "plain-id"]) {
       const bucket = sourceOfId(id);
-      expect(policyForId(id)).toBe(
-        ({ cron: "skip", callback: "silent", event: "silent", agent: "silent", worker: "silent", human: "notify" } as const)[
-          bucket
-        ],
-      );
+      expect(policyForId(id), `policyForId(${id})`).toBe(POLICY[bucket]);
+      expect(waitingFor(id), `waitingFor(${id})`).toBe(WAITING[bucket]);
     }
   });
 
@@ -218,13 +229,25 @@ describe("sourceOfId / waitingFor (KPR-454 D7, AC4)", () => {
 });
 ```
 
-Update the file's import line to pull in the four new exports:
+Update the file's import line to pull in the **three** new exports. `policyFor` is already imported (`outage-notices.test.ts:4`) — only `policyForId`, `sourceOfId` and `waitingFor` are added:
 
 ```typescript
 import { policyFor, policyForId, sourceOfId, waitingFor, /* …existing… */ } from "./outage-notices.js";
 ```
 
 - [ ] **Step 5:** Create the repository-wide single-predicate guard, `src/ops/single-prefix-predicate.test.ts`.
+
+**The repository-scan idiom, stated once here and referenced from chunk 5.** Three tests in this plan scan source text (this one, and chunk 5's AC7 and AC15 scans). All three use the same two lines, and chunk 5 references this block rather than restating them:
+
+```typescript
+import { globSync } from "tinyglobby";          // already a dependency; used by src/skills/loader.ts
+import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+
+// `import.meta.url` is `<repo>/src/<dir>/<file>.test.ts`, so "../.." is the
+// repository root for any test one directory below `src/`.
+const root = fileURLToPath(new URL("../..", import.meta.url));
+```
 
 ```typescript
 import { describe, it, expect } from "vitest";
@@ -241,6 +264,8 @@ import { globSync } from "tinyglobby";
  * that would otherwise never be imported by this test.
  */
 describe("one reserved-prefix predicate (KPR-454 AC4, C6)", () => {
+  // The shared idiom, hoisted to describe scope so both cases read it.
+  const root = fileURLToPath(new URL("../..", import.meta.url));
   const RESERVED = ["sched:", "callback:", "event:", "team-", "worker:"];
 
   // Deliberate, reviewed classifications. Adding to this list is a decision,
@@ -257,13 +282,26 @@ describe("one reserved-prefix predicate (KPR-454 AC4, C6)", () => {
     {
       file: "src/outage/outage-notices.ts",
       literal: "*",
+      // DEFENSIVE, and inert post-refactor: after Task 1 this file contains
+      // `id.startsWith(prefix)` over a table variable, not a reserved
+      // LITERAL, so the scan below finds nothing here to exempt. Keep it
+      // anyway — it is what keeps the guard honest if the one predicate ever
+      // legitimately regains a literal — but do NOT read a green run as
+      // evidence this entry matched anything. The second `it` below
+      // deliberately skips `literal: "*"` rows for exactly that reason.
       reason: "the one predicate itself (SOURCE_PREFIXES / sourceOfId)",
     },
   ];
 
   it("no module outside outage-notices.ts tests a reserved id prefix", () => {
-    const root = fileURLToPath(new URL("../..", import.meta.url));
-    const files = globSync(["src/**/*.ts"], { cwd: root, absolute: false })
+    // AC4 says "repository-wide", so the glob is every TypeScript directory
+    // the engine ships from, not `src/` alone. `scripts/`, `build/` and
+    // `setup/` are confirmed clean at this tree (round-1 verification), so
+    // widening costs nothing today and closes the gap AC4's wording opens.
+    const files = globSync(["src/**/*.ts", "scripts/**/*.ts", "build/**/*.ts", "setup/**/*.ts"], {
+      cwd: root,
+      absolute: false,
+    })
       // Tests may name a prefix freely — they assert against the predicate,
       // they do not implement one.
       .filter((f) => !f.endsWith(".test.ts"));
@@ -272,8 +310,14 @@ describe("one reserved-prefix predicate (KPR-454 AC4, C6)", () => {
     for (const file of files) {
       const source = readFileSync(`${root}/${file}`, "utf8");
       for (const literal of RESERVED) {
-        // `.startsWith("<prefix>")` in any receiver shape.
-        const pattern = new RegExp(`\\.\\s*startsWith\\s*\\(\\s*["'\`]${literal.replace(":", ":")}`, "g");
+        // `.startsWith("<prefix>")` in any receiver shape. No `g` flag: the
+        // regex is used for a single `.test()` per file, and `g` would make
+        // it stateful via `lastIndex` the moment anyone hoisted it out of
+        // this loop. The five literals contain no regex metacharacter (`:`
+        // and `-` are literal outside a character class), so no escaping is
+        // needed — the earlier `literal.replace(":", ":")` was a no-op that
+        // read as intentional escaping and is removed rather than replaced.
+        const pattern = new RegExp(`\\.\\s*startsWith\\s*\\(\\s*["'\`]${literal}`);
         if (!pattern.test(source)) continue;
         const allowed = ALLOWLIST.some(
           (a) => a.file === file && (a.literal === "*" || a.literal === literal),
@@ -290,7 +334,7 @@ describe("one reserved-prefix predicate (KPR-454 AC4, C6)", () => {
   });
 
   it("every allowlist entry still corresponds to a real occurrence (no stale entries)", () => {
-    const root = fileURLToPath(new URL("../..", import.meta.url));
+    // `root` as defined in the shared idiom above.
     for (const entry of ALLOWLIST) {
       if (entry.literal === "*") continue;
       const source = readFileSync(`${root}/${entry.file}`, "utf8");
@@ -310,11 +354,22 @@ Run:
 ```
 npx vitest run src/outage/outage-notices.test.ts src/ops/single-prefix-predicate.test.ts src/channels/deadline-continuation.test.ts
 npx vitest run src/channels/dispatcher.test.ts
-npm run typecheck
 ```
-Expected: all pass. `deadline-continuation.test.ts:90-95` and the dispatcher suite are the behaviour-preservation evidence — they call `policyFor` and were written before this refactor existed.
+Expected: all pass.
 
-Negative-verify (required): change `["team-", "agent"]` to `["team-", "worker"]` in `SOURCE_PREFIXES`, re-run `src/outage/outage-notices.test.ts`, and confirm the `team- is \`agent\`` case fails. Restore.
+**`npm run typecheck` is NOT run here and is expected to FAIL until chunk 2, Task 2, Step 6.** `src/outage/outage-notices.ts` now carries `import type { Waiting } from "../ops/types.js"` and that file does not exist until Task 2 creates it. This is the accepted commit ordering (note 3 above): Task 1's gate is the Vitest command only. Do not "fix" it by creating a stub `src/ops/types.ts` from inside Task 1.
+
+**Behaviour-preservation evidence, stated precisely.** The *direct* pre-refactor pins are `deadline-continuation.test.ts:90-95` (five literal `policyFor` assertions, one per prefix class, written before this refactor existed) and Step 1's table in `outage-notices.test.ts`. `dispatcher.test.ts` never imports `policyFor` — verified at this tree — so it is *indirect* evidence only: it exercises the honest-outage arms that call `policyFor` internally, and a green run means the refactor did not break the callers. Run it, but do not cite it as the per-prefix pin.
+
+**Negative-verify (required):** change `["sched:", "cron"]` to `["sched:", "callback"]` in `SOURCE_PREFIXES` and re-run
+`npx vitest run src/outage/outage-notices.test.ts src/channels/deadline-continuation.test.ts`.
+
+Three cases must fail:
+1. Step 1's table row `["sched:agent-a:daily digest:1725465600000", "skip"]`;
+2. the pre-existing `it("skips cron turns (sched: prefix — re-fires by design)")` at `outage-notices.test.ts:30`;
+3. `deadline-continuation.test.ts:94`, `expect(policyFor(item("sched:x#dl1"))).toBe("skip")`.
+
+**Why this mutation crosses the boundary and the obvious one does not.** `POLICY_BY_SOURCE.cron === "skip"` while `POLICY_BY_SOURCE.callback === "silent"`, so re-bucketing `sched:` changes `policyFor`'s observable output and every pre-refactor pin above trips. The mutation round 1 replaced — `["team-", "agent"]` → `["team-", "worker"]` — does **not**: `POLICY_BY_SOURCE.agent === POLICY_BY_SOURCE.worker === "silent"`, so `policyFor` is byte-identical under it and the whole pre-refactor suite stays green. (It would still fail the new `waitingFor` case, but a negative-verify whose job is to prove the *behaviour-preservation* pins are live must move a value those pins can see.) Restore after each.
 
 - [ ] **Step 7:** Commit.
 
