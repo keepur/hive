@@ -1,0 +1,135 @@
+{
+  "node": "v24.16.0",
+  "result": {
+    "scenario": "fake-stt user-state, startup replacement, accepted hook, provisional speech, false interruption",
+    "events": [
+      "speech:speech_25d376bb-7fc",
+      "speech:speech_ba4f126f-4a7",
+      "metric:llm_metrics:speech_25d376bb-7fc",
+      "handle_done:opening:none",
+      "metric:llm_metrics:speech_ba4f126f-4a7",
+      "metric:tts_metrics:speech_ba4f126f-4a7",
+      "handle_done:replacement:none",
+      "metric:vad_metrics:none",
+      "user:listening->speaking",
+      "user:speaking->listening",
+      "metric:vad_metrics:none",
+      "user:listening->speaking",
+      "user:speaking->listening",
+      "speech:speech_6bc262db-418",
+      "accepted_turn",
+      "metric:eou_metrics:speech_6bc262db-418",
+      "metric:llm_metrics:speech_6bc262db-418",
+      "metric:tts_metrics:speech_6bc262db-418",
+      "speech:speech_a91b026a-836",
+      "metric:vad_metrics:none",
+      "user:listening->speaking",
+      "user:speaking->listening",
+      "false_interruption:true",
+      "speech:speech_e4827667-767",
+      "metric:llm_metrics:speech_a91b026a-836",
+      "metric:tts_metrics:speech_a91b026a-836",
+      "handle_done:resume-candidate:none",
+      "error:llm_error",
+      "metric:llm_metrics:speech_e4827667-767",
+      "handle_done:bridge-failure:none"
+    ],
+    "handles": [
+      {
+        "label": "opening",
+        "id": "speech_25d376bb-7fc",
+        "interrupted": true,
+        "done": true,
+        "exception": null,
+        "chatItems": 0
+      },
+      {
+        "label": "replacement",
+        "id": "speech_ba4f126f-4a7",
+        "interrupted": false,
+        "done": true,
+        "exception": null,
+        "chatItems": 1
+      },
+      {
+        "label": "resume-candidate",
+        "id": "speech_a91b026a-836",
+        "interrupted": false,
+        "done": true,
+        "exception": null,
+        "chatItems": 1
+      },
+      {
+        "label": "bridge-failure",
+        "id": "speech_e4827667-767",
+        "interrupted": false,
+        "done": true,
+        "exception": null,
+        "chatItems": 0
+      }
+    ],
+    "callbacks": [
+      {
+        "label": "opening",
+        "kind": "done",
+        "interrupted": true,
+        "items": 0,
+        "exception": null
+      },
+      {
+        "label": "replacement",
+        "kind": "done",
+        "interrupted": false,
+        "items": 1,
+        "exception": null
+      },
+      {
+        "label": "resume-candidate",
+        "kind": "done",
+        "interrupted": false,
+        "items": 1,
+        "exception": null
+      },
+      {
+        "label": "bridge-failure",
+        "kind": "done",
+        "interrupted": false,
+        "items": 0,
+        "exception": null
+      }
+    ],
+    "fakeOutput": {
+      "frameCount": 4,
+      "frames": [
+        {
+          "sampleRate": 24000,
+          "samplesPerChannel": 480
+        },
+        {
+          "sampleRate": 24000,
+          "samplesPerChannel": 480
+        },
+        {
+          "sampleRate": 24000,
+          "samplesPerChannel": 480
+        },
+        {
+          "sampleRate": 24000,
+          "samplesPerChannel": 480
+        }
+      ],
+      "clearCount": 0
+    },
+    "assertions": {
+      "openingCancelledAndReplacementGenerated": true,
+      "provisionalEmptyTranscriptNotAccepted": true,
+      "acceptedHookBeforeCallerResponse": true,
+      "falseInterruptionEvent": "false_interruption:true",
+      "failedHandleFinalization": {
+        "errorBeforeMetricBeforeDone": true,
+        "handleException": null,
+        "designGate": "public SpeechHandle exposes no thrown LLM error; the error event has no speech ID, so application-level causal attribution requires a design binding before readiness"
+      }
+    }
+  }
+}

@@ -1,0 +1,266 @@
+{
+  "runtime": {
+    "node": "v24.16.0",
+    "platform": "darwin",
+    "arch": "arm64"
+  },
+  "llm": {
+    "cases": [
+      {
+        "name": "before-run",
+        "handleId": "speech_a02f9c92-a47",
+        "interrupted": true,
+        "exception": null,
+        "metrics": [
+          {
+            "type": "llm_metrics",
+            "cancelled": true,
+            "requestId": "",
+            "speechId": "speech_a02f9c92-a47",
+            "trace": {
+              "turnId": "turn-before-run"
+            }
+          }
+        ],
+        "events": [
+          {
+            "event": "SpeechCreated",
+            "speechId": "speech_a02f9c92-a47"
+          },
+          {
+            "event": "llm_metrics",
+            "type": "llm_metrics",
+            "cancelled": true,
+            "requestId": "",
+            "speechId": "speech_a02f9c92-a47",
+            "trace": {
+              "turnId": "turn-before-run"
+            }
+          }
+        ]
+      },
+      {
+        "name": "before-headers",
+        "handleId": "speech_0b3b1bf7-b0b",
+        "interrupted": true,
+        "exception": null,
+        "metrics": [
+          {
+            "type": "llm_metrics",
+            "cancelled": true,
+            "requestId": "",
+            "speechId": "speech_0b3b1bf7-b0b",
+            "trace": {
+              "turnId": "turn-before-headers"
+            }
+          }
+        ],
+        "events": [
+          {
+            "event": "SpeechCreated",
+            "speechId": "speech_0b3b1bf7-b0b"
+          },
+          {
+            "event": "llm_metrics",
+            "type": "llm_metrics",
+            "cancelled": true,
+            "requestId": "",
+            "speechId": "speech_0b3b1bf7-b0b",
+            "trace": {
+              "turnId": "turn-before-headers"
+            }
+          }
+        ]
+      },
+      {
+        "name": "after-headers-before-text",
+        "handleId": "speech_6d18e976-fd5",
+        "interrupted": true,
+        "exception": null,
+        "metrics": [
+          {
+            "type": "llm_metrics",
+            "cancelled": true,
+            "requestId": "",
+            "speechId": "speech_6d18e976-fd5",
+            "trace": {
+              "turnId": "turn-after-headers-before-text"
+            }
+          }
+        ],
+        "events": [
+          {
+            "event": "SpeechCreated",
+            "speechId": "speech_6d18e976-fd5"
+          },
+          {
+            "event": "llm_metrics",
+            "type": "llm_metrics",
+            "cancelled": true,
+            "requestId": "",
+            "speechId": "speech_6d18e976-fd5",
+            "trace": {
+              "turnId": "turn-after-headers-before-text"
+            }
+          }
+        ]
+      },
+      {
+        "name": "during-text",
+        "handleId": "speech_bfd2523b-09d",
+        "interrupted": true,
+        "exception": null,
+        "metrics": [
+          {
+            "type": "llm_metrics",
+            "cancelled": true,
+            "requestId": "request-turn-during-text",
+            "speechId": "speech_bfd2523b-09d",
+            "trace": {
+              "turnId": "turn-during-text"
+            }
+          }
+        ],
+        "events": [
+          {
+            "event": "SpeechCreated",
+            "speechId": "speech_bfd2523b-09d"
+          },
+          {
+            "event": "llm_metrics",
+            "type": "llm_metrics",
+            "cancelled": true,
+            "requestId": "request-turn-during-text",
+            "speechId": "speech_bfd2523b-09d",
+            "trace": {
+              "turnId": "turn-during-text"
+            }
+          }
+        ]
+      },
+      {
+        "name": "empty-success",
+        "handleId": "speech_c566e37d-a48",
+        "interrupted": false,
+        "exception": null,
+        "metrics": [
+          {
+            "type": "llm_metrics",
+            "cancelled": false,
+            "requestId": "",
+            "speechId": "speech_c566e37d-a48",
+            "trace": {
+              "turnId": "turn-empty-success"
+            }
+          }
+        ],
+        "events": [
+          {
+            "event": "SpeechCreated",
+            "speechId": "speech_c566e37d-a48"
+          },
+          {
+            "event": "llm_metrics",
+            "type": "llm_metrics",
+            "cancelled": false,
+            "requestId": "",
+            "speechId": "speech_c566e37d-a48",
+            "trace": {
+              "turnId": "turn-empty-success"
+            }
+          }
+        ]
+      }
+    ],
+    "error": {
+      "handleId": "speech_6cdef55e-ef8",
+      "exception": null,
+      "llmMetric": {
+        "type": "llm_metrics",
+        "cancelled": false,
+        "requestId": "",
+        "speechId": "speech_6cdef55e-ef8",
+        "trace": {
+          "turnId": "turn-error"
+        }
+      }
+    },
+    "overlap": {
+      "left": {
+        "type": "llm_metrics",
+        "cancelled": false,
+        "requestId": "request-turn-overlap-left",
+        "speechId": "speech_233d2173-82f",
+        "trace": {
+          "turnId": "turn-overlap-left"
+        }
+      },
+      "right": {
+        "type": "llm_metrics",
+        "cancelled": false,
+        "requestId": "request-turn-overlap-right",
+        "speechId": "speech_9304b5fc-dd0",
+        "trace": {
+          "turnId": "turn-overlap-right"
+        }
+      },
+      "reverseCompletion": true
+    }
+  },
+  "tts": {
+    "directDefaultNode": {
+      "frames": 2,
+      "originalFrames": true,
+      "timedMetadata": [
+        "alpha",
+        "beta"
+      ],
+      "metricTraceIds": [
+        "synth-1"
+      ]
+    },
+    "cancellation": {
+      "preFrameMetricDelta": 0,
+      "afterFrameMetricDelta": 0
+    },
+    "errors": {
+      "beforeFrameErrorCount": 1,
+      "afterFrameErrorCount": 2,
+      "publicErrors": [
+        {
+          "type": "tts_error",
+          "name": "Error",
+          "message": "synthetic TTS error"
+        },
+        {
+          "type": "tts_error",
+          "name": "Error",
+          "message": "synthetic TTS error after frame"
+        }
+      ]
+    },
+    "sessionOutput": {
+      "handleId": "speech_029646b0-423",
+      "receivedFrames": 1,
+      "outputEventHasSpeechId": false,
+      "wrapperInvocationHasSpeechId": false
+    }
+  },
+  "unproved": {
+    "completeCorrelation": {
+      "proved": false,
+      "failedContract": "The requested public-seam contract cannot bind a canceled/no-metric TTS attempt or an AudioOutput frame to an SDK SpeechHandle. Agent.default.ttsNode receives only agent, text, and modelSettings; AudioOutput capture callbacks expose only AudioFrame; MetricsCollected is absent before first frame. No public callback exposes the active SpeechHandle at those seams.",
+      "leastInvasiveDesignAdjustment": "Revise the contract to record an explicit application-owned synthesisAttemptId at wrapper entry, classify pre-frame cancellation as unbound, and require handle association only where the application initiated the speech and retains its public SpeechHandle. If per-generated-frame SpeechHandle correlation is mandatory, the SDK needs a public speechHandle/speechId parameter or output event field; do not infer it from timing or queue order."
+    },
+    "ttsBackpressure": {
+      "proved": false,
+      "failedContract": "The public default-node stream supports reader cancellation, which this probe asserts, but it exposes no public producer-demand or queue-depth signal. A bounded backpressure proof cannot be made without timing-based inference or private queues.",
+      "leastInvasiveDesignAdjustment": "Treat cancellation/terminal cleanup as the public SDK contract. If bounded producer backpressure is a required product invariant, enforce it in the Hive wrapper with an application-owned bounded queue and test that queue directly."
+    },
+    "errorAttribution": {
+      "proved": false,
+      "failedContract": "The thrown LLM case reaches a public SpeechHandle terminal and an LLM metric, but SpeechHandle.exception() is null and the public LLM metric contains no error. The BridgeError cannot be attributed from those public terminal records.",
+      "leastInvasiveDesignAdjustment": "Capture BridgeError in the application-owned llmNode/stream wrapper while its explicit turn/attempt context exists, emit one application terminal there, and use the public handle done callback only for settlement. Keep SDK metrics as optional enrichment and never wait for them to invent the error."
+    }
+  }
+}

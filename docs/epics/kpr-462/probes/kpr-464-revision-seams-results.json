@@ -1,0 +1,144 @@
+{
+  "runtime": {
+    "node": "v24.16.0",
+    "platform": "darwin",
+    "arch": "arm64",
+    "agents": "1.6.4",
+    "rtcNode": "0.13.33"
+  },
+  "orderings": [
+    {
+      "mode": "stt",
+      "preemptive": true,
+      "preflight": false,
+      "events": [
+        "transcript_observed",
+        "accepted_hook_enter",
+        "accepted_hook_return",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "handleCount": 1,
+      "outputFrames": 2
+    },
+    {
+      "mode": "vad",
+      "preemptive": true,
+      "preflight": false,
+      "events": [
+        "transcript_observed",
+        "speech_created",
+        "llm_text",
+        "accepted_hook_enter",
+        "accepted_hook_return",
+        "output_frame",
+        "output_frame"
+      ],
+      "handleCount": 1,
+      "outputFrames": 2
+    },
+    {
+      "mode": "vad",
+      "preemptive": false,
+      "preflight": false,
+      "events": [
+        "transcript_observed",
+        "accepted_hook_enter",
+        "accepted_hook_return",
+        "speech_created",
+        "llm_text",
+        "output_frame",
+        "output_frame"
+      ],
+      "handleCount": 1,
+      "outputFrames": 2
+    },
+    {
+      "mode": "stt",
+      "preemptive": true,
+      "preflight": true,
+      "events": [
+        "transcript_observed",
+        "speech_created",
+        "llm_text",
+        "transcript_observed",
+        "accepted_hook_enter",
+        "accepted_hook_return",
+        "output_frame",
+        "output_frame"
+      ],
+      "handleCount": 1,
+      "outputFrames": 2
+    }
+  ],
+  "llmError": {
+    "observations": [
+      {
+        "event": "application_error",
+        "trace": {
+          "turnId": "revision-turn"
+        }
+      },
+      {
+        "event": "public_error",
+        "trace": {
+          "turnId": "revision-turn"
+        }
+      },
+      {
+        "event": "metric",
+        "speechId": "speech_fd42bdaf-eff",
+        "trace": {
+          "turnId": "revision-turn"
+        }
+      },
+      {
+        "event": "handle_done"
+      }
+    ],
+    "exception": null,
+    "applicationOutcome": "failed"
+  },
+  "ttsErrors": [
+    {
+      "mode": "error-before",
+      "observations": [
+        {
+          "event": "public_error",
+          "trace": {
+            "synthesisId": "revision-synth-error-before"
+          }
+        },
+        {
+          "event": "node_terminal",
+          "outcome": "failed"
+        }
+      ],
+      "frames": 0,
+      "speechId": null,
+      "association": "unbound",
+      "readerCompletedNormally": true
+    },
+    {
+      "mode": "error-after",
+      "observations": [
+        {
+          "event": "public_error",
+          "trace": {
+            "synthesisId": "revision-synth-error-after"
+          }
+        },
+        {
+          "event": "node_terminal",
+          "outcome": "failed"
+        }
+      ],
+      "frames": 1,
+      "speechId": null,
+      "association": "unbound",
+      "readerCompletedNormally": true
+    }
+  ]
+}
