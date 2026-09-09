@@ -65,6 +65,7 @@ import { installKeepAliveDispatcher } from "./http/loopback-dispatcher.js";
 import { OutageQueueStore, type OutageQueueDoc } from "./outage/outage-queue-store.js";
 import { OutageEpisodeTracker } from "./outage/outage-notices.js";
 import { OutageReplayProcessor } from "./outage/outage-replay-processor.js";
+import { bootIdentityForModule, bootIdentityLogFields, writeBootIdentityRecord } from "./deployment/release.js";
 const log = createLogger("index");
 
 function provisionAgentDirs(agentIds: string[]): void {
@@ -80,12 +81,19 @@ function provisionAgentDirs(agentIds: string[]): void {
 }
 
 async function main(): Promise<void> {
+  const engineBootIdentity = bootIdentityForModule(import.meta.url, "engine");
+  const engineBootFields = bootIdentityLogFields(engineBootIdentity);
+  writeBootIdentityRecord(resolve(hiveStateDir, "runtime", "engine.json"), engineBootIdentity);
   // KPR-252: pool all outbound HTTP (loopback control plane + external) behind a
   // single keep-alive dispatcher before any fetch() runs, so the registration
   // loop and task-ledger clients reuse connections instead of exhausting the
   // IPv4 ephemeral port range. Must run before startBeekeeperRegistration().
   installKeepAliveDispatcher();
-  log.info("Hive starting up", { instance: config.instance.id, portBase: config.instance.portBase });
+  log.info("Hive starting up", {
+    instance: config.instance.id,
+    portBase: config.instance.portBase,
+    ...engineBootFields,
+  });
 
   // Boot-time integrity + upgrade checks
   // Refuse to boot if both 0.1.x and 0.2.0 engine layouts exist side-by-side
@@ -976,7 +984,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 
-  log.info("Hive is running");
+  log.info("Hive is running", engineBootFields);
 
   // First-boot: greet owner and offer onboarding if this is a fresh hive
   checkFirstBoot(memoryManager, registry, dispatcher, channelIdByName).catch((err) => {

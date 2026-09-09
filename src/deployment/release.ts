@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 export interface Release {
@@ -87,7 +88,17 @@ export function readRelease(root: string, requireClean = false): Release {
   return release as Release;
 }
 
-export function bootIdentity(release: Release, component: "engine" | "voice-worker") {
+export interface SourceUnavailableRelease {
+  classification: "source/unavailable";
+  packageVersion: null;
+  sourceRevision: null;
+  sourceDirty: null;
+  dependencyLockSha256: null;
+}
+
+export type RuntimeRelease = Release | SourceUnavailableRelease;
+
+export function bootIdentity(release: RuntimeRelease, component: "engine" | "voice-worker") {
   return {
     release,
     component,
@@ -98,3 +109,52 @@ export function bootIdentity(release: Release, component: "engine" | "voice-work
 }
 
 export type BootIdentity = ReturnType<typeof bootIdentity>;
+
+const sourceUnavailable = (): SourceUnavailableRelease => ({
+  classification: "source/unavailable",
+  packageVersion: null,
+  sourceRevision: null,
+  sourceDirty: null,
+  dependencyLockSha256: null,
+});
+
+/** Resolve release identity from the canonical module that is actually executing. */
+export function packageRootForModule(moduleUrl: string, component: "engine" | "voice-worker"): string | null {
+  const entrypoint = realpathSync(fileURLToPath(moduleUrl));
+  const expectedName = component === "engine" ? "server.min.js" : "voice-worker.min.js";
+  const packageDirectory = dirname(entrypoint);
+  if (basename(packageDirectory) === "pkg" && basename(entrypoint) === expectedName) {
+    return dirname(packageDirectory);
+  }
+  return null;
+}
+
+/** Resolve release identity from the canonical module that is actually executing. */
+export function bootIdentityForModule(moduleUrl: string, component: "engine" | "voice-worker"): BootIdentity {
+  const packageRoot = packageRootForModule(moduleUrl, component);
+  return bootIdentity(packageRoot === null ? sourceUnavailable() : readRelease(packageRoot), component);
+}
+
+export function bootIdentityLogFields(identity: BootIdentity): Record<string, unknown> {
+  return {
+    bootIdentity: identity,
+    component: identity.component,
+    pid: identity.pid,
+    bootId: identity.bootId,
+    startedAt: identity.startedAt,
+    releaseClassification: "classification" in identity.release ? identity.release.classification : "packaged",
+    packageVersion: identity.release.packageVersion,
+    sourceRevision: identity.release.sourceRevision,
+    sourceDirty: identity.release.sourceDirty,
+    dependencyLockSha256: identity.release.dependencyLockSha256,
+  };
+}
+
+/** Persist the local observation record consumed by runtime health checks. */
+export function writeBootIdentityRecord(path: string, identity: BootIdentity): void {
+  const directory = dirname(path);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, JSON.stringify(identity) + "\n", { flag: "wx", mode: 0o600 });
+  renameSync(temporary, path);
+}

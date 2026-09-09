@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 interface MutableMockConfig {
+  instance: { id: string };
   voice: {
     workerPort: number;
     port: number;
@@ -31,11 +32,13 @@ vi.mock("../config.js", () => ({
   resolveSecretEnv: resolveSecretEnvMock,
 }));
 vi.mock("../logging/logger.js", () => ({ createLogger: () => ({ warn: warnMock }) }));
+vi.mock("../paths.js", () => ({ hiveHome: "/fixture/hive" }));
 
 import { livekitServerAuth, loadWorkerConfig } from "./worker-config.js";
 
 beforeEach(() => {
   Object.assign(mockConfig, {
+    instance: { id: "fixture" },
     voice: {
       workerPort: 4107,
       port: 4105,
@@ -99,6 +102,8 @@ describe("livekitServerAuth (KPR-322)", () => {
 describe("loadWorkerConfig", () => {
   it("propagates the resolved health port and preserves loader-owned values", () => {
     expect(loadWorkerConfig()).toEqual({
+      instanceHome: "/fixture/hive",
+      instanceId: "fixture",
       healthPort: 4107,
       livekitUrl: "wss://example.livekit.cloud",
       livekitApiKey: "livekit-key",

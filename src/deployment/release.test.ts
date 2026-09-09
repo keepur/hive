@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readRelease, sha256, type Release } from "./release.js";
+import { pathToFileURL } from "node:url";
+import { bootIdentityForModule, readRelease, sha256, writeBootIdentityRecord, type Release } from "./release.js";
 
 const ARTIFACTS = [
   "pkg/server.min.js",
@@ -158,4 +159,53 @@ describe("readRelease", () => {
       expect(() => readRelease(root)).toThrow(`shrinkwrap ${field} mismatch`);
     });
   }
+
+  it("derives packaged identity from the actual canonical module", () => {
+    const identity = bootIdentityForModule(
+      pathToFileURL(join(root, "pkg", "voice-worker.min.js")).href,
+      "voice-worker",
+    );
+
+    expect(identity).toMatchObject({
+      component: "voice-worker",
+      pid: process.pid,
+      release: { packageVersion: packageJson.version, sourceRevision: "a".repeat(40) },
+    });
+    expect(identity.bootId).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it("requires a manifest for a packaged entrypoint", () => {
+    unlinkSync(join(root, "pkg", "release.json"));
+
+    expect(() => bootIdentityForModule(pathToFileURL(join(root, "pkg", "server.min.js")).href, "engine")).toThrow();
+  });
+
+  it("classifies source entrypoints unavailable without borrowing an adjacent package manifest", () => {
+    mkdirSync(join(root, "src"));
+    writeFileSync(join(root, "src", "index.js"), "");
+
+    const identity = bootIdentityForModule(pathToFileURL(join(root, "src", "index.js")).href, "engine");
+
+    expect(identity).toMatchObject({
+      component: "engine",
+      pid: process.pid,
+      release: {
+        classification: "source/unavailable",
+        packageVersion: null,
+        sourceRevision: null,
+        dependencyLockSha256: null,
+      },
+    });
+  });
+
+  it("writes the engine boot identity record under a newly-created runtime directory", () => {
+    mkdirSync(join(root, "src"));
+    writeFileSync(join(root, "src", "index.js"), "");
+    const identity = bootIdentityForModule(pathToFileURL(join(root, "src", "index.js")).href, "engine");
+    const record = join(root, ".hive-state", "runtime", "engine.json");
+
+    writeBootIdentityRecord(record, identity);
+
+    expect(JSON.parse(readFileSync(record, "utf8"))).toEqual(identity);
+  });
 });

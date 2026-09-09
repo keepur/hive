@@ -133,6 +133,9 @@ describe("resolveFailureAction session-layer truth table (KPR-322 §8)", () => {
 describe("CallStats.retryConsumed (KPR-322 Task 7 stand-in)", () => {
   const cell: VendorCell = { stt: "deepgram/flux-general-en", tts: "cartesia/sonic-3" };
   const wc = {
+    instanceHome: "/fixture/hive",
+    instanceId: "fixture",
+    healthPort: 4107,
     livekitUrl: "wss://example.livekit.cloud",
     livekitApiKey: "k",
     livekitApiSecret: "s",
@@ -162,6 +165,9 @@ describe("CallStats.retryConsumed (KPR-322 Task 7 stand-in)", () => {
 describe("recordSetupFailure (KPR-322 setup telemetry)", () => {
   const cell: VendorCell = { stt: "deepgram/flux-general-en", tts: "cartesia/sonic-3" };
   const wc = {
+    instanceHome: "/fixture/hive",
+    instanceId: "fixture",
+    healthPort: 4107,
     livekitUrl: "wss://example.livekit.cloud",
     livekitApiKey: "k",
     livekitApiSecret: "s",

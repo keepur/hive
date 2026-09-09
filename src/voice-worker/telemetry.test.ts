@@ -2,6 +2,7 @@ import { voice, type MetricsCollectedEvent } from "@livekit/agents";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { VendorCell } from "./cells.js";
 import type { WorkerConfig } from "./worker-config.js";
+import type { BootIdentity } from "../deployment/release.js";
 
 const { mockLog, mongoMocks } = vi.hoisted(() => ({
   mockLog: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -37,6 +38,9 @@ import { CallStats, percentile, TurnMetrics, VoiceWorkerHeartbeat } from "./tele
 const CELL: VendorCell = { stt: "deepgram/flux-general-en", tts: "cartesia/sonic-3" };
 
 const WC = {
+  instanceHome: "/fixture/hive",
+  instanceId: "fixture",
+  healthPort: 4107,
   livekitUrl: "wss://example.livekit.cloud",
   livekitApiKey: "k",
   livekitApiSecret: "s",
@@ -161,6 +165,19 @@ function interruptionEvent(numInterruptions: number): MetricsCollectedEvent {
 
 describe("VoiceWorkerHeartbeat (KPR-322 Task 8)", () => {
   const cellDefaults = { defaultStt: CELL.stt, defaultTts: CELL.tts };
+  const supervisorIdentity: BootIdentity = {
+    component: "voice-worker",
+    pid: 701,
+    bootId: "11111111-1111-4111-8111-111111111111",
+    startedAt: "2026-09-09T00:00:00.000Z",
+    release: {
+      classification: "source/unavailable",
+      packageVersion: null,
+      sourceRevision: null,
+      sourceDirty: null,
+      dependencyLockSha256: null,
+    },
+  };
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -285,6 +302,42 @@ describe("VoiceWorkerHeartbeat (KPR-322 Task 8)", () => {
     expect(mockLog.warn).toHaveBeenCalledWith("voice-worker heartbeat write failed", {
       error: "Error: mongo down",
     });
+  });
+
+  it("publishes immutable supervisor identity and separate freshness only from the supervisor", async () => {
+    const coll = makeFakeCollection();
+    const supervisor = new VoiceWorkerHeartbeat(coll as never, cellDefaults, 1_000, supervisorIdentity);
+    await supervisor.writeBoot();
+    await supervisor.writeOnce();
+
+    for (const call of coll.updateOne.mock.calls) {
+      const update = call[1] as { $set: Record<string, unknown> };
+      expect(update.$set.supervisorIdentity).toEqual(supervisorIdentity);
+      expect(update.$set.supervisorUpdatedAt).toBeInstanceOf(Date);
+    }
+
+    const child = new VoiceWorkerHeartbeat(coll as never, cellDefaults);
+    await child.noteCallStarted();
+    await child.noteError("budget_saturated");
+    await child.noteCallEnded();
+
+    for (const call of coll.updateOne.mock.calls.slice(2)) {
+      const update = call[1] as { $set: Record<string, unknown> };
+      expect(update.$set).not.toHaveProperty("supervisorIdentity");
+      expect(update.$set).not.toHaveProperty("supervisorUpdatedAt");
+      expect(update.$set.updatedAt).toBeInstanceOf(Date);
+    }
+  });
+
+  it("does not let a child heartbeat replace an older supervisor identity or freshen it", async () => {
+    const coll = makeFakeCollection();
+    const child = new VoiceWorkerHeartbeat(coll as never, cellDefaults);
+
+    await child.writeOnce();
+
+    const update = coll.updateOne.mock.calls[0]![1] as { $set: Record<string, unknown> };
+    expect(update.$set).not.toHaveProperty("supervisorIdentity");
+    expect(update.$set).not.toHaveProperty("supervisorUpdatedAt");
   });
 });
 

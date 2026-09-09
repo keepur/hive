@@ -1,13 +1,14 @@
 import { defineAgent, cli, WorkerOptions, type JobContext } from "@livekit/agents";
 import { MongoClient } from "mongodb";
 import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { bootIdentityForModule, bootIdentityLogFields, packageRootForModule } from "../deployment/release.js";
 import { createLogger } from "../logging/logger.js";
 import { resolveCell } from "./cells.js";
 import { parseDispatchMetadata } from "./dispatch-meta.js";
-import { runCallSession } from "./session.js";
-import { VoiceWorkerHeartbeat } from "./telemetry.js";
-import { livekitServerAuth, loadWorkerConfig } from "./worker-config.js";
+import { withJobLifecycle } from "./job-lifecycle.js";
+import { createJobReporter, createMaintenanceSupervisor } from "./maintenance-ipc.js";
 
 const log = createLogger("voice-worker");
 
@@ -16,19 +17,35 @@ export { parseDispatchMetadata } from "./dispatch-meta.js";
 
 export default defineAgent({
   entry: async (ctx: JobContext) => {
-    const wc = loadWorkerConfig();
-    const meta = parseDispatchMetadata(ctx.job.metadata);
-    const cell = resolveCell(meta, wc);
-    const mongo = new MongoClient(wc.mongoUri);
-    await mongo.connect();
-    const heartbeat = new VoiceWorkerHeartbeat(mongo.db(wc.mongoDbName).collection("telemetry"), {
-      defaultStt: wc.defaultStt,
-      defaultTts: wc.defaultTts,
+    const trackingKeys = ["HIVE_VOICE_SUPERVISOR_PID", "HIVE_VOICE_SUPERVISOR_BOOT_ID", "HIVE_VOICE_STATE_DIR"];
+    const hasTrackingEnvironment = trackingKeys.some((key) => process.env[key] !== undefined);
+    const reporter =
+      hasTrackingEnvironment || packageRootForModule(import.meta.url, "voice-worker") !== null
+        ? createJobReporter({ jobId: ctx.job.id })
+        : {
+            entered() {},
+            completed() {},
+          };
+    await withJobLifecycle(ctx, reporter, async (hooks) => {
+      const { loadWorkerConfig } = await import("./worker-config.js");
+      const { runCallSession } = await import("./session.js");
+      const { VoiceWorkerHeartbeat } = await import("./telemetry.js");
+      const wc = loadWorkerConfig();
+      const meta = parseDispatchMetadata(ctx.job.metadata);
+      const cell = resolveCell(meta, wc);
+      const mongo = new MongoClient(wc.mongoUri);
+      hooks.setEarlyCleanup(() => mongo.close());
+      await mongo.connect();
+      const heartbeat = new VoiceWorkerHeartbeat(mongo.db(wc.mongoDbName).collection("telemetry"), {
+        defaultStt: wc.defaultStt,
+        defaultTts: wc.defaultTts,
+      });
+      const cleanupFinished = hooks.delegateCleanup();
+      await runCallSession(ctx, wc, meta, cell, heartbeat, async () => {
+        await mongo.close();
+        cleanupFinished();
+      });
     });
-    // entry() returns while the LiveKit job is still running. Close Mongo
-    // from the session's ordered shutdown callback (after noteCallEnded),
-    // not as a sibling Promise.all callback — close must not race persist().
-    await runCallSession(ctx, wc, meta, cell, heartbeat, () => mongo.close().catch(() => {}));
   },
 });
 
@@ -61,24 +78,70 @@ export function isEntrypoint(argv1: string | undefined, moduleUrl: string): bool
 
 if (isEntrypoint(process.argv[1], import.meta.url)) {
   void (async () => {
+    const [{ livekitServerAuth, loadWorkerConfig }, { VoiceWorkerHeartbeat }, { ServiceController }] =
+      await Promise.all([import("./worker-config.js"), import("./telemetry.js"), import("../deployment/services.js")]);
     const wc = loadWorkerConfig();
+    const identity = bootIdentityForModule(import.meta.url, "voice-worker");
+    const supervisorRef = { pid: identity.pid, bootId: identity.bootId };
+    const processInspector = new ServiceController({
+      instanceId: wc.instanceId,
+      hiveHome: wc.instanceHome,
+      home: process.env.HOME ?? wc.instanceHome,
+      operationDir: resolve(wc.instanceHome, ".hive-state", "deployment", "operations", identity.bootId),
+    });
+    const mailbox = createMaintenanceSupervisor({
+      instanceHome: wc.instanceHome,
+      instanceId: wc.instanceId,
+      supervisor: supervisorRef,
+      bootedAt: Date.parse(identity.startedAt),
+      sdkHost: "127.0.0.1",
+      sdkPort: wc.healthPort,
+      inspectChildPids: async (pids) => {
+        const observations = new Map<number, "absent" | "present" | "unknown">();
+        await Promise.all(
+          pids.map(async (pid) => {
+            try {
+              observations.set(pid, (await processInspector.process(pid)) === null ? "absent" : "present");
+            } catch {
+              observations.set(pid, "unknown");
+            }
+          }),
+        );
+        return observations;
+      },
+    });
+    process.env.HIVE_VOICE_SUPERVISOR_PID = String(supervisorRef.pid);
+    process.env.HIVE_VOICE_SUPERVISOR_BOOT_ID = supervisorRef.bootId;
+    process.env.HIVE_VOICE_STATE_DIR = mailbox.stateDirectory;
     // Forked job procs fall back to env when WorkerOptions aren't forwarded.
     // This process is the voice-worker, not a cloud-model agent — env is allowed.
     process.env.LIVEKIT_URL = wc.livekitUrl;
     process.env.LIVEKIT_API_KEY = wc.livekitApiKey;
     process.env.LIVEKIT_API_SECRET = wc.livekitApiSecret;
     const mongo = new MongoClient(wc.mongoUri);
-    await mongo.connect();
-    const workerHeartbeat = new VoiceWorkerHeartbeat(mongo.db(wc.mongoDbName).collection("telemetry"), {
-      defaultStt: wc.defaultStt,
-      defaultTts: wc.defaultTts,
+    const workerHeartbeat = new VoiceWorkerHeartbeat(
+      mongo.db(wc.mongoDbName).collection("telemetry"),
+      { defaultStt: wc.defaultStt, defaultTts: wc.defaultTts },
+      VoiceWorkerHeartbeat.INTERVAL_MS,
+      identity,
+    );
+    process.once("exit", () => {
+      mailbox.stop();
+      workerHeartbeat.stop();
+      void mongo.close();
     });
+    await mongo.connect();
+    log.info("voice worker release boot", bootIdentityLogFields(identity));
     await workerHeartbeat.writeBoot();
     workerHeartbeat.start();
+    mailbox.start();
     cli.runApp(
       new WorkerOptions({
         agent: fileURLToPath(import.meta.url),
         agentName: "hive-voice",
+        host: "127.0.0.1",
+        port: wc.healthPort,
+        requestFunc: (request) => mailbox.ledger.request(request),
         ...livekitServerAuth(wc),
       }),
     );

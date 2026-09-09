@@ -1,9 +1,61 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { isEntrypoint } from "./main.js";
+import { createMaintenanceSupervisor } from "./maintenance-ipc.js";
+
+const mocks = vi.hoisted(() => ({
+  loadWorkerConfig: vi.fn(),
+  runCallSession: vi.fn(),
+  connect: vi.fn(),
+  close: vi.fn(),
+  db: vi.fn(() => ({ collection: vi.fn(() => ({})) })),
+  MongoClient: vi.fn(),
+}));
+
+vi.mock("./worker-config.js", () => ({
+  loadWorkerConfig: mocks.loadWorkerConfig,
+  livekitServerAuth: vi.fn(() => ({ wsURL: "wss://fixture", apiKey: "key", apiSecret: "secret" })),
+}));
+vi.mock("./session.js", () => ({ runCallSession: mocks.runCallSession }));
+vi.mock("./telemetry.js", () => ({
+  VoiceWorkerHeartbeat: class VoiceWorkerHeartbeat {
+    static readonly INTERVAL_MS = 30_000;
+    writeBoot = vi.fn();
+    start = vi.fn();
+    stop = vi.fn();
+  },
+}));
+vi.mock("mongodb", () => ({
+  MongoClient: mocks.MongoClient.mockImplementation(function MongoClient() {
+    return { connect: mocks.connect, close: mocks.close, db: mocks.db };
+  }),
+}));
+
+import voiceAgent, { isEntrypoint } from "./main.js";
+
+const WORKER_CONFIG = {
+  instanceHome: "/fixture/hive",
+  instanceId: "fixture",
+  healthPort: 4107,
+  livekitUrl: "wss://fixture",
+  livekitApiKey: "key",
+  livekitApiSecret: "secret",
+  sipTrunkId: "ST_fixture",
+  inboundAgents: {},
+  agentVoices: {},
+  defaultStt: "deepgram/flux-general-en",
+  defaultTts: "cartesia/sonic-3",
+  deepgramApiKey: "deepgram",
+  cartesiaApiKey: "cartesia",
+  elevenlabsApiKey: "elevenlabs",
+  bridgeToken: "bridge",
+  bridgeUrl: "http://127.0.0.1:4105/v1/chat/completions",
+  mongoUri: "mongodb://fixture",
+  mongoDbName: "fixture",
+};
 
 // Node resolves a module's `import.meta.url` through the real filesystem
 // path (symlinks included) at load time — so the accurate way to simulate
@@ -100,5 +152,139 @@ describe("isEntrypoint (KPR-428)", () => {
     writeFileSync(real, "");
     const missing = join(tmp, "does-not-exist.ts");
     expect(isEntrypoint(missing, moduleUrlFor(real))).toBe(false);
+  });
+});
+
+describe("tracked default agent entry (KPR-463)", () => {
+  const trackingKeys = ["HIVE_VOICE_SUPERVISOR_PID", "HIVE_VOICE_SUPERVISOR_BOOT_ID", "HIVE_VOICE_STATE_DIR"] as const;
+  let savedEnvironment: Array<[string, string | undefined]>;
+  let home: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.loadWorkerConfig.mockReturnValue(WORKER_CONFIG);
+    mocks.connect.mockResolvedValue(undefined);
+    mocks.close.mockResolvedValue(undefined);
+    mocks.runCallSession.mockResolvedValue(undefined);
+    savedEnvironment = trackingKeys.map((key) => [key, process.env[key]]);
+    home = realpathSync(mkdtempSync(join(tmpdir(), "voice-worker-tracked-entry-")));
+  });
+
+  afterEach(() => {
+    for (const [key, value] of savedEnvironment) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  async function harness(metadata = "{}") {
+    const supervisorRef = { pid: 700, bootId: "11111111-1111-4111-8111-111111111111" };
+    const supervisor = createMaintenanceSupervisor({
+      instanceHome: home,
+      instanceId: "fixture",
+      supervisor: supervisorRef,
+      bootedAt: 1,
+      sdkHost: "127.0.0.1",
+      sdkPort: 4107,
+    });
+    await supervisor.ledger.request({ id: "job-a", accept: async () => {}, reject: async () => {} });
+    process.env.HIVE_VOICE_SUPERVISOR_PID = String(supervisorRef.pid);
+    process.env.HIVE_VOICE_SUPERVISOR_BOOT_ID = supervisorRef.bootId;
+    process.env.HIVE_VOICE_STATE_DIR = supervisor.stateDirectory;
+    let shutdown!: () => Promise<void>;
+    const ctx = {
+      job: { id: "job-a", metadata },
+      addShutdownCallback(callback: () => Promise<void>) {
+        shutdown = callback;
+      },
+    };
+    return { supervisor, ctx, shutdown: () => shutdown() };
+  }
+
+  it("imports the compiled production agent without starting the supervisor or loading config", () => {
+    const scratch = realpathSync(mkdtempSync(join(tmpdir(), "voice-worker-import-")));
+    try {
+      const compiled = pathToFileURL(join(import.meta.dirname, "../../dist/voice-worker/main.js")).href;
+      const result = spawnSync(
+        process.execPath,
+        ["--input-type=module", "-e", `await import(${JSON.stringify(compiled)}); process.stdout.write("IMPORTED\\n")`],
+        {
+          cwd: scratch,
+          env: { HOME: scratch, PATH: process.env.PATH ?? "", NODE_ENV: "test" },
+          encoding: "utf8",
+        },
+      );
+      expect({ status: result.status, stdout: result.stdout, stderr: result.stderr }).toEqual({
+        status: 0,
+        stdout: "IMPORTED\n",
+        stderr: "",
+      });
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("reports pre-config failure only after SDK shutdown", async () => {
+    const h = await harness();
+    mocks.loadWorkerConfig.mockImplementation(() => {
+      throw new Error("configuration failed");
+    });
+
+    await expect(voiceAgent.entry(h.ctx as never)).rejects.toThrow("configuration failed");
+    await h.supervisor.pollOnce();
+    expect(h.supervisor.ledger.snapshot().unresolved).toMatchObject([
+      { jobId: "job-a", phase: "entered-awaiting-completion", childPid: process.pid },
+    ]);
+
+    await h.shutdown();
+    await h.supervisor.pollOnce();
+    expect(h.supervisor.ledger.snapshot().unresolved).toEqual([]);
+  });
+
+  it("does not construct Mongo when metadata-derived cell validation fails", async () => {
+    const h = await harness('{"stt":"deepgram/unknown"}');
+
+    await expect(voiceAgent.entry(h.ctx as never)).rejects.toThrow("Unknown STT cell");
+
+    expect(mocks.MongoClient).not.toHaveBeenCalled();
+    await h.shutdown();
+  });
+
+  it("closes Mongo only on shutdown after a connect failure", async () => {
+    const h = await harness();
+    mocks.connect.mockRejectedValue(new Error("mongo unavailable"));
+
+    await expect(voiceAgent.entry(h.ctx as never)).rejects.toThrow("mongo unavailable");
+    expect(mocks.close).not.toHaveBeenCalled();
+
+    await h.shutdown();
+    expect(mocks.close).toHaveBeenCalledOnce();
+  });
+
+  it("waits for the session's ordered Mongo cleanup before reporting completion", async () => {
+    const h = await harness();
+    let orderedCleanup!: () => Promise<void>;
+    mocks.runCallSession.mockImplementation(async (...args: unknown[]) => {
+      orderedCleanup = args[5] as () => Promise<void>;
+    });
+
+    await voiceAgent.entry(h.ctx as never);
+    await h.supervisor.pollOnce();
+    let shutdownSettled = false;
+    const shutdown = h.shutdown().then(() => {
+      shutdownSettled = true;
+    });
+    await Promise.resolve();
+
+    expect(shutdownSettled).toBe(false);
+    expect(mocks.close).not.toHaveBeenCalled();
+    expect(h.supervisor.ledger.snapshot().unresolved).toHaveLength(1);
+
+    await orderedCleanup();
+    await shutdown;
+    await h.supervisor.pollOnce();
+    expect(mocks.close).toHaveBeenCalledOnce();
+    expect(h.supervisor.ledger.snapshot().unresolved).toEqual([]);
   });
 });
