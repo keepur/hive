@@ -9,6 +9,7 @@ import { DEFAULT_OUTAGE_QUEUE_CONFIG, type OutageQueueConfig } from "./outage/ou
 import { DEFAULT_MEETING_WORKERS_CONFIG, type MeetingWorkersConfig } from "./workers/worker-pool-config.js";
 import { fromKeychain as fromKeychainRaw } from "./keychain/from-keychain.js";
 import { engineDir, hiveHome, resolveConfigFile, resolveDotenvPath } from "./paths.js";
+import { assertWorkerPortAvailableInConfig, voiceWorkerPort } from "./deployment/ports.js";
 
 // Load .env from resolved hive home
 const dotenvPath = resolveDotenvPath(hiveHome);
@@ -579,6 +580,7 @@ export const config = {
     apiKey: optional("VAPI_API_KEY", ""),
     serverSecret: optional("VAPI_SERVER_SECRET", ""),
     port: parseInt(optional("VOICE_PORT", String(ports.voice ?? portBase + 5)), 10),
+    workerPort: voiceWorkerPort(hive.instance?.portBase, ports.voiceWorker),
     // KPR-322 E1/E3: shared bridge secret (worker → adapter) + bind host.
     // Loopback default — both callers are local (worker directly; Vapi via
     // the cloudflared tunnel, which connects from localhost ⚠ verify tunnel
@@ -848,3 +850,16 @@ export const config = {
     background: optional("BG_TASKS_DIR", `/tmp/${instanceId}-bg-tasks`),
   },
 } as const;
+
+if (config.voice.livekit.enabled) {
+  assertWorkerPortAvailableInConfig(config.voice.workerPort, {
+    background: config.background.port,
+    recall: config.recall.monitorPort,
+    codeTask: config.codeTask.port,
+    ws: config.ws.port,
+    adminApi: config.adminApi.port,
+    voice: config.voice.port,
+    slackInternal: config.slackInternal.port,
+    beekeeper: config.beekeeper.port,
+  });
+}

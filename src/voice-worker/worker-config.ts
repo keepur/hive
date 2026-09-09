@@ -10,6 +10,7 @@ import { createLogger } from "../logging/logger.js";
 const log = createLogger("voice-worker-config");
 
 export interface WorkerConfig {
+  healthPort: number;
   livekitUrl: string;
   livekitApiKey: string;
   livekitApiSecret: string;
@@ -40,6 +41,7 @@ export function loadWorkerConfig(): WorkerConfig {
   const lk = config.voice.livekit;
   if (!lk.enabled) throw new Error("voice.livekit.enabled is false — voice worker refusing to start");
   const wc: WorkerConfig = {
+    healthPort: config.voice.workerPort,
     livekitUrl: lk.url,
     livekitApiKey: config.voice.livekitApiKey,
     livekitApiSecret: config.voice.livekitApiSecret,
