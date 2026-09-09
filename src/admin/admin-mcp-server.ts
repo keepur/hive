@@ -1351,7 +1351,7 @@ export function buildAdminTools(deps: AdminToolDeps) {
     ),
     tool(
       "verify_path",
-      "Check that an absolute filesystem path exists and is a directory. Use it to validate any directory path before writing it into an agent definition (e.g. a workspace or cwd path in `fields`), so the caller catches typos at write time instead of at agent-load time.",
+      "Check that an absolute filesystem path exists and is a directory. General-purpose path-validation utility — currently has no in-repo caller, since the workflow it originally served (the agent-builder seed skill's software-engineer workshop verification) was removed in KPR-435.",
       {
         path: z
           .string()

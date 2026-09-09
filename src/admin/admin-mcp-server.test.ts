@@ -1741,6 +1741,24 @@ describe("KPR-435 — admin tools reject code-task and archetype at write time",
     expect(agentDocsStore.get("existing-agent").coreServers).toEqual(["memory", "slack"]);
   });
 
+  it("agent_update on a legacy doc still carrying a stray archetype is not locked out by an unrelated field change", async () => {
+    // KPR-435: `merged` is built from `fields` + top-level params only, never
+    // spread from the existing doc — so an un-migrated legacy agent (e.g.
+    // hive_keepur's alexandria) stays fully editable. This must never
+    // regress into reading `merged.archetype` off `existing`.
+    agentDocsStore.set(
+      "existing-agent",
+      makeBaseAgent({ archetype: "software-engineer", archetypeConfig: { workshop: "/tmp/x" } }),
+    );
+    const res = await update({ fields: { coreServers: ["memory", "slack"] } });
+    expect(res.isError).toBeFalsy();
+    const doc = agentDocsStore.get("existing-agent");
+    expect(doc.coreServers).toEqual(["memory", "slack"]);
+    // The stray archetype fields are untouched by this unrelated update —
+    // registry load (agent-registry.ts) is what strips them, not this path.
+    expect(doc.archetype).toBe("software-engineer");
+  });
+
   it("list_archetypes is no longer registered", () => {
     expect(makeTools().find((t: any) => t.name === "list_archetypes")).toBeUndefined();
   });
