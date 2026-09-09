@@ -16,12 +16,13 @@
 
 ## Review chunks and file structure
 
-Each chunk file is under 1,000 lines. Code fences carry complete new-file payloads or exact insertion/replacement blocks. Apply repository formatting (`npm run format`); formatting changes are not design changes.
+Each chunk file is under 1,000 lines, with one deliberate exception: [chunk 3](kpr-454-plan-3-publisher.md) runs slightly over (~1,050) because it is a single task and the invariant-dense heart of the ticket — the drainer, the accept path, the epoch resolver and the open-condition map argue as one piece, and splitting them across two files would make the invariants harder to review as a whole, which is the opposite of what the bound is for. Code fences carry complete new-file payloads or exact insertion/replacement blocks. Apply repository formatting (`npm run format`); formatting changes are not design changes.
 
 | Chunk | Plan file | Tasks | Responsibility |
 | --- | --- | --- | --- |
 | 1 | [Prefix table and `waiting`](kpr-454-plan-1-prefix-table.md) | 1 | Behaviour-preserving refactor of `src/outage/outage-notices.ts` to one prefix→bucket table; `waitingFor`; AC4 |
-| 2 | [Contract module](kpr-454-plan-2-contract.md) | 2, 3 | `ops_events` envelope types, reason registry rows + enable gate, `classifyToolError`, id admissibility bound |
+| 2 | [Contract module](kpr-454-plan-2-contract.md) | 2 | `ops_events` envelope types, reason registry rows + enable gate, `classifyToolError`, id admissibility bound |
+| 2b | [Contract module unit coverage](kpr-454-plan-2b-contract-tests.md) | 3 | `error-tokens.test.ts`, `ids.test.ts`, `reasons.test.ts`, `match.test.ts` — the C7/AC5 grammar enumeration and the C13 closed-token pin |
 | 3 | [Publisher](kpr-454-plan-3-publisher.md) | 4 | Store/indexes, accept path, epoch resolver, open-condition map, bounded queue + drainer, counters, singleton |
 | 4 | [Capture points and boot](kpr-454-plan-4-capture-and-boot.md) | 5, 6 | Claude-lane hooks, Lane B `wrap()`, `ProviderTurnAssembly.agentId?` → `ToolBridgeOptions.agentSlug?`, `index.ts` wiring, `boot-order.test.ts`, `CLAUDE.md` |
 | 5 | [Acceptance suite and probes](kpr-454-plan-5-acceptance.md) | 7 | AC1–AC16 as named tests; the two `⚠ Verify at implementation` probes |
@@ -171,7 +172,7 @@ Run from the child implementation worktree on Node 22 or 24 (CLAUDE.md: dev mode
 
 ## Task and commit map
 
-Seven tasks, seven commits. Chunked into five files because the ticket spans four distinct production surfaces (a shared-code refactor, a new module, two provider lanes, boot) plus a sixteen-criterion acceptance suite, and a single file would exceed the 1,000-line review chunk.
+Seven tasks, seven commits. Chunked into six files (chunk 2 split at its Task 2 | Task 3 seam) because the ticket spans four distinct production surfaces (a shared-code refactor, a new module, two provider lanes, boot) plus a sixteen-criterion acceptance suite, and a single file would exceed the 1,000-line review chunk.
 
 | Task | Chunk | Commit subject |
 | --- | --- | --- |
