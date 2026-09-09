@@ -14,7 +14,7 @@ This chunk inherits the complete [Testing Contract](./kpr-464-plan.md#testing-co
 
 **Files:**
 - Create: `src/agents/voice-request-cancellation.ts`
-- Modify: `src/agents/agent-manager.ts` (`TurnContext`, `withSpawnTicket`, `runOneSpawnAttempt`, `openWarmLease`, `runWarmTurn`)
+- Modify: `src/agents/agent-manager.ts` (`TurnContext`, `spawnTurn`, `withSpawnTicket`, `runOneSpawnAttempt`, `openWarmLease`, new `openWarmLeaseAttempt`, `runWarmTurn`)
 - Modify: `src/agents/warm-voice-session.ts` (`WarmTurnRequest`, `runTurn`, `consumeOneTurn`)
 - Test: `src/agents/voice-request-cancellation.test.ts`
 - Test: `src/agents/warm-voice-session.test.ts`
@@ -104,17 +104,61 @@ This fixes three distinct boundaries: canceled lock-waiter never acquires; cance
 
 - [ ] **Step 3: Keep the warm lifetime ticket separate from per-request interruption.**
 
-`openWarmLease` calls `withSpawnTicket(ctx, leaseLifetimeCallback, { requestSignalMode: "admission_only" })`. This checks request cancellation while waiting for acquisition, then leaves the lifetime ticket's `attachAbort(() => lease.close("ticket-abort"))` governed by existing stop/shutdown ownership. The HTTP request's signal must never remain attached to that lifetime ticket after admission, or the first request's delayed close could destroy every later warm turn.
+**Coordinate before the first acquisition await, including concurrent entry with no published lease.** Add `pendingWarmOpenings: Map<string, Promise<void>>` beside `warmLeases`. Rename the existing opening body `openWarmLeaseAttempt(ctx, onStream, published: () => void)` and wrap it with this method. No ticket, Query or permit is allocated by a joining request:
 
-After acquisition the opening initialization belongs to the lease. Reserve live opener A's demux slot **before publishing** the lease to successor B. In `openWarmLease`, after policy pinning/resume eligibility selection and immediately before `this.warmLeases.set(threadKey, pinnedLease)`, invoke the existing async `runWarmTurn` once; it synchronously checks/acquires its permit and calls `lease.runTurn` before its first await. `runTurn` must synchronously append its chain slot before waiting for start. Attach a rejection observer immediately so initialization cannot leave an unhandled rejection:
+```typescript
+private async openWarmLease(ctx: TurnContext, onStream?: SpawnTurnStreamCallback): Promise<TurnResult> {
+  const threadKey = `${ctx.agentId}:${ctx.threadId}`;
+  let wake!: () => void;
+  const pending = new Promise<void>((resolve) => { wake = resolve; });
+  this.pendingWarmOpenings.set(threadKey, pending); // Before invoking the async body.
+  const published = () => {
+    if (this.pendingWarmOpenings.get(threadKey) === pending) this.pendingWarmOpenings.delete(threadKey);
+    wake();
+  };
+  try { return await this.openWarmLeaseAttempt(ctx, onStream, published); }
+  finally { published(); } // Rejection before publication wakes surviving waiters too.
+}
+```
+
+At `spawnTurn` entry check the request signal, registry and stopped-agent state. In its warm voice branch, keep live `warmLeases` reuse first, then insert the following **before** `isWarmPathEligible`/`openWarmLease`. No await intervenes between this map read, eligibility and the opening wrapper's map insertion:
+
+```typescript
+const pending = this.pendingWarmOpenings.get(threadKey);
+if (pending) {
+  await waitForVoiceOpening(pending, ctx.voiceRequestSignal);
+  return this.spawnTurn(ctx, onStream); // Recheck live lease, stop, definition and signal.
+}
+```
+
+Add the disposable wait to `voice-request-cancellation.ts`:
+
+```typescript
+export async function waitForVoiceOpening(pending: Promise<void>, signal?: AbortSignal): Promise<void> {
+  checkVoiceRequest(signal);
+  let detach = () => {};
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    detach = bindVoiceRequest(signal, () => reject(new VoiceRequestCancelledError()));
+  });
+  try { await Promise.race([pending, cancelled]); checkVoiceRequest(signal); }
+  finally { detach(); }
+}
+```
+
+The pending promise signals **publication or completed failed admission**, never lease lifetime. After reserving A, insert the fully pinned lease and call `published()` synchronously before awaiting Query initialization. Waiting B then re-enters and queues on that lease. If A fails/cancels before acquiring a ticket, close its unused lease, await `coordinator.catch(() => {})` to finish ticket cleanup, then propagate the original error; the wrapper's finally wakes B to try its own admission. Apply the same close/await/rethrow to failures in post-acquisition eligibility/policy/shaping before publication. In the `opening-ineligible` branch, close the unused lease, await the coordinator, call `published()`, then recurse into `spawnTurn`; otherwise A would wait on its own opening. Identity-checked deletion cannot erase a newer opening. Keep the detached coordinator rejection observer and contain its own rejection. There is only one lifetime admission per opening; published-lease queue readiness alone does not solve concurrent entry.
+
+`openWarmLeaseAttempt` calls `withSpawnTicket(ctx, leaseLifetimeCallback, { requestSignalMode: "admission_only" })`. This checks request cancellation while waiting for acquisition, then leaves the lifetime ticket's `attachAbort(() => lease.close("ticket-abort"))` governed by existing stop/shutdown ownership. The HTTP request's signal must never remain attached to that lifetime ticket after admission, or the first request's delayed close could destroy every later warm turn.
+
+After acquisition the opening initialization belongs to the lease. Reserve live opener A's demux slot **before publishing** the lease to successor B. In `openWarmLeaseAttempt`, after policy pinning/resume eligibility selection and immediately before `this.warmLeases.set(threadKey, pinnedLease)`, invoke the existing async `runWarmTurn` once; it synchronously checks/acquires its permit and calls `lease.runTurn` before its first await. `runTurn` must synchronously append its chain slot before waiting for start. Attach a rejection observer immediately so initialization cannot leave an unhandled rejection:
 
 ```typescript
 const openingTurn = this.runWarmTurn(pinnedLease, ctx, onStream);
 void openingTurn.catch(() => {}); // Original promise is still returned to A below.
 this.warmLeases.set(threadKey, pinnedLease);
+published(); // Wakes requests that entered before this registry entry existed.
 ```
 
-Retain the existing `openVoiceStreamingSession` try/catch and late-Query close guard. Replace the final second call to `runWarmTurn` with `return openingTurn`; the opener is never enqueued twice. If initialization fails, close the lease (which resolves readiness), retain the initialization error for A, and allow the observed opening promise to settle. A canceled request or circuit-open permit rejection reserves no work; it cannot later push an obsolete full-transcript opening. Starting an otherwise healthy published lease continues for an independently admitted B. There is no await or publication between live A's reservation and registry insertion. A's actual breaker acquisition now precedes initialization and is still recorded once; no extra probe permit is introduced.
+Retain the existing `openVoiceStreamingSession` try/catch and late-Query close guard. Replace the final second call to `runWarmTurn` with `return openingTurn`; the opener is never enqueued twice. If initialization fails, close the lease (which resolves readiness), await coordinator cleanup, retain the initialization error for A, and allow the observed opening promise to settle. Keep that initialization catch separate from the returned opening promise: canceled A's request rejection must not close the healthy lease. A canceled request or circuit-open permit rejection reserves no work; it cannot later push an obsolete full-transcript opening. Starting an otherwise healthy published lease continues for an independently admitted B. There is no await or publication between live A's reservation and registry insertion. A's actual breaker acquisition now precedes initialization and is still recorded once; no extra probe permit is introduced.
 
 Extend lease readiness with a promise resolved by either `start(query)` or `close(reason)`. Successors can queue against a published unstarted lease behind A's already-reserved slot; at consumption each awaits readiness then checks closed/canceled state. A readiness promise alone without that pre-publication reservation is insufficient. Closing before a late Query arrives still calls `query.close()` through the existing `start()` guard.
 
@@ -127,7 +171,36 @@ private readonly ready = new Promise<void>((resolve) => { this.markReady = resol
 
 Call `this.markReady()` after `this.query = query` in successful `start`, and in `close` after marking closed. A canceled opener does not close an otherwise healthy published lease used by its successor. Idle/lifetime reclaim and stopAgent still own whole-lease cleanup.
 
-**Choose prompt continuity when the surviving request consumes the slot.** Remove `shapeVoicePrompt(ctx, true)` and the early `onVoiceAdmission("warm")` from `spawnTurn`'s reused-lease branch; pass the original `ctx` into `runWarmTurn`. In `openWarmLease`, preserve that original `ctx.voicePrompt` for the reserved request. Derive a separate `openingCtx = this.shapeVoicePrompt(ctx, !!ctx.sessionId)` after the existing provider compatibility check solely to select the Query's resume candidate, and use `openingCtx.sessionId` for `openVoiceStreamingSession` and the fresh-spawn guard (`if (!openingCtx.sessionId) this.recordSpawn(ctx.workItem.source.id)`). Remove the early opening admission callback. The stream input is still provided by the per-request queue, never by `openingCtx.workItem.text` during initialization.
+**Retain launch admission independently of input selection.** Add `onVoiceLaunchAdmission?: (continuity: "resume" | "fresh") => void` to `TurnContext`. This reports the compatible Query launch candidate admitted for this request, including initialization failures before `start`; it does not assert that a Query started, an input was pushed, or a prompt form was consumed. Add `resumeSessionId?: string` to `WarmVoiceLease.opening` and set it from the exact `openingCtx.sessionId` selected below, before reserving A or publishing. Inside `runWarmTurn`'s existing try, after its request check/permit acquisition and before `lease.runTurn`, invoke:
+
+```typescript
+checkVoiceRequest(ctx.voiceRequestSignal);
+ctx.onVoiceLaunchAdmission?.(lease.opening.resumeSessionId ? "resume" : "fresh");
+checkVoiceRequest(ctx.voiceRequestSignal); // A callback can synchronously disconnect this request.
+```
+
+Thus A and any live B admitted against this launch retain resume evidence when `openVoiceStreamingSession` throws before readiness/selection. A canceled before admission receives no launch callback; later cancellation still prohibits adapter retries. Cold admission keeps its existing callback. Task 5 latches positive continuity from either callback and separately records launch admission versus actual input selection. Never clear positive launch evidence merely because selection was never reached.
+
+**Choose prompt continuity when the surviving request consumes the slot.** Remove `shapeVoicePrompt(ctx, true)` and the early `onVoiceAdmission("warm")` from `spawnTurn`'s reused-lease branch; pass the original `ctx` into `runWarmTurn`. In `openWarmLeaseAttempt`, preserve that original `ctx.voicePrompt` for the reserved request. Derive a separate `openingCtx = this.shapeVoicePrompt(ctx, !!ctx.sessionId)` after the existing provider compatibility check solely to select the Query's resume candidate, and use `openingCtx.sessionId` for `openVoiceStreamingSession` and the fresh-spawn guard (`if (!openingCtx.sessionId) this.recordSpawn(ctx.workItem.source.id)`). Replace the old early opening callback with the launch-admission channel above; it is separate from consumption-time `onVoiceAdmission`. The stream input is still provided by the per-request queue, never by `openingCtx.workItem.text` during initialization.
+
+Replace the original policy pin/compatibility/shaping block with this order, inside the pre-publication cleanup boundary. Readonly launch metadata is complete when constructed:
+
+```typescript
+const definition = this.registry.get(ctx.agentId)!;
+const openingRoute = resolveProviderModel(definition.model);
+if (ctx.sessionProvider && ctx.sessionProvider !== openingRoute.provider) {
+  ctx = { ...ctx, sessionId: undefined, sessionProvider: undefined };
+}
+const openingCtx = this.shapeVoicePrompt(ctx, !!ctx.sessionId);
+const pinnedLease: WarmVoiceLease = Object.assign(lease, {
+  opening: {
+    model: definition.model,
+    route: openingRoute,
+    timeoutMs: definition.timeoutMs ?? 300_000,
+    resumeSessionId: openingCtx.sessionId,
+  },
+});
+```
 
 Extend `start(query, options = {})` with `options: { resumedSessionId?: string }`; the manager passes the exact candidate used to construct that Query. Add `private resumedSessionId: string | undefined`; store the supplied ID only on successful start, before resolving readiness. Add `private inputPushed = false` to the lease. Neither registry publication, reservation, canceled skipped slots nor `turnCount` alone supplies prompt continuity. Add this optional selector while retaining `text` for existing direct lease callers:
 
@@ -256,6 +329,8 @@ Extend the manager fixture from `src/agents/agent-manager.test.ts`; mock only st
 7. A requests interruption, drains result, and B begins before the interrupt promise rejects: rejection neither closes Query/lease nor interrupts B; B completes. Repeat stale resolution (no grace timer), same-owner rejection (lease closes), and idle interrupt rejection after a successor starts (successor survives). Also reject an idle interruption then synchronously queue B before promise reactions execute: the rejection callback runs before B's consumption callback; B remains queued/alive and then completes. This test must assert `turnCount`/`turnInFlight` have not changed at rejection, so it cannot pass merely by testing an already-started B. Same idle owner with no successor still escalates.
 8. stopAgent and shutdown still close the entire warm lease; request cancellation preserves its lease.
 9. Thrown preparation/admission/provider error, canceled queued request and zero-progress abort retain existing breaker and persistence semantics.
+10. Invoke `spawnTurn(A)` and `spawnTurn(B)` synchronously in the same stack with `warmLeases` initially absent; gate A's acquisition continuation **before registry publication**. Assert B sees `pendingWarmOpenings`, never enters a second `withSpawnTicket`, and does not finish merely from an idle/lifetime timeout. Release acquisition, keep Query start gated, assert one ticket/budget slot and B queued behind A; release start and drive A/B to normal completion on the same Query. Repeat canceling A after acquisition but before publication/start: B sends its full sentinel conversation once and completes on the surviving lease without advancing idle/lifetime clocks or releasing its lifetime ticket. Repeat A canceled while still waiting behind a cold ticket: B wakes after A's admission cleanup, obtains one new ticket and completes; A has no provider input. Cancel B while awaiting the opening notification: no B permit/ticket/input and A survives. Test pre-publication budget/pinning failures, post-publication init failure, stop/shutdown, and eligibility reroute; all settle pending entries and ticket resources without self-wait or an orphan promise.
+11. Use real adapter/manager composition from Task 5: compatible stored resume → `openVoiceStreamingSession` throws before `start`/`selectText` → exactly one adapter retry with cleared resume and full conversation → fake provider output completes. Assert attempt 1 has launch admission `resume`, no selected prompt, and one failed terminal; attempt 2 has launch admission `fresh`, selected full prompt, and normal output. Repeat with disconnect before admission and while resumed initialization is gated: zero retry and no post-cancel output. Include a live joining B on the failed resumed opening; its own launch evidence is retained rather than borrowed from A's callback.
 
 Run: `npx vitest run src/agents/voice-request-cancellation.test.ts src/agents/warm-voice-session.test.ts src/agents/agent-manager.test.ts`
 
@@ -296,7 +371,20 @@ The callback does not call `agentManager.abortThread`. The final `finally` detac
 
 - [ ] **Step 2: Wrap every authenticated execution path in the scope.**
 
-Move `buildVoiceSystemPrompt`, session store lookup and work-item assembly inside the existing request `try/catch/finally`. Preserve top-level auth/unknown-agent rejection semantics. Check `requestAbort.signal.aborted` after each preparation await and before admission/retry; no subsequent spawn or response write follows a disconnect. Add `voiceRequestSignal: requestAbort.signal` to TurnContext and retain it in all spread retry contexts. `runOnce` increments `engineAttemptSeq` before entering dispatcher/manager, emits attempt-start, then emits its own attempt-terminal in `finally`. The adapter's existing resume/full-transcript retry retains the bridge turn ID and increases the engine attempt number. Record admitted continuity from the existing callback, including thrown failures.
+Move `buildVoiceSystemPrompt`, session store lookup and work-item assembly inside the existing request `try/catch/finally`. Preserve top-level auth/unknown-agent rejection semantics. Check `requestAbort.signal.aborted` after each preparation await and before admission/retry; no subsequent spawn or response write follows a disconnect. Add `voiceRequestSignal: requestAbort.signal` to TurnContext and retain it in all spread retry contexts. `runOnce` increments `engineAttemptSeq` before entering dispatcher/manager, emits attempt-start, then emits its own attempt-terminal in `finally`. The adapter's existing resume/full-transcript retry retains the bridge turn ID and increases the engine attempt number. At each `runOnce` entry reset the request-local latch and both nullable observations; install these callbacks on `spawnCtx` (fields are bounded continuity enums):
+
+```typescript
+onVoiceLaunchAdmission: (continuity) => {
+  launchAdmission = continuity;
+  hasAdmittedContinuity ||= continuity === "resume";
+},
+onVoiceAdmission: (continuity) => {
+  selectedContinuity = continuity;
+  hasAdmittedContinuity ||= continuity === "warm" || continuity === "resume";
+},
+```
+
+Declare `launchAdmission: "fresh" | "resume" | null` and `selectedContinuity: "fresh" | "resume" | "warm" | null` in that attempt's scope, initialized to null. Include both in the attempt terminal; preserve null if initialization failed before selection. Use the latch only for retry eligibility and the existing `continuityAttempted` diagnostic; consumed prompt/`resumedSession` telemetry derives from the selected admission/result. Add `!requestAbort.signal.aborted` and a request-cancel-error exclusion to the existing pre-bytes outer-retry predicate (carry a typed `cancelled` flag from the catch). A compatible resumed initialization failure with a live request gets its one fresh/full retry even if no selection callback ran. A canceled request never retries, regardless of retained launch evidence.
 
 Request outcome categories: `completed` for successful normal response including no-content; `cancelled` for local disconnect/request-canceled exception or explicit returned abort; `failed` for lookup/admission/provider/SSE failure; `incomplete` only when execution finalization itself cannot observe an end (reader reconstructs process loss). Keep classified `errorClass` separate. Do not classify disconnect as barge-in. No-content completion carries `firstText: { value: null, reason: "not_reached" }` and `generatedAudio: unknown`.
 
