@@ -3,6 +3,7 @@
 ## Workflow
 
 - **Major planning work**: After a plan is approved, always run `/spec-and-implement` to generate specification documents and delegate parallel implementation. Never skip this step for non-trivial architectural changes.
+- **Tests**: Model-catalog integration tests in `npm run test` and `npm run check` require `mongod` on `PATH` or an executable path in `MONGOD_BINARY`. The harness starts and cleans up its own isolated standalone WiredTiger process and temporary database.
 
 ## Project
 

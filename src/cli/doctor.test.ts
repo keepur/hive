@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   renderCircuitBreakerSection,
+  renderModelCatalogsSection,
   renderOutageQueueSection,
   renderDatastoreIdentitySection,
   renderPrefixCacheSection,
@@ -15,6 +16,8 @@ import {
   resolveRequiredEnvVars,
 } from "./doctor.js";
 import type { DatastoreIdentityReport, VoiceWorkerStatsRow } from "./doctor-checks.js";
+import { emptyNotificationStatus } from "../admin/model-catalog-notification-status.js";
+import { catalogStatus, catalogStatusNote } from "../admin/model-catalog-status.js";
 
 describe("resolveRequiredEnvVars", () => {
   let dir: string;
@@ -520,6 +523,117 @@ describe("renderCircuitBreakerSection (KPR-306)", () => {
     // Renderer returns void — structurally incapable of flipping the exit
     // code (D4): only renderDatastoreIdentitySection returns a verdict.
     expect(renderCircuitBreakerSection([], () => {})).toBeUndefined();
+  });
+});
+
+describe("renderModelCatalogsSection (KPR-460/KPR-461, informational)", () => {
+  const capture = () => {
+    const lines: string[] = [];
+    return { lines, emit: (line: string) => lines.push(line) };
+  };
+
+  it("renders an explicit unavailable result without a failure verdict", () => {
+    const { lines, emit } = capture();
+
+    expect(renderModelCatalogsSection({ kind: "unavailable" }, emit)).toBeUndefined();
+    expect(lines).toEqual(["\nModel catalogs", "  catalog storage unavailable"]);
+  });
+
+  it("renders built-in and plugin rows with the shared durable-status notes", () => {
+    const now = new Date("2026-09-07T12:00:00.000Z").getTime();
+    const rows = [
+      catalogStatus("claude", undefined, now),
+      catalogStatus(
+        "codex",
+        {
+          models: [{ id: "gpt-5.5", displayName: "GPT-5.5", addedAt: new Date(now - 86_400_000) }],
+          source: "manual",
+          updatedAt: new Date(now - 60_000),
+          scan: {
+            outcome: "failed",
+            startedAt: new Date(now - 3_600_000),
+            finishedAt: new Date(now - 1_800_000),
+            lastSucceededAt: new Date(now - 32_400_000),
+            error: { code: "auth", message: "test-secret" },
+          },
+        },
+        now,
+      ),
+      catalogStatus(
+        "sol",
+        {
+          models: [{ id: "sol-2", displayName: "Sol 2", addedAt: new Date(now - 86_400_000) }],
+          source: "manual",
+          updatedAt: new Date(now - 7_200_000),
+        },
+        now,
+      ),
+    ];
+    const { lines, emit } = capture();
+
+    const codexNotifications = {
+      ...emptyNotificationStatus("codex"),
+      pending: 1,
+      oldest: { id: "codex-change", at: now - 60_000 },
+      nextAt: now + 60_000,
+      reason: { code: "turn-failed" as const, at: now - 30_000 },
+      timingTrouble: true,
+    };
+    const outboxOnly = {
+      ...emptyNotificationStatus("zeta-plugin"),
+      pending: 1,
+      oldest: { id: "plugin-change", at: now - 120_000 },
+      nextAt: now + 120_000,
+    };
+    const notifications = {
+      kind: "available" as const,
+      rows: [emptyNotificationStatus("claude"), codexNotifications, emptyNotificationStatus("sol"), outboxOnly],
+    };
+
+    renderModelCatalogsSection({ kind: "available", rows, notifications }, emit);
+
+    expect(lines[0]).toBe("\nModel catalogs");
+    expect(lines[1]).toBe(`  ${catalogStatusNote(rows[0]!)}`);
+    expect(lines[2]).toMatch(/^ {2}"claude": notifications pending 0/);
+    expect(lines[3]).toBe(`  ${catalogStatusNote(rows[1]!)}`);
+    expect(lines[4]).toMatch(/^ {2}"codex": notifications pending 1/);
+    expect(lines[4]).toContain("reason turn-failed");
+    expect(lines[4]).toContain("timing unavailable/clock-inconsistent");
+    expect(lines[5]).toBe(`  ${catalogStatusNote(rows[2]!)}`);
+    expect(lines[6]).toMatch(/^ {2}"sol": notifications pending 0/);
+    expect(lines[7]).toMatch(/^ {2}"zeta-plugin": notifications pending 1/);
+    expect(lines.join("\n")).toContain("claude: not yet seeded");
+    expect(lines.join("\n")).toContain("codex: saved");
+    expect(lines.join("\n")).toContain("latest attempt failed");
+    expect(lines.join("\n")).toContain("sol: saved");
+    expect(lines.join("\n")).toContain("manually maintained");
+    expect(lines.join("\n")).not.toContain("test-secret");
+  });
+
+  it("keeps catalog rows visible when notification status alone is unavailable", () => {
+    const rows = [catalogStatus("claude", undefined, Date.now())];
+    const { lines, emit } = capture();
+
+    expect(
+      renderModelCatalogsSection({ kind: "available", rows, notifications: { kind: "unavailable" } }, emit),
+    ).toBeUndefined();
+    expect(lines).toEqual(["\nModel catalogs", `  ${catalogStatusNote(rows[0]!)}`, "  Notifications unavailable."]);
+  });
+
+  it("is wired as a standalone informational call immediately after circuit breakers", () => {
+    const src = readFileSync(join(import.meta.dirname, "doctor.ts"), "utf-8");
+    const breaker = src.indexOf("renderCircuitBreakerSection(breakerRows);");
+    const catalog = src.indexOf(
+      "renderModelCatalogsSection(await modelCatalogsForDoctor(config.mongo.uri, config.mongo.dbName));",
+    );
+    const outage = src.indexOf("const outageStats = await outageQueueStatsForDoctor", catalog);
+
+    expect(breaker).toBeGreaterThan(-1);
+    expect(catalog).toBeGreaterThan(breaker);
+    expect(outage).toBeGreaterThan(catalog);
+    expect(src.slice(breaker, outage)).not.toMatch(/allPassed\s*=/);
+    expect(src.slice(breaker, catalog)).not.toContain("renderModelCatalogsSection");
+    expect(src.slice(catalog, outage).match(/modelCatalogsForDoctor/g)).toHaveLength(1);
   });
 });
 

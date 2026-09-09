@@ -10,27 +10,74 @@ vi.mock("../logging/logger.js", () => ({
   }),
 }));
 
-// Track all chat.postMessage calls and files.uploadV2 calls
-const postMessageMock = vi.fn().mockResolvedValue({ ok: true, ts: "1234.5678", channel: "C123" });
-const uploadV2Mock = vi.fn().mockResolvedValue({ ok: true });
-const conversationsListMock = vi.fn().mockResolvedValue({ channels: [], response_metadata: { next_cursor: "" } });
-
-vi.mock("@slack/web-api", () => ({
-  WebClient: vi.fn().mockImplementation(function () {
+// Track ordinary and focused WebClient calls separately. Vitest hoists module
+// factories, so every value they close over must be created by vi.hoisted.
+const mocks = vi.hoisted(() => {
+  const postMessageMock = vi.fn().mockResolvedValue({ ok: true, ts: "1234.5678", channel: "C123" });
+  const notificationPostMessageMock = vi.fn().mockResolvedValue({
+    ok: true,
+    ts: "9000.0001",
+    channel: "CNOTICE",
+  });
+  const uploadV2Mock = vi.fn().mockResolvedValue({ ok: true });
+  const conversationsListMock = vi.fn().mockResolvedValue({ channels: [], response_metadata: { next_cursor: "" } });
+  const notificationConversationsListMock = vi
+    .fn()
+    .mockResolvedValue({ ok: true, channels: [], response_metadata: { next_cursor: "" } });
+  const authTestMock = vi.fn().mockResolvedValue({ ok: true, user_id: "UBOT", bot_id: "BBOT" });
+  const socketHandlers = new Map<string, (...args: unknown[]) => unknown>();
+  const socketStartMock = vi.fn().mockResolvedValue(undefined);
+  const socketDisconnectMock = vi.fn().mockResolvedValue(undefined);
+  const webClientConstructorMock = vi.fn().mockImplementation(function (
+    _token: string,
+    options?: Record<string, unknown>,
+  ) {
+    if (options?.rejectRateLimitedCalls === true) {
+      return {
+        chat: { postMessage: notificationPostMessageMock },
+        conversations: { list: notificationConversationsListMock },
+      };
+    }
     return {
+      auth: { test: authTestMock },
       chat: { postMessage: postMessageMock },
       files: { uploadV2: uploadV2Mock },
       conversations: { list: conversationsListMock },
     };
-  }),
+  });
+  return {
+    postMessageMock,
+    notificationPostMessageMock,
+    uploadV2Mock,
+    conversationsListMock,
+    notificationConversationsListMock,
+    webClientConstructorMock,
+    socketHandlers,
+    socketStartMock,
+    socketDisconnectMock,
+  };
+});
+
+const {
+  postMessageMock,
+  notificationPostMessageMock,
+  uploadV2Mock,
+  conversationsListMock,
+  notificationConversationsListMock,
+  webClientConstructorMock,
+  socketHandlers,
+} = mocks;
+
+vi.mock("@slack/web-api", () => ({
+  WebClient: mocks.webClientConstructorMock,
 }));
 
 vi.mock("@slack/socket-mode", () => ({
   SocketModeClient: vi.fn().mockImplementation(function () {
     return {
-      on: vi.fn(),
-      start: vi.fn(),
-      disconnect: vi.fn(),
+      on: vi.fn((event: string, handler: (...args: unknown[]) => unknown) => mocks.socketHandlers.set(event, handler)),
+      start: mocks.socketStartMock,
+      disconnect: mocks.socketDisconnectMock,
     };
   }),
 }));
@@ -293,5 +340,142 @@ describe("SlackGateway — resolveChannelId", () => {
 
     const result = await gateway.resolveChannelId("nonexistent-channel");
     expect(result).toBeNull();
+  });
+});
+
+describe("SlackGateway — explicit notification receipts", () => {
+  let gateway: SlackGateway;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    socketHandlers.clear();
+    notificationPostMessageMock.mockReset().mockResolvedValue({
+      ok: true,
+      ts: "9000.0001",
+      channel: "CNOTICE",
+    });
+    notificationConversationsListMock
+      .mockReset()
+      .mockResolvedValue({ ok: true, channels: [], response_metadata: { next_cursor: "" } });
+    gateway = new SlackGateway("xapp-test", "xoxb-test");
+  });
+
+  it("constructs a separate focused client with both replay controls and the request bound", () => {
+    expect(webClientConstructorMock).toHaveBeenCalledTimes(2);
+    expect(webClientConstructorMock.mock.calls[0]).toEqual(["xoxb-test"]);
+    expect(webClientConstructorMock.mock.calls[1]?.[0]).toBe("xoxb-test");
+    expect(webClientConstructorMock.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({
+        retryConfig: { retries: 0 },
+        rejectRateLimitedCalls: true,
+        timeout: 30_000,
+        maxRequestConcurrency: 1,
+        fetch: expect.any(Function),
+        logger: expect.any(Object),
+      }),
+    );
+  });
+
+  it("posts exactly one plain bounded message and registers only a validated receipt", async () => {
+    const result = await gateway.postNotificationReceipt("CNOTICE", "catalog changed");
+
+    expect(result).toEqual({ kind: "acknowledged", channelId: "CNOTICE", messageTs: "9000.0001" });
+    expect(notificationPostMessageMock).toHaveBeenCalledTimes(1);
+    expect(notificationPostMessageMock).toHaveBeenCalledWith({
+      channel: "CNOTICE",
+      text: "catalog changed",
+      mrkdwn: false,
+      parse: "none",
+      link_names: false,
+      unfurl_links: false,
+      unfurl_media: false,
+    });
+    expect(postMessageMock).not.toHaveBeenCalled();
+    expect(uploadV2Mock).not.toHaveBeenCalled();
+    expect(gateway.isOutboundEcho("CNOTICE", "9000.0001")).toBe(true);
+  });
+
+  it("does not register malformed or mismatched success responses", async () => {
+    notificationPostMessageMock.mockResolvedValueOnce({ ok: true, channel: "COTHER", ts: "9000.0002" });
+    await expect(gateway.postNotificationReceipt("CNOTICE", "catalog changed")).resolves.toEqual({
+      kind: "outcome-unknown",
+      reason: "delivery-unconfirmed",
+    });
+    expect(gateway.isOutboundEcho("COTHER", "9000.0002")).toBe(false);
+
+    notificationPostMessageMock.mockResolvedValueOnce({ ok: true, channel: "CNOTICE", ts: "" });
+    await expect(gateway.postNotificationReceipt("CNOTICE", "catalog changed")).resolves.toEqual({
+      kind: "outcome-unknown",
+      reason: "delivery-unconfirmed",
+    });
+    expect(gateway.isOutboundEcho("CNOTICE", "")).toBe(false);
+  });
+
+  it.each([
+    ["invalid channel", "channel", "text"],
+    ["blank text", "CNOTICE", "  "],
+    ["overlong text", "CNOTICE", "x".repeat(3901)],
+  ])("rejects %s without making a request", async (_case, channel, text) => {
+    await expect(gateway.postNotificationReceipt(channel, text)).resolves.toEqual({
+      kind: "not-accepted",
+      reason: "invalid-state",
+    });
+    expect(notificationPostMessageMock).not.toHaveBeenCalled();
+    expect(postMessageMock).not.toHaveBeenCalled();
+    expect(uploadV2Mock).not.toHaveBeenCalled();
+  });
+
+  it("returns immediately from the first lookup page that contains the channel", async () => {
+    notificationConversationsListMock.mockResolvedValueOnce({
+      ok: true,
+      channels: [{ id: "CNOTICE", name: "catalog-notices" }],
+      response_metadata: { next_cursor: "unused-page" },
+    });
+    notificationConversationsListMock.mockRejectedValueOnce(new Error("unused page must not run"));
+    const gate = { check: vi.fn().mockResolvedValue(true), current: vi.fn(() => true) };
+
+    await expect(gateway.resolveNotificationChannel("#catalog-notices", gate)).resolves.toEqual({
+      channelId: "CNOTICE",
+    });
+    expect(notificationConversationsListMock).toHaveBeenCalledTimes(1);
+    expect(gate.check).toHaveBeenCalledTimes(1);
+    expect(gate.current).toHaveBeenCalledTimes(1);
+    expect(gateway.notificationChannelMatches("catalog-notices", "CNOTICE")).toBe(true);
+    expect(gateway.notificationChannelMatches("#catalog-notices", "COTHER")).toBe(false);
+  });
+
+  it("honors lookup gates before each physical request", async () => {
+    const gate = { check: vi.fn().mockResolvedValue(false), current: vi.fn(() => true) };
+    await expect(gateway.resolveNotificationChannel("catalog-notices", gate)).resolves.toEqual({ channelId: null });
+    expect(notificationConversationsListMock).not.toHaveBeenCalled();
+    expect(gate.current).not.toHaveBeenCalled();
+  });
+
+  it("propagates focused lookup rate limits without mutable gateway error state", async () => {
+    notificationConversationsListMock.mockRejectedValueOnce({
+      code: "slack_webapi_rate_limited_error",
+      retryAfter: 120,
+    });
+    const gate = { check: vi.fn().mockResolvedValue(true), current: vi.fn(() => true) };
+    await expect(gateway.resolveNotificationChannel("catalog-notices", gate)).resolves.toEqual({
+      channelId: null,
+      retryAfterMs: 120_000,
+      retryBlocked: undefined,
+    });
+  });
+
+  it("suppresses the inbound event matching an acknowledged notification timestamp", async () => {
+    const onMessage = vi.fn();
+    gateway.onMessage(onMessage);
+    await gateway.start();
+    await gateway.postNotificationReceipt("CNOTICE", "catalog changed");
+
+    const handler = socketHandlers.get("message");
+    expect(handler).toBeDefined();
+    const ack = vi.fn().mockResolvedValue(undefined);
+    await handler?.({ event: { channel: "CNOTICE", ts: "9000.0001", user: "UOTHER", text: "echo" }, ack });
+
+    expect(ack).toHaveBeenCalledTimes(1);
+    expect(onMessage).not.toHaveBeenCalled();
   });
 });

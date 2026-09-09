@@ -11,6 +11,7 @@ vi.mock("../logging/logger.js", () => ({
 
 import { SlackAdapter } from "./slack-adapter.js";
 import type { AgentRegistry } from "../agents/agent-registry.js";
+import type { NoticeBinding, NoticeLookupGate } from "../admin/model-catalog-notification.js";
 import type { SlackGateway } from "../slack/slack-gateway.js";
 import type { IncomingMessage } from "../types/agent-config.js";
 import type { WorkItem } from "../types/work-item.js";
@@ -26,6 +27,9 @@ interface GatewayStub {
   emit: (msg: IncomingMessage) => Promise<void>;
   setThreadStatus: ReturnType<typeof vi.fn>;
   postMessage: ReturnType<typeof vi.fn>;
+  postNotificationReceipt: ReturnType<typeof vi.fn>;
+  resolveNotificationChannel: ReturnType<typeof vi.fn>;
+  notificationChannelMatches: ReturnType<typeof vi.fn>;
   resolveUserName: ReturnType<typeof vi.fn>;
   start: ReturnType<typeof vi.fn>;
   stop: ReturnType<typeof vi.fn>;
@@ -35,6 +39,11 @@ function makeGatewayStub(): GatewayStub {
   let messageHandler: MessageHandler | null = null;
   const setThreadStatus = vi.fn().mockResolvedValue(undefined);
   const postMessage = vi.fn().mockResolvedValue(undefined);
+  const postNotificationReceipt = vi
+    .fn()
+    .mockResolvedValue({ kind: "acknowledged", channelId: "CNOTICE", messageTs: "123.456" });
+  const resolveNotificationChannel = vi.fn().mockResolvedValue({ channelId: "CNOTICE" });
+  const notificationChannelMatches = vi.fn().mockReturnValue(true);
   const resolveUserName = vi.fn(async (u: string) => u);
   const start = vi.fn().mockResolvedValue(undefined);
   const stop = vi.fn().mockResolvedValue(undefined);
@@ -48,6 +57,9 @@ function makeGatewayStub(): GatewayStub {
     addIntegrationChannels: () => {},
     setThreadStatus,
     postMessage,
+    postNotificationReceipt,
+    resolveNotificationChannel,
+    notificationChannelMatches,
     resolveUserName,
     setSuggestedPrompts: vi.fn().mockResolvedValue(undefined),
     start,
@@ -59,6 +71,9 @@ function makeGatewayStub(): GatewayStub {
     gateway: gateway as unknown as SlackGateway,
     setThreadStatus,
     postMessage,
+    postNotificationReceipt,
+    resolveNotificationChannel,
+    notificationChannelMatches,
     resolveUserName,
     start,
     stop,
@@ -202,5 +217,126 @@ describe("SlackAdapter", () => {
 
     const item = onWorkItem.mock.calls[0]![0] as WorkItem;
     expect(item.threadId).toBe("slack:C123:888.0");
+  });
+
+  it("exposes notification availability only after a successful connection", async () => {
+    const gw = makeGatewayStub();
+    const adapter = new SlackAdapter(gw.gateway, makeRegistryStub(), [], "slack");
+
+    expect(adapter.notificationAvailable()).toBe(false);
+    expect(adapter.notificationAvailable("named")).toBe(false);
+    await adapter.start(vi.fn());
+    expect(adapter.notificationAvailable()).toBe(true);
+    expect(adapter.notificationAvailable("named")).toBe(false);
+    expect(adapter.notificationBotLabel).toBeUndefined();
+  });
+
+  it("does not become available when gateway startup fails", async () => {
+    const gw = makeGatewayStub();
+    gw.start.mockRejectedValueOnce(new Error("connect failed"));
+    const adapter = new SlackAdapter(gw.gateway, makeRegistryStub(), [], "slack");
+
+    await expect(adapter.start(vi.fn())).rejects.toThrow("connect failed");
+    expect(adapter.notificationAvailable()).toBe(false);
+  });
+
+  it("honors only the adapter's supported bot binding", async () => {
+    const gw = makeGatewayStub();
+    const adapter = new SlackAdapter(gw.gateway, makeRegistryStub(), [], "slack-main", undefined, "main");
+    await adapter.start(vi.fn());
+
+    expect(adapter.notificationBotLabel).toBe("main");
+    expect(adapter.notificationAvailable()).toBe(true);
+    expect(adapter.notificationAvailable("main")).toBe(true);
+    expect(adapter.notificationAvailable("other")).toBe(false);
+  });
+
+  it("wraps lookup liveness with current adapter availability", async () => {
+    const gw = makeGatewayStub();
+    const adapter = new SlackAdapter(gw.gateway, makeRegistryStub(), [], "slack");
+    await adapter.start(vi.fn());
+    const outer = { check: vi.fn().mockResolvedValue(true), current: vi.fn(() => true) };
+    gw.resolveNotificationChannel.mockImplementationOnce(async (_homeBase: string, gate: NoticeLookupGate) => {
+      expect(await gate.check()).toBe(true);
+      expect(gate.current()).toBe(true);
+      return { channelId: "CNOTICE" };
+    });
+
+    await expect(adapter.resolveNotificationChannel("catalog-notices", outer)).resolves.toEqual({
+      channelId: "CNOTICE",
+    });
+    expect(gw.resolveNotificationChannel).toHaveBeenCalledTimes(1);
+    expect(outer.check).toHaveBeenCalledTimes(1);
+    expect(outer.current).toHaveBeenCalledTimes(1);
+
+    await adapter.stop();
+    await expect(adapter.resolveNotificationChannel("catalog-notices", outer)).resolves.toEqual({ channelId: null });
+    expect(gw.resolveNotificationChannel).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears notification availability synchronously before gateway teardown", async () => {
+    const gw = makeGatewayStub();
+    let release!: () => void;
+    gw.stop.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const adapter = new SlackAdapter(gw.gateway, makeRegistryStub(), [], "slack");
+    await adapter.start(vi.fn());
+
+    const stopping = adapter.stop();
+    expect(adapter.notificationAvailable()).toBe(false);
+    release();
+    await stopping;
+  });
+
+  it("validates the frozen route before using the receipt path", async () => {
+    const gw = makeGatewayStub();
+    const adapter = new SlackAdapter(gw.gateway, makeRegistryStub(), [], "slack");
+    const route: NoticeBinding = {
+      agentId: "chief-of-staff",
+      homeBase: "catalog-notices",
+      adapterId: "slack",
+      channelId: "CNOTICE",
+    };
+    await adapter.start(vi.fn());
+
+    expect(adapter.notificationRouteMatches(route)).toBe(true);
+    expect(gw.notificationChannelMatches).toHaveBeenCalledWith("catalog-notices", "CNOTICE");
+    await expect(adapter.deliverNotificationReceipt(route, "catalog changed")).resolves.toEqual({
+      kind: "acknowledged",
+      channelId: "CNOTICE",
+      messageTs: "123.456",
+    });
+    expect(gw.postNotificationReceipt).toHaveBeenCalledWith("CNOTICE", "catalog changed");
+
+    gw.notificationChannelMatches.mockReturnValueOnce(false);
+    await expect(adapter.deliverNotificationReceipt(route, "stale route")).resolves.toEqual({
+      kind: "not-accepted",
+      reason: "transport-unavailable",
+    });
+    expect(gw.postNotificationReceipt).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects the primary adapter for an explicit bot route without posting", async () => {
+    const gw = makeGatewayStub();
+    const adapter = new SlackAdapter(gw.gateway, makeRegistryStub(), [], "slack");
+    await adapter.start(vi.fn());
+    const route: NoticeBinding = {
+      agentId: "chief-of-staff",
+      homeBase: "CNOTICE",
+      adapterId: "slack",
+      channelId: "CNOTICE",
+      botLabel: "named",
+    };
+
+    expect(adapter.notificationRouteMatches(route)).toBe(false);
+    await expect(adapter.deliverNotificationReceipt(route, "catalog changed")).resolves.toEqual({
+      kind: "not-accepted",
+      reason: "transport-unavailable",
+    });
+    expect(gw.postNotificationReceipt).not.toHaveBeenCalled();
   });
 });

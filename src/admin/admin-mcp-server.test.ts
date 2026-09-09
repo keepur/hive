@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { createCatalogFake, faultDb } from "./testing/catalog-db.test-support.js";
 
 // ---------------------------------------------------------------------------
 // KPR-122 in-process port: the admin MCP server is now a pure builder
@@ -26,8 +27,7 @@ vi.mock("../config.js", () => ({ config: mockConfig }));
 
 let agentDocsStore = new Map<string, any>();
 let agentVersionsStore: any[] = [];
-let catalogDocsStore = new Map<string, any>();
-let catalogVersionsStore: any[] = [];
+let catalogFake = createCatalogFake();
 
 function makeAgentDefsCollection(): any {
   return {
@@ -74,40 +74,19 @@ function makeAgentVersionsCollection(): any {
   };
 }
 
-function makeCatalogDocsCollection(): any {
-  return {
-    findOne: vi.fn(async (filter: any) => catalogDocsStore.get(filter?._id) ?? null),
-    updateOne: vi.fn(async (filter: any, update: any, opts: any) => {
-      const id = filter?._id;
-      const existing = catalogDocsStore.get(id);
-      if (existing && update.$set) Object.assign(existing, update.$set);
-      else if (opts?.upsert) catalogDocsStore.set(id, { _id: id, ...update.$set });
-      return { modifiedCount: existing ? 1 : 0 };
-    }),
-    createIndex: vi.fn().mockResolvedValue("ok"),
-  };
-}
-
-function makeCatalogVersionsCollection(): any {
-  return {
-    insertOne: vi.fn(async (doc: any) => {
-      catalogVersionsStore.push({ ...doc });
-      return { insertedId: "cv" };
-    }),
-    createIndex: vi.fn().mockResolvedValue("ok"),
-  };
-}
-
-function makeFakeDb(): any {
+function makeFakeDb(catalogDb: any = catalogFake.db): any {
   const defs = makeAgentDefsCollection();
   const versions = makeAgentVersionsCollection();
-  const catalogDocs = makeCatalogDocsCollection();
-  const catalogVersions = makeCatalogVersionsCollection();
   return {
     collection: (name: string) => {
       if (name === "agent_definitions") return defs;
-      if (name === "agent_model_catalog") return catalogDocs;
-      if (name === "agent_model_catalog_versions") return catalogVersions;
+      if (
+        name === "agent_model_catalog" ||
+        name === "agent_model_catalog_versions" ||
+        name === "agent_model_catalog_changes"
+      ) {
+        return catalogDb.collection(name);
+      }
       return versions;
     },
   };
@@ -115,6 +94,9 @@ function makeFakeDb(): any {
 
 import { buildAdminTools } from "./admin-mcp-server.js";
 import { invalidateGeminiModelCache } from "./model-catalog-cache.js";
+import { notificationNote, emptyNotificationStatus } from "./model-catalog-notification-status.js";
+import { catalogStatus, catalogStatusNote } from "./model-catalog-status.js";
+import { ModelCatalogStore } from "./model-catalog-store.js";
 
 function getHandler(tools: any[], name: string): any {
   const t = tools.find((x) => x.name === name);
@@ -151,11 +133,12 @@ function makeBaseAgent(overrides: Record<string, any> = {}): any {
 }
 
 function makeTools(depsOverride: Record<string, any> = {}) {
+  const { adminDb, catalogDb, ...deps } = depsOverride;
   return buildAdminTools({
-    db: makeFakeDb(),
+    db: adminDb ?? makeFakeDb(catalogDb),
     agentId: "admin",
     instanceCapabilitiesJson: "{}",
-    ...depsOverride,
+    ...deps,
   });
 }
 
@@ -904,8 +887,7 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
   beforeEach(() => {
     agentDocsStore = new Map();
     agentVersionsStore = [];
-    catalogDocsStore = new Map();
-    catalogVersionsStore = [];
+    catalogFake = createCatalogFake();
     mockConfig.gemini.apiKey = "test-gemini-key";
   });
 
@@ -921,25 +903,26 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toMatch(/grok catalog updated: \+2 \(grok-4\.6, grok-4\.5\), -0\. 2 models total\./);
 
-    const doc = catalogDocsStore.get("grok");
+    const doc = catalogFake.rows("agent_model_catalog").get("grok");
     expect(doc.provider).toBe("grok");
     expect(doc.models).toHaveLength(2);
     expect(doc.models[0].addedAt).toBeInstanceOf(Date);
     expect(doc.updatedBy).toBe("admin");
     expect(doc.updatedAt).toBeInstanceOf(Date);
 
-    expect(catalogVersionsStore).toHaveLength(1);
-    expect(catalogVersionsStore[0].provider).toBe("grok");
-    expect(catalogVersionsStore[0].snapshot).toHaveLength(2);
-    expect(catalogVersionsStore[0].changeSummary).toMatch(/\+2/);
-    expect(catalogVersionsStore[0].createdAt).toBeInstanceOf(Date);
-    expect(catalogVersionsStore[0].updatedBy).toBe("admin");
+    const versions = [...catalogFake.rows("agent_model_catalog_versions").values()];
+    expect(versions).toHaveLength(1);
+    expect(versions[0].provider).toBe("grok");
+    expect(versions[0].snapshot).toHaveLength(2);
+    expect(versions[0].changeSummary).toMatch(/\+2/);
+    expect(versions[0].createdAt).toBeInstanceOf(Date);
+    expect(versions[0].updatedBy).toBe("admin");
   });
 
   it("diffs against the current doc and preserves addedAt for retained ids", async () => {
     const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
     const oldDate = new Date("2026-01-01T00:00:00Z");
-    catalogDocsStore.set("claude", {
+    catalogFake.rows("agent_model_catalog").set("claude", {
       _id: "claude",
       provider: "claude",
       models: [
@@ -961,12 +944,14 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
     expect(result.content[0].text).toMatch(/\+1 \(claude-opus-6\), -1 \(claude-opus-4-7\)\. 2 models total/);
     expect(result.content[0].text).toMatch(/Opus 6 shipped/);
 
-    const doc = catalogDocsStore.get("claude");
+    const doc = catalogFake.rows("agent_model_catalog").get("claude");
     const retained = doc.models.find((m: any) => m.id === "claude-opus-5");
     const fresh = doc.models.find((m: any) => m.id === "claude-opus-6");
     expect(retained.addedAt).toEqual(oldDate);
     expect(fresh.addedAt.getTime()).toBeGreaterThan(oldDate.getTime());
-    expect(catalogVersionsStore[0].changeSummary).toBe("Opus 6 shipped; 4.7 deprecated");
+    expect([...catalogFake.rows("agent_model_catalog_versions").values()][0].changeSummary).toBe(
+      "Opus 6 shipped; 4.7 deprecated",
+    );
   });
 
   it("rejects duplicate model ids", async () => {
@@ -980,8 +965,84 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
     });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/Duplicate model ids/);
-    expect(catalogDocsStore.size).toBe(0);
-    expect(catalogVersionsStore).toHaveLength(0);
+    expect(catalogFake.rows("agent_model_catalog").size).toBe(0);
+    expect([...catalogFake.rows("agent_model_catalog_versions").values()]).toHaveLength(0);
+  });
+
+  it("rejects an empty replacement even when the mocked SDK bypasses Zod", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    const result = await handler({ provider: "codex", models: [] });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("Model catalog codex: empty.");
+    expect(catalogFake.rows("agent_model_catalog").size).toBe(0);
+    expect([...catalogFake.rows("agent_model_catalog_versions").values()]).toHaveLength(0);
+  });
+
+  it("audits an identical manual replacement without creating another membership change", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    const input = { provider: "codex", models: [{ id: "gpt-5.5", displayName: "GPT-5.5" }] };
+    const first = await handler(input);
+    const second = await handler(input);
+
+    expect(first.isError).toBeUndefined();
+    expect(second.content[0].text).toBe("codex catalog updated: +0, -0. 1 models total.");
+    expect([...catalogFake.rows("agent_model_catalog_versions").values()]).toHaveLength(2);
+    expect([...catalogFake.rows("agent_model_catalog_changes").values()]).toHaveLength(1);
+    expect(catalogFake.rows("agent_model_catalog").get("codex")?.revision).toBe(2);
+  });
+
+  it("lets a full manual replacement clear notes from retained models", async () => {
+    const handler = getHandler(makeTools(), "agent_model_catalog_refresh");
+    await handler({
+      provider: "claude",
+      models: [{ id: "claude-opus-5", displayName: "Opus 5", notes: "preferred" }],
+    });
+    const result = await handler({
+      provider: "claude",
+      models: [{ id: "claude-opus-5", displayName: "Opus 5" }],
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(catalogFake.rows("agent_model_catalog").get("claude")?.models?.[0]).not.toHaveProperty("notes");
+  });
+
+  it("reports a committed catalog as saved when audit/change projection is pending", async () => {
+    const unavailableProjection = faultDb(catalogFake.db, async (collection, method, _args, run) => {
+      if (collection === "agent_model_catalog_versions" && method === "insertOne") {
+        throw new Error("test history unavailable");
+      }
+      return run();
+    });
+    const handler = getHandler(makeTools({ catalogDb: unavailableProjection }), "agent_model_catalog_refresh");
+    const result = await handler({ provider: "grok", models: [{ id: "grok-4.6", displayName: "Grok 4.6" }] });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe(
+      "grok catalog updated: +1 (grok-4.6), -0. 1 models total. Catalog saved; audit/change recovery pending.",
+    );
+    expect(catalogFake.rows("agent_model_catalog").get("grok")?.models?.[0]?.id).toBe("grok-4.6");
+    expect(catalogFake.rows("agent_model_catalog").get("grok")?.pendingExport).toBeDefined();
+  });
+
+  it("returns the stable operation id when the catalog commit acknowledgment is unknown", async () => {
+    let operationId = "";
+    const unknownCommit = faultDb(catalogFake.db, async (collection, method, args, run) => {
+      if (collection === "agent_model_catalog" && method === "insertOne") {
+        operationId = args[0].pendingExport.version._id;
+        throw new Error("test acknowledgment unavailable");
+      }
+      return run();
+    });
+    const handler = getHandler(makeTools({ catalogDb: unknownCommit }), "agent_model_catalog_refresh");
+    const result = await handler({ provider: "codex", models: [{ id: "gpt-5.5", displayName: "GPT-5.5" }] });
+
+    expect(result.isError).toBe(true);
+    expect(operationId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(result.content[0].text).toBe(
+      `Catalog commit outcome unknown (operation ${operationId}); reconcile this operation before retrying.`,
+    );
+    expect(result.content[0].text).not.toContain("updated");
+    expect(result.content[0].text).not.toContain("saved");
   });
 
   it("an explicit empty changeSummary falls back to the diff text — no blank audit row", async () => {
@@ -994,7 +1055,7 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
     expect(result.isError).toBeUndefined();
     // Response text omits the empty summary; the version row must not be blank.
     expect(result.content[0].text).toBe("codex catalog updated: +1 (gpt-5.5), -0. 1 models total.");
-    expect(catalogVersionsStore[0].changeSummary).toBe("+1 (gpt-5.5), -0");
+    expect([...catalogFake.rows("agent_model_catalog_versions").values()][0].changeSummary).toBe("+1 (gpt-5.5), -0");
   });
 
   // KPR-394 (§4.11): the provider schema widened from a zod enum to z.string()
@@ -1014,6 +1075,10 @@ describe("admin-mcp-server — agent_model_catalog_refresh (KPR-381)", () => {
 });
 
 describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
+  const statusNow = new Date("2026-09-07T12:00:00.000Z");
+  const hour = 60 * 60 * 1000;
+  const statusAt = (offsetMs: number) => new Date(statusNow.getTime() + offsetMs);
+  const statusModels = [{ id: "gpt-5.5", displayName: "GPT-5.5", addedAt: statusAt(-24 * hour) }];
   const geminiOkResponse = {
     ok: true,
     status: 200,
@@ -1046,8 +1111,7 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
   beforeEach(() => {
     agentDocsStore = new Map();
     agentVersionsStore = [];
-    catalogDocsStore = new Map();
-    catalogVersionsStore = [];
+    catalogFake = createCatalogFake();
     invalidateGeminiModelCache();
     mockConfig.gemini.apiKey = "test-gemini-key";
     // KPR-382: the gemini leg now reads the adapter's env fallbacks — clear
@@ -1058,12 +1122,13 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
   });
 
   function seedGrok() {
-    catalogDocsStore.set("grok", {
+    catalogFake.rows("agent_model_catalog").set("grok", {
       _id: "grok",
       provider: "grok",
       models: [
@@ -1077,11 +1142,11 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
 
   it("returns curated entries with source/asOf for a seeded provider", async () => {
     seedGrok();
+    vi.spyOn(Date, "now").mockReturnValue(statusNow.getTime());
     const handler = getHandler(makeTools(), "agent_model_catalog_list");
     const result = await handler({ provider: "grok" });
     expect(result.isError).toBeUndefined();
-    const parsed = JSON.parse(result.content[0].text);
-    expect(parsed).toEqual([
+    const expectedEntries = [
       {
         provider: "grok",
         id: "grok-4.6",
@@ -1097,7 +1162,16 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
         source: "curated",
         asOf: "2026-08-23T00:00:00.000Z",
       },
-    ]);
+    ];
+    expect(result.content[0].text).toBe(JSON.stringify(expectedEntries, null, 2));
+    expect(JSON.parse(result.content[0].text)).toEqual(expectedEntries);
+    expect(result.content).toHaveLength(3);
+    expect(result.content[1].text).toBe(
+      catalogStatusNote(
+        catalogStatus("grok", catalogFake.rows("agent_model_catalog").get("grok"), statusNow.getTime()),
+      ),
+    );
+    expect(result.content[2].text).toBe(notificationNote(emptyNotificationStatus("grok"), statusNow.getTime()));
   });
 
   it("unseeded curated provider → empty entries array + prose note, not an error", async () => {
@@ -1105,7 +1179,434 @@ describe("admin-mcp-server — agent_model_catalog_list (KPR-381)", () => {
     const result = await handler({ provider: "codex" });
     expect(result.isError).toBeUndefined();
     expect(JSON.parse(result.content[0].text)).toEqual([]);
-    expect(result.content[1].text).toMatch(/codex: not yet seeded — call agent_model_catalog_refresh first/);
+    expect(result.content[1].text).toBe(
+      "codex: not yet seeded — manual option: agent_model_catalog_refresh; last discovery success never; latest attempt never; next normal attempt unknown/clock-inconsistent; automatic checks every 8h; discovery timestamps describe checks, not later manual edits.",
+    );
+    expect(result.content[2].text).toBe(notificationNote(emptyNotificationStatus("codex"), statusNow.getTime()));
+  });
+
+  it.each([
+    {
+      name: "legacy saved catalog",
+      snapshot: { models: statusModels, updatedAt: statusAt(-10 * hour) },
+      fragments: ["saved 2026-09-07T02:00:00.000Z (legacy/unknown)", "last discovery success never"],
+    },
+    {
+      name: "recent successful discovery",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-4 * hour),
+        scan: {
+          outcome: "succeeded",
+          startedAt: statusAt(-2 * hour),
+          finishedAt: statusAt(-1.5 * hour),
+          lastSucceededAt: statusAt(-hour),
+        },
+      },
+      fragments: ["last discovery success 2026-09-07T11:00:00.000Z (recent; age 3600s)", "latest attempt succeeded"],
+    },
+    {
+      name: "overdue successful discovery",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-9 * hour),
+        scan: {
+          outcome: "succeeded",
+          startedAt: statusAt(-9 * hour),
+          finishedAt: statusAt(-8.5 * hour),
+          lastSucceededAt: statusAt(-8 * hour),
+        },
+      },
+      fragments: ["last discovery success 2026-09-07T04:00:00.000Z (overdue; age 28800s)"],
+    },
+    {
+      name: "failed latest attempt with retained entries",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-24 * hour),
+        scan: {
+          outcome: "failed",
+          startedAt: statusAt(-hour),
+          finishedAt: statusAt(-0.5 * hour),
+          lastSucceededAt: statusAt(-9 * hour),
+          error: { code: "auth", httpStatus: 401, message: "test-secret", body: "test-secret" },
+        },
+      },
+      fragments: [
+        "last discovery success 2026-09-07T03:00:00.000Z (overdue",
+        "latest attempt failed",
+        "(auth HTTP 401)",
+      ],
+    },
+    {
+      name: "active running attempt",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-3 * hour),
+        scan: {
+          outcome: "running",
+          startedAt: statusAt(-hour),
+          leaseExpiresAt: statusAt(hour),
+          lastSucceededAt: statusAt(-2 * hour),
+        },
+      },
+      fragments: ["latest attempt running", "lease 2026-09-07T13:00:00.000Z"],
+    },
+    {
+      name: "expired unresolved attempt",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-3 * hour),
+        scan: {
+          outcome: "running",
+          startedAt: statusAt(-hour),
+          leaseExpiresAt: statusAt(-1),
+          lastSucceededAt: statusAt(-2 * hour),
+        },
+      },
+      fragments: ["latest attempt expired/unresolved", "lease 2026-09-07T11:59:59.999Z"],
+    },
+    {
+      name: "unfinished attempt with unknown lease",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-3 * hour),
+        scan: { outcome: "running", startedAt: statusAt(-hour), lastSucceededAt: statusAt(-2 * hour) },
+      },
+      fragments: ["latest attempt unfinished; lease unknown", "lease unknown/clock-inconsistent"],
+    },
+    {
+      name: "pending audit and change recovery",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-2 * hour),
+        scan: {
+          outcome: "succeeded",
+          startedAt: statusAt(-2 * hour),
+          finishedAt: statusAt(-hour),
+          lastSucceededAt: statusAt(-hour),
+        },
+        pendingExport: {},
+      },
+      fragments: ["latest attempt succeeded", "audit/change recovery pending"],
+    },
+    {
+      name: "manual edit after successful discovery",
+      snapshot: {
+        models: statusModels,
+        source: "manual",
+        updatedAt: statusAt(-5 * 60 * 1000),
+        scan: {
+          outcome: "succeeded",
+          startedAt: statusAt(-7.5 * hour),
+          finishedAt: statusAt(-7 * hour),
+          lastSucceededAt: statusAt(-7 * hour),
+        },
+      },
+      fragments: [
+        "saved 2026-09-07T11:55:00.000Z (manual)",
+        "last discovery success 2026-09-07T05:00:00.000Z (recent; age 25200s)",
+      ],
+    },
+    {
+      name: "unchanged success advances check freshness without saved time",
+      snapshot: {
+        models: statusModels,
+        source: "discovery",
+        updatedAt: statusAt(-24 * hour),
+        scan: {
+          outcome: "succeeded",
+          startedAt: statusAt(-2 * hour),
+          finishedAt: statusAt(-hour),
+          lastSucceededAt: statusAt(-hour),
+        },
+      },
+      fragments: [
+        "saved 2026-09-06T12:00:00.000Z (discovery)",
+        "last discovery success 2026-09-07T11:00:00.000Z (recent; age 3600s)",
+      ],
+    },
+    {
+      name: "future dates",
+      snapshot: {
+        models: statusModels,
+        source: "manual",
+        updatedAt: statusAt(hour),
+        scan: {
+          outcome: "succeeded",
+          startedAt: statusAt(hour),
+          finishedAt: statusAt(1.5 * hour),
+          lastSucceededAt: statusAt(2 * hour),
+        },
+      },
+      fragments: [
+        "saved unknown/clock-inconsistent (manual)",
+        "unknown/clock-inconsistent",
+        "scan timing unavailable/clock-inconsistent",
+      ],
+    },
+    {
+      name: "invalid date values",
+      snapshot: {
+        models: statusModels,
+        source: "manual",
+        updatedAt: "invalid-date",
+        scan: {
+          outcome: "succeeded",
+          startedAt: "invalid-date",
+          finishedAt: "invalid-date",
+          lastSucceededAt: "invalid-date",
+        },
+      },
+      fragments: [
+        "saved unknown/clock-inconsistent (manual)",
+        "unknown/clock-inconsistent",
+        "scan timing unavailable/clock-inconsistent",
+      ],
+    },
+  ])("renders durable status for $name", async ({ snapshot, fragments }) => {
+    const doc = { _id: "codex", provider: "codex", ...snapshot };
+    catalogFake.rows("agent_model_catalog").set("codex", doc);
+    const now = vi.spyOn(Date, "now").mockReturnValue(statusNow.getTime());
+
+    const result = await getHandler(makeTools(), "agent_model_catalog_list")({ provider: "codex" });
+
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toHaveLength(1);
+    expect(result.content[1].text).toBe(catalogStatusNote(catalogStatus("codex", doc, statusNow.getTime())));
+    for (const fragment of fragments) expect(result.content[1].text).toContain(fragment);
+    expect(result.content[1].text).not.toContain("test-secret");
+    expect(now).toHaveBeenCalledTimes(1);
+  });
+
+  it("is a read-only status path with one shared clock sample and no index, discovery, apply, or recovery work", async () => {
+    const operations: string[] = [];
+    const observedCatalogDb = faultDb(catalogFake.db, async (collection, method, _args, run) => {
+      operations.push(`${collection}.${method}`);
+      return run();
+    });
+    const adminDb = makeFakeDb(observedCatalogDb);
+    const agentIndex = adminDb.collection("agent_definition_versions").createIndex;
+    const storeIndex = vi.spyOn(ModelCatalogStore.prototype, "ensureIndexes");
+    const begin = vi.spyOn(ModelCatalogStore.prototype, "beginDiscoveryAttempt");
+    const apply = vi.spyOn(ModelCatalogStore.prototype, "applyDiscovery");
+    const fail = vi.spyOn(ModelCatalogStore.prototype, "failDiscoveryAttempt");
+    const recover = vi.spyOn(ModelCatalogStore.prototype, "recoverPendingExports");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const now = vi.spyOn(Date, "now").mockReturnValue(statusNow.getTime());
+
+    const result = await getHandler(makeTools({ adminDb }), "agent_model_catalog_list")({ provider: "codex" });
+
+    expect(result.isError).toBeUndefined();
+    expect(operations).toEqual(["agent_model_catalog.findOne", "agent_model_catalog_changes.find"]);
+    expect(agentIndex).not.toHaveBeenCalled();
+    expect(storeIndex).not.toHaveBeenCalled();
+    expect(begin).not.toHaveBeenCalled();
+    expect(apply).not.toHaveBeenCalled();
+    expect(fail).not.toHaveBeenCalled();
+    expect(recover).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(now).toHaveBeenCalledTimes(1);
+  });
+
+  it("appends projected notification timing without changing the catalog JSON or freshness note", async () => {
+    const catalogDoc = {
+      _id: "codex",
+      provider: "codex",
+      models: statusModels,
+      source: "manual",
+      updatedAt: statusAt(-hour),
+    };
+    catalogFake.rows("agent_model_catalog").set("codex", catalogDoc);
+    catalogFake.rows("agent_model_catalog_changes").set("future-intent", {
+      _id: "future-intent",
+      provider: "codex",
+      createdAt: statusAt(-hour),
+      delivery: {
+        state: "claimed",
+        attempts: 1,
+        version: 2,
+        nextAttemptAt: statusAt(-hour),
+        lastAttemptAt: statusAt(-30 * 60 * 1000),
+        preparation: {
+          id: "preparation-1",
+          binding: {
+            agentId: "chief",
+            homeBase: "catalog-alerts",
+            adapterId: "slack",
+            channelId: "C123ABC",
+          },
+          processedAt: statusAt(-20 * 60 * 1000),
+          text: "must not be projected",
+        },
+        claim: {
+          token: "claim-1",
+          owner: "notifier-1",
+          startedAt: statusAt(-30 * 60 * 1000),
+          leaseExpiresAt: statusAt(hour),
+          stage: "sending",
+          sendIntent: {
+            preparationId: "preparation-1",
+            startedAt: statusAt(hour / 2),
+            previouslyUncertain: false,
+          },
+        },
+      },
+    });
+    vi.spyOn(Date, "now").mockReturnValue(statusNow.getTime());
+
+    const result = await getHandler(makeTools(), "agent_model_catalog_list")({ provider: "codex" });
+
+    expect(JSON.parse(result.content[0].text)).toEqual([
+      {
+        provider: "codex",
+        id: "gpt-5.5",
+        displayName: "GPT-5.5",
+        source: "curated",
+        asOf: "2026-09-07T11:00:00.000Z",
+      },
+    ]);
+    expect(result.content[1].text).toBe(catalogStatusNote(catalogStatus("codex", catalogDoc, statusNow.getTime())));
+    expect(result.content[2].text).toContain("in progress 1, prepared 1, possibly repeated 1");
+    expect(result.content[2].text).toContain("timing unavailable/clock-inconsistent");
+    expect(result.content[2].text).not.toContain("must not be projected");
+  });
+
+  it("includes outbox-only manual plugin status on all-provider reads and excludes Gemini outbox rows", async () => {
+    mockConfig.gemini.apiKey = "";
+    catalogFake.rows("agent_model_catalog_changes").set("sol-change", {
+      _id: "sol-change",
+      provider: "sol",
+      createdAt: statusAt(-hour),
+      source: "manual",
+      delivery: { state: "pending", attempts: 0, nextAttemptAt: statusAt(-1) },
+    });
+    catalogFake.rows("agent_model_catalog_changes").set("gemini-change", {
+      _id: "gemini-change",
+      provider: "gemini",
+      createdAt: statusAt(-hour),
+      delivery: { state: "pending", attempts: 0, nextAttemptAt: statusAt(-1) },
+    });
+    vi.spyOn(Date, "now").mockReturnValue(statusNow.getTime());
+
+    const result = await getHandler(makeTools(), "agent_model_catalog_list")({});
+    const notes = result.content.slice(1).map((item: { text: string }) => item.text);
+
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+    expect(notes.filter((note: string) => note.startsWith('"sol": notifications'))).toEqual([
+      expect.stringContaining("notifications pending 1"),
+    ]);
+    expect(notes.some((note: string) => note.startsWith('"gemini": notifications'))).toBe(false);
+    expect(notes.at(-1)).toMatch(/^gemini: Gemini API key not configured/);
+  });
+
+  it("keeps catalog facts available and reports a failed outbox cursor separately", async () => {
+    const unavailableOutbox = faultDb(catalogFake.db, async (collection, method, _args, run) => {
+      if (collection === "agent_model_catalog_changes" && method === "find") {
+        throw new Error("test-secret outbox failure");
+      }
+      return run();
+    });
+    vi.spyOn(Date, "now").mockReturnValue(statusNow.getTime());
+
+    const result = await getHandler(
+      makeTools({ catalogDb: unavailableOutbox }),
+      "agent_model_catalog_list",
+    )({ provider: "codex" });
+
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+    expect(result.content[1].text).toMatch(/^codex: not yet seeded/);
+    expect(result.content[2].text).toBe("Notifications unavailable.");
+    expect(JSON.stringify(result)).not.toContain("test-secret");
+  });
+
+  it("returns a safe hard error when the requested stored provider cannot be read", async () => {
+    const unavailable = faultDb(catalogFake.db, async (collection, method, args, run) => {
+      if (collection === "agent_model_catalog" && method === "findOne" && args[0]._id === "codex") {
+        throw new Error("mongodb://user:test-secret@example.invalid/catalog");
+      }
+      return run();
+    });
+
+    const result = await getHandler(
+      makeTools({ catalogDb: unavailable }),
+      "agent_model_catalog_list",
+    )({
+      provider: "codex",
+    });
+
+    expect(result).toEqual({
+      isError: true,
+      content: [{ type: "text", text: "codex: catalog storage unavailable." }],
+    });
+    expect(JSON.stringify(result)).not.toContain("test-secret");
+  });
+
+  it("keeps other provider rows available when one all-provider catalog read fails", async () => {
+    seedGrok();
+    mockConfig.gemini.apiKey = "";
+    const partlyUnavailable = faultDb(catalogFake.db, async (collection, method, args, run) => {
+      if (collection === "agent_model_catalog" && method === "findOne" && args[0]._id === "grok") {
+        throw new Error("test-secret raw storage failure");
+      }
+      return run();
+    });
+
+    const result = await getHandler(makeTools({ catalogDb: partlyUnavailable }), "agent_model_catalog_list")({});
+
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+    const notes = result.content.slice(1).map((item: { text: string }) => item.text);
+    expect(notes).toHaveLength(7);
+    expect(notes[0]).toMatch(/^claude: not yet seeded/);
+    expect(notes[1]).toBe("grok: catalog storage unavailable.");
+    expect(notes[1]).not.toContain("not yet seeded");
+    expect(notes[2]).toMatch(/^codex: not yet seeded/);
+    expect(notes.slice(3, 6)).toEqual(
+      ["claude", "grok", "codex"].map((id) => notificationNote(emptyNotificationStatus(id), statusNow.getTime())),
+    );
+    expect(notes[6]).toMatch(/^gemini: Gemini API key not configured/);
+    expect(notes.join("\n")).not.toContain("test-secret");
+  });
+
+  it("sanitizes failures outside the isolated provider reads", async () => {
+    const result = await getHandler(
+      makeTools({
+        listPluginProviderIds: () => {
+          throw new Error("test-secret plugin registry failure");
+        },
+      }),
+      "agent_model_catalog_list",
+    )({ provider: "codex" });
+
+    expect(result).toEqual({
+      isError: true,
+      content: [{ type: "text", text: "Model catalog storage unavailable." }],
+    });
+  });
+
+  it("retains provider validation order and the durable-list/manual-refresh descriptions", async () => {
+    const tools = makeTools({ listPluginProviderIds: () => ["sol"] });
+    const list = tools.find((tool: { name: string }) => tool.name === "agent_model_catalog_list")!;
+    const refresh = tools.find((tool: { name: string }) => tool.name === "agent_model_catalog_refresh")!;
+    const invalid = await list.handler({ provider: "unknown" });
+
+    expect(invalid.content[0].text).toBe("Unknown provider 'unknown'. Valid: claude, grok, codex, sol, gemini.");
+    expect(list.description).toBe(
+      "List valid LLM model ids for agent model assignment. Claude/grok/codex use stored catalogs checked automatically every eight hours; notes report saved-list time, successful discovery, latest attempt, pending recovery, notification retry status, and acknowledged CoS processing/Slack acceptance. Plugins are manually maintained. Gemini is resolved live (cached ~10 min). Returns a JSON entries array followed by provider notes. Listing does not trigger built-in discovery.",
+    );
+    expect(refresh.description).toBe(
+      "Replace one stored catalog with the FULL list, not a delta. The manual write performs no vendor calls. The next successful built-in scan replaces membership, names and order while retaining notes for retained IDs; a manual edit does not postpone discovery. Plugin catalogs remain manual; Gemini remains live and cannot be refreshed.",
+    );
   });
 
   it("gemini live lookup uses x-goog-api-key HEADER auth — key never in the URL", async () => {
@@ -1373,8 +1874,7 @@ describe("admin-mcp-server — model field discoverability (KPR-381)", () => {
 
 describe("agent_model_catalog — plugin providers (KPR-394)", () => {
   beforeEach(() => {
-    catalogDocsStore = new Map();
-    catalogVersionsStore = [];
+    catalogFake = createCatalogFake();
   });
 
   it("list accepts a registered plugin id; unseeded returns the prose note", async () => {
@@ -1383,19 +1883,64 @@ describe("agent_model_catalog — plugin providers (KPR-394)", () => {
     expect(res.isError).toBeUndefined();
     const texts = res.content.map((c: any) => c.text).join("\n");
     expect(texts).toContain("sol: not yet seeded");
+    expect(texts).toContain("manually maintained");
   });
 
-  it("refresh upserts a plugin provider's curated doc", async () => {
+  it("renders a stored plugin catalog as manual without discovery claims", async () => {
+    catalogFake.rows("agent_model_catalog").set("sol", {
+      _id: "sol",
+      provider: "sol",
+      models: [{ id: "sol-large-2", displayName: "Sol Large 2", addedAt: new Date("2026-09-01T00:00:00Z") }],
+      updatedAt: new Date("2026-09-07T11:00:00Z"),
+      source: "manual",
+      pendingExport: {},
+    });
+
+    const res = await getHandler(
+      makeTools({ listPluginProviderIds: () => ["sol"] }),
+      "agent_model_catalog_list",
+    )({
+      provider: "sol",
+    });
+
+    expect(JSON.parse(res.content[0].text)).toEqual([
+      {
+        provider: "sol",
+        id: "sol-large-2",
+        displayName: "Sol Large 2",
+        source: "curated",
+        asOf: "2026-09-07T11:00:00.000Z",
+      },
+    ]);
+    expect(res.content[1].text).toContain("sol: saved 2026-09-07T11:00:00.000Z (manual), 1 models");
+    expect(res.content[1].text).toContain("manually maintained");
+    expect(res.content[1].text).toContain("audit/change recovery pending");
+    expect(res.content[1].text).not.toContain("discovery");
+  });
+
+  it("refresh records a plugin provider's actor, diff, and summary", async () => {
     const tools = makeTools({ listPluginProviderIds: () => ["sol"] });
     const res = await getHandler(
       tools,
       "agent_model_catalog_refresh",
     )({
       provider: "sol",
-      models: [{ id: "sol-large-2", displayName: "Sol Large 2" }],
+      models: [
+        { id: "sol-large-2", displayName: "Sol Large 2" },
+        { id: "sol-small-2", displayName: "Sol Small 2" },
+      ],
+      changeSummary: "Sol 2 catalog",
     });
     expect(res.isError).toBeUndefined();
-    expect(catalogDocsStore.get("sol")?.models?.[0]?.id).toBe("sol-large-2");
+    expect(res.content[0].text).toBe(
+      "sol catalog updated: +2 (sol-large-2, sol-small-2), -0. 2 models total. — Sol 2 catalog",
+    );
+    expect(catalogFake.rows("agent_model_catalog").get("sol")?.models?.[0]?.id).toBe("sol-large-2");
+    const version = [...catalogFake.rows("agent_model_catalog_versions").values()][0];
+    expect(version.updatedBy).toBe("admin");
+    expect(version.added).toEqual(["sol-large-2", "sol-small-2"]);
+    expect(version.removed).toEqual([]);
+    expect(version.changeSummary).toBe("Sol 2 catalog");
   });
 
   it("refresh rejects an unknown provider naming the valid set", async () => {
