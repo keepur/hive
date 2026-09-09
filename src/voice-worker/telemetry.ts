@@ -6,32 +6,16 @@
  *
  * No transcript text, no phone numbers, no `to` in any log/telemetry object.
  */
-import { voice, type MetricsCollectedEvent } from "@livekit/agents";
 import { MongoClient, type Collection } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import type { VendorCell } from "./cells.js";
 import type { BridgeFailureClass } from "./error-map.js";
+import type { CallDiagnosticCounts } from "./speech-trace.js";
 import type { WorkerConfig } from "./worker-config.js";
 
 const log = createLogger("voice-worker-metrics");
 
 export type CallDirection = "inbound" | "outbound";
-
-export interface TurnMetricsLine {
-  ts: string;
-  callId: string;
-  turnSeq: number;
-  direction: CallDirection;
-  cell: VendorCell;
-  eouDelayMs: number;
-  llmTtftMs: number;
-  maxInterChunkGapMs: number;
-  ttsTtfbMs: number;
-  totalToFirstAudioMs: number;
-  interrupted: boolean;
-  falseInterruption: boolean;
-  errors: string[];
-}
 
 /**
  * Nearest-rank percentile (C = n·p / 100, no interpolation). Empty → -1.
@@ -43,123 +27,6 @@ export function percentile(samples: number[], p: number): number {
   const sorted = [...samples].sort((a, b) => a - b);
   const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
   return sorted[idx]!;
-}
-
-/**
- * 1.6.4 mapping (do not treat metrics_collected as a flat Record):
- * `session.on(AgentSessionEventTypes.MetricsCollected)` delivers
- * `{ type:"metrics_collected", metrics: AgentMetrics, createdAt }`.
- * AgentMetrics is a discriminated union — `eou_metrics.endOfUtteranceDelayMs`,
- * `tts_metrics.ttfbMs`, `llm_metrics.ttftMs`; `interruption_metrics` has
- * counts (not a boolean `falseInterruption`); there is no `totalToFirstAudioMs`.
- *
- * agents-js 1.6.4 emits `eou_metrics` immediately after `generateReply()` is
- * scheduled — before this turn's LLM stream or TTS TTFB exist. Production
- * order is EOU (with `speechId` = the new SpeechHandle) → this turn's LLM →
- * this turn's TTS TTFB. Hold the pending EOU; emit one TurnMetricsLine when
- * matching TTS TTFB arrives (join on `speechId`). Cancelled TTS still emits
- * (interrupted turns must score). `llmTtftMs` is populated only from matching
- * genuine `llm_metrics`; the old mutable object-identity bridge timing fallback
- * was removed because overlapping attempts could cross-wire it. The legacy
- * summary has no correlated maximum-gap source, so that field remains -1 until
- * Task 3 replaces this class with the schema-v2 reducer.
- * `totalToFirstAudioMs` is the sum of EOU + LLM TTFT + TTS TTFB when all
- * are >= 0, else -1. Incomplete turns are dropped, not cross-wired with
- * another speech's TTS. `interrupted` is true when `numInterruptions`
- * increased since the last line; `falseInterruption` latches
- * `agent_false_interruption` until the next emitted line (the TTS-joined
- * line, not EOU). `speechId` is internal join key only — omit from JSONL.
- */
-export class TurnMetrics {
-  private turnSeq = 0;
-  private pendingEou: {
-    speechId: string;
-    endOfUtteranceDelayMs: number;
-  } | null = null;
-  private llmTtftBySpeechId = new Map<string, number>();
-  private lastInterruptionCount = 0;
-  private pendingInterrupted = false;
-  private pendingFalseInterruption = false;
-
-  constructor(
-    private readonly callId: string,
-    private readonly cell: VendorCell,
-    private readonly direction: CallDirection = "outbound",
-    private readonly onTurn?: (line: TurnMetricsLine) => void,
-  ) {}
-
-  attach(session: Pick<voice.AgentSession, "on">): void {
-    session.on(voice.AgentSessionEventTypes.MetricsCollected, (ev) => {
-      this.onMetricsCollected(ev);
-    });
-    session.on(voice.AgentSessionEventTypes.AgentFalseInterruption, () => {
-      this.pendingFalseInterruption = true;
-    });
-  }
-
-  private onMetricsCollected(ev: MetricsCollectedEvent): void {
-    const m = ev.metrics;
-    switch (m.type) {
-      case "tts_metrics":
-        // Do not skip cancelled TTS — interrupted turns still emit; they
-        // must not inherit the previous turn's LLM timing (object-identity
-        // check in emitTurn).
-        if (m.speechId !== undefined && this.pendingEou?.speechId === m.speechId) {
-          const eou = this.pendingEou;
-          this.pendingEou = null;
-          this.emitTurn(eou.endOfUtteranceDelayMs, m.ttfbMs, m.speechId);
-        }
-        return;
-      case "llm_metrics":
-        if (m.speechId !== undefined) this.llmTtftBySpeechId.set(m.speechId, m.ttftMs);
-        return;
-      case "interruption_metrics":
-        if (m.numInterruptions > this.lastInterruptionCount) this.pendingInterrupted = true;
-        this.lastInterruptionCount = m.numInterruptions;
-        return;
-      case "eou_metrics":
-        // Hold until matching TTS TTFB. A new EOU replaces an unmatched one
-        // (incomplete turns are dropped, never flushed with another speech's TTS).
-        this.pendingEou =
-          m.speechId !== undefined
-            ? {
-                speechId: m.speechId,
-                endOfUtteranceDelayMs: m.endOfUtteranceDelayMs,
-              }
-            : null;
-        return;
-      default:
-        return;
-    }
-  }
-
-  private emitTurn(eouDelayMs: number, ttsTtfbMs: number, speechId: string): void {
-    const llmTtftMs = this.llmTtftBySpeechId.get(speechId) ?? -1;
-    const maxInterChunkGapMs = -1;
-    this.llmTtftBySpeechId.delete(speechId);
-    const totalToFirstAudioMs =
-      eouDelayMs >= 0 && llmTtftMs >= 0 && ttsTtfbMs >= 0 ? eouDelayMs + llmTtftMs + ttsTtfbMs : -1;
-    const line: TurnMetricsLine = {
-      ts: new Date().toISOString(),
-      callId: this.callId,
-      turnSeq: this.turnSeq++,
-      direction: this.direction,
-      cell: this.cell,
-      eouDelayMs,
-      llmTtftMs,
-      maxInterChunkGapMs,
-      ttsTtfbMs,
-      totalToFirstAudioMs,
-      interrupted: this.pendingInterrupted,
-      falseInterruption: this.pendingFalseInterruption,
-      errors: [],
-    };
-    this.pendingInterrupted = false;
-    this.pendingFalseInterruption = false;
-    // Flatten cell so the log object has no nested vendor dump.
-    log.info("voice turn metrics", { ...line, cell: `${this.cell.stt}+${this.cell.tts}` });
-    this.onTurn?.(line);
-  }
 }
 
 export class VoiceWorkerHeartbeat {
@@ -274,12 +141,12 @@ export class VoiceWorkerHeartbeat {
 
 export class CallStats {
   private readonly consumed = new Set<BridgeFailureClass>();
-  private flushedOutcome: string | null = null;
-  private interruptions = 0;
+  private terminalOutcome: string | null = null;
+  private flushPromise: Promise<CallStatsFlushResult> | null = null;
   private retries = 0;
-  private readonly failures: string[] = [];
+  private failureCount = 0;
+  private lastFailureClass: string | null = null;
   private readonly startedAt = Date.now();
-  private readonly turnLatencies: number[] = [];
 
   constructor(
     private readonly wc: WorkerConfig,
@@ -289,18 +156,19 @@ export class CallStats {
       cell: VendorCell;
       direction: CallDirection;
     },
+    private readonly observePersistence?: (
+      status: "acknowledged" | "failed",
+      reason?: "connect_failed" | "insert_failed" | "close_failed",
+    ) => void,
   ) {}
 
-  recordInterruption(): void {
-    this.interruptions += 1;
-  }
-
-  recordTurnLatency(ms: number): void {
-    this.turnLatencies.push(ms);
-  }
-
   recordFailure(outcome: string): void {
-    this.failures.push(outcome);
+    this.failureCount += 1;
+    this.lastFailureClass = outcome.slice(0, 128);
+  }
+
+  recordTerminalOutcome(outcome: string): void {
+    this.terminalOutcome ??= outcome.slice(0, 128);
   }
 
   /** First call per class returns false (retry still available); second returns true. */
@@ -311,39 +179,197 @@ export class CallStats {
     return false;
   }
 
-  async flush(outcome: string): Promise<void> {
-    // First outcome wins so a terminal flush("failed") is not overwritten by
-    // the shutdown-callback flush("completed").
-    if (this.flushedOutcome !== null) return;
-    this.flushedOutcome = outcome;
+  flush(outcome: string, diagnostics: CallDiagnosticCounts = EMPTY_DIAGNOSTICS): Promise<CallStatsFlushResult> {
+    this.recordTerminalOutcome(outcome);
+    if (this.flushPromise) return this.flushPromise;
+    const snapshot = copyDiagnostics(diagnostics);
+    const callState = {
+      terminalOutcome: this.terminalOutcome ?? "unknown",
+      failureCount: this.failureCount,
+      lastFailureClass: this.lastFailureClass,
+      retries: this.retries,
+    };
+    this.flushPromise = this.persist(snapshot, callState);
+    return this.flushPromise;
+  }
 
+  private async persist(
+    diagnostics: CallDiagnosticCounts,
+    callState: { terminalOutcome: string; failureCount: number; lastFailureClass: string | null; retries: number },
+  ): Promise<CallStatsFlushResult> {
     let client: MongoClient | undefined;
+    let connected = false;
+    let persisted = false;
+    let closeFailed = false;
+    let persistenceFailure: "connect_failed" | "insert_failed" | null = null;
     try {
       client = new MongoClient(this.wc.mongoUri, { serverSelectionTimeoutMS: 2000 });
       await client.connect();
+      connected = true;
       const resolvedOutcome =
-        this.failures.length && outcome === "failed" ? this.failures[this.failures.length - 1]! : outcome;
-      await client
+        callState.failureCount > 0 && callState.terminalOutcome === "failed"
+          ? callState.lastFailureClass
+          : callState.terminalOutcome;
+      const result = await client
         .db(this.wc.mongoDbName)
         .collection("telemetry")
         .insertOne({
           kind: "voice_call_stats",
+          schemaVersion: 2,
           callId: this.meta.callId,
           agentId: this.meta.agentId,
           cell: this.meta.cell,
           direction: this.meta.direction,
-          turns: this.turnLatencies.length,
-          interruptions: this.interruptions,
-          retries: this.retries,
+          speechAttempts: diagnostics.speechAttempts,
+          speechOutcomes: diagnostics.speechOutcomes,
+          bridgeAttempts: diagnostics.bridgeAttempts,
+          bridgeOutcomes: diagnostics.bridgeOutcomes,
+          synthesisAttempts: diagnostics.synthesisAttempts,
+          synthesisOutcomes: diagnostics.synthesisOutcomes,
+          generatedAudioObserved: diagnostics.generatedAudioObserved,
+          knownPlayoutObserved: diagnostics.knownPlayoutObserved,
+          incomplete: diagnostics.incomplete,
+          unbound: diagnostics.unbound,
+          diagnosticGaps: diagnostics.diagnosticGaps,
+          loggingFailures:
+            diagnostics.logging.filtered +
+            diagnostics.logging.failed +
+            diagnostics.logging.overflow +
+            diagnostics.logging.pending +
+            diagnostics.logging.unacknowledged +
+            diagnostics.logging.sinkErrors,
+          turns: diagnostics.eligibleLatencyEstimateCount,
+          interruptions: diagnostics.sdkInterruptions,
+          cancelled: diagnostics.cancelledSpeechAttempts,
+          retries: callState.retries,
           outcome: resolvedOutcome,
+          failureCount: callState.failureCount,
+          lastFailureClass: callState.lastFailureClass,
           durationMs: Date.now() - this.startedAt,
-          latency: { p50: percentile(this.turnLatencies, 50), p95: percentile(this.turnLatencies, 95) },
+          latencyEstimateSamples: diagnostics.latencyEstimateSamples,
+          excludedByReason: diagnostics.excludedByReason,
+          latency: {
+            kind: "estimated_eou_to_first_generated_audio",
+            sampled: true,
+            eligibleSampleCount: diagnostics.eligibleLatencyEstimateCount,
+            retainedSampleCount: diagnostics.latencyEstimateSamples.length,
+            truncated: diagnostics.eligibleLatencyEstimateCount > diagnostics.latencyEstimateSamples.length,
+            p50: percentile(diagnostics.latencyEstimateSamples, 50),
+            p95: percentile(diagnostics.latencyEstimateSamples, 95),
+          },
           createdAt: new Date(),
         });
-    } catch (err) {
-      log.warn("voice_call_stats flush failed", { callId: this.meta.callId, error: String(err) });
+      if (result.acknowledged !== true) throw new Error("summary insert was not acknowledged");
+      persisted = true;
+    } catch {
+      persistenceFailure = connected ? "insert_failed" : "connect_failed";
     } finally {
-      await client?.close().catch(() => {});
+      try {
+        await client?.close();
+      } catch {
+        closeFailed = true;
+      }
+    }
+    if (persisted) {
+      this.safeLog("info", "summary_persistence", { callId: this.meta.callId, status: "acknowledged" });
+      this.safeObservePersistence("acknowledged");
+    } else {
+      const reason = persistenceFailure ?? "insert_failed";
+      this.safeLog("warn", "summary_persistence", { callId: this.meta.callId, status: "failed", reason });
+      this.safeObservePersistence("failed", reason);
+    }
+    if (closeFailed) {
+      this.safeLog("warn", "voice_call_stats close failed", { callId: this.meta.callId });
+      this.safeObservePersistence("failed", "close_failed");
+    }
+    return { persisted, closeFailed };
+  }
+
+  private safeLog(level: "info" | "warn", message: string, data: Record<string, unknown>): void {
+    try {
+      log[level](message, data);
+    } catch {
+      // Summary persistence truth is independent of diagnostic logging.
     }
   }
+
+  private safeObservePersistence(
+    status: "acknowledged" | "failed",
+    reason?: "connect_failed" | "insert_failed" | "close_failed",
+  ): void {
+    try {
+      if (reason === undefined) this.observePersistence?.(status);
+      else this.observePersistence?.(status, reason);
+    } catch {
+      // A diagnostic observer cannot rewrite acknowledged persistence.
+    }
+  }
+}
+
+export interface CallStatsFlushResult {
+  persisted: boolean;
+  closeFailed: boolean;
+}
+
+const EMPTY_OUTCOMES = { completed: 0, interrupted: 0, cancelled: 0, failed: 0, incomplete: 0 } as const;
+const EMPTY_DIAGNOSTICS: CallDiagnosticCounts = {
+  speechAttempts: 0,
+  speechOutcomes: { ...EMPTY_OUTCOMES },
+  bridgeAttempts: 0,
+  bridgeOutcomes: { ...EMPTY_OUTCOMES },
+  synthesisAttempts: 0,
+  synthesisOutcomes: { ...EMPTY_OUTCOMES },
+  generatedAudioObserved: 0,
+  knownPlayoutObserved: 0,
+  sdkInterruptions: 0,
+  cancelledSpeechAttempts: 0,
+  incomplete: 0,
+  unbound: 0,
+  diagnosticGaps: 0,
+  latencyEstimateSamples: [],
+  eligibleLatencyEstimateCount: 0,
+  excludedByReason: {
+    not_applicable: 0,
+    interrupted: 0,
+    cancelled: 0,
+    failed: 0,
+    incomplete: 0,
+    ambiguous_components: 0,
+    missing_eou: 0,
+    missing_bridge_first_text: 0,
+    missing_tts_metric: 0,
+    missing_generated_audio: 0,
+  },
+  logging: {
+    attempted: 0,
+    acknowledged: 0,
+    filtered: 0,
+    failed: 0,
+    overflow: 0,
+    pending: 0,
+    unacknowledged: 0,
+    sinkErrors: 0,
+    complete: true,
+  },
+  registry: {
+    activeSpeech: 0,
+    recentSpeech: 0,
+    activeBridge: 0,
+    recentBridge: 0,
+    activeSynthesis: 0,
+    recentSynthesis: 0,
+  },
+};
+
+function copyDiagnostics(diagnostics: CallDiagnosticCounts): CallDiagnosticCounts {
+  return {
+    ...diagnostics,
+    speechOutcomes: { ...diagnostics.speechOutcomes },
+    bridgeOutcomes: { ...diagnostics.bridgeOutcomes },
+    synthesisOutcomes: { ...diagnostics.synthesisOutcomes },
+    latencyEstimateSamples: diagnostics.latencyEstimateSamples.slice(0, 1_024),
+    excludedByReason: { ...diagnostics.excludedByReason },
+    logging: { ...diagnostics.logging },
+    registry: { ...diagnostics.registry },
+  };
 }

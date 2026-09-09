@@ -48,8 +48,9 @@ import type { VendorCell } from "./cells.js";
 import type { DispatchMetadata } from "./dispatch-meta.js";
 import { FAILURE_BEHAVIOR, FALLBACK_LINES, resolveFailureAction } from "./error-map.js";
 import { BridgeError, HiveLLM } from "./hive-llm.js";
-import { SpeechTrace } from "./speech-trace.js";
-import { CallStats, TurnMetrics, type VoiceWorkerHeartbeat } from "./telemetry.js";
+import { SpeechTrace, type CallDiagnosticCounts } from "./speech-trace.js";
+import { CallStats, type VoiceWorkerHeartbeat } from "./telemetry.js";
+import { TracedAgent } from "./traced-agent.js";
 import { VOICE_PROCESS_ID } from "../voice/voice-trace.js";
 import { normalizeForTTS } from "./tts-normalize.js";
 import type { WorkerConfig } from "./worker-config.js";
@@ -112,12 +113,18 @@ export function resolveInboundAgent(
 /** Ordered job teardown so noteCallEnded hits a live Mongo client (KPR-322). */
 export async function runJobShutdown(hooks: {
   releaseCall: () => Promise<void>;
-  flush: () => Promise<void>;
+  closeTrace?: () => void;
+  settleTrace?: () => Promise<unknown>;
+  snapshotTrace?: () => CallDiagnosticCounts;
+  flush: (diagnostics?: CallDiagnosticCounts) => Promise<unknown>;
   closeMongo: () => Promise<void>;
 }): Promise<void> {
-  await hooks.releaseCall();
-  await hooks.flush();
-  await hooks.closeMongo();
+  hooks.closeTrace?.();
+  await hooks.settleTrace?.().catch(() => {});
+  const diagnostics = hooks.snapshotTrace?.();
+  await hooks.releaseCall().catch(() => {});
+  await hooks.flush(diagnostics).catch(() => {});
+  await hooks.closeMongo().catch(() => {});
 }
 
 export async function runCallSession(
@@ -128,9 +135,9 @@ export async function runCallSession(
   heartbeat?: VoiceWorkerHeartbeat,
   closeMongo?: () => Promise<void>,
 ): Promise<void> {
-  const shutdownHooks = {
+  const shutdownHooks: Parameters<typeof runJobShutdown>[0] = {
     releaseCall: async () => {},
-    flush: async () => {},
+    flush: async (_diagnostics?: CallDiagnosticCounts) => {},
     closeMongo: closeMongo ?? (async () => {}),
   };
   ctx.addShutdownCallback(() => runJobShutdown(shutdownHooks));
@@ -170,26 +177,49 @@ export async function runCallSession(
     trace: speechTrace,
   });
 
+  const ttsProvider = buildTts(cell, wc, hiveAgentId);
   const vad = await silero.VAD.load();
   const session = new voice.AgentSession({
     stt: buildStt(cell, wc.deepgramApiKey),
-    tts: buildTts(cell, wc, hiveAgentId),
+    tts: ttsProvider,
     vad,
     llm: hiveLLM,
     turnHandling: { turnDetection: cell.stt === "deepgram/flux-general-en" ? "stt" : "vad" },
     ttsTextTransforms: ["filter_markdown", "filter_emoji", hiveTtsNormalize],
   });
 
-  const stats = new CallStats(wc, {
+  const stats = new CallStats(
+    wc,
+    {
+      callId,
+      agentId: hiveAgentId,
+      cell,
+      direction: outbound ? "outbound" : "inbound",
+    },
+    (status, reason) => speechTrace.summaryPersistence(status, reason),
+  );
+  const callAbort = new AbortController();
+  const agent = new TracedAgent({
+    // §5.3: intentionally unused — the ENGINE owns the prompt
+    // (buildVoiceSystemPrompt via TurnContext.systemPromptOverride).
+    instructions: "Placeholder — hive owns the prompt server-side.",
+    tts: ttsProvider,
     callId,
-    agentId: hiveAgentId,
-    cell,
-    direction: outbound ? "outbound" : "inbound",
+    workerBootId: VOICE_PROCESS_ID,
+    callSignal: callAbort.signal,
+    trace: speechTrace,
+    // Task 6 supplies startup ownership; Task 3 only installs the synchronous seam.
+    onAcceptedUserTurn: () => {},
   });
-  const metrics = new TurnMetrics(callId, cell, outbound ? "outbound" : "inbound", (line) => {
-    if (line.totalToFirstAudioMs >= 0) stats.recordTurnLatency(line.totalToFirstAudioMs);
-  });
-  metrics.attach(session);
+
+  let traceClosed = false;
+  const closeTrace = (cause: "call_closed" | "setup_failed") => {
+    if (traceClosed) return;
+    traceClosed = true;
+    callAbort.abort();
+    agent.dispose();
+    speechTrace.close(cause);
+  };
 
   if (heartbeat) void heartbeat.noteCallStarted();
   let callReleased = false;
@@ -200,26 +230,34 @@ export async function runCallSession(
     await heartbeat.noteCallEnded();
   };
   shutdownHooks.releaseCall = releaseCall;
-  shutdownHooks.flush = () => stats.flush("completed");
+  shutdownHooks.closeTrace = () => closeTrace("call_closed");
+  shutdownHooks.settleTrace = () => speechTrace.settleWrites();
+  shutdownHooks.snapshotTrace = () => speechTrace.snapshot();
+  shutdownHooks.flush = (diagnostics) => stats.flush("completed", diagnostics);
+
+  session.on(voice.AgentSessionEventTypes.SpeechCreated, (ev) => {
+    speechTrace.speechCreated(ev.speechHandle, "sdk_response", 0);
+  });
+
+  session.on(voice.AgentSessionEventTypes.MetricsCollected, (ev) => {
+    speechTrace.metrics(ev);
+  });
+
+  session.on(voice.AgentSessionEventTypes.Close, () => {
+    closeTrace("call_closed");
+  });
 
   session.on(voice.AgentSessionEventTypes.ConversationItemAdded, (ev) => {
     const item = ev.item;
     if (item.type === "message" && item.role === "assistant" && item.interrupted) {
       hiveLLM.interruptedSpokenText = item.textContent ?? "";
-      stats.recordInterruption();
     }
   });
 
   session.on(voice.AgentSessionEventTypes.Error, (ev) => {
-    void handleSessionError(ev, { session, stats, ctx, callId, heartbeat, releaseCall });
+    void handleSessionError(ev, { session, stats, ctx, callId, heartbeat });
   });
 
-  const agent = new voice.Agent({
-    // §5.3: intentionally unused — the ENGINE owns the prompt
-    // (buildVoiceSystemPrompt via TurnContext.systemPromptOverride). Do not
-    // "fix" agent behavior here.
-    instructions: "Placeholder — hive owns the prompt server-side.",
-  });
   try {
     await session.start({ agent, room: ctx.room });
 
@@ -234,7 +272,9 @@ export async function runCallSession(
   } catch (err) {
     // callId only — LiveKit/SIP errors can embed the destination.
     log.error("Call setup failed", { callId });
-    await recordSetupFailure(stats, heartbeat);
+    closeTrace("setup_failed");
+    await speechTrace.settleWrites().catch(() => {});
+    await recordSetupFailure(stats, heartbeat, speechTrace.snapshot());
     throw err;
   }
 }
@@ -243,10 +283,11 @@ export async function runCallSession(
 export async function recordSetupFailure(
   stats: Pick<CallStats, "recordFailure" | "flush">,
   heartbeat?: Pick<VoiceWorkerHeartbeat, "noteError">,
+  diagnostics?: CallDiagnosticCounts,
 ): Promise<void> {
   stats.recordFailure("setup_failed");
   if (heartbeat) await heartbeat.noteError("setup_failed");
-  await stats.flush("failed");
+  await stats.flush("failed", diagnostics);
 }
 
 async function handleSessionError(
@@ -257,10 +298,9 @@ async function handleSessionError(
     ctx: JobContext;
     callId: string;
     heartbeat?: VoiceWorkerHeartbeat;
-    releaseCall: () => Promise<void>;
   },
 ): Promise<void> {
-  const { session, stats, ctx, callId, heartbeat, releaseCall } = args;
+  const { session, stats, ctx, callId, heartbeat } = args;
   const inner = ev.error;
   const failure = inner.type === "llm_error" && inner.error instanceof BridgeError ? inner.error : null;
   if (!failure) {
@@ -278,10 +318,9 @@ async function handleSessionError(
     return;
   }
   if (action.kind === "continue") return;
+  stats.recordTerminalOutcome("failed");
   await speakAndWait(session, FALLBACK_LINES[action.say]);
   if (heartbeat) void heartbeat.noteError(behavior.telemetryOutcome);
-  await stats.flush("failed");
-  await releaseCall();
   ctx.shutdown();
 }
 

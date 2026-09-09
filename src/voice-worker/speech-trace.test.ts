@@ -121,6 +121,49 @@ function ttsMetric(speechId: string, ttfbMs = 6): MetricsCollectedEvent {
   };
 }
 
+function eouMetric(speechId: string, eouMs = 4): MetricsCollectedEvent {
+  return {
+    type: "metrics_collected",
+    createdAt: Date.now(),
+    metrics: {
+      type: "eou_metrics",
+      timestamp: Date.now(),
+      endOfUtteranceDelayMs: eouMs,
+      transcriptionDelayMs: 0,
+      onUserTurnCompletedDelayMs: 0,
+      lastSpeakingTimeMs: 0,
+      speechId,
+    },
+  };
+}
+
+function completeEligibleSpeech(
+  trace: SpeechTrace,
+  handle: FakeSpeechHandle,
+  index: number,
+  options: { duplicateTtsObject?: boolean; secondTtsMetric?: boolean } = {},
+): void {
+  const speechId = handle.id;
+  trace.speechCreated(handle.asHandle(), "sdk_response", index);
+  const bridgeCtx = bridgeContext("call", `turn-${index}`);
+  const bridge = trace.bridgeCreated(bridgeCtx);
+  bridge.started();
+  bridge.response(200);
+  bridge.text(1, performance.now() + 5);
+  bridge.finish("completed", "unknown");
+  bridgeTraceContext.run(bridgeCtx, () => trace.metrics(llmMetric(speechId)));
+  const synthCtx = synthesisContext("call", `synth-${index}`);
+  const synth = trace.synthesisCreated(synthCtx);
+  synth.frame({ sampleRate: 10, samplesPerChannel: 10 });
+  const metric = ttsMetric(speechId, 6);
+  synthesisTraceContext.run(synthCtx, () => trace.metrics(metric));
+  if (options.duplicateTtsObject) synthesisTraceContext.run(synthCtx, () => trace.metrics(metric));
+  if (options.secondTtsMetric) synthesisTraceContext.run(synthCtx, () => trace.metrics(ttsMetric(speechId, 6)));
+  synth.finish("completed", "unknown");
+  trace.metrics(eouMetric(speechId, 4));
+  handle.settle();
+}
+
 describe("immutable trace contexts", () => {
   it("keeps bridge and synthesis scopes separate across overlapping async work", async () => {
     const bridge = Object.freeze({ workerBootId: BOOT, callId: "call", turnId: "turn-a" });
@@ -141,6 +184,85 @@ describe("immutable trace contexts", () => {
     ]);
     expect(Object.isFrozen(bridge)).toBe(true);
     expect(Object.isFrozen(synthesis)).toBe(true);
+  });
+});
+
+describe("schema-v2 latency eligibility", () => {
+  it("retains one eligible stage estimate and deduplicates the same metric object", () => {
+    const { trace } = setup();
+    completeEligibleSpeech(trace, new FakeSpeechHandle("speech-eligible"), 1, { duplicateTtsObject: true });
+    const snapshot = trace.snapshot();
+    expect(snapshot.eligibleLatencyEstimateCount).toBe(1);
+    expect(snapshot.latencyEstimateSamples).toHaveLength(1);
+    expect(snapshot.latencyEstimateSamples[0]).toBeGreaterThanOrEqual(14);
+    expect(snapshot.latencyEstimateSamples[0]).toBeLessThan(20);
+    expect(Object.values(snapshot.excludedByReason).reduce((sum, count) => sum + count, 0)).toBe(0);
+  });
+
+  it("excludes distinct TTS segment metrics as ambiguous instead of choosing by arrival", () => {
+    const { trace } = setup();
+    completeEligibleSpeech(trace, new FakeSpeechHandle("speech-segments"), 2, { secondTtsMetric: true });
+    const snapshot = trace.snapshot();
+    expect(snapshot.eligibleLatencyEstimateCount).toBe(0);
+    expect(snapshot.latencyEstimateSamples).toEqual([]);
+    expect(snapshot.excludedByReason.ambiguous_components).toBe(1);
+  });
+
+  it("keeps opening, interrupted, cancelled, incomplete, and missing-metric exclusions distinct", () => {
+    const { trace } = setup();
+    const opening = new FakeSpeechHandle("opening");
+    trace.speechCreated(opening.asHandle(), "opening", 0);
+    opening.settle();
+
+    const interrupted = new FakeSpeechHandle("interrupted");
+    trace.speechCreated(interrupted.asHandle(), "sdk_response", 1);
+    interrupted.interrupted = true;
+    interrupted.settle();
+
+    const cancelled = new FakeSpeechHandle("cancelled");
+    trace.speechCreated(cancelled.asHandle(), "sdk_response", 2);
+    trace.markCancellation(cancelled.id, "startup_superseded");
+    cancelled.interrupted = true;
+    cancelled.settle();
+
+    const incomplete = new FakeSpeechHandle("incomplete");
+    trace.speechCreated(incomplete.asHandle(), "sdk_response", 3);
+    incomplete.settle();
+
+    expect(trace.snapshot()).toMatchObject({
+      sdkInterruptions: 2,
+      cancelledSpeechAttempts: 1,
+      excludedByReason: {
+        not_applicable: 1,
+        interrupted: 1,
+        cancelled: 1,
+        incomplete: 1,
+      },
+    });
+  });
+
+  it("counts an interrupted handle independently when call close owns cancellation", () => {
+    const { trace } = setup();
+    const handle = new FakeSpeechHandle("speech-close-interrupted");
+    trace.speechCreated(handle.asHandle(), "opening", 0);
+    handle.interrupted = true;
+    trace.close("call_closed");
+    expect(trace.snapshot()).toMatchObject({
+      sdkInterruptions: 1,
+      cancelledSpeechAttempts: 1,
+      speechOutcomes: { cancelled: 1 },
+      excludedByReason: { not_applicable: 1 },
+    });
+  });
+
+  it("retains only the deterministic first 1,024 eligible samples", () => {
+    const { trace } = setup();
+    for (let index = 0; index < 1_030; index += 1) {
+      completeEligibleSpeech(trace, new FakeSpeechHandle(`speech-${index}`), index);
+    }
+    const snapshot = trace.snapshot();
+    expect(snapshot.eligibleLatencyEstimateCount).toBe(1_030);
+    expect(snapshot.latencyEstimateSamples).toHaveLength(1_024);
   });
 });
 

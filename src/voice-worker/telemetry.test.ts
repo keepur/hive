@@ -1,6 +1,6 @@
-import { voice, type MetricsCollectedEvent } from "@livekit/agents";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { VendorCell } from "./cells.js";
+import type { CallDiagnosticCounts } from "./speech-trace.js";
 import type { WorkerConfig } from "./worker-config.js";
 
 const { mockLog, mongoMocks } = vi.hoisted(() => ({
@@ -32,7 +32,7 @@ vi.mock("mongodb", () => {
   return { MongoClient: mongoMocks.MongoClient };
 });
 
-import { CallStats, percentile, TurnMetrics, VoiceWorkerHeartbeat } from "./telemetry.js";
+import { CallStats, percentile, VoiceWorkerHeartbeat } from "./telemetry.js";
 
 const CELL: VendorCell = { stt: "deepgram/flux-general-en", tts: "cartesia/sonic-3" };
 
@@ -69,93 +69,56 @@ function makeFakeCollection() {
   };
 }
 
-function makeFakeSession() {
-  const listeners = new Map<string, Array<(payload: unknown) => void>>();
+function diagnostics(overrides: Partial<CallDiagnosticCounts> = {}): CallDiagnosticCounts {
+  const outcomes = { completed: 0, interrupted: 0, cancelled: 0, failed: 0, incomplete: 0 };
   return {
-    on(event: string, cb: (payload: unknown) => void) {
-      const arr = listeners.get(event) ?? [];
-      arr.push(cb);
-      listeners.set(event, arr);
-      return this;
+    speechAttempts: 0,
+    speechOutcomes: { ...outcomes },
+    bridgeAttempts: 0,
+    bridgeOutcomes: { ...outcomes },
+    synthesisAttempts: 0,
+    synthesisOutcomes: { ...outcomes },
+    generatedAudioObserved: 0,
+    knownPlayoutObserved: 0,
+    sdkInterruptions: 0,
+    cancelledSpeechAttempts: 0,
+    incomplete: 0,
+    unbound: 0,
+    diagnosticGaps: 0,
+    latencyEstimateSamples: [],
+    eligibleLatencyEstimateCount: 0,
+    excludedByReason: {
+      not_applicable: 0,
+      interrupted: 0,
+      cancelled: 0,
+      failed: 0,
+      incomplete: 0,
+      ambiguous_components: 0,
+      missing_eou: 0,
+      missing_bridge_first_text: 0,
+      missing_tts_metric: 0,
+      missing_generated_audio: 0,
     },
-    emit(event: string, payload: unknown) {
-      for (const cb of listeners.get(event) ?? []) cb(payload);
+    logging: {
+      attempted: 0,
+      acknowledged: 0,
+      filtered: 0,
+      failed: 0,
+      overflow: 0,
+      pending: 0,
+      unacknowledged: 0,
+      sinkErrors: 0,
+      complete: true,
     },
-  };
-}
-
-function eouEvent(endOfUtteranceDelayMs: number, speechId?: string): MetricsCollectedEvent {
-  return {
-    type: "metrics_collected",
-    createdAt: Date.now(),
-    metrics: {
-      type: "eou_metrics",
-      timestamp: Date.now(),
-      endOfUtteranceDelayMs,
-      transcriptionDelayMs: 0,
-      onUserTurnCompletedDelayMs: 0,
-      lastSpeakingTimeMs: 0,
-      ...(speechId !== undefined ? { speechId } : {}),
+    registry: {
+      activeSpeech: 0,
+      recentSpeech: 0,
+      activeBridge: 0,
+      recentBridge: 0,
+      activeSynthesis: 0,
+      recentSynthesis: 0,
     },
-  };
-}
-
-function ttsEvent(ttfbMs: number, speechId?: string): MetricsCollectedEvent {
-  return {
-    type: "metrics_collected",
-    createdAt: Date.now(),
-    metrics: {
-      type: "tts_metrics",
-      label: "tts",
-      requestId: "r1",
-      timestamp: Date.now(),
-      ttfbMs,
-      durationMs: 0,
-      audioDurationMs: 0,
-      cancelled: false,
-      charactersCount: 0,
-      streamed: true,
-      ...(speechId !== undefined ? { speechId } : {}),
-    },
-  };
-}
-
-function llmEvent(ttftMs: number, speechId?: string): MetricsCollectedEvent {
-  return {
-    type: "metrics_collected",
-    createdAt: Date.now(),
-    metrics: {
-      type: "llm_metrics",
-      label: "llm",
-      requestId: "r1",
-      timestamp: Date.now(),
-      durationMs: 0,
-      ttftMs,
-      cancelled: false,
-      completionTokens: 0,
-      promptTokens: 0,
-      promptCachedTokens: 0,
-      totalTokens: 0,
-      tokensPerSecond: 0,
-      ...(speechId !== undefined ? { speechId } : {}),
-    },
-  };
-}
-
-function interruptionEvent(numInterruptions: number): MetricsCollectedEvent {
-  return {
-    type: "metrics_collected",
-    createdAt: Date.now(),
-    metrics: {
-      type: "interruption_metrics",
-      timestamp: Date.now(),
-      totalDuration: 0,
-      predictionDuration: 0,
-      detectionDelay: 0,
-      numInterruptions,
-      numBackchannels: 0,
-      numRequests: 1,
-    },
+    ...overrides,
   };
 }
 
@@ -288,170 +251,6 @@ describe("VoiceWorkerHeartbeat (KPR-322 Task 8)", () => {
   });
 });
 
-describe("TurnMetrics (KPR-322 Task 8)", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it("emits one JSONL line on matching TTS after production-order EOU/LLM — callId only, no to / number / text / speechId", () => {
-    const metrics = new TurnMetrics("call-abc", CELL, "outbound");
-    const session = makeFakeSession();
-    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
-
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110, "s1"));
-    expect(mockLog.info).not.toHaveBeenCalled();
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, llmEvent(200, "s1"));
-    expect(mockLog.info).not.toHaveBeenCalled();
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
-
-    expect(mockLog.info).toHaveBeenCalledTimes(1);
-    const [msg, logged] = mockLog.info.mock.calls[0] as [string, Record<string, unknown>];
-    expect(msg).toBe("voice turn metrics");
-    expect(logged.callId).toBe("call-abc");
-    expect(logged.turnSeq).toBe(0);
-    expect(logged.direction).toBe("outbound");
-    expect(logged.cell).toBe("deepgram/flux-general-en+cartesia/sonic-3");
-    expect(typeof logged.cell).toBe("string");
-    expect(logged.eouDelayMs).toBe(110);
-    expect(logged.llmTtftMs).toBe(200);
-    expect(logged.maxInterChunkGapMs).toBe(-1);
-    expect(logged.ttsTtfbMs).toBe(80);
-    expect(logged.totalToFirstAudioMs).toBe(110 + 200 + 80);
-    expect(logged.interrupted).toBe(false);
-    expect(logged.falseInterruption).toBe(false);
-    expect(logged).not.toHaveProperty("speechId");
-    assertNoPii(logged);
-  });
-
-  it("joins EOU to this-turn TTS on speechId — previous-turn TTS does not complete the next EOU", () => {
-    const metrics = new TurnMetrics("call-x", CELL);
-    const session = makeFakeSession();
-    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
-
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110, "s1"));
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
-    expect(mockLog.info).toHaveBeenCalledTimes(1);
-    expect((mockLog.info.mock.calls[0]![1] as Record<string, unknown>).ttsTtfbMs).toBe(80);
-
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(90, "s2"));
-    expect(mockLog.info).toHaveBeenCalledTimes(1);
-
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(50, "s2"));
-    expect(mockLog.info).toHaveBeenCalledTimes(2);
-    const lineB = mockLog.info.mock.calls[1]![1] as Record<string, unknown>;
-    expect(lineB.eouDelayMs).toBe(90);
-    expect(lineB.ttsTtfbMs).toBe(50);
-    expect(lineB.turnSeq).toBe(1);
-    expect(lineB).not.toHaveProperty("speechId");
-    assertNoPii(lineB);
-  });
-
-  it("leaves LLM timing unknown when no matching genuine metric exists", () => {
-    const metrics = new TurnMetrics("call-bridge", CELL);
-    const session = makeFakeSession();
-    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
-
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110, "s1"));
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
-
-    const logged = mockLog.info.mock.calls[0]![1] as Record<string, unknown>;
-    expect(logged.llmTtftMs).toBe(-1);
-    expect(logged.maxInterChunkGapMs).toBe(-1);
-    expect(logged.ttsTtfbMs).toBe(80);
-    expect(logged.totalToFirstAudioMs).toBe(-1);
-    expect(logged).not.toHaveProperty("speechId");
-    assertNoPii(logged);
-  });
-
-  it("uses matching llm_metrics timing", () => {
-    const metrics = new TurnMetrics("call-map", CELL);
-    const session = makeFakeSession();
-    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
-
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, llmEvent(50, "s1"));
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110, "s1"));
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
-
-    const logged = mockLog.info.mock.calls[0]![1] as Record<string, unknown>;
-    expect(logged.llmTtftMs).toBe(50);
-    expect(logged.maxInterChunkGapMs).toBe(-1);
-    expect(logged.totalToFirstAudioMs).toBe(110 + 50 + 80);
-    expect(logged).not.toHaveProperty("speechId");
-    assertNoPii(logged);
-  });
-
-  it("does not emit on EOU alone — incomplete turns are dropped", () => {
-    const metrics = new TurnMetrics("call-xyz", CELL, "inbound");
-    const session = makeFakeSession();
-    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
-
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(50, "s1"));
-    expect(mockLog.info).not.toHaveBeenCalled();
-  });
-
-  it("does not emit a turn line on tts/llm metrics alone", () => {
-    const metrics = new TurnMetrics("call-none", CELL);
-    const session = makeFakeSession();
-    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(9, "s1"));
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, llmEvent(9, "s1"));
-    expect(mockLog.info).not.toHaveBeenCalled();
-  });
-
-  it("maps interruption_metrics and agent_false_interruption onto the next TTS-joined line", () => {
-    const metrics = new TurnMetrics("call-int", CELL);
-    const session = makeFakeSession();
-    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
-
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, interruptionEvent(1));
-    session.emit(voice.AgentSessionEventTypes.AgentFalseInterruption, {
-      type: "agent_false_interruption",
-      resumed: true,
-      createdAt: Date.now(),
-    });
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(20, "s1"));
-    expect(mockLog.info).not.toHaveBeenCalled();
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
-
-    const logged = mockLog.info.mock.calls[0]![1] as Record<string, unknown>;
-    expect(logged.interrupted).toBe(true);
-    expect(logged.falseInterruption).toBe(true);
-    assertNoPii(logged);
-
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(20, "s2"));
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(50, "s2"));
-    const next = mockLog.info.mock.calls[1]![1] as Record<string, unknown>;
-    expect(next.interrupted).toBe(false);
-    expect(next.falseInterruption).toBe(false);
-  });
-
-  it("invokes onTurn with the emitted line when matching TTS arrives", () => {
-    const onTurn = vi.fn();
-    const metrics = new TurnMetrics("call-abc", CELL, "outbound", onTurn);
-    const session = makeFakeSession();
-    metrics.attach(session as unknown as Pick<voice.AgentSession, "on">);
-
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, eouEvent(110, "s1"));
-    expect(onTurn).not.toHaveBeenCalled();
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, llmEvent(200, "s1"));
-    session.emit(voice.AgentSessionEventTypes.MetricsCollected, ttsEvent(80, "s1"));
-
-    expect(onTurn).toHaveBeenCalledTimes(1);
-    const line = onTurn.mock.calls[0]![0] as Record<string, unknown>;
-    expect(line.callId).toBe("call-abc");
-    expect(line.turnSeq).toBe(0);
-    expect(line.direction).toBe("outbound");
-    expect(line.cell).toEqual(CELL);
-    expect(line.eouDelayMs).toBe(110);
-    expect(line.llmTtftMs).toBe(200);
-    expect(line.maxInterChunkGapMs).toBe(-1);
-    expect(line.ttsTtfbMs).toBe(80);
-    expect(line.totalToFirstAudioMs).toBe(110 + 200 + 80);
-    expect(line).not.toHaveProperty("speechId");
-    assertNoPii(line);
-  });
-});
-
 describe("CallStats (KPR-322 Task 8)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -468,13 +267,34 @@ describe("CallStats (KPR-322 Task 8)", () => {
     expect(stats.retryConsumed("spawn_failed")).toBe(true);
   });
 
-  it("flush inserts voice_call_stats without to / phone / transcript fields", async () => {
+  it("flush inserts bounded schema-v2 denominators and explicitly labeled latency estimates", async () => {
     const stats = new CallStats(WC, { callId: "call-1", agentId: "luna", cell: CELL, direction: "outbound" });
-    stats.recordTurnLatency(100);
-    stats.recordTurnLatency(200);
-    stats.recordInterruption();
     stats.retryConsumed("budget_saturated");
-    await stats.flush("completed");
+    const snapshot = diagnostics({
+      speechAttempts: 5,
+      speechOutcomes: { completed: 2, interrupted: 1, cancelled: 1, failed: 0, incomplete: 1 },
+      bridgeAttempts: 4,
+      bridgeOutcomes: { completed: 3, interrupted: 0, cancelled: 1, failed: 0, incomplete: 0 },
+      synthesisAttempts: 3,
+      synthesisOutcomes: { completed: 2, interrupted: 0, cancelled: 0, failed: 1, incomplete: 0 },
+      generatedAudioObserved: 2,
+      knownPlayoutObserved: 1,
+      sdkInterruptions: 2,
+      cancelledSpeechAttempts: 1,
+      incomplete: 1,
+      unbound: 2,
+      diagnosticGaps: 3,
+      latencyEstimateSamples: [100, 200],
+      eligibleLatencyEstimateCount: 2,
+      excludedByReason: {
+        ...diagnostics().excludedByReason,
+        cancelled: 1,
+        incomplete: 1,
+        ambiguous_components: 1,
+      },
+      logging: { ...diagnostics().logging, failed: 1, overflow: 2, complete: false },
+    });
+    await expect(stats.flush("completed", snapshot)).resolves.toEqual({ persisted: true, closeFailed: false });
 
     expect(mongoMocks.MongoClient).toHaveBeenCalledWith("mongodb://localhost", { serverSelectionTimeoutMS: 2000 });
     expect(mongoMocks.insertOne).toHaveBeenCalledTimes(1);
@@ -484,14 +304,40 @@ describe("CallStats (KPR-322 Task 8)", () => {
     expect(doc.agentId).toBe("luna");
     expect(doc.cell).toEqual(CELL);
     expect(doc.direction).toBe("outbound");
+    expect(doc.schemaVersion).toBe(2);
+    expect(doc.speechAttempts).toBe(5);
+    expect(doc.speechOutcomes).toEqual(snapshot.speechOutcomes);
+    expect(doc.bridgeAttempts).toBe(4);
+    expect(doc.synthesisAttempts).toBe(3);
+    expect(doc.generatedAudioObserved).toBe(2);
+    expect(doc.knownPlayoutObserved).toBe(1);
+    expect(doc.incomplete).toBe(1);
+    expect(doc.unbound).toBe(2);
+    expect(doc.diagnosticGaps).toBe(3);
+    expect(doc.loggingFailures).toBe(3);
     expect(doc.turns).toBe(2);
-    expect(doc.interruptions).toBe(1);
+    expect(doc.interruptions).toBe(2);
+    expect(doc.cancelled).toBe(1);
     expect(doc.retries).toBe(1);
     expect(doc.outcome).toBe("completed");
-    expect(doc.latency).toEqual({ p50: percentile([100, 200], 50), p95: percentile([100, 200], 95) });
+    expect(doc.latencyEstimateSamples).toEqual([100, 200]);
+    expect(doc.excludedByReason).toEqual(snapshot.excludedByReason);
+    expect(doc.latency).toEqual({
+      kind: "estimated_eou_to_first_generated_audio",
+      sampled: true,
+      eligibleSampleCount: 2,
+      retainedSampleCount: 2,
+      truncated: false,
+      p50: percentile([100, 200], 50),
+      p95: percentile([100, 200], 95),
+    });
     expect(doc.createdAt).toBeInstanceOf(Date);
     assertNoPii(doc);
     expect(mongoMocks.close).toHaveBeenCalledTimes(1);
+    expect(mockLog.info).toHaveBeenCalledWith("summary_persistence", {
+      callId: "call-1",
+      status: "acknowledged",
+    });
   });
 
   it("first-wins flush: failed is not overwritten by completed", async () => {
@@ -505,15 +351,100 @@ describe("CallStats (KPR-322 Task 8)", () => {
     expect(doc.outcome).toBe("engine_unreachable");
   });
 
-  it("flush write failure logs, does not throw, and still closes the client", async () => {
+  it("concurrent flushes share one insert and retain the first terminal outcome", async () => {
+    let acknowledge!: (value: { acknowledged: boolean }) => void;
+    mongoMocks.insertOne.mockImplementation(
+      () => new Promise<{ acknowledged: boolean }>((resolve) => (acknowledge = resolve)),
+    );
+    const stats = new CallStats(WC, { callId: "call-concurrent", agentId: "luna", cell: CELL, direction: "outbound" });
+    const first = stats.flush("failed", diagnostics({ speechAttempts: 1 }));
+    const second = stats.flush("completed", diagnostics({ speechAttempts: 99 }));
+    expect(first).toBe(second);
+    await vi.waitFor(() => expect(mongoMocks.insertOne).toHaveBeenCalledTimes(1));
+    acknowledge({ acknowledged: true });
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { persisted: true, closeFailed: false },
+      { persisted: true, closeFailed: false },
+    ]);
+    const doc = mongoMocks.insertOne.mock.calls[0]![0] as Record<string, unknown>;
+    expect(doc.outcome).toBe("failed");
+    expect(doc.speechAttempts).toBe(1);
+  });
+
+  it("insert failure is never marked persisted and still closes the client", async () => {
     mongoMocks.insertOne.mockRejectedValue(new Error("insert failed"));
     const stats = new CallStats(WC, { callId: "call-1", agentId: "luna", cell: CELL, direction: "outbound" });
-    await expect(stats.flush("completed")).resolves.toBeUndefined();
-    expect(mockLog.warn).toHaveBeenCalledWith("voice_call_stats flush failed", {
+    await expect(stats.flush("completed")).resolves.toEqual({ persisted: false, closeFailed: false });
+    expect(mockLog.warn).toHaveBeenCalledWith("summary_persistence", {
       callId: "call-1",
-      error: "Error: insert failed",
+      status: "failed",
+      reason: "insert_failed",
     });
+    expect(mockLog.info).not.toHaveBeenCalledWith("summary_persistence", expect.anything());
     expect(mongoMocks.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("connect failure reports bounded failure without attempting an insert", async () => {
+    mongoMocks.connect.mockRejectedValue(new Error("secret-bearing connection error"));
+    const stats = new CallStats(WC, { callId: "call-connect", agentId: "luna", cell: CELL, direction: "outbound" });
+    await expect(stats.flush("completed")).resolves.toEqual({ persisted: false, closeFailed: false });
+    expect(mongoMocks.insertOne).not.toHaveBeenCalled();
+    expect(mockLog.warn).toHaveBeenCalledWith("summary_persistence", {
+      callId: "call-connect",
+      status: "failed",
+      reason: "connect_failed",
+    });
+  });
+
+  it("keeps acknowledged persistence truthful when client close fails", async () => {
+    mongoMocks.close.mockRejectedValue(new Error("close failed"));
+    const observe = vi.fn();
+    const stats = new CallStats(
+      WC,
+      { callId: "call-close", agentId: "luna", cell: CELL, direction: "outbound" },
+      observe,
+    );
+    await expect(stats.flush("completed")).resolves.toEqual({ persisted: true, closeFailed: true });
+    expect(observe.mock.calls).toEqual([["acknowledged"], ["failed", "close_failed"]]);
+    expect(mockLog.info).toHaveBeenCalledWith("summary_persistence", {
+      callId: "call-close",
+      status: "acknowledged",
+    });
+    expect(mockLog.warn).toHaveBeenCalledWith("voice_call_stats close failed", { callId: "call-close" });
+  });
+
+  it("keeps acknowledged persistence truthful when reporting callbacks throw", async () => {
+    mockLog.info.mockImplementationOnce(() => {
+      throw new Error("logger failed");
+    });
+    const stats = new CallStats(
+      WC,
+      { callId: "call-reporting", agentId: "luna", cell: CELL, direction: "outbound" },
+      () => {
+        throw new Error("observer failed");
+      },
+    );
+    await expect(stats.flush("completed")).resolves.toEqual({ persisted: true, closeFailed: false });
+    expect(mongoMocks.insertOne).toHaveBeenCalledTimes(1);
+  });
+
+  it("caps persisted latency samples at 1,024 and marks overflow as truncated", async () => {
+    const samples = Array.from({ length: 1_100 }, (_, i) => i);
+    const stats = new CallStats(WC, { callId: "call-samples", agentId: "luna", cell: CELL, direction: "outbound" });
+    await stats.flush(
+      "completed",
+      diagnostics({ latencyEstimateSamples: samples, eligibleLatencyEstimateCount: samples.length }),
+    );
+    const doc = mongoMocks.insertOne.mock.calls[0]![0] as {
+      latencyEstimateSamples: number[];
+      latency: { eligibleSampleCount: number; retainedSampleCount: number; truncated: boolean };
+    };
+    expect(doc.latencyEstimateSamples).toHaveLength(1_024);
+    expect(doc.latency).toMatchObject({
+      eligibleSampleCount: 1_100,
+      retainedSampleCount: 1_024,
+      truncated: true,
+    });
   });
 });
 

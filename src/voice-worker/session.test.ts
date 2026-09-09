@@ -210,7 +210,7 @@ describe("recordSetupFailure (KPR-322 setup telemetry)", () => {
 });
 
 describe("runJobShutdown (KPR-322 call-end heartbeat)", () => {
-  it("invokes closeMongo only after releaseCall resolves, even if close is faster", async () => {
+  it("closes trace, settles writes, snapshots, releases heartbeat, flushes, then closes Mongo", async () => {
     const order: string[] = [];
     let finishRelease!: () => void;
     const releaseCall = () =>
@@ -229,12 +229,60 @@ describe("runJobShutdown (KPR-322 call-end heartbeat)", () => {
       return Promise.resolve();
     };
 
-    const running = runJobShutdown({ releaseCall, flush, closeMongo });
+    const running = runJobShutdown({
+      closeTrace: () => order.push("trace-close"),
+      settleTrace: async () => {
+        order.push("settle");
+      },
+      snapshotTrace: () => {
+        order.push("snapshot");
+        return undefined as never;
+      },
+      releaseCall,
+      flush,
+      closeMongo,
+    });
     await Promise.resolve();
-    expect(order).toEqual(["release-started"]);
+    expect(order).toEqual(["trace-close", "settle"]);
+    await Promise.resolve();
+    expect(order).toEqual(["trace-close", "settle", "snapshot", "release-started"]);
     finishRelease();
     await running;
-    expect(order).toEqual(["release-started", "release-finished", "flush", "close"]);
+    expect(order).toEqual([
+      "trace-close",
+      "settle",
+      "snapshot",
+      "release-started",
+      "release-finished",
+      "flush",
+      "close",
+    ]);
+  });
+
+  it("continues ordered persistence and close when bounded log settlement fails", async () => {
+    const order: string[] = [];
+    await runJobShutdown({
+      closeTrace: () => order.push("trace-close"),
+      settleTrace: async () => {
+        order.push("settle");
+        throw new Error("logging timeout");
+      },
+      snapshotTrace: () => {
+        order.push("snapshot");
+        return undefined as never;
+      },
+      releaseCall: async () => {
+        order.push("release");
+      },
+      flush: async () => {
+        order.push("flush");
+        throw new Error("persistence failed");
+      },
+      closeMongo: async () => {
+        order.push("close");
+      },
+    });
+    expect(order).toEqual(["trace-close", "settle", "snapshot", "release", "flush", "close"]);
   });
 });
 

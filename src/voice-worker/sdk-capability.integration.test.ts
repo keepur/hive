@@ -23,6 +23,7 @@ import {
 } from "../voice/voice-trace.js";
 import { HiveLLM } from "./hive-llm.js";
 import { SpeechTrace } from "./speech-trace.js";
+import { TracedAgent } from "./traced-agent.js";
 import {
   CaptureAudioOutput,
   ControlledLLM,
@@ -119,6 +120,83 @@ class TracedTtsAgent extends Agent {
 }
 
 describe("public TTS observer seams", () => {
+  it("routes the real default provider through the production observer and public error listener", async () => {
+    const model = new ControlledTTS();
+    const session = new AgentSession({
+      tts: model,
+      vad: null,
+      turnHandling: { turnDetection: null },
+    });
+    const callId = "call-production-tts-observer";
+    const { rows, trace } = traceHarness(callId);
+    const call = new AbortController();
+    const agent = new TracedAgent({
+      instructions: "offline capability fixture",
+      tts: model,
+      callId,
+      workerBootId: VOICE_PROCESS_ID,
+      callSignal: call.signal,
+      trace,
+      onAcceptedUserTurn: () => {},
+    });
+    session.on(AgentSessionEventTypes.MetricsCollected, (event) => trace.metrics(event));
+    await startSession(session, agent);
+    try {
+      const normalNode = await agent.ttsNode(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue("production normal");
+            controller.close();
+          },
+        }),
+        {},
+      );
+      const normalFrames = [];
+      const normalReader = normalNode!.getReader();
+      for (;;) {
+        const next = await normalReader.read();
+        if (next.done) break;
+        normalFrames.push(next.value);
+      }
+      expect(normalFrames[0]).toBe(model.frames[0]);
+      expect(rows.find((row) => row.event === "synthesis_terminal")).toMatchObject({
+        outcome: "completed",
+        frameCount: 1,
+      });
+
+      for (const [mode, frameCount] of [
+        ["error-before-frame", 0],
+        ["error-after-frame", 1],
+      ] as const) {
+        model.plans.push({ mode });
+        const node = await agent.ttsNode(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(`production ${mode}`);
+              controller.close();
+            },
+          }),
+          {},
+        );
+        const frames = [];
+        const reader = node!.getReader();
+        for (;;) {
+          const next = await reader.read();
+          if (next.done) break;
+          frames.push(next.value);
+        }
+        expect(frames).toHaveLength(frameCount);
+        const failed = rows.filter((row) => row.event === "synthesis_terminal").at(-1);
+        expect(failed).toMatchObject({ outcome: "failed", errorClass: "tts_provider_failed", frameCount });
+      }
+    } finally {
+      call.abort();
+      agent.dispose();
+      trace.close("call_closed");
+      await closeSession(session);
+    }
+  });
+
   it("preserves real default-node frames and timed transcript metadata", async () => {
     const model = new ControlledTTS();
     const session = new AgentSession({
