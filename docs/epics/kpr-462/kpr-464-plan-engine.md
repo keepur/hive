@@ -149,22 +149,27 @@ The pending promise signals **publication or completed failed admission**, never
 
 `openWarmLeaseAttempt` calls `withSpawnTicket(ctx, leaseLifetimeCallback, { requestSignalMode: "admission_only" })`. This checks request cancellation while waiting for acquisition, then leaves the lifetime ticket's abort governed by existing stop/shutdown ownership. The HTTP request's signal must never remain attached to that lifetime ticket after admission, or the first request's delayed close could destroy every later warm turn.
 
-**Reject a closed lifetime before publication or provider initialization.** Declare `let lifetimeAborted = false` beside `acquired`; install this lifetime callback before `markAcquired()`. The sticky ticket from Step 2 replays an abort that preceded attachment:
+**Reject a closed lifetime before publication or provider initialization, retaining its stopped identity through initialization.** Declare `let lifetimeStopError: AgentStoppedError | undefined` beside `acquired`; install this lifetime callback before `markAcquired()`. The sticky ticket from Step 2 replays an abort that preceded attachment. Allocate one stopped error for this lifetime and pass that same object to the lease before resolving readiness:
 
 ```typescript
 ticket.attachAbort(() => {
-  lifetimeAborted = true;
-  lease.close("ticket-abort");
+  lifetimeStopError ??= new AgentStoppedError(ctx.agentId);
+  lease.close("ticket-abort", lifetimeStopError);
 });
 ```
 
-Define this local guard in `openWarmLeaseAttempt`. Put the acquisition race and guard inside the pre-publication close/await/rethrow boundary above, with the guard immediately after the await and before eligibility, policy pinning, shaping or reservation:
+Define both closures in `openWarmLeaseAttempt`'s method scope so the initialization catch can call `getOpeningStopError`. Put the acquisition race and `checkOpeningLifetime()` invocation inside the pre-publication close/await/rethrow boundary above, with that invocation immediately after the await and before eligibility, policy pinning, shaping or reservation:
 
 ```typescript
-const checkOpeningLifetime = () => {
-  if (lifetimeAborted || this.stoppedAgents.has(ctx.agentId)) {
-    throw new AgentStoppedError(ctx.agentId);
+const getOpeningStopError = (): AgentStoppedError | undefined => {
+  if (lifetimeStopError || this.stoppedAgents.has(ctx.agentId)) {
+    return lifetimeStopError ??= new AgentStoppedError(ctx.agentId);
   }
+  return undefined;
+};
+const checkOpeningLifetime = () => {
+  const stopped = getOpeningStopError();
+  if (stopped) throw stopped;
   if (lease.isClosed) throw new Error("Warm voice lease closed before initialization");
 };
 
@@ -172,7 +177,21 @@ await Promise.race([ready, coordinator]);
 checkOpeningLifetime();
 ```
 
-`spawnTurn(A); stopAgent(agentId)` in one synchronous stack can acquire and close the ticket before this continuation runs. The guard must inspect the lease as well as current stopped state; a same-stack `restartAgent` clears that state but cannot revive the closed lifetime. Every guard failure closes the lease idempotently, awaits `coordinator.catch(() => {})`, and propagates the error; the wrapper then deletes its own pending entry and wakes waiters. Do not publish a closed lease whose `onClosed` already ran, and do not delete/release ticket resources separately from the coordinator. Request cancellation after acquisition does **not** set `lifetimeAborted` or fail this guard: a healthy opening remains available to live B.
+`spawnTurn(A); stopAgent(agentId)` in one synchronous stack can acquire and close the ticket before this continuation runs. The guard must inspect the lease as well as current stopped state; a same-stack `restartAgent` clears that state but cannot revive the closed lifetime. Every guard failure closes the lease idempotently with that error as the second argument, awaits `coordinator.catch(() => {})`, and propagates the error; the wrapper then deletes its own pending entry and wakes waiters. Do not publish a closed lease whose `onClosed` already ran, and do not delete/release ticket resources separately from the coordinator. Request cancellation after acquisition does **not** set `lifetimeStopError` or fail this guard: a healthy opening remains available to live B.
+
+In `WarmVoiceSession`, add `private terminalError: Error | undefined` and extend `close(reason: string, terminalError?: Error)`. Immediately after its existing `if (this.closed) return` guard, assign `this.terminalError = terminalError` before marking closed/resolving readiness; retain all existing throw-safe cleanup. Repeated closes never replace the first close's error or cause. Replace `notRunnableError` with this body, preserving the runtime type supplied by the manager without adding a runtime import/cycle:
+
+```typescript
+private notRunnableError(): Error {
+  return this.terminalError ?? new Error(
+    this.closed
+      ? `Warm voice lease closed (${this.closeReason ?? "unknown"})`
+      : "Warm voice lease not started yet (session still opening)",
+  );
+}
+```
+
+All closed checks at `runTurn` entry, after readiness and at consumption throw `this.notRunnableError()`; none reconstruct a string-only closed-lease error. Thus every reserved request A/B/C that has not consumed input receives the same typed stopped error when this lifetime closes, even if `restartAgent` clears current manager state before queue continuations run. Ordinary initialization failures retain their provider error through the same optional close argument and remain retryable; unrelated closes retain the existing generic fallback. A separately canceled request may still settle as `VoiceRequestCancelledError`, which independently prohibits retry. Do not store either error in WorkItem/session metadata or diagnostic payloads.
 
 After acquisition the opening initialization belongs to the lease. Reserve live opener A's demux slot **before publishing** the lease to successor B. In `openWarmLeaseAttempt`, after policy pinning/resume eligibility selection and immediately before `this.warmLeases.set(threadKey, pinnedLease)`, invoke the existing async `runWarmTurn` once; it synchronously checks/acquires its permit and calls `lease.runTurn` before its first await. `runTurn` must synchronously append its chain slot before waiting for start. Attach a rejection observer immediately so initialization cannot leave an unhandled rejection:
 
@@ -184,7 +203,22 @@ this.warmLeases.set(threadKey, pinnedLease);
 published(); // Wakes requests that entered before this registry entry existed.
 ```
 
-Retain the existing `openVoiceStreamingSession` try/catch and late-Query close guard. In that initialization try, call `checkOpeningLifetime()` before the fresh-spawn `recordSpawn`, again before `createRunner`, and immediately before `runner.openVoiceStreamingSession`; synchronous bookkeeping/construction callbacks cannot dispatch a lifetime they just stopped. No await intervenes between that final check and the provider call. A stop during the provider await still uses the existing late-Query close guard. Replace the final second call to `runWarmTurn` with `return openingTurn`; the opener is never enqueued twice. If initialization or a lifetime guard fails, close the lease (which resolves readiness), await coordinator cleanup, retain the error for A, and allow the observed opening promise to settle. Keep that initialization catch separate from the returned opening promise: canceled A's request rejection must not close the healthy lease. A canceled request or circuit-open permit rejection reserves no work; it cannot later push an obsolete full-transcript opening. Starting an otherwise healthy published lease continues for an independently admitted B. There is no await or publication between live A's reservation, the post-callback lifetime check and registry insertion. A's actual breaker acquisition now precedes initialization and is still recorded once; no extra probe permit is introduced.
+Retain the existing `openVoiceStreamingSession` try/catch and late-Query close guard. In that initialization try, call `checkOpeningLifetime()` before the fresh-spawn `recordSpawn`, again before `createRunner`, and immediately before `runner.openVoiceStreamingSession`; synchronous bookkeeping/construction callbacks cannot dispatch a lifetime they just stopped. No await intervenes between that final check and the provider call. After the awaited Query returns, call `start` **before** the post-await guard so its existing closed guard disposes a late Query exactly once; skipping `start` on a stopped lifetime would orphan that Query. Replace the end of the initialization try/catch with:
+
+```typescript
+  lease.start(q, { resumedSessionId: openingCtx.sessionId });
+  checkOpeningLifetime(); // Stop/restart during await remains sticky after late-Query cleanup.
+} catch (err) {
+  // Both rejected initialization and a late successful Query preserve stop identity.
+  const failure = getOpeningStopError() ?? err;
+  lease.close("open-failed", failure instanceof Error ? failure : undefined);
+  await coordinator.catch(() => {});
+  throw failure;
+}
+return openingTurn; // Outside the initialization try/catch; never enqueue A a second time.
+```
+
+The opener A remains awaiting initialization while already-queued B can settle from closed readiness; both must propagate `AgentStoppedError`, never a provider rejection or generic closed-lease error that enables the adapter's fresh retry after restart. Pass the caught error into the pre-publication cleanup's `close` as well. The immediately observed reserved promise settles on close without an orphan rejection. Keep the initialization catch separate from the returned opening promise: canceled A's request rejection must not close the healthy lease. A canceled request or circuit-open permit rejection reserves no work; it cannot later push an obsolete full-transcript opening. Starting an otherwise healthy published lease continues for an independently admitted B. There is no await or publication between live A's reservation, the post-callback lifetime check and registry insertion. A's actual breaker acquisition now precedes initialization and is still recorded once; no extra probe permit is introduced.
 
 Extend lease readiness with a promise resolved by either `start(query)` or `close(reason)`. Successors can queue against a published unstarted lease behind A's already-reserved slot; at consumption each awaits readiness then checks closed/canceled state. A readiness promise alone without that pre-publication reservation is insufficient. Closing before a late Query arrives still calls `query.close()` through the existing `start()` guard.
 
@@ -357,6 +391,7 @@ Extend the manager fixture from `src/agents/agent-manager.test.ts`; mock only st
 9. Thrown preparation/admission/provider error, canceled queued request and zero-progress abort retain existing breaker and persistence semantics.
 10. Invoke `spawnTurn(A)` and `spawnTurn(B)` synchronously in the same stack with `warmLeases` initially absent; gate A's acquisition continuation **before registry publication**. Assert B sees `pendingWarmOpenings`, never enters a second `withSpawnTicket`, and does not finish merely from an idle/lifetime timeout. Release acquisition, keep Query start gated, assert one ticket/budget slot and B queued behind A; release start and drive A/B to normal completion on the same Query. Repeat canceling A after acquisition but before publication/start: B sends its full sentinel conversation once and completes on the surviving lease without advancing idle/lifetime clocks or releasing its lifetime ticket. Repeat A canceled while still waiting behind a cold ticket: B wakes after A's admission cleanup, obtains one new ticket and completes; A has no provider input. Cancel B while awaiting the opening notification: no B permit/ticket/input and A survives. Test pre-publication budget/pinning failures, post-publication init failure, stop/shutdown, and eligibility reroute; all settle pending entries and ticket resources without self-wait or an orphan promise.
 11. Use real adapter/manager composition from Task 5: compatible stored resume → `openVoiceStreamingSession` throws before `start`/`selectText` → exactly one adapter retry with cleared resume and full conversation → fake provider output completes. Assert attempt 1 has launch admission `resume`, no selected prompt, and one failed terminal; attempt 2 has launch admission `fresh`, selected full prompt, and normal output. Repeat with disconnect before admission and while resumed initialization is gated: zero retry and no post-cancel output. Include a live joining B on the failed resumed opening; its own launch evidence is retained rather than borrowed from A's callback.
+12. Gate `openVoiceStreamingSession` **after provider entry**, admit A with a compatible resume, and join live B (also C for queue-chain coverage) against the published unstarted lease. Confirm each request recorded its own `resume` launch admission and no input selection. Stop the manager, then settle the initialization gate with either a Query or a rejection. Repeat both cases with `restartAgent` immediately after stop and before gate settlement. B/C reject with the lease's exact `AgentStoppedError` while initialization is still held; A rejects with the same object when the gate settles. All requests have one adapter `runOnce`, zero outer retries and no selected/pushed input despite positive resume admission; no fresh provider initialization occurs for these old requests. Late success closes that Query exactly once; late rejection still surfaces the stopped cause. Assert readiness/reserved promises settle, permits/lock/budget/tickets and both opening registries return to baseline, with no orphan rejection. For restart, open independent new D while old A is still gated; let D initialize/complete, then settle old A and prove its cleanup cannot close/delete D's lease or ticket. Repeat shutdown, and retain the ordinary live resumed-init-failure control from case 11: the typed stop exclusion must not disable its one fresh/full retry.
 
 Run: `npx vitest run src/agents/voice-request-cancellation.test.ts src/agents/warm-voice-session.test.ts src/agents/agent-manager.test.ts`
 
@@ -412,6 +447,8 @@ onVoiceAdmission: (continuity) => {
 
 Declare `launchAdmission: "fresh" | "resume" | null` and `selectedContinuity: "fresh" | "resume" | "warm" | null` in that attempt's scope, initialized to null. Include both in the attempt terminal; preserve null if initialization failed before selection. Use the latch only for retry eligibility and the existing `continuityAttempted` diagnostic; consumed prompt/`resumedSession` telemetry derives from the selected admission/result. Add `!requestAbort.signal.aborted` and request-cancel-error/`AgentStoppedError` exclusions to the existing pre-bytes outer-retry predicate (carry typed cancellation and stopped flags from the catch). A compatible resumed initialization failure with a live request gets its one fresh/full retry even if no selection callback ran. A canceled request or stopped lifetime never retries, regardless of retained launch evidence or an immediate restart; keep the existing stopped-agent response classification.
 
+**Observation scope:** `engineAttemptSeq` counts adapter `runOnce` entries, each of which calls the dispatcher/manager once. Existing manager-internal auth-rebuild, stale-handle and Claude-resume retries can call `runOneSpawnAttempt` more than once inside that single observed attempt; they neither increment this sequence nor emit additional schema-v2 attempt terminals. The recorded result/stages are the manager's returned aggregate/final result, and nullable launch/selection observations describe only their explicit callbacks. Do not label `engineAttempts` a count of provider launches or imply this schema separately observes every manager-internal retry. Preserve those existing retry and breaker/persistence semantics; no provider-attempt ID is added in this child.
+
 Import `AgentStoppedError` from the manager, extend `runOnce`'s existing failure union with `cancelled?: boolean; stopped?: boolean`, and add these fields to its catch return. The existing retry `if` additionally requires `!outcome.cancelled && !outcome.stopped`; returned provider errors without either flag retain their current retry behavior:
 
 ```typescript
@@ -461,7 +498,7 @@ Keep existing HTTP tests for both auth schemes, assistant resolution, payload co
 
 Create `voice-startup.integration.test.ts` composing real `VoiceAdapter`, `Dispatcher.routeVoiceTurn` (when configured), `AgentManager` and `WarmVoiceSession` with fake provider/store dependencies. Use two real HTTP client requests and explicit server-side barriers. In cold and warm modes, settle predecessor engine work, admit/queue the replacement, and only then close the predecessor client socket. Assert replacement emits text, reaches a normal done frame, settles, and owns its own new trace/attempt IDs. Also close a queued successor before admission and prove it never invokes provider. At least one scenario must pipe the replacement's SSE through real HiveLLM and fake TTS/output fixture to prove forward progression across both boundaries.
 
-Assert one request terminal and each internal attempt terminal on: prompt failure, lookup failure, budget rejection, provider circuit-open, returned errors, resumed retry, no-content, midstream failure, throwing response write swallowed by warm/provider onStream, async response write callback/error failure, accepted write(false), disconnect before spawn and disconnect after text. Add a resumed launch-admission callback that stops/restarts the manager before publication: the stopped request has one attempt, no outer retry, no provider initialization and a request terminal despite its positive launch evidence. Error while a predecessor is winding down cannot trigger a successor abort or retry. Existing warm/tool-ack suites remain required.
+Assert one request terminal and each adapter `runOnce` attempt terminal on: prompt failure, lookup failure, budget rejection, provider circuit-open, returned errors, resumed retry, no-content, midstream failure, throwing response write swallowed by warm/provider onStream, async response write callback/error failure, accepted write(false), disconnect before spawn and disconnect after text. Add a resumed launch-admission callback that stops/restarts the manager before publication: the stopped request has one attempt, no outer retry, no provider initialization and a request terminal despite its positive launch evidence. Also cover the post-publication gated-initialization matrix from Task 4 case 12 using real HTTP A/B: stop and immediate restart, each with late provider success/rejection; both requests retain typed stopped flags, one attempt/one request terminal each, no fresh retry and no input/output for the old lifetime. Let a new independent HTTP request succeed after restart to expose stale cleanup. Include a cold manager-internal resume retry control: two `runOneSpawnAttempt` calls inside one `runOnce` yield one schema-v2 engine attempt; an adapter outer retry yields two. Error while a predecessor is winding down cannot trigger a successor abort or retry. Existing warm/tool-ack suites remain required.
 
 Run: `npx vitest run src/channels/voice/voice-adapter.test.ts src/channels/voice/voice-adapter.integration.test.ts src/channels/voice/voice-startup.integration.test.ts src/agents/voice-tool-ack.test.ts`
 
