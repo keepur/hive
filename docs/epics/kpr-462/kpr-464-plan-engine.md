@@ -42,7 +42,7 @@ export function bindVoiceRequest(
   const onAbort = () => {
     if (fired) return;
     fired = true;
-    cancel();
+    try { cancel(); } catch { /* AbortSignal listeners must never throw. */ }
   };
   signal.addEventListener("abort", onAbort, { once: true });
   if (signal.aborted) onAbort();
@@ -50,7 +50,7 @@ export function bindVoiceRequest(
 }
 ```
 
-The `cancel` callback supplied by cold/warm code must be throw-safe; these callbacks call existing safe cancellation, never a logger or arbitrary hook without a catch. Add `voiceRequestSignal?: AbortSignal` to `TurnContext`, documented as per-request, voice-only, never serialized into WorkItem/store/audit metadata. `Dispatcher.routeVoiceTurn` already passes the context intact, so no new dispatch path is needed. Add the same optional signal field to `WarmTurnRequest`.
+The helper contains synchronous callback failures at the actual AbortSignal boundary; Node reports an uncaught listener exception separately from `AbortController.abort()`, so a catch around that caller is insufficient. Cold/warm callbacks also contain their own abort/replay calls. No logger or arbitrary hook may throw from these catches. Add `voiceRequestSignal?: AbortSignal` to `TurnContext`, documented as per-request, voice-only, never serialized into WorkItem/store/audit metadata. `Dispatcher.routeVoiceTurn` already passes the context intact, so no new dispatch path is needed. Add the same optional signal field to `WarmTurnRequest`.
 
 - [ ] **Step 2: Make cold ticket abort sticky and request-specific.**
 
@@ -67,24 +67,38 @@ Replace the local abort-handle implementation with sticky state:
 ```typescript
 let abortHandle: (() => void) | undefined;
 let abortRequested = false;
+const invokeAbort = () => {
+  try { abortHandle?.(); }
+  catch { /* Abort stays sticky; provider/logger throws cannot escape cleanup. */ }
+};
 const ticket: SpawnTicket = {
   agentId: ctx.agentId,
   threadKey,
   workItem: ctx.workItem,
   attachAbort: (handle) => {
     abortHandle = handle;
-    if (abortRequested) handle();
+    if (abortRequested) invokeAbort();
   },
   abort: () => {
     abortRequested = true;
-    abortHandle?.();
+    invokeAbort();
   },
 };
 ```
 
 Install the request listener only for normal `turn` mode, after ticket construction and before any `await`; callback invokes **this ticket**. Dispose it in the existing `finally` that removes this ticket/releases lock and budget. Put post-lock checks and `fn(ticket)` inside that same `try/finally` instead of duplicating cleanup. A signal abort before `fn` begins throws `VoiceRequestCancelledError` and releases resources. An abort during shaping latches until the owning adapter is attached; no thread-wide lookup occurs. Preserve the existing stopped-agent exception and all status/reflection/budget logic.
 
-In `runOneSpawnAttempt`, retain its pre-assembly `abortedEarly` flag and adapter abort attachment. The sticky ticket now replays an abort which arrived before that function installed its early flag. Change the bypass condition to `abortedEarly || ctx.voiceRequestSignal?.aborted`. Return the existing `synthesizeAbortedResult` with shaping cost, so an admitted cancellation remains breaker-neutral. Before any auth/stale-handle retry arm in `spawnTurn`, require `!ctx.voiceRequestSignal?.aborted`; an already-canceled request never starts another provider attempt. Do not discard observed spend or alter resume-on-abort persistence.
+In `runOneSpawnAttempt`, retain its pre-assembly `abortedEarly` flag. After adapter construction, replace both the attached `() => adapter.abort()` and the direct early-abort call with this shared contained callback:
+
+```typescript
+const abortAdapter = () => {
+  try { adapter.abort(); }
+  catch { /* Actual ClaudeAgentAdapter -> AgentRunner.abort may throw in log/close. */ }
+};
+ticket.attachAbort(abortAdapter);
+```
+
+The bypass branch calls `abortAdapter()` and returns the existing aborted result even when it threw internally. A running adapter still owns its existing deadline/settlement; do not fabricate provider termination when abort failed. The request signal prevents retries and post-cancel output. Tests inject failure at the real adapter abort seam, not only a harmless fake cancel callback. The sticky ticket now replays an abort which arrived before that function installed its early flag. Change the bypass condition to `abortedEarly || ctx.voiceRequestSignal?.aborted`. Return the existing `synthesizeAbortedResult` with shaping cost, so an admitted cancellation remains breaker-neutral. Before any auth/stale-handle retry arm in `spawnTurn`, require `!ctx.voiceRequestSignal?.aborted`; an already-canceled request never starts another provider attempt. Do not discard observed spend or alter resume-on-abort persistence.
 
 This fixes three distinct boundaries: canceled lock-waiter never acquires; canceled preparer never dispatches after its awaits; canceled running request aborts its own provider. Adding a request ID to `abortThread` alone would miss the first two.
 
@@ -92,7 +106,7 @@ This fixes three distinct boundaries: canceled lock-waiter never acquires; cance
 
 `openWarmLease` calls `withSpawnTicket(ctx, leaseLifetimeCallback, { requestSignalMode: "admission_only" })`. This checks request cancellation while waiting for acquisition, then leaves the lifetime ticket's `attachAbort(() => lease.close("ticket-abort"))` governed by existing stop/shutdown ownership. The HTTP request's signal must never remain attached to that lifetime ticket after admission, or the first request's delayed close could destroy every later warm turn.
 
-After acquisition the opening initialization belongs to the lease. Reserve live opener A's demux slot **before publishing** the lease to successor B. In `openWarmLease`, after policy pinning/prompt shaping and immediately before `this.warmLeases.set(threadKey, pinnedLease)`, invoke the existing async `runWarmTurn` once; it synchronously checks/acquires its permit and calls `lease.runTurn` before its first await. `runTurn` must synchronously append its chain slot before waiting for start. Attach a rejection observer immediately so initialization cannot leave an unhandled rejection:
+After acquisition the opening initialization belongs to the lease. Reserve live opener A's demux slot **before publishing** the lease to successor B. In `openWarmLease`, after policy pinning/resume eligibility selection and immediately before `this.warmLeases.set(threadKey, pinnedLease)`, invoke the existing async `runWarmTurn` once; it synchronously checks/acquires its permit and calls `lease.runTurn` before its first await. `runTurn` must synchronously append its chain slot before waiting for start. Attach a rejection observer immediately so initialization cannot leave an unhandled rejection:
 
 ```typescript
 const openingTurn = this.runWarmTurn(pinnedLease, ctx, onStream);
@@ -113,7 +127,54 @@ private readonly ready = new Promise<void>((resolve) => { this.markReady = resol
 
 Call `this.markReady()` after `this.query = query` in successful `start`, and in `close` after marking closed. A canceled opener does not close an otherwise healthy published lease used by its successor. Idle/lifetime reclaim and stopAgent still own whole-lease cleanup.
 
-In `runTurn`, retain `turnChain` serialization and rejection recovery. Check canceled/closed before queueing. In the chain callback, await `ready`, check cancellation again, then call `consumeOneTurn(req)`. If the signal is already canceled while the request waits, it must not push a message, increment `turnCount`, disarm the idle timer or call `query.interrupt()`. Do not add a global listener at `runTurn` entry: a queued request's signal would otherwise interrupt the current different turn.
+**Choose prompt continuity when the surviving request consumes the slot.** Remove `shapeVoicePrompt(ctx, true)` and the early `onVoiceAdmission("warm")` from `spawnTurn`'s reused-lease branch; pass the original `ctx` into `runWarmTurn`. In `openWarmLease`, preserve that original `ctx.voicePrompt` for the reserved request. Derive a separate `openingCtx = this.shapeVoicePrompt(ctx, !!ctx.sessionId)` after the existing provider compatibility check solely to select the Query's resume candidate, and use `openingCtx.sessionId` for `openVoiceStreamingSession` and the fresh-spawn guard (`if (!openingCtx.sessionId) this.recordSpawn(ctx.workItem.source.id)`). Remove the early opening admission callback. The stream input is still provided by the per-request queue, never by `openingCtx.workItem.text` during initialization.
+
+Extend `start(query, options = {})` with `options: { resumedSessionId?: string }`; the manager passes the exact candidate used to construct that Query. Add `private resumedSessionId: string | undefined`; store the supplied ID only on successful start, before resolving readiness. Add `private inputPushed = false` to the lease. Neither registry publication, reservation, canceled skipped slots nor `turnCount` alone supplies prompt continuity. Add this optional selector while retaining `text` for existing direct lease callers:
+
+```typescript
+export interface WarmInputAdmission {
+  continuity: "fresh" | "resume" | "warm";
+  turnSeq: number;
+  launchSessionId?: string;
+}
+// WarmTurnRequest:
+selectText?: (admission: WarmInputAdmission) => string;
+```
+
+After readiness and final closed/canceled checks, but before any turn-state mutation in `consumeOneTurn`, choose the input synchronously:
+
+```typescript
+const admission: WarmInputAdmission = {
+  continuity: this.inputPushed ? "warm" : this.resumedSessionId ? "resume" : "fresh",
+  turnSeq: this.turnCount + 1,
+  launchSessionId: this.resumedSessionId,
+};
+const requestText = req.selectText?.(admission) ?? req.text;
+checkVoiceRequest(req.voiceRequestSignal); // Selector/admission callback may reenter abort.
+```
+
+Use `requestText` in the existing `composeTurnInput` push and set `inputPushed = true` immediately after that successful synchronous push. No await or foreign callback occurs between the final signal check and owner setup/push. Canceled A that never pushed leaves a fresh Query empty, so B selects its own full conversation, including A's earlier caller text, exactly once. A that did push supplies continuity even when later interrupted; B then selects only its latest message. A Query actually launched with the compatible resume candidate retains that continuity even if its reserved opener was canceled. Provider resume failures still use the existing failure/outer fresh retry path.
+
+In `runWarmTurn`, capture the selected context/admission in this request's closure; use them for finalization, observability, `lastTurn`, `resumedSession` and `warmTurnSeq`, rather than a successor's mutable lease count:
+
+```typescript
+let admittedCtx = ctx;
+let selected: WarmInputAdmission | undefined;
+// Fields in the existing lease.runTurn call:
+selectText: (admission) => {
+  selected = admission;
+  admittedCtx = this.shapeVoicePrompt({ ...ctx,
+    ...(admission.continuity === "resume" ? { sessionId: admission.launchSessionId,
+      sessionProvider: route.provider } : {}),
+  }, admission.continuity !== "fresh");
+  admittedCtx.onVoiceAdmission?.(admission.continuity);
+  return admittedCtx.workItem.text;
+},
+```
+
+After successful `lease.runTurn`, require `selected` to exist, assign `ctx = admittedCtx`, derive `resumedSession = selected.continuity === "resume"` and `warmTurnSeq = selected.turnSeq`. An absent selection on a successful result is an invariant failure and closes the lease through normal failure handling. No selection runs for a canceled queued request, and no request can replay an already-pushed full transcript.
+
+In `runTurn`, retain `turnChain` serialization and rejection recovery. Add `private enqueueGeneration = 0`; check canceled/closed before queueing, then execute `this.enqueueGeneration += 1` synchronously immediately before appending the chain slot. This invalidates an idle interrupt owner as soon as a successor queues, including while its ready/chain callback has not run. In the chain callback, await `ready`, check cancellation again, then call `consumeOneTurn(req)`. If the signal is already canceled while the request waits, it must not push a message, increment `turnCount`, disarm the idle timer or call `query.interrupt()`. Do not add a global listener at `runTurn` entry: a queued request's signal would otherwise interrupt the current different turn.
 
 In `consumeOneTurn`, after existing closed/query checks and before any state mutation call `checkVoiceRequest(req.voiceRequestSignal)`. After setting `turnInFlight`, resetting interruption state and assigning the turn number, attach:
 
@@ -130,7 +191,7 @@ const detachRequest = bindVoiceRequest(req.voiceRequestSignal, () => {
 });
 ```
 
-No `await` may occur between the final pre-push signal check, installing this owner and pushing this request's user message. If cancellation raced before attachment, rechecking/binding handles it synchronously. Dispose `detachRequest()` first in the existing `finally`, before setting `turnInFlight=false` and rearming idle. Suppress `req.onStream` when `req.voiceRequestSignal?.aborted`, including tool-ack text; still consume the result boundary so the next turn cannot read the predecessor's output. Retain the grace window, but replace `requestInterrupt` escalation with ownership checks on **every asynchronous path**, including rejection. Capture Query identity, turn sequence and whether a turn was in flight; a predecessor's late failure may close only that same still-active owner. Use this body (retain the existing safeLog implementation):
+No `await` may occur between the final pre-push signal check, installing this owner and pushing this request's user message. If cancellation raced before attachment, rechecking/binding handles it synchronously. Dispose `detachRequest()` first in the existing `finally`, before setting `turnInFlight=false` and rearming idle. Suppress `req.onStream` when `req.voiceRequestSignal?.aborted`, including tool-ack text; still consume the result boundary so the next turn cannot read the predecessor's output. Retain the grace window, but replace `requestInterrupt` escalation with ownership checks on **every asynchronous path**, including rejection. Capture Query identity, turn sequence, whether a turn was in flight, and queue generation for an idle interruption; a predecessor's late failure may close only that same still-active owner. Use this body (retain the existing safeLog implementation):
 
 ```typescript
 requestInterrupt(reason: string): void {
@@ -138,8 +199,10 @@ requestInterrupt(reason: string): void {
   if (this.closed || !query) return;
   const turn = this.turnCount;
   const inFlight = this.turnInFlight;
+  const enqueued = this.enqueueGeneration;
   const stillOwns = () => !this.closed && this.query === query &&
-    this.turnCount === turn && this.turnInFlight === inFlight;
+    this.turnCount === turn && this.turnInFlight === inFlight &&
+    (inFlight || this.enqueueGeneration === enqueued);
   this.interruptRequested = true;
   const failed = () => {
     if (!stillOwns()) return;
@@ -162,7 +225,7 @@ requestInterrupt(reason: string): void {
 }
 ```
 
-Add `private readonly interruptGraceTimers = new Set<NodeJS.Timeout>()`; delete each timer from the set when it fires, and clear/delete all timers on turn settlement and lease close. The timer's deletion must occur before its owner check. A stale success must not arm a timer; a stale rejection cannot close an idle lease or a running/queued successor. Preserve same-owner failure escalation and stopped-agent whole-lease cleanup.
+Add `private readonly interruptGraceTimers = new Set<NodeJS.Timeout>()`; delete each timer from the set when it fires, and clear/delete all timers on turn settlement and lease close. The timer's deletion must occur before its owner check. A stale success must not arm a timer; a stale rejection cannot close an idle lease or a running/queued successor. Preserve same-owner failure escalation and stopped-agent whole-lease cleanup. Queueing B does not invalidate an interrupt of still-active A: its escalation must still unblock A's stuck demux. The queue-generation check applies only to idle interrupts.
 
 Pass `voiceRequestSignal: ctx.voiceRequestSignal` in `runWarmTurn`'s `lease.runTurn` call. Add `checkVoiceRequest(ctx.voiceRequestSignal)` before breaker acquisition. Replace its catch with the following request-cancellation branch ahead of existing provider failure handling; `TurnClassification` already defines `{ outcome: "aborted" }` as breaker-neutral:
 
@@ -186,11 +249,11 @@ Extend the manager fixture from `src/agents/agent-manager.test.ts`; mock only st
 
 1. A owns cold ticket, B queues. Abort B: A is not aborted, B never calls provider after A finishes, lock/budget return to baseline.
 2. A finishes, B becomes active, then A's original signal aborts: B's abort spy remains zero and B completes.
-3. A is canceled during prompt/store preparation or async provider assembly: no later `adapter.runTurn`, no retry, sticky abort does not affect B.
+3. A is canceled during prompt/store preparation or async provider assembly: no later `adapter.runTurn`, no retry, sticky abort does not affect B. Inject a real cold adapter whose `abort()` throws from its runner/log/Query-close path, during running abort and sticky post-assembly replay: no uncaught AbortSignal listener exception, no canceled retry, early cancellation remains breaker-neutral, and eventual settlement releases lock/budget.
 4. Warm A consumes, B queues. Abort B: A continues, B pushes no message; C subsequently completes on the same Query.
 5. Warm A is interrupted, drains result, then B consumes. Abort A again/late: no new Query interrupt, B completes and lease remains open.
-6. Publish live opener A while Query start is gated, then admit B before start: A consumes exactly once before B, and no full-transcript opener follows B. Repeat with A canceled before start: A pushes no message, B consumes exactly once and progresses. Close during initialization closes the late Query once and releases lock/budget.
-7. A requests interruption, drains result, and B begins before the interrupt promise rejects: rejection neither closes Query/lease nor interrupts B; B completes. Repeat stale resolution (no grace timer), same-owner rejection (lease closes), and idle interrupt rejection after a successor starts (successor survives).
+6. Publish live opener A while Query start is gated, then admit B before start: A consumes exactly once before B, and no full-transcript opener follows B. Repeat with A canceled before start: A pushes no message, B consumes exactly once and progresses with its full transcript. Put distinct earlier/current caller sentinels in B's full conversation; assert both reach the fresh provider input exactly once and C pushes only its latest message. Repeat with A having pushed before cancellation (B latest only), and with a genuinely resumed Query (B latest only and resume observability derives from lease launch). Close during initialization closes the late Query once and releases lock/budget.
+7. A requests interruption, drains result, and B begins before the interrupt promise rejects: rejection neither closes Query/lease nor interrupts B; B completes. Repeat stale resolution (no grace timer), same-owner rejection (lease closes), and idle interrupt rejection after a successor starts (successor survives). Also reject an idle interruption then synchronously queue B before promise reactions execute: the rejection callback runs before B's consumption callback; B remains queued/alive and then completes. This test must assert `turnCount`/`turnInFlight` have not changed at rejection, so it cannot pass merely by testing an already-started B. Same idle owner with no successor still escalates.
 8. stopAgent and shutdown still close the entire warm lease; request cancellation preserves its lease.
 9. Thrown preparation/admission/provider error, canceled queued request and zero-progress abort retain existing breaker and persistence semantics.
 

@@ -220,6 +220,10 @@ Bound each strong active registry to 256 entities and the recent-terminal lookup
 Required public recorder interface:
 
 ```typescript
+export type BridgeBinding =
+  | { readonly state: "bound"; readonly speechId: string }
+  | { readonly state: "unbound" }
+  | { readonly state: "unavailable"; readonly reason: "evicted" | "conflict" | "closed" };
 export interface SpeechTracePort {
   speechCreated(handle: import("@livekit/agents").voice.SpeechHandle,
     origin: "opening" | "sdk_response" | "retry" | "fallback",
@@ -227,17 +231,21 @@ export interface SpeechTracePort {
   bridgeCreated(context: BridgeTraceContext): BridgeAttempt;
   synthesisCreated(context: SynthesisTraceContext): SynthesisAttempt;
   bindBridge(turnId: string, speechId: string): void;
+  bridgeBinding(turnId: string): BridgeBinding;
+  onBridgeBinding(listener: (turnId: string) => void): () => void;
   bindSynthesis(synthesisId: string, speechId: string): void;
   markCancellation(speechId: string, cause: CancellationCause): void;
   synthesisFailure(synthesisId: string, errorClass: "tts_provider_failed"): void;
   unboundProviderFailure(kind: "tts" | "llm", errorClass: "tts_provider_failed" | "llm_provider_failed"): void;
   metrics(event: import("@livekit/agents").MetricsCollectedEvent): void;
-  actionGap(reason: "cancel_failed" | "action_ownership_unproved", speechId: string): void;
+  actionGap(reason: "cancel_failed" | "action_ownership_unproved" | "action_overflow", speechId: string): void;
   teardown(result: "closed" | "failed" | "timeout", reason: "call_close" | "late_start" | "late_start_failed"): void;
   close(cause: "call_closed" | "setup_failed"): void;
   snapshot(): CallDiagnosticCounts;
 }
 ```
+
+`bridgeBinding(turnId)` reads only the validated active/recent bridge owner: return `bound` for its one nonconflicting explicit association, `unbound` for an existing owner awaiting genuine binding, and `unavailable` for missing/evicted/conflicting/closed lookup. It never consults the latest speech or returns a stale first binding after conflict. `onBridgeBinding` installs one call-local synchronous listener used by startup recovery and returns an idempotent disposer. Notify with the original turn ID after the validated binding/state and associated failure evidence are installed, including late binding, conflict, lookup eviction and close. Duplicate unchanged binding is a no-op. The subscriber rereads `bridgeBinding`; a listener exception is contained and recorded as a content-free gap, never thrown into SDK metrics. Register this single listener before session start; initial error capture also reads the binding, covering errors arriving after notification. Do not install one listener per pending error or retain an event backlog. Remove the subscription on call cleanup. This adds no speech admission or recovery policy to diagnostics; startup alone consumes genuine EOU IDs as specified in Task 6. Add binding-before-subscribe/read, subscribe-before-binding, late binding, conflict, eviction, duplicate and disposer/throwing-subscriber assertions to the existing registry suite.
 
 `BridgeAttempt` methods are `started`, `response(status)`, `text(length, monoMs)`, `fail(errorClass)`, `finish(outcome,cause)`, `bind(speechId)`; synthesis equivalents are `frame(frameMetadata)`, `fail(errorClass)`, `finish` and `bind`. `frame` accumulates frame count, per-channel sample count and generated duration (`samplesPerChannel / sampleRate` summed per frame); emit the first-frame event once and include final totals in the terminal even for cancellation/error. Mixed sample rates retain summed duration with terminal `sampleRate: null`/`not_applicable`; never sum samples as a duration under a guessed constant rate. `fail` latches a directly observed error before cleanup; `finish(cancelled)` cannot erase it. Terminal event includes nullable observations plus reasons. Methods called after terminal emit only supplemental observations under original IDs and do not mutate another attempt or its counters. Run ID/conflicting-binding validation: a different second speech ID for one turn/synthesis emits a gap and marks correlation missing, rather than replacing the first association.
 

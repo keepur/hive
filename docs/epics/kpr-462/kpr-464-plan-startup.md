@@ -4,7 +4,7 @@
 
 **Goal:** Request one opening only while still needed; preserve early caller input and let its response replace any stale opening.
 
-**Architecture:** A synchronous arbiter owns the optional explicit opening. Public nonempty-final input holds startup across listening; the accepted-turn hook consumes the opening before response output admission. A preemptive caller handle/text may already exist before that hook. Speech-scoped recovery ownership is invalidated by newer accepted input, newer speech or call closure; the SDK keeps normal interruption and false-interruption recovery.
+**Architecture:** A synchronous arbiter owns the optional explicit opening. Public nonempty-final input holds startup across listening; the accepted-turn hook consumes the opening before response output admission. A preemptive caller handle/text may already exist before that hook. Immutable speech creation tokens stay separate from action authority: genuine EOU speech IDs admit SDK responses, while retained application handles transfer bounded recovery authority. New accepted input, supersession or call closure revokes that authority; the SDK keeps normal interruption and false-interruption recovery.
 
 **Tech Stack:** TypeScript, pinned LiveKit Agent/AgentSession/SpeechHandle APIs, existing error-map and offline fixture.
 
@@ -128,15 +128,15 @@ Construct call scope after room/agent resolution and before `session.start`. Ins
 
 Wire in this order before `start`:
 
-1. `SpeechCreated`: read synchronous application generation scope (`opening/retry/fallback` or default `sdk_response`), create speech trace and a creation-fenced action token, attach public done callback. Do not interpret a speculative SDK handle as accepted caller input or consume the opening.
-2. `MetricsCollected`: recorder metrics binding/enrichment; process any bounded pending BridgeError for the now explicitly bound turn.
+1. `SpeechCreated`: read synchronous application generation scope (`opening/retry/fallback` or default `sdk_response`), create speech trace and an immutable creation token, attach public done callback. SDK-origin creation alone grants no recovery authority; application-origin scope provides the explicit owner/transfer described below. Do not interpret a speculative SDK handle as accepted caller input or consume the opening.
+2. `MetricsCollected`: call recorder metrics binding/enrichment first. Its binding notification rechecks only that bridge turn. For a genuine `eou_metrics` with explicit `speechId`, run the accepted-response admission transition below and recheck pending failures for that exact speech. EOU observation is an admission seam, independent of the bridge/synthesis timing joins.
 3. `UserInputTranscribed`: synchronously derive `hasNonemptyFinal = ev.isFinal && !!ev.transcript.trim()`, emit content-free `caller_final_input` with `hasFinalInput: true` only on that observation, and call `arbiter.finalInput(hasNonemptyFinal)`. Never log the event/transcript itself.
 4. `UserStateChanged`: record caller state and forward speaking/listening to outbound arbiter. These events belong to the selected intended participant's input.
 5. `ConversationItemAdded`: keep the existing interrupted assistant text → `hiveLLM.interruptedSpokenText` logic; remove interruption **counting** here because handle outcomes own it. Never use this late event as accepted-user-turn precedence.
 6. `Error`: record call-level provider error or bridge error by its own `turnId`; guard recovery as Step 3 specifies.
 7. `Close` and room disconnect/intended participant disconnect: synchronously terminalize startup/abort call scope before scheduling asynchronous cleanup.
 
-TracedAgent's public `onUserTurnCompleted` synchronously invalidates all obsolete application opening/recovery handles, calls `arbiter.acceptedCallerTurn()` for nonempty text and records `caller_turn_accepted`; it returns immediately without awaiting diagnostics. For inbound, retain normal SDK response scheduling and record the accepted epoch without scheduling any optional opening. The hook is before output admission with the existing `preemptiveTts: false`; it is not universally before SpeechCreated or speculative LLM text. Final input and the hook expose no speech identity, so neither labels/adopts the next/latest SDK handle. Before the SIP await, no explicit opening is requested; caller activity/accepted input is already retained. After await, record SIP answer and call `arbiter.answer()` only if live. An answer callback arriving after hangup does nothing.
+TracedAgent's public `onUserTurnCompleted` synchronously revokes old action authority, cancels the old active recovery chains/application handles, calls `arbiter.acceptedCallerTurn()` for nonempty text, opens the resulting epoch's unassigned admission slot, and records `caller_turn_accepted`; it returns immediately without awaiting diagnostics. For inbound, retain normal SDK response scheduling and record the accepted epoch without scheduling any optional opening. The hook is before output admission with the existing `preemptiveTts: false`; it is not universally before SpeechCreated or speculative LLM text. Final input and the hook expose no speech identity, so neither labels/adopts the next/latest SDK handle. Before the SIP await, no explicit opening is requested; caller activity/accepted input is already retained. After await, record SIP answer and call `arbiter.answer()` only if live. An answer callback arriving after hangup does nothing.
 
 Use synchronous generation scope wrapping to label only application-issued handles:
 
@@ -155,20 +155,68 @@ The public SDK `SpeechCreated` must be synchronous within `generateReply`/`say`;
 
 - [ ] **Step 3: Guard all recovery work with the failed speech's owner.**
 
-Maintain an immutable creation token `{ speechId, acceptedEpoch, serial }` plus its actual handle. New creation advances the serial used to reject stale asynchronous continuations; accepted input invalidates earlier epochs synchronously. Creation is not proof of caller origin. A preemptive SDK response created before acceptance retains its creation epoch and may lack proved application action ownership afterward; do not relabel it at the hook. Record unproved recovery ownership and skip app recovery in that case, while SDK response admission/output proceeds normally. This conservative guard cannot suppress an unrelated provider's standard SDK error behavior.
+**Creation identifies; admission authorizes.** Keep immutable creation tokens `{ speechId, createdEpoch, serial, origin }` and their actual handles in a bounded active/recent lookup (256 each, matching recorder retention). `createdEpoch` always means the epoch when `SpeechCreated` ran; never rewrite it at the hook. SDK-origin creation is speculative until a genuine public `eou_metrics.speechId` identifies that exact response after acceptance. An explicit application opening has authority from its synchronous generation scope without EOU; retry/fallback authority is transferred from its validated chain. These are separate admission tokens, not relabeled creation records.
 
-A BridgeError carries `turnId`; only genuine recorder binding resolves its failed token. Before binding, keep the error in the bounded 256-entry pending map. Binding triggers processing for that exact error; absence/eviction remains unbound and cannot authorize retry/fallback/shutdown. Deduplicate by turn ID/object identity so one SDK/app observation does not consume several retries. Owner failure is recorded even when stale.
+**Executed admission capability:** [portable test-local source](./probes/kpr-464-admission-probe.mjs) and [actual results](./probes/kpr-464-admission-results.json), freshly executed with `/opt/homebrew/opt/node@24/bin/node docs/epics/kpr-462/probes/kpr-464-admission-probe.mjs` (exit 0; Node 24.16.0, Agents 1.6.4, rtc-node 0.13.33). Six cases cover error-before-hook, error-after-hook/delayed binding, newer accepted turn, held first hook with a second speculative LLM, no-EOU unowned generation, and no-EOU explicitly owned generation. This uses real public SDK events with fake STT/VAD/LLM/TTS, and validates recovery eligibility; it does not emit production fallback audio, test HTTP, or establish caller audibility. Production action/frames regressions remain Task 7. Runtime root resolves from the probe file rather than an absolute worktree/scratch path.
+
+For the pinned ordinary LLM caller path, source inspection shows `userTurnCompleted` awaits the preceding accepted-turn task, awaits the public hook, selects/schedules the preemptive or new handle, and emits its EOU synchronously before returning. Port the executed real-SDK admission probe into Task 0/Task 7: `hook A -> EOU(A.speechId) -> hook B -> EOU(B.speechId)` with both failure orderings. This bracket supplies the accepted epoch; **EOU's supplied speech ID supplies identity**. No next/latest SpeechCreated, timestamp, queue order, transcript comparison or SDK private state supplies identity. The production hook returns immediately, never throws `StopResponse`, and does not schedule its own caller reply. If no genuine EOU appears, no speculative recovery is authorized; normal SDK output still proceeds and diagnostics remain incomplete/unbound as appropriate.
+
+Use this core state/transition in `startup-arbiter.ts` with injected trace/cancellation dependencies for direct tests; session owns the actual handles and bounded maps:
 
 ```typescript
-interface ActionOwner {
+interface CreationToken {
   readonly speechId: string;
-  readonly acceptedEpoch: number;
+  readonly createdEpoch: number;
   readonly serial: number;
+  readonly origin: "opening" | "sdk_response" | "retry" | "fallback";
 }
+interface ActionOwner {
+  readonly creation: CreationToken;
+  readonly acceptedEpoch: number;
+  readonly source: "application" | "eou";
+}
+let awaitingAdmission: number | null = null;
+let currentOwner: ActionOwner | null = null;
+const admissions = new Map<string, ActionOwner>(); // At most 256 active/recent tokens.
+const everAdmitted = new WeakSet<CreationToken>();
 const owns = (owner: ActionOwner) =>
-  !arbiter.closed && owner.acceptedEpoch === arbiter.epoch &&
-  currentOwner?.speechId === owner.speechId && currentOwner.serial === owner.serial;
+  !arbiter.closed && owner.acceptedEpoch === arbiter.epoch && currentOwner === owner;
+
+function acceptCallerTurn(): void {
+  if (arbiter.closed) return;
+  currentOwner = null;
+  cancelAllRecovery("startup_superseded");
+  cancelApplicationHandles("startup_superseded");
+  arbiter.acceptedCallerTurn();
+  // No handle lookup/adoption here. Earlier speculative errors remain pending.
+  awaitingAdmission = arbiter.epoch;
+}
+function admitEou(speechId: string): void {
+  if (arbiter.closed) return;
+  const previous = admissions.get(speechId);
+  if (previous) return; // Duplicate/late EOU never grants a new epoch to old speech.
+  const creation = creations.get(speechId);
+  if (creation && everAdmitted.has(creation)) return;
+  if (awaitingAdmission === null || !creation || creation.origin !== "sdk_response") {
+    trace.actionGap("action_ownership_unproved", speechId);
+    return;
+  }
+  const acceptedEpoch = awaitingAdmission;
+  awaitingAdmission = null;
+  if (acceptedEpoch !== arbiter.epoch) return;
+  const owner: ActionOwner = Object.freeze({ creation, acceptedEpoch, source: "eou" });
+  everAdmitted.add(creation);
+  rememberAdmission(owner); // Bounded insertion, cancels an evicted owner's chains.
+  currentOwner = owner;
+  recheckPendingForSpeech(speechId);
+}
 ```
+
+`creations` maps the exact SDK ID to its original frozen token; duplicate registration of the same handle is idempotent, conflicting handle reuse is a gap and has no authority. `rememberAdmission` adds to `admissions` and evicts oldest insertion over 256; if an evicted token owns a chain, cancel that chain before eviction. The `everAdmitted` WeakSet survives recent-admission-map eviction while the exact creation token remains reachable; a duplicate EOU cannot readmit that token in a newer epoch. Application admission adds its token to this WeakSet too. Missing/evicted creation cannot be adopted, and a second distinct EOU without an open accepted slot is a gap. The SDK-only creation callback revokes `currentOwner` and aborts its obsolete recovery continuations, without canceling the optional opening merely for speculative speech; it grants no new owner. EOU admission may legitimately select an older creation serial/epoch than a canceled application opening; the current accepted epoch plus explicit EOU identity provides its new authority. Never require `createdEpoch === arbiter.epoch` or “latest creation” for admitted recovery. On an accepted hook, replace any obsolete unassigned slot with the new epoch while retaining the old pending failure as unproved; the pinned serialization probe verifies the supported caller path emits EOU before that next hook. No absent speech ID is invented for a gap.
+
+**Retain an early failure until both exact binding and action admission resolve.** Keep `pendingErrors: Map<turnId, BridgeError>` capped at 256 plus a weak identity deduplicator for repeated delivery of the same Error. A callback records each local failure immediately. For an exact BridgeError, insert it once then call `recheckPending(turnId)`. This function reads `trace.bridgeBinding(turnId)`; `unbound` stays pending, `unavailable` is recorded unproved and removed, and `bound` reads `admissions.get(binding.speechId)`. No admission yet means retain it even when its immutable creation epoch is older than the accepted hook. A present but revoked/older admission is stale and removes the error without consuming retry budget. A current owner removes/latches the error **before** registering its single recovery chain. Queue the chain body with `Promise.resolve().then(...)`, rechecking `chainOwns` in that continuation before running recovery, so no fallback is emitted reentrantly inside the SDK metrics callback. The error's failure classification/terminal evidence is never removed from the recorder by action decisions.
+
+Subscribe once before start with `trace.onBridgeBinding((turnId) => recheckPending(turnId))`; also recheck on initial error capture and after exact EOU/application admission. These cover error -> binding -> EOU, EOU -> error -> binding, and binding -> EOU -> delayed session Error, without an event-order race. Keep a bounded 256-entry processed-turn decision cache plus weak Error identity deduplication; conflicting errors for the same turn cannot spend twice. When a creation/admission becomes known stale, drop its pending errors with unproved/stale action evidence. Pending overflow emits an action-overflow gap before evicting; no missing binding, creation, EOU or cache entry ever authorizes fallback/shutdown. There is no timer waiting for optional metrics and no wait on this registry in the media path.
 
 **Own the SDK failure route as well as app recovery.** The pinned `LLMStream` catches ordinary BridgeError and emits an unrecoverable provider error; after session listeners run, the SDK closes at its fourth error (default maximum is 3) even if the application's stale-owner check returned. Install a synchronous `hiveLLM.prependListener("error", routeOwnedBridgeError)` in HiveLLM construction before AgentSession subscribes. For only an exact BridgeError already recorded by this HiveLLM stream under its own turn ID, set that public event's `recoverable` field to true **before** SDK listeners see it. Keep the original error/event, and rethrow the original error from `run`: the base ordinary-Error branch does not add automatic retries. The field delegates those known bridge failures to existing bounded application recovery; it does not mark the attempt successful. Unrelated LLM/STT/TTS errors are untouched. Do not remove SDK listeners, change global thresholds, override a private emit method, or mutate all errors in a late session callback.
 
@@ -183,31 +231,71 @@ this.prependListener("error", (event) => {
 });
 ```
 
-Add `ownedFailures: Map<string, BridgeError>` to HiveLLM, capped at 256. In the stream catch, call `attempt.fail(failure.failureClass)` and register the exact failure immediately before `throw failure`, with no await; constructor's early listener deletes the matching entry after marking the event. Keep pending recovery details separately in the recorder, so removing this routing entry loses no action. If a routing entry is unavailable/conflicting, leave the event untouched and record a gap. All already-known errors still precede one-shot terminalization in `finally`.
+Add `ownedFailures: Map<string, BridgeError>` to HiveLLM, capped at 256. In the stream catch, call `attempt.fail(failure.failureClass)` and register the exact failure immediately before `throw failure`, with no await; constructor's early listener deletes the matching entry after marking the event. Keep pending recovery details in the startup call scope's `pendingErrors`, separately from this routing map and the recorder's binding lookup, so deleting a routing entry loses no pending action. If a routing entry is unavailable/conflicting, leave the event untouched and record a gap. All already-known errors still precede one-shot terminalization in `finally`.
 
 **Executed proof of this newly selected public seam:** [test-local source](./probes/kpr-464-owned-error-probe.mjs), [actual results](./probes/kpr-464-owned-error-results.json). `node docs/epics/kpr-462/probes/kpr-464-owned-error-probe.mjs` executed on Node 24.16.0 with exit 0 during this revision: baseline closes on error 4; early exact-error routing preserves all four original events as recoverable, genuine ALS/speech metric bindings, and a pending replacement's text completion; four unrelated provider failures still close at the original threshold. The replacement is deliberately text-only in this seam proof. Task 7 must test the actual Hive failure route with TTS/fake output and production owner guards. No private SDK fields or emitted fake metrics are used.
 
-**Invalidate actual queued application handles, not only future continuations.** Keep a bounded `Map<speechId, { handle, owner, chainAbort }>` for every unfinished application-created opening/retry/fallback. Add at synchronous SpeechCreated within generation scope, remove on its done callback. This is distinct from SDK speculative handles. On nonempty acceptance, intentional application supersession, and call close, synchronously interrupt every obsolete retained handle, including queued fallback/retry handles that the SDK's current-speech interruption can miss:
+**Keep recovery chains alive independently of their handles.** Maintain separate bounded registries: `applicationHandles` for unfinished explicit opening/retry/fallback handles, and `activeRecovery` for the entire async action chain, including gaps after handle settlement and during retry delay. Removing a done handle must never remove its active chain/controller. A chain owns one controller and its current admission token; its terminal `finally` is the only normal removal point. Create/register before the first fallback/delay, cap at 256, and cancel the oldest chain on overflow before eviction with an action-overflow gap. All cancellation functions and their logging/trace callbacks are synchronous and throw-safe.
 
 ```typescript
+interface RecoveryChain {
+  readonly id: string;
+  readonly abort: AbortController;
+  owner: ActionOwner;
+}
+const activeRecovery = new Map<string, RecoveryChain>();
+const applicationHandles = new Map<string, {
+  handle: voice.SpeechHandle;
+  owner: ActionOwner;
+  chain: RecoveryChain | null; // Opening can exist before any recovery chain.
+}>();
+const chainOwns = (chain: RecoveryChain) =>
+  activeRecovery.get(chain.id) === chain && !chain.abort.signal.aborted && owns(chain.owner);
+
+function cancelChain(chain: RecoveryChain): void {
+  try { chain.abort.abort(); } catch { /* All owned listeners also contain throws. */ }
+}
+function cancelAllRecovery(_cause: "startup_superseded" | "call_closed", keep?: RecoveryChain): void {
+  for (const chain of activeRecovery.values()) if (chain !== keep) cancelChain(chain);
+}
 function cancelApplicationHandles(cause: "startup_superseded" | "call_closed", keep?: string) {
-  const retainedChain = keep ? applicationHandles.get(keep)?.chainAbort : undefined;
   for (const [id, entry] of applicationHandles) {
     if (id === keep) continue;
-    if (entry.chainAbort !== retainedChain) entry.chainAbort.abort();
     trace.markCancellation(id, cause);
     if (!entry.handle.done() && !entry.handle.interrupted) {
       try { entry.handle.interrupt(); } catch { trace.actionGap("cancel_failed", id); }
     }
   }
 }
+async function waitOwned<T>(chain: RecoveryChain, make: () => Promise<T>): Promise<T | undefined> {
+  if (!chainOwns(chain)) return undefined;
+  const signal = chain.abort.signal;
+  let onAbort!: () => void;
+  const stopped = new Promise<undefined>((resolve) => { onAbort = () => resolve(undefined); });
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
+  try { return await Promise.race([make(), stopped]); }
+  finally { signal.removeEventListener("abort", onAbort); }
+}
 ```
 
-Define `trace.actionGap` as a typed content-free gap event (reason enum and supplied speech ID), not arbitrary error text. On active-map overflow cancel the oldest owned handle and emit an overflow gap before evicting. An already-interrupted handle is idempotent. Provisional speaking or speculative `SpeechCreated` alone must not cancel/consume the one opening; only known acceptance, call closure or an explicit app-owned supersession does. New speculative creation can revoke an old recovery continuation's serial permission, but cannot authorize new speech or be adopted as accepted input.
+Register application handles synchronously from generation scope, remove only their own entry on done, and keep the chain owner token after handle settlement for the next allowed action. Limit `applicationHandles` to 256; before evicting, mark cancellation, interrupt that handle, and cancel its chain if present. Startup opening is canceled only on accepted input, call closure or explicit application supersession; provisional speaking/speculative creation alone does not consume it. A speculative creation can abort a recovery continuation as a newer-speech fence without granting recovery or interrupting the standalone opening. On acceptance/closure, enumerate **both** maps, so a finished fallback whose handle was removed cannot leave an uncanceled retry timer.
 
-For intentional recovery transfer, pass the expected owner into `scheduleOwned`; check `owns` immediately before `say/generateReply`. Its synchronous generation scope carries the chain controller and `transferFrom` token. On the new SpeechCreated callback, first validate the expected token, create/register the new owner, then cancel obsolete app handles while keeping the newly created one and **without aborting its shared chain controller**. Revoking the old owner invalidates old waits; updating the local chain owner to the returned handle permits only the planned next action. If acceptance occurs reentrantly before return, the post-return owner check interrupts the returned handle and ends the chain. No await intervenes in transfer. At most 256 active handles/256 pending errors are retained; overflow cannot silently abandon a queued handle.
+For intentional transfer, extend the Step 2 generation scope with `{ chain, transferFrom }`. `scheduleOwned(origin, make, chain)` requires `chainOwns(chain)` immediately before `make`. In the synchronous `SpeechCreated` callback, validate `transferFrom === chain.owner && chainOwns(chain)` **before** invalidating any current owner; this branch must precede the generic new-creation revocation. Create the immutable creation token, then a new `ActionOwner` with the same accepted epoch/source `application`, register it in `admissions`/`applicationHandles`, set `chain.owner = newOwner` and `currentOwner = newOwner`, cancel all other chains, and interrupt obsolete application handles keeping the new ID. Never abort the transferred chain. Initial explicit opening instead creates application authority at `arbiter.epoch` with no chain. After `make` returns, require the returned ID to equal the synchronously registered owner and require `chainOwns`; otherwise interrupt the returned handle and cancel the chain. Acceptance reentering before return therefore cannot leave a queued fallback alive. Restore the previous scope in `finally`; no await occurs during the transfer.
 
-Preserve `FAILURE_BEHAVIOR`/`resolveFailureAction` and existing retry budgets. Call `stats.retryConsumed` only after ownership succeeds. Use the recovery chain's AbortController for `node:timers/promises.setTimeout(action.delayMs, undefined, { signal: chainAbort.signal })`; acceptance/closure/supersession aborts it immediately. After fallback `waitForPlayout`, after the classified delay, before retry and before terminal flush/release/shutdown, recheck the transferred owner. A wait failure is best-effort fallback evidence, not another retry. Do not wait for a canceled predecessor to produce another caller utterance.
+Preserve `FAILURE_BEHAVIOR`/`resolveFailureAction` and existing retry budgets. Start recovery only after `owns` succeeds; register the chain before `stats.retryConsumed` or scheduling a handle. If that failed application handle is still retained, update its `applicationHandles` entry to this new chain so overflow/cancellation cannot retain a controller from a completed earlier chain. The chain body uses `waitOwned(chain, () => handle.waitForPlayout())` with a catch for best-effort fallback failure, then checks `chainOwns` before its delay. Delay uses `node:timers/promises.setTimeout(action.delayMs, undefined, { signal: chain.abort.signal })`; abort ends it immediately even when no handle remains. Recheck after wait/delay, before `say/generateReply`, and before terminal flush/release/shutdown. Catch abort as expected cancellation; a failed fallback wait is evidence, never an extra retry. The chain body has an observed catch/finally:
+
+```typescript
+const run = Promise.resolve().then(() => {
+  if (chainOwns(chain)) return performExistingRecovery(chain, error);
+}); // Calls guarded steps above after the SDK event callback returns.
+void run.catch(() => { trace.actionGap("action_ownership_unproved", chain.owner.creation.speechId); })
+  .finally(() => {
+    if (activeRecovery.get(chain.id) === chain) activeRecovery.delete(chain.id);
+  }).catch(() => {});
+```
+
+`waitOwned` creates the SDK wait only after validating ownership and installing its abort listener; `Promise.race` retains a rejection handler even when abort wins; no unhandled later rejection. All actual unfinished handles are separately interrupted at accepted supersession/closure. Active-map eviction aborts the chain before removing it; call cleanup aborts every remaining controller, drains handle ownership and clears pending action lookups. No failed, speculative, stale or evicted token may use `currentOwner` as a replacement identity. A pending failure never waits for another caller utterance once its actual admission and binding are known.
 
 An empty HTTP success is recorded as completed bridge generation with no first text/no generated audio. It is excluded from audible-success denominators and does not automatically mint an extra opening or loop. The controlled fixture must distinguish this case from ordinary successful output. If the empty-generation scenario reveals an independent startup-liveness defect requiring a new retry/fallback policy, return to spec/plan review with an explicit bounded `empty_generation` path; do not silently classify it as spawn failure or infer an unapproved policy from this plan.
 
@@ -270,7 +358,7 @@ Adapt `runJobShutdown` so all cleanup stages run even if one fails: finalize/can
 
 - [ ] **Step 5: Verify focused state/setup tests and commit.**
 
-Unit permutations: quiet answer twice; final before answer/listening/acceptance (STT/VAD); no-final absent/interim/empty/preflight returns to listening; delayed final after an opening; accepted before answer; speaking at answer then accepted; provisional speaking/listening without accepted input; same-turn hook/answer ordering; immediate accepted input after explicit handle returns; reentrant acceptance during scheduling; false interruption no new request; close before/after answer; unrelated participant does not satisfy startup/input; old error after successor; close during retry delay/fallback wait; terminal fallback loses ownership before shutdown. Add startup-pending teardown tests: disconnect/shutdown while `session.start` is gated, let initial close resolve, then release start; no SIP call, no later media/request, and post-start close removes late resources/listeners. Repeat late start rejection, post-start close timeout, and close still pending when start settles. Add already-queued fallback/retry invalidation and intentional-transfer cases. Verify each initial observation listener is installed before `start` and SIP request. Tests of pure reducer alone do not satisfy integration acceptance.
+Unit permutations: quiet answer twice; final before answer/listening/acceptance (STT/VAD); no-final absent/interim/empty/preflight returns to listening; delayed final after an opening; accepted before answer; speaking at answer then accepted; provisional speaking/listening without accepted input; same-turn hook/answer ordering; immediate accepted input after explicit handle returns; reentrant acceptance during scheduling; false interruption no new request; close before/after answer; unrelated participant does not satisfy startup/input; old error after successor; close during retry delay/fallback wait; terminal fallback loses ownership before shutdown. Add startup-pending teardown tests: disconnect/shutdown while `session.start` is gated, let initial close resolve, then release start; no SIP call, no later media/request, and post-start close removes late resources/listeners. Repeat late start rejection, post-start close timeout, and close still pending when start settles. Add already-queued fallback/retry invalidation and intentional-transfer cases. Complete/remove a fallback handle, enter its retry delay, then accept new input/close/supersede: the independently registered chain aborts the timer immediately, is removed in finally, and never retries/shuts down. Inject late wait rejection after abort and verify no unhandled rejection. Verify each initial observation listener is installed before `start` and SIP request. Tests of pure reducer alone do not satisfy integration acceptance.
 
 Run: `npx vitest run src/voice-worker/startup-arbiter.test.ts src/voice-worker/session.test.ts src/voice-worker/error-map.test.ts src/voice-worker/tts-normalize.test.ts`
 
@@ -302,9 +390,9 @@ Use table-driven named barriers, not elapsed-time sleeps. Each progression scena
 | S1 quiet answer | Resolve SIP, deliver bridge text, synthesize known frame, finish output; exactly one opening handle. |
 | S2 early hello | STT/VAD nonempty final before answer, final during answer completion, or accepted before decision; final-pending survives listening before hook, explicit opening suppressed; transcript preserved in engine request. |
 | S3 immediate input | Gate old request before text, before first generated frame, during playout; inject input; replacement text/frame/output finish without another caller utterance. |
-| S4 provisional/false interruption | Run all 22 proved startup permutations against Hive: absent/interim/empty/preflight-only listening permits one opening; final already observed holds across listening; delayed final after opening gives normal replacement; preemptive handle/text may precede hook but no output precedes accepted admission. Then Actual SDK false-interruption recovery resumes original handle and doesn't create another opening. |
+| S4 provisional/false interruption | Run all 22 proved startup permutations against Hive: absent/interim/empty/preflight-only listening permits one opening; final already observed holds across listening; delayed final after opening gives normal replacement; preemptive handle/text may precede hook but no output precedes accepted admission. Public EOU must admit the exact preemptive ID even when an application opening was created later; creation epoch/serial remain unchanged. Genuine EOU(A) precedes hook B in two accepted turns; duplicate/late EOU cannot readmit A. Then Actual SDK false-interruption recovery resumes original handle and doesn't create another opening. |
 | S5 hangup | Before/during session start, answer, fetch, TTS and replacement; no late request/frame/retry/fallback; finalized records/counts and closed resources. |
-| S6 failures | Bridge HTTP rejection; old delayed BridgeError after replacement; midstream body error; TTS error before/after frame; empty success; verify application failure precedes terminal even with no handle exception/normal EOF and bounded owned recovery. Gate predecessor cleanup with fallback/retry already queued, accept caller input, verify those owned handles interrupt and replacement progresses. Exercise stale bridge errors at the SDK fourth-error threshold while successor is pending and before speaking resets the counter; unrelated provider threshold remains active. Empty success expects no generated frames and explicit no-content counts, not a replacement. |
+| S6 failures | Bridge HTTP rejection; old delayed BridgeError after replacement; midstream body error; TTS error before/after frame; empty success; verify application failure precedes terminal even with no handle exception/normal EOF and bounded owned recovery. Gate predecessor cleanup with fallback/retry already queued, accept caller input, verify those owned handles interrupt and replacement progresses. Exercise an error/LLM binding before accepted hook: no speculative fallback/frame/retry budget consumption, then genuine EOU for that exact speech authorizes one bounded recovery without another utterance. Repeat acceptance/EOU before error and delayed binding: the older-created admitted handle recovers and reaches known fallback/replacement output. Invalidate speculative A and admit distinct B: A never recovers even if its delayed error/binding arrives. Exercise stale bridge errors at the SDK fourth-error threshold while successor is pending and before speaking resets the counter; unrelated provider threshold remains active. Empty success expects no generated frames and explicit no-content counts, not a replacement. |
 | S7 diagnostics | No EOU opening, no TTS cancellation, overlapping streams, reverse/late/duplicate metrics, multi-segment synthesis; bind only explicit IDs. |
 | S8 actual adapter | Loopback real adapter/manager cold and warm; old HTTP close after successor is active/queued; successor frames/output done; auth/SSE and legacy no-trace unchanged. |
 | S9 cleanup/privacy | Bounded overflow/filtered+async log failure/Mongo failure/process-loss fixture (missing terminal reduces to incomplete; no replacement expected); no content/phone/token/tool/audio fields; no orphan timers or stream readers. |

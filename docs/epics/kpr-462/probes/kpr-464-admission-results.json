@@ -1,0 +1,374 @@
+{
+  "runtime": {
+    "node": "v24.16.0",
+    "platform": "darwin",
+    "arch": "arm64",
+    "agents": "1.6.4",
+    "rtcNode": "0.13.33"
+  },
+  "before": {
+    "name": "before-hook",
+    "errorTiming": "before-hook",
+    "twoTurns": false,
+    "firstSpeechId": "speech_ed09a414-6ed",
+    "events": [
+      {
+        "event": "speech_created",
+        "speechId": "speech_ed09a414-6ed"
+      },
+      {
+        "event": "llm_constructed",
+        "turnId": "before-hook-one"
+      },
+      {
+        "event": "llm_run",
+        "turnId": "before-hook-one"
+      },
+      {
+        "event": "application_error",
+        "turnId": "before-hook-one"
+      },
+      {
+        "event": "public_llm_error",
+        "turnId": "before-hook-one"
+      },
+      {
+        "event": "registry_error",
+        "turnId": "before-hook-one"
+      },
+      {
+        "event": "llm_metrics",
+        "turnId": "before-hook-one",
+        "speechId": "speech_ed09a414-6ed",
+        "cancelled": false
+      },
+      {
+        "event": "llm_binding",
+        "turnId": "before-hook-one",
+        "speechId": "speech_ed09a414-6ed"
+      },
+      {
+        "event": "accepted_hook",
+        "serial": 1
+      },
+      {
+        "event": "eou_admission",
+        "speechId": "speech_ed09a414-6ed",
+        "serial": 1
+      },
+      {
+        "event": "recovery_pending",
+        "turnId": "before-hook-one",
+        "speechId": "speech_ed09a414-6ed",
+        "origin": 1
+      },
+      {
+        "event": "recovery_recover",
+        "turnId": "before-hook-one",
+        "speechId": "speech_ed09a414-6ed"
+      }
+    ],
+    "recovery": [
+      {
+        "turnId": "before-hook-one",
+        "speechId": "speech_ed09a414-6ed",
+        "outcome": "recover"
+      }
+    ]
+  },
+  "after": {
+    "name": "after-hook",
+    "errorTiming": "after-hook",
+    "twoTurns": false,
+    "firstSpeechId": "speech_d3663a31-4ab",
+    "events": [
+      {
+        "event": "speech_created",
+        "speechId": "speech_d3663a31-4ab"
+      },
+      {
+        "event": "llm_constructed",
+        "turnId": "after-hook-one"
+      },
+      {
+        "event": "llm_run",
+        "turnId": "after-hook-one"
+      },
+      {
+        "event": "accepted_hook",
+        "serial": 1
+      },
+      {
+        "event": "eou_admission",
+        "speechId": "speech_d3663a31-4ab",
+        "serial": 1
+      },
+      {
+        "event": "application_error",
+        "turnId": "after-hook-one"
+      },
+      {
+        "event": "public_llm_error",
+        "turnId": "after-hook-one"
+      },
+      {
+        "event": "registry_error",
+        "turnId": "after-hook-one"
+      },
+      {
+        "event": "llm_metrics",
+        "turnId": "after-hook-one",
+        "speechId": "speech_d3663a31-4ab",
+        "cancelled": false
+      },
+      {
+        "event": "llm_binding",
+        "turnId": "after-hook-one",
+        "speechId": "speech_d3663a31-4ab"
+      },
+      {
+        "event": "recovery_pending",
+        "turnId": "after-hook-one",
+        "speechId": "speech_d3663a31-4ab",
+        "origin": 1
+      },
+      {
+        "event": "recovery_recover",
+        "turnId": "after-hook-one",
+        "speechId": "speech_d3663a31-4ab"
+      }
+    ],
+    "recovery": [
+      {
+        "turnId": "after-hook-one",
+        "speechId": "speech_d3663a31-4ab",
+        "outcome": "recover"
+      }
+    ]
+  },
+  "superseded": {
+    "name": "superseded",
+    "errorTiming": "after-hook",
+    "twoTurns": true,
+    "firstSpeechId": "speech_81ff8f17-25e",
+    "events": [
+      {
+        "event": "speech_created",
+        "speechId": "speech_81ff8f17-25e"
+      },
+      {
+        "event": "llm_constructed",
+        "turnId": "superseded-one"
+      },
+      {
+        "event": "llm_run",
+        "turnId": "superseded-one"
+      },
+      {
+        "event": "accepted_hook",
+        "serial": 1
+      },
+      {
+        "event": "eou_admission",
+        "speechId": "speech_81ff8f17-25e",
+        "serial": 1
+      },
+      {
+        "event": "application_error",
+        "turnId": "superseded-one"
+      },
+      {
+        "event": "public_llm_error",
+        "turnId": "superseded-one"
+      },
+      {
+        "event": "registry_error",
+        "turnId": "superseded-one"
+      },
+      {
+        "event": "llm_metrics",
+        "turnId": "superseded-one",
+        "speechId": "speech_81ff8f17-25e",
+        "cancelled": false
+      },
+      {
+        "event": "llm_binding",
+        "turnId": "superseded-one",
+        "speechId": "speech_81ff8f17-25e"
+      },
+      {
+        "event": "recovery_pending",
+        "turnId": "superseded-one",
+        "speechId": "speech_81ff8f17-25e",
+        "origin": 1
+      },
+      {
+        "event": "speech_created",
+        "speechId": "speech_babf7135-295"
+      },
+      {
+        "event": "llm_constructed",
+        "turnId": "superseded-two"
+      },
+      {
+        "event": "llm_run",
+        "turnId": "superseded-two"
+      },
+      {
+        "event": "llm_metrics",
+        "turnId": "superseded-two",
+        "speechId": "speech_babf7135-295",
+        "cancelled": false
+      },
+      {
+        "event": "llm_binding",
+        "turnId": "superseded-two",
+        "speechId": "speech_babf7135-295"
+      },
+      {
+        "event": "accepted_hook",
+        "serial": 2
+      },
+      {
+        "event": "eou_admission",
+        "speechId": "speech_babf7135-295",
+        "serial": 2
+      },
+      {
+        "event": "recovery_superseded",
+        "turnId": "superseded-one",
+        "speechId": "speech_81ff8f17-25e"
+      }
+    ],
+    "recovery": [
+      {
+        "turnId": "superseded-one",
+        "speechId": "speech_81ff8f17-25e",
+        "outcome": "superseded"
+      }
+    ]
+  },
+  "queuedAcceptedCalls": {
+    "events": [
+      {
+        "event": "llm_constructed",
+        "turnId": "queued-one"
+      },
+      {
+        "event": "llm_run",
+        "turnId": "queued-one"
+      },
+      {
+        "event": "hook_enter",
+        "hook": 1
+      },
+      {
+        "event": "llm_constructed",
+        "turnId": "queued-two"
+      },
+      {
+        "event": "hook_return",
+        "hook": 1
+      },
+      {
+        "event": "eou",
+        "speechId": "speech_982a580a-2a6"
+      },
+      {
+        "event": "llm_run",
+        "turnId": "queued-two"
+      },
+      {
+        "event": "hook_enter",
+        "hook": 2
+      },
+      {
+        "event": "hook_return",
+        "hook": 2
+      },
+      {
+        "event": "eou",
+        "speechId": "speech_70ad0594-bbd"
+      }
+    ]
+  },
+  "unownedNoEou": {
+    "name": "unowned-no-eou",
+    "appOwned": false,
+    "handleId": "speech_e5787af0-b7e",
+    "events": [
+      {
+        "event": "llm_constructed",
+        "turnId": "unowned-no-eou"
+      },
+      {
+        "event": "llm_run",
+        "turnId": "unowned-no-eou"
+      },
+      {
+        "event": "application_error",
+        "turnId": "unowned-no-eou"
+      },
+      {
+        "event": "registry_error",
+        "turnId": "unowned-no-eou"
+      },
+      {
+        "event": "llm_binding",
+        "turnId": "unowned-no-eou",
+        "speechId": "speech_e5787af0-b7e"
+      }
+    ],
+    "recovery": []
+  },
+  "appOwnedNoEou": {
+    "name": "app-owned-no-eou",
+    "appOwned": true,
+    "handleId": "speech_b4d4ed13-b78",
+    "events": [
+      {
+        "event": "llm_constructed",
+        "turnId": "app-owned-no-eou"
+      },
+      {
+        "event": "app_owned_handle",
+        "speechId": "speech_b4d4ed13-b78"
+      },
+      {
+        "event": "llm_run",
+        "turnId": "app-owned-no-eou"
+      },
+      {
+        "event": "application_error",
+        "turnId": "app-owned-no-eou"
+      },
+      {
+        "event": "registry_error",
+        "turnId": "app-owned-no-eou"
+      },
+      {
+        "event": "llm_binding",
+        "turnId": "app-owned-no-eou",
+        "speechId": "speech_b4d4ed13-b78"
+      },
+      {
+        "event": "recovery_pending",
+        "turnId": "app-owned-no-eou",
+        "speechId": "speech_b4d4ed13-b78",
+        "origin": "app-owned"
+      },
+      {
+        "event": "recovery_recover",
+        "turnId": "app-owned-no-eou",
+        "speechId": "speech_b4d4ed13-b78"
+      }
+    ],
+    "recovery": [
+      {
+        "turnId": "app-owned-no-eou",
+        "speechId": "speech_b4d4ed13-b78",
+        "outcome": "recover"
+      }
+    ]
+  }
+}

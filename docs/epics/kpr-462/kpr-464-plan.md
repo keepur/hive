@@ -58,7 +58,7 @@ Execution order: Task 0 → [diagnostics chunk](./kpr-464-plan-diagnostics.md) T
 - Unit: `required`
   - Scope: trace validation and reduction, bounded registries, startup arbiter, failure ownership, aggregate summaries and request cancellation helpers.
   - Reason: event reordering and cleanup must remain deterministic without vendor timing.
-  - Minimum assertions: every start has one terminal or explicit process-loss gap; unknown measurements remain nullable; ID joins never use proximity/latest state; interrupted empty-item speech is counted; same request/speech cannot terminal twice; overflow is visible; stale errors cannot schedule recovery or trip SDK shutdown; canceled pending reads cannot become completed; queued recovery handles are interrupted on supersession; a live warm opener reserves its slot before publication; final-pending input survives listening and no-final provisional input releases immediately; invalid trace objects never enter prompts/log payloads.
+  - Minimum assertions: every start has one terminal or explicit process-loss gap; unknown measurements remain nullable; ID joins never use proximity/latest state; interrupted empty-item speech is counted; same request/speech cannot terminal twice; overflow is visible; stale errors cannot schedule recovery or trip SDK shutdown; speculative errors stay pending until explicit EOU admission and exact bridge binding; admitted preemptive speech retains recovery despite its earlier creation epoch; canceled pending reads cannot become completed; queued recovery handles are interrupted on supersession and independently retained recovery chains cancel between handle settlement and retry delay; a live warm opener reserves its slot before publication; a canceled fresh opener transfers full-conversation initialization to the first surviving push; idle interrupt escalation is invalidated when a successor queues; final-pending input survives listening and no-final provisional input releases immediately; invalid trace objects never enter prompts/log payloads.
 - Integration: `required`
   - Scope: real pinned SDK session lifecycle; HiveLLM → loopback HTTP → real VoiceAdapter → real AgentManager cold/warm cancellation; Mongo summary uses injected fake client, not a real database.
   - Reason: ALS propagation, synchronous hook ordering, HTTP close timing and warm serialization are implementation facts that mocks of those boundaries cannot prove.
@@ -75,7 +75,7 @@ Execution order: Task 0 → [diagnostics chunk](./kpr-464-plan-diagnostics.md) T
 - SIP answer while quiet schedules one explicit opening, without adding greeting instructions to worker prompt.
 - Accepted caller greeting before/at answer consumes optional opening; input immediately after scheduling interrupts only the stale handle and its HTTP work.
 - Old socket close after successor admission leaves successor work and warm lease intact; close while queued prevents that request from later executing.
-- A known failure retains its classification through cleanup; superseded failure cannot retry/say/end a healthy successor.
+- A known failure retains its classification through cleanup; superseded failure cannot retry/say/end a healthy successor. Immutable creation identity never grants speculative recovery; genuine EOU speech identity plus exact bridge binding authorizes the admitted caller response, in either error/acceptance order.
 - Each speech is recorded before optional stage metrics; a preemptive caller handle/text can precede the accepted hook, while output admission remains gated; late metrics stay with their original identities; no generated frame is equivalent to neither confirmed zero playout nor caller silence.
 - Finalize worker records before summary persistence and Mongo close; abrupt-loss starts reduce to incomplete evidence.
 
@@ -131,6 +131,7 @@ Expected automated output: every named Vitest file passes with zero skipped requ
 
 **Files:**
 - Read: `docs/epics/kpr-462/kpr-464-sdk-capability.md`
+- Read/run: `docs/epics/kpr-462/probes/kpr-464-admission-probe.mjs`; results `docs/epics/kpr-462/probes/kpr-464-admission-results.json` (six executed public admission cases)
 - Read/run: `docs/epics/kpr-462/probes/kpr-464-owned-error-probe.mjs`; results `docs/epics/kpr-462/probes/kpr-464-owned-error-results.json` (new narrow error-route proof in this revision)
 - Read/run: `docs/epics/kpr-462/probes/kpr-464-sdk-probe.mjs`, `kpr-464-sdk-full-probe.mjs`, `kpr-464-startup-probe.mjs`, `kpr-464-revision-seams-probe.mjs` in that same directory
 - Create during delivery: `src/voice-worker/testing/startup-fixture.ts`
@@ -154,9 +155,10 @@ node docs/epics/kpr-462/probes/kpr-464-sdk-probe.mjs
 node docs/epics/kpr-462/probes/kpr-464-sdk-full-probe.mjs
 node docs/epics/kpr-462/probes/kpr-464-startup-probe.mjs
 node docs/epics/kpr-462/probes/kpr-464-revision-seams-probe.mjs
+node docs/epics/kpr-462/probes/kpr-464-admission-probe.mjs
 ```
 
-Expected: each exits 0, including all 22 startup observations and observer cases. The existing evidence already supplies these observations for review; rerunning is needed for a changed artifact/seam, not to require unimplemented production files as a planning prerequisite. The new narrow owned-bridge-error event route is proved separately in the startup chunk before readiness.
+Expected: each exits 0, including all 22 startup observations and observer cases. The existing evidence already supplies these observations for review; rerunning is needed for a changed artifact/seam, not to require unimplemented production files as a planning prerequisite. The startup chunk separately records the proved owned-bridge-error route and six executed admission cases: both failure/acceptance orders, delayed exact binding, newer accepted supersession, held-hook serialization and explicit application versus unowned no-EOU generation. These prerequisites establish the public seams; product recovery/output regressions remain required.
 
 - [ ] **Step 2: Port the public-API fixtures during delivery.**
 
