@@ -8,11 +8,13 @@
 
 **Tech Stack:** TypeScript, Node AsyncLocalStorage/performance, LiveKit agents 1.6.4, existing logger/Mongo summaries.
 
-Inherits the full [Testing Contract](./kpr-464-plan.md#testing-contract), especially S6/S7/S9. This chunk's TTS association remains conditional on Task 0: the existing probe observes no TTS metric before first-frame cancellation. Record that as unbound/incomplete until a reviewed explicit association meets the required contract; never invent a speech ID.
+Inherits the full [Testing Contract](./kpr-464-plan.md#testing-contract), especially S6/S7/S9. The approved spec explicitly permits unbound synthesis when no genuine metric supplies speech identity. The executed test-local proof includes normal metric enrichment, no-metric cancellation, public provider-error context and the observer's pending-read race. Attempt outcome and binding completeness remain independent; no-metric synthesis can be cancelled/failed/completed with an unbound association. Never invent a speech ID.
 
 ### Task 1: Establish schema, immutable contexts and attempt lifecycle
 
 **Files:**
+- Modify: `src/logging/logger.ts`
+- Create: `src/logging/logger.test.ts`
 - Create: `src/voice/voice-trace.ts`
 - Create: `src/voice/voice-trace.test.ts`
 - Create: `src/voice-worker/trace-context.ts`
@@ -102,16 +104,91 @@ export interface TraceEnvelope {
 
 | Events | Payload fields |
 | --- | --- |
-| `call_started`, `session_started`, `sip_answered`, `participant_available`, `caller_state`, `caller_turn_accepted`, `opening_decision`, `call_closed` | `direction`, `intendedParticipant` boolean, `state`, `decision`, bounded reason enum, `acceptedEpoch`; no caller text |
+| `call_started`, `session_started`, `sip_answered`, `participant_available`, `caller_state`, `caller_final_input`, `caller_turn_accepted`, `opening_decision`, `call_closed` | `direction`, `intendedParticipant` boolean, `state`, `decision`, bounded reason enum, `acceptedEpoch`, `hasFinalInput` boolean; no caller text |
 | `speech_started`, `speech_terminal` | `origin`, `acceptedEpoch`, `source`, outcome/cause, generated/known-playout booleans, nullable measurements, bounded error-class enum |
 | `bridge_created`, `bridge_started`, `bridge_response`, `bridge_first_text`, `bridge_terminal` | status, text length, first-text duration, maximum gap, outcome/cause/error class |
 | `bridge_bound`, `synthesis_bound` | IDs in envelope, `source: "sdk_metrics_context"`; no inferred linkage |
 | `synthesis_started`, `synthesis_first_frame`, `synthesis_terminal` | frame count, sample count/rate, duration, outcome/cause; original frame never serialized |
 | `sdk_metric`, `handle_playout_item`, `output_playback`, `false_interruption` | numeric allowlist of EOU/TTFT/TTFB/startedSpeakingAt/interruption counts and observation source; call-level if no association |
 | `engine_received`, `engine_attempt_started`, `engine_first_text`, `engine_client_closed`, `engine_attempt_terminal`, `engine_terminal` | status, attempt sequence, continuity, warm/tool numeric/boolean allowlist, outcome/error class and stage measures |
-| `diagnostic_gap`, `summary_persistence` | gap/failure reason enum, count, persistence status, no raw failure text |
+| `diagnostic_gap`, `teardown`, `summary_persistence` | gap/failure reason enum, count, persistence status, no raw failure text |
 
-Implement `createVoiceTraceWriter` using `createLogger("voice-diagnostics")`; wrap logger calls in try/catch and keep `writeFailures` count. The next successful write emits one `diagnostic_gap` for the accumulated count, then resets it. Do not recursively log from the catch. Expose `writeFailures`/`complete` in the call summary so a permanent log failure remains detectable by summary when persistence succeeds. If both sinks fail, the result must be reported as failed persistence, never successful diagnostics. Use `performance.now()` and one process UUID initialized at module load.
+Add an explicit tracked-write method to `createLogger("voice-diagnostics")`; try/catch around existing `info` cannot detect filtering or asynchronous stream errors. Preserve existing `debug/info/warn/error` signatures and formatting. In `src/logging/logger.ts`, export `LogWriteResult = "acknowledged" | "filtered" | "failed" | "overflow"` and this bounded sink. It acknowledges the stream callback, not durable disk storage:
+
+```typescript
+import type { Writable } from "node:stream";
+export type LogWriteResult = "acknowledged" | "filtered" | "failed" | "overflow";
+export function createTrackedLogSink(out: Writable) {
+  const pending = new Set<(result: LogWriteResult) => void>();
+  let sinkErrors = 0;
+  const onError = () => {
+    sinkErrors += 1;
+    for (const settle of [...pending]) settle("failed");
+  };
+  out.on("error", onError); // One retained listener per process output stream.
+  return {
+    write(line: string, callback: (result: LogWriteResult) => void): void {
+      const notify = (result: LogWriteResult) => { try { callback(result); } catch {} };
+      if (pending.size >= 256) { notify("overflow"); return; }
+      if (out.destroyed || out.errored || !out.writable) { notify("failed"); return; }
+      let settled = false;
+      const settle = (result: LogWriteResult) => {
+        if (settled) return;
+        settled = true;
+        pending.delete(settle);
+        notify(result);
+      };
+      pending.add(settle);
+      try { out.write(line, (error?: Error | null) => settle(error ? "failed" : "acknowledged")); }
+      catch { settle("failed"); }
+      // write(false) is accepted backpressure; wait for its callback.
+    },
+    snapshot: () => ({ pending: pending.size, sinkErrors }),
+    dispose(): void {
+      for (const settle of [...pending]) settle("failed");
+      out.off("error", onError);
+    },
+  };
+}
+```
+
+Cache the stdout/stderr sinks once per process. Add these module functions beside the existing `emit`:
+
+```typescript
+const trackedSinks = new WeakMap<Writable, ReturnType<typeof createTrackedLogSink>>();
+function trackedSink(out: Writable) {
+  let sink = trackedSinks.get(out);
+  if (!sink) { sink = createTrackedLogSink(out); trackedSinks.set(out, sink); }
+  return sink;
+}
+function emitTracked(level: Level, component: string, msg: string,
+  data: Record<string, unknown> | undefined, callback: (result: LogWriteResult) => void): void {
+  const notify = (result: LogWriteResult) => { try { callback(result); } catch {} };
+  if (LEVEL_RANK[level] < LEVEL_RANK[minLevel]) { notify("filtered"); return; }
+  try {
+    const entry = { ts: new Date().toISOString(), level, component, msg, ...data };
+    const out = level === "error" ? process.stderr : process.stdout;
+    trackedSink(out).write(JSON.stringify(entry) + "\n", notify);
+  } catch { notify("failed"); }
+}
+```
+
+Add these two members to the existing object returned by `createLogger`:
+
+```typescript
+writeTracked: (level: Level, msg: string, data: Record<string, unknown> | undefined,
+  callback: (result: LogWriteResult) => void) => emitTracked(level, component, msg, data, callback),
+trackedSinkSnapshot: () => ({
+  sinkErrors: trackedSink(process.stdout).snapshot().sinkErrors +
+    trackedSink(process.stderr).snapshot().sinkErrors,
+}),
+```
+
+Production process sinks keep their error listener for process lifetime, including after the last pending callback; test sinks call `dispose()` only after stream close/error settlement. No per-call process listener accumulation. The writer's start/end `sinkErrors` delta is a clock-level diagnostic gap, never assigned to a particular already-acknowledged row. Filtered levels perform no write. Serialization/sink errors and a throwing result observer never escape into media or recursively log. Existing logger methods retain their behavior and formatting.
+
+`createVoiceTraceWriter` keeps attempted/acknowledged/filtered/failed/overflow/pending counters and a cumulative `sinkErrors` delta. A row is delivered only after `acknowledged`; filtering is counted as missing diagnostics. Pending writes are bounded by the sink's 256 cap; overflow is an explicit lost row and never an unbounded memory queue. After the next normal acknowledged row, submit at most one `diagnostic_gap` containing the unreported failure count; latch gap-in-flight before invoking `writeTracked`, clear only the reported count on its acknowledgment, and retry only after a later normal write. Failure of the gap writer does not recursively log. The cumulative failure count never resets: a later gap does not recover the lost rows.
+
+Expose `settleWrites(timeoutMs = 250)` for finalization only: wait for the writer's pending acknowledgments with a cleared bounded timer, then freeze remaining unresolved count as `unacknowledged`. Late callbacks cannot turn a frozen incomplete snapshot into success. `complete` is false on any filtered/failed/overflow/unacknowledged row or sink error. Finalize attempt rows → bounded write settlement → summary snapshot/persistence; never await log delivery on media paths. Permanent log failure remains detectable in a successful Mongo summary; if both sinks fail there is no durable success claim. A timeout means unknown delivery, never acknowledged. Use `performance.now()` and one process UUID initialized at module load.
 
 - [ ] **Step 2: Introduce separate immutable contexts.**
 
@@ -152,13 +229,17 @@ export interface SpeechTracePort {
   bindBridge(turnId: string, speechId: string): void;
   bindSynthesis(synthesisId: string, speechId: string): void;
   markCancellation(speechId: string, cause: CancellationCause): void;
+  synthesisFailure(synthesisId: string, errorClass: "tts_provider_failed"): void;
+  unboundProviderFailure(kind: "tts" | "llm", errorClass: "tts_provider_failed" | "llm_provider_failed"): void;
   metrics(event: import("@livekit/agents").MetricsCollectedEvent): void;
+  actionGap(reason: "cancel_failed" | "action_ownership_unproved", speechId: string): void;
+  teardown(result: "closed" | "failed" | "timeout", reason: "call_close" | "late_start" | "late_start_failed"): void;
   close(cause: "call_closed" | "setup_failed"): void;
   snapshot(): CallDiagnosticCounts;
 }
 ```
 
-`BridgeAttempt` methods are `started`, `response(status)`, `text(length, monoMs)`, `fail(errorClass)`, `finish(outcome,cause)`, `bind(speechId)`; synthesis equivalents are `firstFrame(frameMetadata)`, `finish` and `bind`. `fail` latches a directly observed error before cleanup; `finish(cancelled)` cannot erase it. Terminal event includes nullable observations plus reasons. Methods called after terminal emit only supplemental observations under original IDs and do not mutate another attempt or its counters. Run ID/conflicting-binding validation: a different second speech ID for one turn/synthesis emits a gap and marks correlation missing, rather than replacing the first association.
+`BridgeAttempt` methods are `started`, `response(status)`, `text(length, monoMs)`, `fail(errorClass)`, `finish(outcome,cause)`, `bind(speechId)`; synthesis equivalents are `frame(frameMetadata)`, `fail(errorClass)`, `finish` and `bind`. `frame` accumulates frame count, per-channel sample count and generated duration (`samplesPerChannel / sampleRate` summed per frame); emit the first-frame event once and include final totals in the terminal even for cancellation/error. Mixed sample rates retain summed duration with terminal `sampleRate: null`/`not_applicable`; never sum samples as a duration under a guessed constant rate. `fail` latches a directly observed error before cleanup; `finish(cancelled)` cannot erase it. Terminal event includes nullable observations plus reasons. Methods called after terminal emit only supplemental observations under original IDs and do not mutate another attempt or its counters. Run ID/conflicting-binding validation: a different second speech ID for one turn/synthesis emits a gap and marks correlation missing, rather than replacing the first association.
 
 Implement owner finalization with this one-shot pattern, specialized to each entity's typed row:
 
@@ -177,18 +258,22 @@ function terminalOnce<T>(emit: (value: T) => void, count: (value: T) => void) {
 
 Counts advance even when logging fails; the writer records failure separately. The recorder callback must be synchronous and throw-safe so logging cannot abort the SDK speech event or provider loop.
 
-Handle completion: use `addDoneCallback`, read its **own** `chatItems` and `exception()` only after `done()`. For each assistant message record text **length**/interrupted boolean and `metrics.startedSpeakingAt` if numeric (seconds since epoch; store source/unit). Keep absence `not_observed`, including an interrupted handle with zero items. Terminal precedence: known provider/bridge error → failed; explicit call/startup cancellation → cancelled; SDK `interrupted` → interrupted; otherwise finished handle → completed. If completion/error ordering cannot establish final classification at the callback (Task 0), use a short diagnostic-pending record finalized by owned error/binding or call close, without gating replacement scheduling; the capability gate must determine a correct bounded policy before implementation readiness. `waitForPlayout()` alone is no proof of audio receipt.
+Register one synchronous public `ttsModel.on("error", onTtsError)` listener **before** session start/default-node invocation. It reads `synthesisTraceContext.getStore()` in that same callback, validates the call/boot and live owner, and invokes `synthesisFailure` to latch `tts_provider_failed` before the SDK can swallow the exception into normal reader EOF. Never look up current speech. The provider instance is the actual `buildTts` result passed to AgentSession. If context is absent/evicted/conflicting, retain a call-level unbound error and diagnostic gap. Remove this listener only after all owned nodes have settled or been synchronously finalized during bounded cleanup. The callback is throw-safe and does not await. `SynthesisAttempt.fail` propagates a known error to its explicitly bound speech token; if binding arrives later, propagate only to that original token as supplemental evidence, preserving any already-emitted incomplete terminal. Overlapping provider errors must remain isolated by ALS.
 
-EOU/LLM/TTS metrics use their explicit `speechId`. `llm_metrics` + matching bridge ALS turn emits `bridge_bound`, even when SDK `requestId === ""`; `tts_metrics` + synthesis ALS emits `synthesis_bound`. First frame may arrive before binding; keep its event keyed by synthesis ID and later enrich the correct speech. Metrics with missing context/IDs emit an explicit gap. Interruption aggregate metrics and false-interruption events are call-level unless an explicit associated speech is supplied by the SDK. Do not assign them to the most recent handle.
+Handle completion: `addDoneCallback` records **SDK settlement** and reads that handle's own `chatItems` and nullish `exception()`; no exception is a weak observation, never success evidence. Record each assistant item's text **length**, interrupted boolean and numeric `startedSpeakingAt` (seconds, `sdk_wall`). Missing items remain `not_observed` even for interrupted empty handles. Application bridge/node owners latch error/cancel before their settlement; this causal ordering determines the one-shot terminal. Do not wait for optional metrics or media output to recover identity.
+
+At SDK settlement, attempt finalization immediately with these precedence rules: known associated application error → `failed`; directly observed local cancellation → `cancelled`; SDK interruption → `interrupted`; otherwise `completed` only if required causal coverage is proved and every associated application owner settled without failure/cancel. For an application `say`, bridge work is `not_applicable`; for generated replies absence of an explicit bridge association is `correlation_missing`. Successful generated-audio coverage requires a genuinely bound settled synthesis; an unknown/unbound synthesis cannot supply a speech frame count or establish success. Any active/unbound synthesis coverage that cannot be excluded from that speech using explicit evidence makes its coverage unknown, not a time-based join. Missing causal coverage or linked work still pending at SDK settlement yields `incomplete` immediately with `sdkSettled: true` and reason `not_observed`/`correlation_missing`. Late binding/settlement supplements the original incomplete record without another terminal/count. This deliberately favors an honest incomplete record over a falsely successful one; no timer or pending diagnostic state gates replacement. `exception()` may add a known failure, but is never the primary error route. `waitForPlayout()` is not handset evidence.
+
+EOU/LLM/TTS metrics use their explicit `speechId`. `llm_metrics` + matching bridge ALS turn emits `bridge_bound`, even when SDK `requestId === ""`; `tts_metrics` + synthesis ALS emits `synthesis_bound`. First frame may arrive before binding; keep its event keyed by synthesis ID and later enrich the correct speech. Metrics with missing context/IDs preserve an unbound observation; distinguish expected no-metric coverage from conflicting/lost identity gaps. Interruption aggregate metrics and false-interruption events are call-level unless an explicit associated speech is supplied by the SDK. Do not assign them to the most recent handle.
 
 - [ ] **Step 4: Verify schema and registry semantics.**
 
-Run: `npx vitest run src/voice/voice-trace.test.ts src/voice-worker/speech-trace.test.ts`
+Run: `npx vitest run src/logging/logger.test.ts src/voice/voice-trace.test.ts src/voice-worker/speech-trace.test.ts`
 
-Assertions: invalid/missing metadata safe fallback; enum/field allowlist; canceled speech before any EOU/TTS; two overlapping requests with reversed metrics; metrics after terminal; duplicate terminal/binding; duplicate handle registration; no-content bridge; say with no bridge; missing TTS; negative SDK metrics map to null; 257 active/recent entities and association overflow produce gaps; summaries count each attempt once; call close twice finalizes once; thrown logger does not escape; all retained maps at/below bounds after stress; close detaches fixed listeners. Expected all pass, not an implementation-mirroring snapshot test.
+Assertions: invalid/missing metadata safe fallback; enum/field allowlist; canceled speech before any EOU/TTS; two overlapping requests with reversed metrics; metrics after terminal; duplicate terminal/binding; duplicate handle registration; no-content bridge; say with no bridge; missing TTS; negative SDK metrics map to null; 257 active/recent entities and association overflow produce gaps; summaries count each attempt once; call close twice finalizes once; real Writable sync throw, asynchronous callback/error event, write(false), filtered LOG_LEVEL, 257 pending writes and never-ack timeout cannot escape or claim delivery; provider error precedes normal node EOF and handle settlement before/after frame; all retained maps at/below bounds after stress; close detaches fixed listeners. Expected all pass, not an implementation-mirroring snapshot test.
 
 ```bash
-git add src/voice/voice-trace.ts src/voice/voice-trace.test.ts src/voice-worker/trace-context.ts src/voice-worker/speech-trace.ts src/voice-worker/speech-trace.test.ts
+git add src/logging/logger.ts src/logging/logger.test.ts src/voice/voice-trace.ts src/voice/voice-trace.test.ts src/voice-worker/trace-context.ts src/voice-worker/speech-trace.ts src/voice-worker/speech-trace.test.ts
 git commit -m "feat(voice): record bounded correlated speech attempts"
 ```
 
@@ -240,7 +325,7 @@ The stream constructor installs its abort listener after `super` and closes over
 
 Use try/catch/finally for request construction, fetch, status parsing, reader consumption and decoder/parser errors. Emit response status immediately; first nonempty content updates first-text time; subsequent nonempty chunks update maximum inter-chunk gap. Skip empty content without minting a first token. Stream original text chunks immediately. Maintain existing interruption-marker snapshot and acceptance clearing behavior. Reader cancellation and release belong in `finally`; detach both fetch and lifecycle listeners. If there was no content, first-text is null/not_reached and max-gap is null/not_applicable unless at least two chunks were observed.
 
-The abort callback must abort HTTP immediately; diagnostics cannot await metrics. `finally` calls attempt.finish once. A pre-run aborted attempt is already terminal but can still receive a late SDK binding/metric. A thrown error preserved in the attempt remains failed if base SDK cleanup subsequently aborts its controller. Missing metrics leave `correlation_missing` and fail the required complete-correlation regression instead of disappearing.
+The abort callback must abort HTTP immediately; diagnostics cannot await metrics. `finally` calls attempt.finish once. A pre-run aborted attempt is already terminal but can still receive a late SDK binding/metric. A thrown error preserved in the attempt remains failed if base SDK cleanup subsequently aborts its controller. Missing metrics retain the bridge attempt with `correlation_missing`; when the pinned genuine LLM metric is present it must bind the correct handle. Tests fail on loss, guessed/wrong joins or false outcomes, not a truthfully unavailable association. Bridge failure is latched before the original BridgeError is rethrown; the narrow public provider event route in startup Task 6 makes application-managed bridge failures nonfatal to the SDK counter while preserving the event and existing bounded application recovery.
 
 - [ ] **Step 3: Verify real HTTP boundaries.**
 
@@ -259,6 +344,7 @@ git commit -m "feat(voice): correlate bridge attempts before streaming starts"
 
 **Files:**
 - Create: `src/voice-worker/traced-agent.ts`
+- Create: `src/voice-worker/traced-agent.test.ts`
 - Modify: `src/voice-worker/telemetry.ts` (`TurnMetrics`, `CallStats`)
 - Modify: `src/voice-worker/telemetry.test.ts`
 
@@ -266,56 +352,84 @@ git commit -m "feat(voice): correlate bridge attempts before streaming starts"
 
 Override `onUserTurnCompleted` to call the injected startup callback synchronously for nonempty `newMessage.textContent?.trim()` before the method returns its resolved promise. Do not modify chat context, messages or worker placeholder instructions. Override `ttsNode` with exact signature derived from `voice.Agent["ttsNode"]`, assign synthesis UUID and invoke the real `voice.Agent.default.ttsNode(this, text, modelSettings)` under synthesis ALS.
 
-Wrap the returned stream using a pull-through reader, preserving original frames and backpressure. No frame cloning/resampling, buffering, new transform text or `userdata` changes:
+Wrap the returned stream with one in-flight read, preserving original frame objects/metadata and incremental delivery. Synchronously latch cancellation **before** `reader.cancel()`; it can resolve an outstanding `read()` with `done: true`, or race a ready frame. A cancellation finalizer must win over that continuation. The listener described in Task 1 latches TTS failure even when the default reader completes normally. Add this reusable helper in `traced-agent.ts` and test its production implementation directly:
 
 ```typescript
-const input = await synthesisTraceContext.run(context,
-  () => voice.Agent.default.ttsNode(this, text, modelSettings));
-if (input === null) {
-  attempt.finish("completed", "unknown");
-  return null;
+export function observeTtsStream<T extends { sampleRate: number; samplesPerChannel: number }>(
+  input: ReadableStream<T>,
+  attempt: {
+    frame(meta: { sampleRate: number; samplesPerChannel: number }): void;
+    fail(errorClass: "tts_node_failed"): void;
+    finish(outcome: AttemptOutcome, cause: CancellationCause): void;
+  },
+  signal: AbortSignal,
+): ReadableStream<T> {
+  const reader = input.getReader();
+  let state: "open" | "cancelled" | "finished" = "open";
+  let pending: Promise<ReadableStreamReadResult<T>> | null = null;
+  let cancelPromise: Promise<void> | null = null;
+  let released = false;
+  let output: ReadableStreamDefaultController<T>;
+  const release = () => {
+    if (released) return;
+    released = true;
+    signal.removeEventListener("abort", onAbort);
+    reader.releaseLock();
+  };
+  const cancelOwned = (cause: CancellationCause, closeOutput: boolean): Promise<void> => {
+    if (state !== "open") return cancelPromise ?? Promise.resolve();
+    state = "cancelled"; // Before upstream cancel can resolve pending read.
+    attempt.finish("cancelled", cause); // Prior fail latch still wins in recorder.
+    if (closeOutput) { try { output.close(); } catch {} }
+    const activeRead = pending;
+    let cancellation: Promise<void>;
+    try { cancellation = reader.cancel(); }
+    catch { cancellation = Promise.resolve(); }
+    cancelPromise = Promise.allSettled([cancellation, activeRead]).then(() => { release(); });
+    return cancelPromise;
+  };
+  const onAbort = () => { void cancelOwned("call_closed", true); };
+  return new ReadableStream<T>({
+    start(controller) {
+      output = controller;
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    },
+    async pull(controller) {
+      if (state !== "open") return;
+      try {
+        pending = reader.read();
+        const next = await pending;
+        if (state !== "open") return; // No completed terminal or late frame after cancel.
+        if (next.done) {
+          state = "finished";
+          attempt.finish("completed", "unknown"); // Recorder's failure latch overrides EOF.
+          release();
+          controller.close();
+          return;
+        }
+        attempt.frame({ sampleRate: next.value.sampleRate,
+          samplesPerChannel: next.value.samplesPerChannel });
+        controller.enqueue(next.value);
+      } catch {
+        if (state !== "open") return;
+        state = "finished";
+        attempt.fail("tts_node_failed");
+        attempt.finish("failed", "unknown");
+        release();
+        controller.error(new Error("Voice synthesis failed"));
+      } finally { pending = null; }
+    },
+    cancel() { return cancelOwned("framework_cancelled", false); },
+  }, { highWaterMark: 0 });
 }
-const reader = input.getReader();
-let finished = false;
-let frameCount = 0;
-const finish = (outcome: AttemptOutcome, cause: CancellationCause) => {
-  if (finished) return;
-  finished = true;
-  attempt.finish(outcome, cause);
-  reader.releaseLock();
-};
-return new ReadableStream({
-  async pull(controller) {
-    try {
-      const next = await reader.read();
-      if (finished) return;
-      if (next.done) {
-        finish("completed", "unknown");
-        controller.close();
-        return;
-      }
-      frameCount += 1;
-      if (frameCount === 1) attempt.firstFrame({
-        sampleRate: next.value.sampleRate,
-        samplesPerChannel: next.value.samplesPerChannel,
-      });
-      controller.enqueue(next.value);
-    } catch {
-      if (finished) return;
-      attempt.fail("tts_node_failed");
-      finish("failed", "unknown");
-      controller.error(new Error("Voice synthesis failed"));
-    }
-  },
-  async cancel() {
-    if (finished) return;
-    try { await reader.cancel(); }
-    finally { finish("cancelled", "framework_cancelled"); }
-  },
-}, { highWaterMark: 0 });
 ```
 
-Also catch default-node construction rejection before reader creation and terminalize failed. In implementation ensure pending-read cancellation releases the lock only after read/cancel settlement; protect late read rejection from double terminal/error. Keep detailed provider exception only in original SDK error path, not new diagnostic output. A node canceled without any TTS metric is still a visible synthesis attempt, with an explicit unbound/incomplete association; the required capability gate must resolve what can be joined before readiness. Do not assign it to the current/last speech. The real default node preserves timed transcripts; Task 0 and integration tests must prove this exact wrapper does too.
+`attempt` methods are the synchronous throw-safe recorder methods; state flags never depend on sink behavior. Reader release follows pending read/cancel settlement and happens once. If upstream ignores cancellation forever, call-level cleanup times out and reports the unreleased resource incomplete; attach rejection handlers and retain the final cleanup continuation. No extra output frames are permitted while waiting. The helper adds no utterance queue and makes no assertion about inaccessible SDK/provider queue sizes.
+
+Allocate the synthesis UUID/owner, then invoke actual `voice.Agent.default.ttsNode(this, text, modelSettings)` inside immutable synthesis ALS. Catch rejection before reader creation as failed. A null node result finalizes its own synthesis with zero observed frames (or the prior failure latch), and stays unbound. Wrap a returned input even when the call signal is already aborted so the reader is canceled/released. Constructor/node rejection after close cannot emit another terminal. No first-frame or retained `say()` handle implies a speech association. Bind only from genuine TTS metric+context; retain expected unbound before/after-frame cancellation and failures.
+
+Minimum production wrapper tests in `traced-agent.test.ts`: pending `read()` then `cancel` (terminal cancelled, zero frames, never completed), enqueue racing cancel (no forwarded frame after latch), upstream rejection racing cancel (one terminal/release), call abort before first pull/during read, reader normal EOF after provider failure before/after frame, original frames+timed metadata, incremental two-frame output, final frame/sample/duration totals and multi-rate totals. Real SDK provider cases in the capability/startup suites cross the public error listener; a throwing fake reader alone is insufficient.
 
 - [ ] **Step 2: Replace `TurnMetrics`' single pending state with recorder delegation.**
 
@@ -323,19 +437,19 @@ Delete `pendingEou`, `llmTtftBySpeechId`, `pendingInterrupted`, `pendingFalseInt
 
 Extend CallStats with a schema-v2 aggregate snapshot received at flush. Store `speechAttempts`, outcome counts, `bridgeAttempts`, `synthesisAttempts`, `generatedAudioObserved`, `knownPlayoutObserved`, `incomplete`, `unbound`, `diagnosticGaps`, logging failures and `latencyEstimateSamples/excludedByReason`; no ID/event arrays. `interruptions` is count of SDK interrupted handles including those canceled before committed text; `cancelled` remains separate and a local startup cancellation can also carry `sdkInterrupted: true` for compatibility. Preserve `retries` and first-terminal-call-outcome rules.
 
-Legacy `turns`/`latency` fields must be explicitly documented: keep `turns` equal to eligible stage-estimate sample count, with `latency.kind: "estimated_eou_to_first_generated_audio"` and `schemaVersion: 2`. Openings, failures/cancellations, multiple ambiguous paths or missing components cannot enter these distributions. Do not reuse historical `totalToFirstAudioMs` name for a newly asserted measured latency. Replace unbounded `turnLatencies` with a fixed reservoir of at most 1,024 eligible estimates and report `latency.sampled`/`eligibleSampleCount`/`retainedSampleCount`; to avoid pretending exact distributions, use deterministic first-1,024 retention and mark `truncated: true` after overflow. KPR-465 uses JSONL full denominators for actual comparisons. Bound failure storage to counts/last class rather than an unbounded string array.
+Legacy `turns`/`latency` fields must be explicitly documented: keep `turns` equal to eligible stage-estimate sample count, with `latency.kind: "estimated_eou_to_first_generated_audio"` and `schemaVersion: 2`. Openings, failures/cancellations, multiple ambiguous paths or missing components cannot enter these distributions. Retain at most one candidate TTS TTFB plus a distinct-metric count per synthesis. Only exactly one distinct genuine metric is eligible; two or more segments are `ambiguous_components`, never last/first-by-arrival. Deduplicate repeated delivery by metric object identity (`WeakSet`) or application eventId in the offline reducer; requestId/timestamp alone is not unique. Do not reuse historical `totalToFirstAudioMs` name for a newly asserted measured latency. Replace unbounded `turnLatencies` with a fixed reservoir of at most 1,024 eligible estimates and report `latency.sampled`/`eligibleSampleCount`/`retainedSampleCount`; to avoid pretending exact distributions, use deterministic first-1,024 retention and mark `truncated: true` after overflow. KPR-465 uses JSONL full denominators for actual comparisons. Bound failure storage to counts/last class rather than an unbounded string array.
 
 - [ ] **Step 3: Make summary persistence truthful and shutdown ordered.**
 
 Replace the single `flushedOutcome` completion guard with `terminalOutcome` (first-wins) plus shared `flushPromise` and persistence result. Concurrent flushes share one attempt; call outcome is latched before writes, but only acknowledged Mongo insert is `persisted: true`. On connect/insert failure, log bounded `summary_persistence: failed` and return `{ persisted: false }`; no caller may log success. Avoid automatic retry without an idempotency key: a response-loss insert could otherwise duplicate. Keep Mongo client close in finally, and close failure separate from insert acknowledgement.
 
-Session close first marks startup terminal/cancels owned activity, calls SpeechTrace.close to terminalize remaining owners synchronously, then snapshots counts, then awaits CallStats.flush, then closes outer Mongo. Do not await optional metrics or SpeechHandle playout during diagnostic finalization. Late callback after close is ignored or emits a supplemental row with the original ID, never another terminal/counter. Listener disposal is idempotent.
+Session close first marks startup terminal/cancels owned activity, calls SpeechTrace.close to terminalize remaining owners synchronously, then performs bounded tracked-write settlement, snapshots counts, awaits CallStats.flush, and closes outer Mongo. Do not await optional metrics or SpeechHandle playout during diagnostic finalization. Late callback after close is ignored or emits a supplemental row with the original ID, never another terminal/counter. Listener disposal is idempotent.
 
-Run: `npx vitest run src/voice-worker/telemetry.test.ts src/voice-worker/session.test.ts src/voice-worker/sdk-capability.integration.test.ts`
+Run: `npx vitest run src/voice-worker/traced-agent.test.ts src/voice-worker/speech-trace.test.ts src/voice-worker/telemetry.test.ts src/voice-worker/session.test.ts src/voice-worker/sdk-capability.integration.test.ts`
 
 Expected: missing metrics remain unknown; first outcome retained across setup/error/shutdown; single concurrent insert; failed insert not marked persisted; close follows finalization/flush even if logging/persistence fails; no heartbeat behavior regression.
 
 ```bash
-git add src/voice-worker/traced-agent.ts src/voice-worker/telemetry.ts src/voice-worker/telemetry.test.ts
+git add src/voice-worker/traced-agent.ts src/voice-worker/traced-agent.test.ts src/voice-worker/telemetry.ts src/voice-worker/telemetry.test.ts
 git commit -m "feat(voice): preserve synthesis evidence and complete call denominators"
 ```

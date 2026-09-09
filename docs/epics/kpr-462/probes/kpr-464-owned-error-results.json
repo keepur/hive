@@ -1,0 +1,145 @@
+{
+  "node": "v24.16.0",
+  "results": [
+    {
+      "routeOwned": false,
+      "mode": "owned",
+      "maxUnrecoverableErrors": 3,
+      "errorCount": 4,
+      "closedBeforeCleanup": true,
+      "replacementCompleted": null,
+      "metricBindings": [
+        {
+          "speechId": "speech_859b7616-72f",
+          "turnId": "prior-0"
+        },
+        {
+          "speechId": "speech_d47363aa-1ca",
+          "turnId": "prior-1"
+        },
+        {
+          "speechId": "speech_3a843be0-edc",
+          "turnId": "prior-2"
+        },
+        {
+          "speechId": "speech_7fcc2707-31c",
+          "turnId": "old-at-threshold"
+        }
+      ],
+      "applicationRouteEvents": [
+        {
+          "kind": "application_failure",
+          "turnId": "prior-0"
+        },
+        {
+          "kind": "application_failure",
+          "turnId": "prior-1"
+        },
+        {
+          "kind": "application_failure",
+          "turnId": "prior-2"
+        },
+        {
+          "kind": "application_failure",
+          "turnId": "old-at-threshold"
+        }
+      ]
+    },
+    {
+      "routeOwned": true,
+      "mode": "owned",
+      "maxUnrecoverableErrors": 3,
+      "errorCount": 4,
+      "closedBeforeCleanup": false,
+      "replacementCompleted": true,
+      "metricBindings": [
+        {
+          "speechId": "speech_8a38257c-606",
+          "turnId": "prior-0"
+        },
+        {
+          "speechId": "speech_c9f1630d-d8b",
+          "turnId": "prior-1"
+        },
+        {
+          "speechId": "speech_c04d2a88-356",
+          "turnId": "prior-2"
+        },
+        {
+          "speechId": "speech_2abede14-6d4",
+          "turnId": "old-at-threshold"
+        },
+        {
+          "speechId": "speech_e8430509-5a4",
+          "turnId": "replacement"
+        }
+      ],
+      "applicationRouteEvents": [
+        {
+          "kind": "application_failure",
+          "turnId": "prior-0"
+        },
+        {
+          "kind": "owned_route",
+          "turnId": "prior-0",
+          "context": "prior-0"
+        },
+        {
+          "kind": "application_failure",
+          "turnId": "prior-1"
+        },
+        {
+          "kind": "owned_route",
+          "turnId": "prior-1",
+          "context": "prior-1"
+        },
+        {
+          "kind": "application_failure",
+          "turnId": "prior-2"
+        },
+        {
+          "kind": "owned_route",
+          "turnId": "prior-2",
+          "context": "prior-2"
+        },
+        {
+          "kind": "application_failure",
+          "turnId": "old-at-threshold"
+        },
+        {
+          "kind": "owned_route",
+          "turnId": "old-at-threshold",
+          "context": "old-at-threshold"
+        }
+      ]
+    },
+    {
+      "routeOwned": true,
+      "mode": "unrelated",
+      "maxUnrecoverableErrors": 3,
+      "errorCount": 4,
+      "closedBeforeCleanup": true,
+      "replacementCompleted": null,
+      "metricBindings": [
+        {
+          "speechId": "speech_0a3c0d8e-560",
+          "turnId": "prior-0"
+        },
+        {
+          "speechId": "speech_36ac763f-e3b",
+          "turnId": "prior-1"
+        },
+        {
+          "speechId": "speech_0be1d68a-034",
+          "turnId": "prior-2"
+        },
+        {
+          "speechId": "speech_738622c2-f32",
+          "turnId": "old-at-threshold"
+        }
+      ],
+      "applicationRouteEvents": []
+    }
+  ],
+  "limits": "Test-local public event routing and real SDK lifecycle. Replacement is text-only; production recovery, TTS/output and live audio are later regressions."
+}

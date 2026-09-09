@@ -92,7 +92,17 @@ This fixes three distinct boundaries: canceled lock-waiter never acquires; cance
 
 `openWarmLease` calls `withSpawnTicket(ctx, leaseLifetimeCallback, { requestSignalMode: "admission_only" })`. This checks request cancellation while waiting for acquisition, then leaves the lifetime ticket's `attachAbort(() => lease.close("ticket-abort"))` governed by existing stop/shutdown ownership. The HTTP request's signal must never remain attached to that lifetime ticket after admission, or the first request's delayed close could destroy every later warm turn.
 
-After acquisition the opening initialization belongs to the lease. The first request and any replacement can be canceled independently before text is pushed. Extend the existing lease start readiness with a promise resolved by either `start(query)` or `close(reason)`; both already have idempotent closed handling. `runTurn` may queue against a published but unstarted lease; at its consumption slot it waits for readiness and then checks `isClosed`/request cancellation. This closes the existing publish-before-start rejection window without changing warm-path defaults. Closing before a late Query arrives still calls `query.close()` through the existing `start()` guard.
+After acquisition the opening initialization belongs to the lease. Reserve live opener A's demux slot **before publishing** the lease to successor B. In `openWarmLease`, after policy pinning/prompt shaping and immediately before `this.warmLeases.set(threadKey, pinnedLease)`, invoke the existing async `runWarmTurn` once; it synchronously checks/acquires its permit and calls `lease.runTurn` before its first await. `runTurn` must synchronously append its chain slot before waiting for start. Attach a rejection observer immediately so initialization cannot leave an unhandled rejection:
+
+```typescript
+const openingTurn = this.runWarmTurn(pinnedLease, ctx, onStream);
+void openingTurn.catch(() => {}); // Original promise is still returned to A below.
+this.warmLeases.set(threadKey, pinnedLease);
+```
+
+Retain the existing `openVoiceStreamingSession` try/catch and late-Query close guard. Replace the final second call to `runWarmTurn` with `return openingTurn`; the opener is never enqueued twice. If initialization fails, close the lease (which resolves readiness), retain the initialization error for A, and allow the observed opening promise to settle. A canceled request or circuit-open permit rejection reserves no work; it cannot later push an obsolete full-transcript opening. Starting an otherwise healthy published lease continues for an independently admitted B. There is no await or publication between live A's reservation and registry insertion. A's actual breaker acquisition now precedes initialization and is still recorded once; no extra probe permit is introduced.
+
+Extend lease readiness with a promise resolved by either `start(query)` or `close(reason)`. Successors can queue against a published unstarted lease behind A's already-reserved slot; at consumption each awaits readiness then checks closed/canceled state. A readiness promise alone without that pre-publication reservation is insufficient. Closing before a late Query arrives still calls `query.close()` through the existing `start()` guard.
 
 Use one ready signal (no timers):
 
@@ -120,7 +130,39 @@ const detachRequest = bindVoiceRequest(req.voiceRequestSignal, () => {
 });
 ```
 
-No `await` may occur between the final pre-push signal check, installing this owner and pushing this request's user message. If cancellation raced before attachment, rechecking/binding handles it synchronously. Dispose `detachRequest()` first in the existing `finally`, before setting `turnInFlight=false` and rearming idle. Suppress `req.onStream` when `req.voiceRequestSignal?.aborted`, including tool-ack text; still consume the result boundary so the next turn cannot read the predecessor's output. Keep the existing interrupt grace and failed-interrupt cleanup.
+No `await` may occur between the final pre-push signal check, installing this owner and pushing this request's user message. If cancellation raced before attachment, rechecking/binding handles it synchronously. Dispose `detachRequest()` first in the existing `finally`, before setting `turnInFlight=false` and rearming idle. Suppress `req.onStream` when `req.voiceRequestSignal?.aborted`, including tool-ack text; still consume the result boundary so the next turn cannot read the predecessor's output. Retain the grace window, but replace `requestInterrupt` escalation with ownership checks on **every asynchronous path**, including rejection. Capture Query identity, turn sequence and whether a turn was in flight; a predecessor's late failure may close only that same still-active owner. Use this body (retain the existing safeLog implementation):
+
+```typescript
+requestInterrupt(reason: string): void {
+  const query = this.query;
+  if (this.closed || !query) return;
+  const turn = this.turnCount;
+  const inFlight = this.turnInFlight;
+  const stillOwns = () => !this.closed && this.query === query &&
+    this.turnCount === turn && this.turnInFlight === inFlight;
+  this.interruptRequested = true;
+  const failed = () => {
+    if (!stillOwns()) return;
+    safeLog("warn", "Warm voice interrupt failed", { ...this.logCtx(), reason });
+    this.close(`interrupt-failed:${reason}`);
+  };
+  let interruption: Promise<void>;
+  try { interruption = query.interrupt(); }
+  catch { failed(); return; }
+  void interruption.then(() => {
+    if (!inFlight || !stillOwns()) return;
+    const grace = setTimeout(() => {
+      this.interruptGraceTimers.delete(grace);
+      try { if (stillOwns()) this.close("interrupt-noop"); }
+      catch { /* close is throw-safe; contain foreign implementations. */ }
+    }, WARM_INTERRUPT_GRACE_MS);
+    grace.unref?.();
+    this.interruptGraceTimers.add(grace);
+  }, failed).catch(() => {});
+}
+```
+
+Add `private readonly interruptGraceTimers = new Set<NodeJS.Timeout>()`; delete each timer from the set when it fires, and clear/delete all timers on turn settlement and lease close. The timer's deletion must occur before its owner check. A stale success must not arm a timer; a stale rejection cannot close an idle lease or a running/queued successor. Preserve same-owner failure escalation and stopped-agent whole-lease cleanup.
 
 Pass `voiceRequestSignal: ctx.voiceRequestSignal` in `runWarmTurn`'s `lease.runTurn` call. Add `checkVoiceRequest(ctx.voiceRequestSignal)` before breaker acquisition. Replace its catch with the following request-cancellation branch ahead of existing provider failure handling; `TurnClassification` already defines `{ outcome: "aborted" }` as breaker-neutral:
 
@@ -147,9 +189,10 @@ Extend the manager fixture from `src/agents/agent-manager.test.ts`; mock only st
 3. A is canceled during prompt/store preparation or async provider assembly: no later `adapter.runTurn`, no retry, sticky abort does not affect B.
 4. Warm A consumes, B queues. Abort B: A continues, B pushes no message; C subsequently completes on the same Query.
 5. Warm A is interrupted, drains result, then B consumes. Abort A again/late: no new Query interrupt, B completes and lease remains open.
-6. Abort opening A before `start(query)` and publish B: B waits for the ready Query, A never pushes text, B progresses; close during initialization closes the late Query once and releases lock/budget.
-7. stopAgent and shutdown still close the entire warm lease; request cancellation preserves its lease.
-8. Thrown preparation/admission/provider error, canceled queued request and zero-progress abort retain existing breaker and persistence semantics.
+6. Publish live opener A while Query start is gated, then admit B before start: A consumes exactly once before B, and no full-transcript opener follows B. Repeat with A canceled before start: A pushes no message, B consumes exactly once and progresses. Close during initialization closes the late Query once and releases lock/budget.
+7. A requests interruption, drains result, and B begins before the interrupt promise rejects: rejection neither closes Query/lease nor interrupts B; B completes. Repeat stale resolution (no grace timer), same-owner rejection (lease closes), and idle interrupt rejection after a successor starts (successor survives).
+8. stopAgent and shutdown still close the entire warm lease; request cancellation preserves its lease.
+9. Thrown preparation/admission/provider error, canceled queued request and zero-progress abort retain existing breaker and persistence semantics.
 
 Run: `npx vitest run src/agents/voice-request-cancellation.test.ts src/agents/warm-voice-session.test.ts src/agents/agent-manager.test.ts`
 
@@ -198,7 +241,33 @@ Keep 503 engine-auth/budget, 500 internal errors, circuit-open spoken notice, er
 
 - [ ] **Step 3: Centralize actual text-write observations.**
 
-Route model chunks, tool acknowledgements and existing circuit-outage spoken text through one request-local observer invoked immediately around the real `res.write`/`res.end` operation. Record first nonempty SSE text only if the write was attempted on a live writable socket; `write(false)` indicates accepted backpressure, not failure. A throw is a write failure. Preserve stream chunk delivery; no buffering or waiting for diagnostics. Include text length, never content. For nonstreaming record response text length and separate response-complete timing; don't falsely label a nonstreaming response as first SSE text.
+Route model chunks, tool acknowledgements and existing circuit-outage spoken text through one request-local observer invoked immediately around the real `res.write`/`res.end` operation. Record first nonempty SSE text only if the write was attempted on a live writable socket; `write(false)` indicates accepted backpressure, not failure. A throw is a write failure and must latch the request outcome **inside the helper**, before propagation: `onStream` exceptions can be swallowed by provider/warm consumers. Install a request-local response `error` listener for asynchronous write failures too and detach it in the outer finally. Centralize all raw writes/end calls behind this closure (use a concrete typed request trace at implementation):
+
+```typescript
+let writeFailed = false;
+const latchWriteFailure = () => {
+  if (writeFailed) return;
+  writeFailed = true;
+  trace.fail("sse_write_failed");
+  requestAbort.abort();
+};
+const writeChunk = (chunk: string, contentLength: number): boolean => {
+  if (clientGone || res.destroyed || res.writableEnded || writeFailed) return false;
+  try {
+    const acceptedWithoutBackpressure = res.write(chunk, (error?: Error | null) => {
+      if (error) latchWriteFailure();
+    });
+    if (contentLength > 0) trace.text(contentLength, performance.now());
+    return acceptedWithoutBackpressure; // false is accepted backpressure, not failure.
+  } catch (error) {
+    latchWriteFailure();
+    throw error;
+  }
+};
+res.on("error", latchWriteFailure);
+```
+
+Terminal precedence reads the latched `writeFailed` flag even if spawn returns a nominal result; it cannot become completed or cancelled merely because failure-triggered cleanup aborts. On response finalization, observe `finish`/`close`/`error` and settle any still-pending writes before choosing the request terminal, with a bounded teardown timeout producing `incomplete` if necessary; text streaming never waits for diagnostics. Apply the same latch-before-propagation rule to `res.end`. Preserve stream chunk delivery; no buffering or waiting for diagnostics. Include text length, never content. For nonstreaming record response text length and separate response-complete timing; don't falsely label a nonstreaming response as first SSE text.
 
 Retain legacy successful `Voice turn complete` fields for existing consumers but correct its comment: `firstTokenMs` measures engine text emission, including hold phrases, not first audio or caller receipt. Add trace version/turn ID to that line or emit a clearly separate schema-v2 event. Stage/tool fields use an allowlist of numeric durations/counts and boolean warm/ack state; do not spread arbitrary provider objects or log raw exception/request bodies in the new diagnostic rows.
 
@@ -208,7 +277,7 @@ Keep existing HTTP tests for both auth schemes, assistant resolution, payload co
 
 Create `voice-startup.integration.test.ts` composing real `VoiceAdapter`, `Dispatcher.routeVoiceTurn` (when configured), `AgentManager` and `WarmVoiceSession` with fake provider/store dependencies. Use two real HTTP client requests and explicit server-side barriers. In cold and warm modes, settle predecessor engine work, admit/queue the replacement, and only then close the predecessor client socket. Assert replacement emits text, reaches a normal done frame, settles, and owns its own new trace/attempt IDs. Also close a queued successor before admission and prove it never invokes provider. At least one scenario must pipe the replacement's SSE through real HiveLLM and fake TTS/output fixture to prove forward progression across both boundaries.
 
-Assert one request terminal and each internal attempt terminal on: prompt failure, lookup failure, budget rejection, provider circuit-open, returned errors, resumed retry, no-content, midstream failure, throwing response write, disconnect before spawn and disconnect after text. Error while a predecessor is winding down cannot trigger a successor abort or retry. Existing warm/tool-ack suites remain required.
+Assert one request terminal and each internal attempt terminal on: prompt failure, lookup failure, budget rejection, provider circuit-open, returned errors, resumed retry, no-content, midstream failure, throwing response write swallowed by warm/provider onStream, async response write callback/error failure, accepted write(false), disconnect before spawn and disconnect after text. Error while a predecessor is winding down cannot trigger a successor abort or retry. Existing warm/tool-ack suites remain required.
 
 Run: `npx vitest run src/channels/voice/voice-adapter.test.ts src/channels/voice/voice-adapter.integration.test.ts src/channels/voice/voice-startup.integration.test.ts src/agents/voice-tool-ack.test.ts`
 
