@@ -82,7 +82,7 @@ const clearingFactsNaming = async (clears: string) =>
 | file | `startMarker` | `endAnchor` | verified |
 | --- | --- | --- | --- |
 | `src/agents/agent-runner.ts` | `"KPR-454 D2: runtime tool-failure observation"` | `"\n    return hooks;"` (four-space indent, the `buildHooks` tail chunk 4 Step 1 inserts above) | exactly **one** occurrence in the file today (`agent-runner.ts:1973`) |
-| `src/agents/provider-adapters/tool-bridge.ts` | `"KPR-454 D3, the failure half"` | `` "return `Tool execution failed (" `` — the last statement of the `catch` arm, which chunk 4 Step 4 leaves in place | exactly **one** occurrence of that literal (the `:302` comment mentions the phrase but not the `return`-plus-backtick prefix) |
+| `src/agents/provider-adapters/tool-bridge.ts` | `"KPR-454 D3, the recovery half"` (precedes "the failure half" in the same catch/try pair — starting here covers BOTH Lane B insertions, not just the failure one) | `` "return `Tool execution failed (" `` — the last statement of the `catch` arm, which chunk 4 Step 4 leaves in place | exactly **one** occurrence of that literal (the `:302` comment mentions the phrase but not the `return`-plus-backtick prefix) |
 
 Declare it at module scope beside the two constants of item 7 — it reads `root` from there:
 
@@ -686,18 +686,20 @@ it("no code path in this diff reads costUsd, a duration threshold, or a tool_res
   // name and which `opsSources` does not cover. They are the only places an
   // inference could plausibly be written, so leaving them unscanned scans the
   // wrong files. Scanning whole modules is not an option — `agent-runner.ts`
-  // and `tool-bridge.ts` both legitimately mention `costUsd` and
-  // `tool_response` elsewhere — so bound each hunk by its own anchor comment.
-  // Both hunks open with a `// ── KPR-454` / `// KPR-454 D3` marker (chunk 4,
-  // Steps 1 and 4) and close on a literal that already exists in the file —
-  // NOT on "the enclosing block", which has no searchable textual form.
+  // legitimately mentions `costUsd` elsewhere (it is not this ticket's field)
+  // — so bound each hunk by its own anchor comment rather than the whole file.
+  // The tool-bridge.ts hunk starts at "the recovery half" (which precedes "the
+  // failure half" in the same try/catch pair), so one hunk covers BOTH Lane B
+  // insertions, not just the failure one. Both hunks close on a literal that
+  // already exists in the file — NOT on "the enclosing block", which has no
+  // searchable textual form.
   // `extractHunk` (harness contract item 10) takes both anchors and carries
   // its own able-to-fail length guards, so neither is repeated here:
   for (const hunk of [extractHunk("src/agents/agent-runner.ts",
                                   "KPR-454 D2: runtime tool-failure observation",
                                   "\n    return hooks;"),
                       extractHunk("src/agents/provider-adapters/tool-bridge.ts",
-                                  "KPR-454 D3, the failure half",
+                                  "KPR-454 D3, the recovery half",
                                   "return `Tool execution failed (")]) {
     expect(hunk).not.toContain("costUsd");
     expect(hunk).not.toContain("tool_response");
