@@ -68,7 +68,10 @@ The reader uses only caller-selected schema-v2 JSONL and explicit IDs. `kpr-464-
 | engine preparation failure | same | `call-diagnostics` / no joined speech / `engine-prep-failure` | request received → failed request terminal | unknown | not applicable | `unknown` | no adapter attempt was reached | pass; one request, zero attempts |
 | engine outer retry | same | `call-diagnostics` / no joined speech / `engine-retry` | request received → failed attempt 1 → completed attempt 2 → completed request | unknown | not applicable | `unknown` | explicit worker bridge binding | pass; one request and two independently terminal attempts |
 | engine missing lifecycle observations | same | `call-diagnostics` / no joined speech / `engine-request-loss`, `engine-request-missing-start`, `engine-attempt-loss`, `engine-attempt-missing-start` | starts or terminals occur independently before EOF | unknown | not applicable | `unknown` | request/attempt start or terminal according to row | expected incomplete with distinct entity/reason counts |
-| authorized live quiet/early-greeting/replacement checks | pending Task 9 deployment identity and explicit go | pending | pending | pending | pending | pending | all handset observations | pending |
+| live quiet answer | unavailable; Task 9 prerequisites below | not allocated | not observed | not observed | not observed | `unknown` | first audible words, silence, duplicate/stale speech, interruption verdict | pending |
+| live immediate hello before or at answer | unavailable; Task 9 prerequisites below | not allocated | not observed | not observed | not observed | `unknown` | first audible words, silence, duplicate/stale speech, interruption verdict | pending |
+| live greeting while opening starts, with caller-response replacement | unavailable; Task 9 prerequisites below | not allocated | not observed | not observed | not observed | `unknown` | first audible words, silence, duplicate/stale speech, interruption verdict | pending |
+| live hangup during startup | unavailable; Task 9 prerequisites below | not allocated | not observed | not observed | not observed | `unknown` | audio heard before hangup and any machine observations missing after disconnect | pending |
 
 Task 8 verification on the final pre-commit tree:
 
@@ -78,6 +81,37 @@ Task 8 verification on the final pre-commit tree:
 - `PATH=/opt/homebrew/opt/node@24/bin:$PATH npx vitest run src/voice-worker/startup.integration.test.ts src/voice-worker/sdk-capability.integration.test.ts src/channels/voice/voice-startup.integration.test.ts --reporter=verbose` — exit 0; 3 files, 112 tests passed, 0 skipped.
 - `PATH=/opt/homebrew/opt/node@24/bin:$PATH SLACK_APP_TOKEN=xapp-test SLACK_BOT_TOKEN=xoxb-test npm run check` — exit 0; typecheck, lint, formatting, and 198 test files with 4,178 tests passed. Existing repository lint warnings remain non-fatal.
 - `PATH=/opt/homebrew/opt/node@24/bin:$PATH npm run build` — exit 0.
+
+## Live startup acceptance status
+
+`implementation/regressions verified; live startup acceptance pending`
+
+That status relies on the recorded Task 8 verification above at commit `6027b2c54c8d2c5373d0fc4f107dadf0470b0a47`; this documentation update did not rerun those suites. Task 9 was not executed, no live proposal identity was invented, and KPR-464 acceptance is not complete.
+
+The live proposal cannot be finalized or submitted for execution because these prerequisites are unavailable:
+
+| prerequisite | current evidence |
+| --- | --- |
+| KPR-463 supported deployment | KPR-463 is `In Progress`, `spec-ready`, `needs-capable-delivery`, and `block:human`, without `ready-to-implement`; no supported running deployment is verified. |
+| Running engine revision | Unknown; no verified deployed-engine identity readback is available. |
+| Running worker revision | Unknown; no verified deployed-worker identity readback is available. |
+| Instance | Unknown; no supported target-instance readback is available. |
+| Deployed dependency pins | Unknown; the repository pins recorded for offline evidence do not prove the deployed runtime pins. |
+| Runtime flags | Unknown; no readback of the relevant deployed startup and warm-path flag values is available. |
+| Model and configured voice | Unknown; neither value has a verified deployed-config readback. |
+| Clock basis | Unknown; no deployed UTC clock basis or uncertainty readback is available for cross-process correlation. |
+| Live execution authorization | May has not given the separate explicit go required for live calls. |
+
+Once every prerequisite has a concrete reviewed value and the separate go is recorded, the smallest remaining call set is:
+
+| call | caller action | expected machine evidence | required caller observation |
+| --- | --- | --- | --- |
+| L1 quiet answer | Answer and remain quiet through startup. | Exactly one relevant opening; complete call/speech/turn attempt accounting; generated-audio and worker-playout observations kept distinct from handset receipt. | Actual first audible words; whether speech arrived without prolonged unexplained silence; whether any duplicate or stale speech played. |
+| L2 immediate hello | Say hello immediately before or at answer. | Caller input owns startup; exactly one caller response and no optional opening; complete attempt accounting. | Actual first audible words; whether the response arrived without prolonged unexplained silence; whether any opening or stale speech replayed. |
+| L3 opening-start replacement | Begin a greeting as the opening starts. | The exact obsolete opening is interrupted and one caller-response replacement proceeds; no later stale opening; complete canceled and replacement denominators. | Actual first audible words; whether interruption behaved normally; whether the response arrived without prolonged unexplained silence; whether old speech replayed. |
+| L4 startup hangup | Hang up while startup work is pending or beginning. | Disconnect terminalizes or explicitly leaves an incomplete observation for every started attempt; no post-disconnect successor audio or retry is attributed as successful. | What, if anything, was audible before hangup; caller recollection remains qualitative rather than a precise handset timestamp. |
+
+Before execution, the operator must have the reviewed call-specific stop procedure available. On identity/config drift, an unexpected destination, loss of required correlation, or a caller stop request: stop further dialing, hang up the active call, retain that attempt as failed or incomplete in the denominator, record missing observations, and do not retry until the same live authorization and verified runtime identity have been re-established. Sanitized call-specific diagnostics must keep destination, credentials, transcript, and audio bytes out of the record.
 
 ## Limits
 
