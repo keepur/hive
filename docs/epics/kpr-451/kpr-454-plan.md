@@ -1,6 +1,6 @@
 # KPR-454 runtime tool-failure producer implementation plan
 
-> **For agentic workers:** Execute this plan through the epic implementation lane (`dodi-dev:implement-ticket`). Read this index and all five numbered chunks as one plan before starting Task 1.
+> **For agentic workers:** Execute this plan through the epic implementation lane (`dodi-dev:implement-ticket`). Read this index and all six numbered chunks as one plan before starting Task 1.
 
 **Goal:** Publish every tool failure and tool recovery observed on either provider lane as a durable, store-only `ops_events` document in the KPR-458 envelope, delivering nothing and altering no turn.
 
@@ -162,9 +162,9 @@ Run from the child implementation worktree on Node 22 or 24 (CLAUDE.md: dev mode
 - If testing exposes a spec or plan mismatch, demote the ticket to the spec lane rather than reinterpreting the spec here.
 - Negative-verify is required at four points, and **each names the mutation, the tests that must fail, and why the mutation crosses the boundary that test guards** — a mutation nobody has confirmed crosses a boundary is not evidence:
   1. **AC4's pre-refactor pins** (chunk 1 Step 6) — `["sched:", "cron"]` → `["sched:", "callback"]`, failing **four** cases: the Step 1 table row, `outage-notices.test.ts:30`, `deadline-continuation.test.ts:94`, and Step 4's `classifies all six buckets`. (Not `team-`→`worker`: both map to `silent`, so `policyFor` is unchanged and every pin stays green.)
-  2. **AC8's containment** (chunk 4 Step 5) — remove the `try` from `observeToolFailure`; the Lane B case fails.
+  2. **AC8's containment** (chunk 4 **Task 5** Step 5) — remove the `try` from `observeToolFailure`; the Lane B case fails. (Chunk 4 holds Tasks 5 *and* 6, each with its own Steps 5 and 6 — always cite the task.)
   3. **AC9's `R1 · F · R2`** (chunk 5 Step 3) — replace the drainer's `entry.openSeq === job.openSeq` identity test with a bare `this.open.has(family)`; three of the four assertions fail.
-  4. **AC13's boot order** (chunk 4 Step 6) — relocate the publisher block below `await bgTaskManager.scanOrphans();`, failing `(b)`. (Not "just below the boundary marker": `(b)` bounds against named surfaces, the earliest of which is `bgTaskManager.start()` at `:492`, so a block at `:474` still passes.)
+  4. **AC13's boot order** (chunk 4 **Task 6** Step 6) — relocate the publisher block below `await bgTaskManager.scanOrphans();`, failing **both `(b)` and `(c)`** (`(a)` is presence-only and stays green). Predict both: `(c)` sweeps the region before `wiringStart`, and `wiringStart` is a `Math.max` over the wiring anchors, so moving the block down pulls `bgTaskManager.start(` and `bgTaskManager.scanOrphans(` into that region — a second red test that reads as a mis-applied mutation invites an implementer to "fix" it by widening `(c)`'s allowlist. Chunk 4 Task 6 Step 6 carries the measured offenders for both states. (Not "just below the boundary marker": `(b)` bounds against named surfaces, the earliest of which is `bgTaskManager.start()` at `:492`, so a block at `:474` still passes.)
 
   Restore after each.
 
@@ -178,7 +178,7 @@ Seven tasks, seven commits. Chunked into six files (chunk 2 split at its Task 2 
 | --- | --- | --- |
 | 1 | 1 | `refactor(KPR-454): one reserved-prefix table in outage-notices; add waitingFor` |
 | 2 | 2 | `feat(KPR-454): ops event contract types, reason registry, error tokens, id bound` |
-| 3 | 2 | `test(KPR-454): unit coverage for the contract module` |
+| 3 | 2b | `test(KPR-454): unit coverage for the contract module` |
 | 4 | 3 | `feat(KPR-454): ops publisher — accept path, epoch resolver, queue, open-condition map` |
 | 5 | 4 | `feat(KPR-454): capture points on both lanes; agentId through the Lane B assembly` |
 | 6 | 4 | `feat(KPR-454): wire the ops publisher above the spawn-capable boundary` |

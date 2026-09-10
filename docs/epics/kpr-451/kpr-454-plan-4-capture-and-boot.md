@@ -77,9 +77,10 @@ Replace the tail of `buildHooks` — the `return hooks;` at `agent-runner.ts:197
     }];
     // The SUCCESS hook — the shipped CLI's own hook table describes
     // PostToolUse as "Run after successful tool", so this is the RECOVERY
-    // signal D2 makes an obligation, never a failure signal. It reads
-    // `tool_response` for nothing (C12/AC15: outcome is published, never
-    // inferred).
+    // signal D2 makes an obligation, never a failure signal. The SDK's
+    // success payload is read for nothing (C12/AC15: outcome is published,
+    // never inferred — and chunk 5's hunk scan runs over this insertion, so
+    // this comment must stay clean of that payload field's name).
     hooks.PostToolUse = [{
       hooks: [async (input: HookInput) => {
         if (this.wasAborted) return {};

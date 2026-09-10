@@ -53,7 +53,29 @@ const opsSources = globSync("src/ops/**/*.ts", { cwd: root })
 
 **8. Per-test isolation.** A fresh `FakeDb` **and** a fresh `OpsPublisher` in `beforeEach`, and `__resetOpsPublisherForTests()` in `afterEach`. Roughly ten assertions below use a bare `findOne({})` with no filter and no sort, and many read absolute counter values (`rejected === 0`, `recoverySuperseded === 1`) rather than deltas — a document or a counter carried over from a prior case makes those pass or fail for the wrong reason, and `findOne({})` in particular will happily return a predecessor's row.
 
-**9. The three drive helpers, named here because every table below uses them and none introduces them:** `failOnTurnWith({ workItemId, threadId, … })` drives one Claude-lane tool failure on a turn whose `WorkItemContext` is built exactly as `agent-manager.ts:1951-1958` does (it carries all 28 AC3 admit rows); `driveFailure(tool)` and `driveSuccess(tool)` are the bare failure/success pair AC9's interleavings are written in. Define all three once at module scope beside the constants above.
+**9. The three drive helpers, named here because every table below uses them and none introduces them:** `failOnTurnWith({ workItemId, threadId, … })` drives one Claude-lane tool failure on a turn whose `WorkItemContext` is built exactly as `agent-manager.ts:1951-1958` does (it carries all 28 AC3 admit rows); `driveFailure(tool)` and `driveSuccess(tool)` are the bare failure/success pair AC9's interleavings are written in. Define all three once at module scope beside the constants above — **and with them the two names AC9's assertions read the publisher through**, which no other block introduces either:
+
+```typescript
+// The one family every AC9 case works in, built the way `observe.ts` builds it
+// (chunk 3, Step 5) rather than hand-spelled — a hand-spelled family that
+// drifts from the producer's own would make every AC9 entry assertion vacuous.
+const family = familyOf({
+  producer: HIVE_RUNTIME_PRODUCER,
+  reasonId: REASON_TOOL_FAILED,
+  subject: { kind: "tool", id: "Bash" },
+});
+
+// "How many clearing facts name this dedupeKey" — AC9's first assertion.
+// ASYNC: it goes through the fake's `find`, which appends one
+// `{collection: "ops_events", operation: "find"}` entry to `fakeDb.operations`,
+// so call it after a case that asserts on `operations.length`, never inside
+// one. Declared as an arrow reading the `beforeEach` binding, so it sees the
+// fresh per-test `fakeDb` (harness contract item 8) and not a module-load copy.
+const clearingFactsNaming = async (clears: string) =>
+  fakeDb.collection("ops_events").find({ clears }).toArray();
+```
+
+`familyOf` imports from `./publisher.js`, `HIVE_RUNTIME_PRODUCER`/`REASON_TOOL_FAILED` from `./reasons.js` — the same modules chunk 3's `observe.ts` reads them from.
 
 - [ ] **Step 1:** AC1–AC3 — the envelope, the zero-match fact, and reject-versus-omit.
 
@@ -446,6 +468,13 @@ it("R1 · F · R2 — the superseded recovery is dropped, not published", async 
   //
   // THE SEQUENCE THAT WORKS (harness contract item 3):
   //
+  //   await driveFailure("Bash");            // F1 — opens the family; without it
+  //   await publisher.__drainForTests();     //      R1 has nothing to clear and
+  //                                          //      enqueueRecoveryIfOpen no-ops
+  //   const entry0 = publisher.__openEntryForTests(family)!;
+  //   const k0 = entry0.dedupeKey;           // D8's "K0", CAPTURED not spelled
+  //   const openBefore = entry0.openSeq;     // D8 narrates this as 7; on the
+  //                                          //   harness's fresh publisher it is 1
   //   const gate = fakeDb.pause("ops_events", "insertOne");
   //   driveSuccess("Bash");    // R1 dequeued, stalls inside accept; entry still openSeq 7
   //   await gate.reached;      // the drainer is INSIDE R1's insert
@@ -463,15 +492,23 @@ it("R1 · F · R2 — the superseded recovery is dropped, not published", async 
   // having no await before `insertOne`. Either is correct; this one does not
   // depend on that property, which is why AC9 uses it.
   //
+  // ⚠ 7 and 8 above are D8's NARRATIVE epoch numbers, kept in the comments
+  // because that is how the design reads. They are not this test's values: the
+  // harness builds a fresh `OpsPublisher` per case (contract item 8) whose
+  // `nextOpenSeq` starts at 1, so F1 opens at 1 and F3 re-opens at 2 — exactly
+  // chunk 3's own worked example ("re-opens the family at `openSeq` 2"). Assert
+  // the RELATION against the captured baseline; a literal 8 cannot pass.
+  //
   // Four assertions, one per harm the identity check prevents:
-  expect(clearingFactsNaming("K0")).toHaveLength(1);      // not two; no second clearing fact for the dead key
+  expect(await clearingFactsNaming(k0)).toHaveLength(1);  // not two; no second clearing fact for the dead key
   expect(publisher.getSnapshot().recoverySuperseded).toBe(1);
-  expect(publisher.__openEntryForTests(family)?.openSeq).toBe(8); // the LIVE entry survives the drop
+  expect(publisher.__openEntryForTests(family)?.openSeq).toBe(openBefore + 1); // the LIVE entry survives the drop
   // a following plain repeat leaves generation unchanged (no C18 flood);
   // and the next success on that tool STILL enqueues a recovery whose
-  // `clears` is K1, not K0 (no permanent silence) — assert both, since the
-  // second is the behavioural restatement of the openSeq assertion above and
-  // holds even if the accessor is ever removed.
+  // `clears` is the LIVE entry's dedupeKey (D8's K1), not the captured `k0`
+  // (no permanent silence) — assert both, since the second is the behavioural
+  // restatement of the openSeq assertion above and holds even if the accessor
+  // is ever removed.
 });
 
 it("a recovery job whose publish faults leaves the family open, so the next success re-enqueues", async () => { /* … */ });
@@ -487,7 +524,7 @@ it("a success with no open condition performs no database access at all", async 
 ```
 **Negative-verify (required):** change the drainer's identity test from `entry.openSeq !== job.openSeq` to a bare `this.open.has(job.family)` membership test and confirm the `R1 · F · R2` case fails. Restore.
 
-*Why it crosses the boundary:* under membership, R2 finds the family present (the entry F3 created at openSeq 8), so it proceeds to `accept()` — `recoverySuperseded` stays 0 instead of 1, a **second** clearing fact naming the dead key K0 is inserted, and `this.open.delete(family)` removes the **live** entry, so `__openEntryForTests(family)` returns `undefined` instead of `{openSeq: 8}`. Three of the four assertions above fail, including both the ones this verify exists to protect. (This is the mutation chunk 3's Step 6 cross-references as living here.)
+*Why it crosses the boundary:* under membership, R2 finds the family present (the entry F3 created at `openBefore + 1` — D8's 8, 2 on a fresh publisher), so it proceeds to `accept()` — `recoverySuperseded` stays 0 instead of 1, a **second** clearing fact naming the dead key `k0` is inserted, and `this.open.delete(family)` removes the **live** entry, so `__openEntryForTests(family)` returns `undefined` instead of the live entry. Three of the four assertions above fail, including both the ones this verify exists to protect. (This is the mutation chunk 3's Step 6 cross-references as living here.)
 
 **AC10 (C19) — clearing provenance.**
 
@@ -624,11 +661,27 @@ it("no code path in this diff reads costUsd, a duration threshold, or a tool_res
     expect(hunk).not.toContain("tool_response");
   }
 
-  // `durationMs` is READ (a declared detail key) but never COMPARED. The
-  // regex, named rather than described: any relational or equality operator
-  // with durationMs on either side, allowing whitespace.
-  const COMPARED = /(durationMs\s*(<|>|<=|>=|===|!==|==|!=)|(<|>|<=|>=|===|!==|==|!=)\s*[A-Za-z0-9_.]*durationMs)/;
-  for (const s of opsSources) expect(s).not.toMatch(COMPARED);
+  // `durationMs` is READ (a declared detail key) but never COMPARED AGAINST A
+  // THRESHOLD — which is narrower than "never appears beside an operator", and
+  // the difference is not academic: the blunt form (any relational OR equality
+  // operator, either side) matches `obs.durationMs !== undefined` in chunk 3's
+  // own `observe.ts` — an optional-key presence check, not a threshold — and so
+  // fails against correct code. Two regexes, each named for what it forbids:
+  //   - RELATIONAL: the four ORDERING operators, on either side. The lookbehind
+  //     on the right-hand alternative excludes `=>`, so `(o) => o.durationMs`
+  //     is not read as "something `>` durationMs".
+  //   - NUMERIC_EQUALITY: `===`/`!==`/`==`/`!=` ONLY where the other operand is
+  //     a numeric literal, which is the only equality shape a threshold can
+  //     take. `!== undefined` and `=== undefined` never match; `durationMs === 0`
+  //     and `30_000 !== obs.durationMs` both do.
+  // Both are able to fail: point either at `if (obs.durationMs > 30_000)` or
+  // `if (obs.durationMs === 0)` and the corresponding expectation trips.
+  const RELATIONAL = /(durationMs\s*(?:<=|>=|<|>)|(?<![=!<>&|])(?:<=|>=|<|>)\s*[A-Za-z0-9_.]*durationMs)/;
+  const NUMERIC_EQUALITY = /(durationMs\s*[!=]==?\s*-?\d|-?\d\s*[!=]==?\s*[A-Za-z0-9_.]*durationMs)/;
+  for (const s of opsSources) {
+    expect(s).not.toMatch(RELATIONAL);
+    expect(s).not.toMatch(NUMERIC_EQUALITY);
+  }
 });
 
 it("activity_log is neither read nor written here", () => {

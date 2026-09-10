@@ -516,16 +516,21 @@ export function assertReasonTableLegal(rows: readonly OpsReason[]): void {
           `(D4: required, no default, "a bounded parameterised string")`,
       );
     }
-    // The three silent normalizations, LOUD for the code-resident half. A
-    // developer fixes these before deploy, so there is no reason to let the
-    // table ship with a key name or a type the compiler will quietly reshape.
-    for (const anomaly of auditReasonRow(row)) {
-      throw new Error(`ops reason table: ${anomaly}`);
-    }
     // C13: the allow-list IS the redaction boundary, so a string key with no
     // declared bound is a development-time defect and refuses loudly here.
     // The DATA-sourced half is handled differently and deliberately — see
     // compileDetailSchema below.
+    //
+    // ⚠ ORDER IS LOAD-BEARING: this range check runs BEFORE the auditReasonRow
+    // loop below, so a code-resident row declaring an over-ceiling maxLength
+    // gets the precise `outside 1..${OPS_DETAIL_STRING_MAX}` message (the legal
+    // range a developer must fix to) rather than auditReasonRow's `clamped to
+    // ${OPS_DETAIL_STRING_MAX}` phrasing, which describes what the DATA-sourced
+    // path does with such a row and is the wrong diagnostic for a table that is
+    // about to throw. Keeping this first is also what keeps the upper-bound arm
+    // reachable at all: with the audit loop first it could never fire, and only
+    // the `< 1` arm would be live. Chunk 2b's "refuses a maxLength above the
+    // ceiling" case pins this ordering — reorder these two blocks and it fails.
     for (const spec of row.detailKeys) {
       if (spec.type !== "string") continue;
       const id = `${row.producer}:${row.reasonId} key "${spec.key}"`;
@@ -535,6 +540,16 @@ export function assertReasonTableLegal(rows: readonly OpsReason[]): void {
       if (spec.maxLength < 1 || spec.maxLength > OPS_DETAIL_STRING_MAX) {
         throw new Error(`ops reason table: ${id} declares maxLength ${spec.maxLength}, outside 1..${OPS_DETAIL_STRING_MAX}`);
       }
+    }
+    // The three silent normalizations, LOUD for the code-resident half. A
+    // developer fixes these before deploy, so there is no reason to let the
+    // table ship with a key name or a type the compiler will quietly reshape.
+    // Runs AFTER the string-bound block above (see the ordering note there), so
+    // in practice it is the key-NAME and unrecognized-type arms that fire here;
+    // the maxLength-clamp anomaly is this function's contribution to chunk 3's
+    // data-sourced `loadReasons` warn path, not to this throw path.
+    for (const anomaly of auditReasonRow(row)) {
+      throw new Error(`ops reason table: ${anomaly}`);
     }
     for (const cleared of row.clearsReasonIds ?? []) {
       if (!ids.has(`${row.producer}:${cleared}`)) {

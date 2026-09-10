@@ -204,6 +204,10 @@ describe("HIVE_RUNTIME_REASONS + assertReasonTableLegal (KPR-454 D5, AC10)", () 
   });
 
   it("refuses a maxLength above the ceiling", () => {
+    // Also pins the gate's block ORDER: the string-bound check runs ahead of
+    // the auditReasonRow loop, so this row reports the legal range rather than
+    // the audit loop's data-sourced `clamped to N` phrasing. Swap those two
+    // blocks in reasons.ts and this expectation is what fails.
     const rows = patch({ detailKeys: [{ key: "huge", type: "string", maxLength: 1_000_000 }] });
     expect(() => assertReasonTableLegal(rows)).toThrow(new RegExp(`outside 1\\.\\.${OPS_DETAIL_STRING_MAX}`));
   });
