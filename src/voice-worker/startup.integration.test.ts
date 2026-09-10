@@ -1096,7 +1096,8 @@ describe("S9 cleanup and privacy", () => {
     trace.close("call_closed");
     const afterLoss = trace.snapshot();
 
-    expect(beforeLoss.incomplete).toBe(1);
+    expect(beforeLoss.incomplete).toBe(0);
+    expect(beforeLoss.incompleteObservations).toBe(1);
     expect(afterLoss.logging).toMatchObject({ filtered: 1, failed: 1, complete: false });
     expect(JSON.stringify(rows)).not.toMatch(/phone|token|tool|audio|transcript|destination/i);
     expect(afterLoss.registry).toEqual({

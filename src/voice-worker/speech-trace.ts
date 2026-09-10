@@ -53,6 +53,12 @@ export interface SynthesisAttempt {
 
 type OutcomeCounts = Record<AttemptOutcome, number>;
 
+export interface AttemptKindCounts {
+  speech: number;
+  bridge: number;
+  synthesis: number;
+}
+
 export type LatencyExclusionReason =
   | "not_applicable"
   | "interrupted"
@@ -74,12 +80,17 @@ export interface CallDiagnosticCounts {
   bridgeOutcomes: OutcomeCounts;
   synthesisAttempts: number;
   synthesisOutcomes: OutcomeCounts;
+  synthesizedAudioObserved: number;
   generatedAudioObserved: number;
   knownPlayoutObserved: number;
   sdkInterruptions: number;
   cancelledSpeechAttempts: number;
   incomplete: number;
+  incompleteByAttemptKind: AttemptKindCounts;
+  incompleteObservations: number;
   unbound: number;
+  unboundByAttemptKind: AttemptKindCounts;
+  unboundObservations: number;
   diagnosticGaps: number;
   latencyEstimateSamples: number[];
   eligibleLatencyEstimateCount: number;
@@ -150,6 +161,7 @@ interface SpeechOwner {
   cancellationCause: CancellationCause | null;
   generatedAudio: boolean;
   generatedDurationMs: number;
+  readonly audioBySynthesis: Map<string, number>;
   knownPlayout: boolean;
   readonly bridgeIds: Set<string>;
   readonly synthesisIds: Set<string>;
@@ -173,6 +185,7 @@ interface BridgeOwner {
   errorClass: VoiceErrorClass | null;
   outcome: AttemptOutcome | null;
   binding: string | null | "conflict";
+  associationCounted: boolean;
 }
 
 interface SynthesisOwner {
@@ -186,12 +199,17 @@ interface SynthesisOwner {
   errorClass: "tts_provider_failed" | "tts_node_failed" | null;
   outcome: AttemptOutcome | null;
   binding: string | null | "conflict";
+  associationCounted: boolean;
   metricCount: number;
   ttfbMs: number | null;
 }
 
 function emptyOutcomes(): OutcomeCounts {
   return { completed: 0, interrupted: 0, cancelled: 0, failed: 0, incomplete: 0 };
+}
+
+function emptyAttemptKinds(): AttemptKindCounts {
+  return { speech: 0, bridge: 0, synthesis: 0 };
 }
 
 function emptyLatencyExclusions(): LatencyExclusions {
@@ -250,13 +268,16 @@ export class SpeechTrace implements SpeechTracePort {
   #speechAttempts = 0;
   #bridgeAttempts = 0;
   #synthesisAttempts = 0;
+  #synthesizedAudioObserved = 0;
   #generatedAudioObserved = 0;
   #knownPlayoutObserved = 0;
   #sdkInterruptions = 0;
   #cancelledSpeechAttempts = 0;
   #eligibleLatencyEstimateCount = 0;
   #diagnosticGaps = 0;
-  #unbound = 0;
+  readonly #finalizedUnboundByAttemptKind = emptyAttemptKinds();
+  #unboundObservations = 0;
+  #unresolvedEvictedSynthesisCoverage = false;
   #teardownIncomplete = 0;
   #startupPendingRecorded = false;
   #closed = false;
@@ -307,6 +328,7 @@ export class SpeechTrace implements SpeechTracePort {
         cancellationCause: null,
         generatedAudio: false,
         generatedDurationMs: 0,
+        audioBySynthesis: new Map(),
         knownPlayout: false,
         bridgeIds: new Set(),
         synthesisIds: new Set(),
@@ -361,6 +383,7 @@ export class SpeechTrace implements SpeechTracePort {
         errorClass: null,
         outcome: null,
         binding: null,
+        associationCounted: false,
       };
       this.#activeBridge.set(context.turnId, owner);
       this.#bridgeAttempts += 1;
@@ -394,6 +417,7 @@ export class SpeechTrace implements SpeechTracePort {
         errorClass: null,
         outcome: null,
         binding: null,
+        associationCounted: false,
         metricCount: 0,
         ttfbMs: null,
       };
@@ -446,7 +470,7 @@ export class SpeechTrace implements SpeechTracePort {
     this.#safe(() => {
       const owner = this.#activeSynthesis.get(synthesisId) ?? this.#recentSynthesis.get(synthesisId);
       if (!owner) {
-        this.#unbound += 1;
+        this.#unboundObservations += 1;
         this.#gap("provider_context_missing", { synthesisId });
         return;
       }
@@ -456,7 +480,7 @@ export class SpeechTrace implements SpeechTracePort {
 
   unboundProviderFailure(kind: "tts" | "llm", errorClass: "tts_provider_failed" | "llm_provider_failed"): void {
     this.#safe(() => {
-      this.#unbound += 1;
+      this.#unboundObservations += 1;
       this.#emit(
         {},
         {
@@ -480,7 +504,7 @@ export class SpeechTrace implements SpeechTracePort {
         const context = bridgeTraceContext.getStore();
         const valid = context && this.#validBridgeContext(context);
         if (valid && metric.speechId) this.#bindBridge(context.turnId, metric.speechId, "sdk_metrics_context");
-        else if (!valid || !metric.speechId) this.#unbound += 1;
+        else if (!valid || !metric.speechId) this.#unboundObservations += 1;
         this.#emit(
           { speechId: metric.speechId ?? null, turnId: valid ? context.turnId : null },
           {
@@ -507,7 +531,7 @@ export class SpeechTrace implements SpeechTracePort {
           }
           if (metric.speechId) this.#bindSynthesis(context.synthesisId, metric.speechId, "sdk_metrics_context");
         }
-        if (!valid || !metric.speechId) this.#unbound += 1;
+        if (!valid || !metric.speechId) this.#unboundObservations += 1;
         this.#emit(
           { speechId: metric.speechId ?? null, synthesisId: valid ? context.synthesisId : null },
           {
@@ -524,7 +548,7 @@ export class SpeechTrace implements SpeechTracePort {
 
       if (metric.type === "eou_metrics") {
         const speech = metric.speechId ? this.#speechById(metric.speechId) : undefined;
-        if (!metric.speechId || !speech) this.#unbound += 1;
+        if (!metric.speechId || !speech) this.#unboundObservations += 1;
         if (speech && !speech.terminalEmitted) {
           speech.eouMetricCount += 1;
           speech.eouDelayMs ??= finiteNonnegative(metric.endOfUtteranceDelayMs) ?? null;
@@ -654,6 +678,7 @@ export class SpeechTrace implements SpeechTracePort {
           cause === "call_closed" ? "cancelled" : "incomplete",
           cause === "call_closed" ? "call_closed" : "unknown",
         );
+        this.#countUnboundAssociation("bridge", bridge);
       }
       for (const synthesis of [...this.#activeSynthesis.values()]) {
         this.#finishSynthesis(
@@ -661,7 +686,10 @@ export class SpeechTrace implements SpeechTracePort {
           cause === "call_closed" ? "cancelled" : "incomplete",
           cause === "call_closed" ? "call_closed" : "unknown",
         );
+        this.#countUnboundAssociation("synthesis", synthesis);
       }
+      for (const bridge of this.#recentBridge.values()) this.#countUnboundAssociation("bridge", bridge);
+      for (const synthesis of this.#recentSynthesis.values()) this.#countUnboundAssociation("synthesis", synthesis);
 
       this.#activeBridge.clear();
       this.#recentBridge.clear();
@@ -675,11 +703,14 @@ export class SpeechTrace implements SpeechTracePort {
   }
 
   snapshot(): CallDiagnosticCounts {
-    const incomplete =
-      this.#speechOutcomes.incomplete +
-      this.#bridgeOutcomes.incomplete +
-      this.#synthesisOutcomes.incomplete +
-      this.#teardownIncomplete;
+    const incompleteByAttemptKind: AttemptKindCounts = {
+      speech: this.#speechOutcomes.incomplete,
+      bridge: this.#bridgeOutcomes.incomplete,
+      synthesis: this.#synthesisOutcomes.incomplete,
+    };
+    const incomplete = Object.values(incompleteByAttemptKind).reduce((sum, count) => sum + count, 0);
+    const unboundByAttemptKind = this.#currentUnboundByAttemptKind();
+    const unbound = Object.values(unboundByAttemptKind).reduce((sum, count) => sum + count, 0);
     return {
       speechAttempts: this.#speechAttempts,
       speechOutcomes: { ...this.#speechOutcomes },
@@ -687,12 +718,17 @@ export class SpeechTrace implements SpeechTracePort {
       bridgeOutcomes: { ...this.#bridgeOutcomes },
       synthesisAttempts: this.#synthesisAttempts,
       synthesisOutcomes: { ...this.#synthesisOutcomes },
+      synthesizedAudioObserved: this.#synthesizedAudioObserved,
       generatedAudioObserved: this.#generatedAudioObserved,
       knownPlayoutObserved: this.#knownPlayoutObserved,
       sdkInterruptions: this.#sdkInterruptions,
       cancelledSpeechAttempts: this.#cancelledSpeechAttempts,
       incomplete,
-      unbound: this.#unbound,
+      incompleteByAttemptKind,
+      incompleteObservations: this.#teardownIncomplete,
+      unbound,
+      unboundByAttemptKind,
+      unboundObservations: this.#unboundObservations,
       diagnosticGaps: this.#diagnosticGaps,
       latencyEstimateSamples: [...this.#latencyEstimateSamples],
       eligibleLatencyEstimateCount: this.#eligibleLatencyEstimateCount,
@@ -861,6 +897,7 @@ export class SpeechTrace implements SpeechTracePort {
       );
       return;
     }
+    if (owner.frameCount === 0) this.#synthesizedAudioObserved += 1;
     owner.frameCount += 1;
     owner.sampleCount += samples;
     owner.generatedDurationMs += (samples / sampleRate) * 1000;
@@ -868,9 +905,8 @@ export class SpeechTrace implements SpeechTracePort {
     else if (owner.sampleRate !== sampleRate) owner.mixedSampleRates = true;
     const speech = this.#speechForBinding(owner.binding);
     if (speech && !speech.terminalEmitted) {
-      if (!speech.generatedAudio) this.#generatedAudioObserved += 1;
-      speech.generatedAudio = true;
-      speech.generatedDurationMs += (samples / sampleRate) * 1000;
+      speech.audioBySynthesis.set(owner.synthesisId, owner.generatedDurationMs);
+      this.#refreshSpeechAudio(speech);
     }
     if (owner.frameCount === 1) {
       this.#emit(
@@ -927,7 +963,7 @@ export class SpeechTrace implements SpeechTracePort {
   #bindBridge(turnId: string, speechId: string, source: "sdk_metrics_context"): void {
     const owner = this.#activeBridge.get(turnId) ?? this.#recentBridge.get(turnId);
     if (!owner) {
-      this.#unbound += 1;
+      this.#unboundObservations += 1;
       this.#gap("correlation_missing", { turnId, speechId });
       this.#notifyBinding(turnId);
       return;
@@ -936,7 +972,7 @@ export class SpeechTrace implements SpeechTracePort {
     if (owner.binding !== null) {
       if (owner.binding === speechId) return;
       owner.binding = "conflict";
-      this.#unbound += 1;
+      this.#countUnboundAssociation("bridge", owner);
       this.#gap("binding_conflict", { turnId, speechId: null });
       this.#notifyBinding(turnId);
       return;
@@ -954,15 +990,21 @@ export class SpeechTrace implements SpeechTracePort {
   #bindSynthesis(synthesisId: string, speechId: string, source: "sdk_metrics_context"): void {
     const owner = this.#activeSynthesis.get(synthesisId) ?? this.#recentSynthesis.get(synthesisId);
     if (!owner) {
-      this.#unbound += 1;
+      this.#unboundObservations += 1;
       this.#gap("correlation_missing", { synthesisId, speechId });
       return;
     }
     if (owner.binding === "conflict") return;
     if (owner.binding !== null) {
       if (owner.binding === speechId) return;
+      const priorSpeechId = owner.binding;
       owner.binding = "conflict";
-      this.#unbound += 1;
+      this.#countUnboundAssociation("synthesis", owner);
+      const priorSpeech = this.#speechById(priorSpeechId);
+      if (priorSpeech) {
+        priorSpeech.audioBySynthesis.delete(synthesisId);
+        this.#refreshSpeechAudio(priorSpeech);
+      }
       this.#gap("binding_conflict", { synthesisId, speechId: null });
       return;
     }
@@ -972,9 +1014,8 @@ export class SpeechTrace implements SpeechTracePort {
     const speech = this.#speechById(speechId);
     if (speech && owner.errorClass) this.#applySpeechFailure(speech, owner.errorClass);
     if (speech && !speech.terminalEmitted && owner.frameCount > 0) {
-      if (!speech.generatedAudio) this.#generatedAudioObserved += 1;
-      speech.generatedAudio = true;
-      speech.generatedDurationMs += owner.generatedDurationMs;
+      speech.audioBySynthesis.set(owner.synthesisId, owner.generatedDurationMs);
+      this.#refreshSpeechAudio(speech);
     } else if (speech?.terminalEmitted && (owner.errorClass || owner.frameCount > 0)) {
       this.#lateSpeechEvidence(speech, owner.errorClass);
     }
@@ -1109,6 +1150,7 @@ export class SpeechTrace implements SpeechTracePort {
         return false;
       }
     }
+    if (this.#hasUnresolvedSynthesisCoverage()) return false;
     return true;
   }
 
@@ -1122,12 +1164,13 @@ export class SpeechTrace implements SpeechTracePort {
     startedSpeakingAt: number | undefined,
   ): void {
     if (owner.terminalEmitted) return;
+    const finalOutcome: AttemptOutcome = owner.errorClass ? "failed" : outcome;
     this.#detachSpeechHandle(owner);
     if (sdkInterrupted) this.#sdkInterruptions += 1;
-    if (outcome === "cancelled") this.#cancelledSpeechAttempts += 1;
-    this.#recordLatency(owner, outcome, sdkInterrupted);
+    if (finalOutcome === "cancelled") this.#cancelledSpeechAttempts += 1;
+    this.#recordLatency(owner, finalOutcome, sdkInterrupted);
     owner.terminalEmitted = true;
-    this.#speechOutcomes[outcome] += 1;
+    this.#speechOutcomes[finalOutcome] += 1;
     this.#emit(
       { speechId: owner.speechId },
       {
@@ -1135,7 +1178,7 @@ export class SpeechTrace implements SpeechTracePort {
         origin: owner.origin,
         acceptedEpoch: owner.acceptedEpoch,
         source: "sdk_handle",
-        outcome,
+        outcome: finalOutcome,
         cause,
         generatedAudio: owner.generatedAudio,
         knownPlayout: owner.knownPlayout,
@@ -1270,6 +1313,7 @@ export class SpeechTrace implements SpeechTracePort {
     const oldestId = this.#recentBridge.keys().next().value as string;
     const evicted = this.#recentBridge.get(oldestId);
     this.#recentBridge.delete(oldestId);
+    if (evicted) this.#countUnboundAssociation("bridge", evicted);
     this.#gap("recent_cache_evicted", {
       turnId: oldestId,
       speechId: evicted ? this.#boundId(evicted.binding) : null,
@@ -1283,6 +1327,10 @@ export class SpeechTrace implements SpeechTracePort {
     const oldestId = this.#recentSynthesis.keys().next().value as string;
     const evicted = this.#recentSynthesis.get(oldestId);
     this.#recentSynthesis.delete(oldestId);
+    if (evicted) {
+      this.#countUnboundAssociation("synthesis", evicted);
+      if (evicted.binding === null || evicted.binding === "conflict") this.#unresolvedEvictedSynthesisCoverage = true;
+    }
     this.#gap("recent_cache_evicted", {
       synthesisId: oldestId,
       speechId: evicted ? this.#boundId(evicted.binding) : null,
@@ -1297,6 +1345,40 @@ export class SpeechTrace implements SpeechTracePort {
     } catch {
       this.#gap("listener_failed", { turnId });
     }
+  }
+
+  #countUnboundAssociation(kind: "bridge" | "synthesis", owner: BridgeOwner | SynthesisOwner): void {
+    if (owner.associationCounted) return;
+    owner.associationCounted = true;
+    if (owner.binding === null || owner.binding === "conflict") this.#finalizedUnboundByAttemptKind[kind] += 1;
+  }
+
+  #currentUnboundByAttemptKind(): AttemptKindCounts {
+    const counts = { ...this.#finalizedUnboundByAttemptKind };
+    for (const owner of [...this.#activeBridge.values(), ...this.#recentBridge.values()]) {
+      if (!owner.associationCounted && (owner.binding === null || owner.binding === "conflict")) counts.bridge += 1;
+    }
+    for (const owner of [...this.#activeSynthesis.values(), ...this.#recentSynthesis.values()]) {
+      if (!owner.associationCounted && (owner.binding === null || owner.binding === "conflict")) counts.synthesis += 1;
+    }
+    return counts;
+  }
+
+  #hasUnresolvedSynthesisCoverage(): boolean {
+    if (this.#unresolvedEvictedSynthesisCoverage) return true;
+    for (const owner of [...this.#activeSynthesis.values(), ...this.#recentSynthesis.values()]) {
+      if (owner.binding === null || owner.binding === "conflict") return true;
+    }
+    return false;
+  }
+
+  #refreshSpeechAudio(speech: SpeechOwner): void {
+    const generatedAudio = speech.audioBySynthesis.size > 0;
+    const generatedDurationMs = [...speech.audioBySynthesis.values()].reduce((sum, duration) => sum + duration, 0);
+    if (speech.generatedAudio && !generatedAudio) this.#generatedAudioObserved -= 1;
+    else if (!speech.generatedAudio && generatedAudio) this.#generatedAudioObserved += 1;
+    speech.generatedAudio = generatedAudio;
+    speech.generatedDurationMs = generatedDurationMs;
   }
 
   #validBridgeContext(context: BridgeTraceContext): boolean {

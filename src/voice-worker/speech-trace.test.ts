@@ -4,7 +4,7 @@ import type { MetricsCollectedEvent } from "@livekit/agents";
 import { describe, expect, it } from "vitest";
 
 import type { VoiceDiagnosticEvent, VoiceTraceWriter } from "../voice/voice-trace.js";
-import { parseVoiceDiagnosticEvent } from "../voice/voice-diagnostic-reader.js";
+import { parseVoiceDiagnosticEvent, reduceVoiceDiagnostics } from "../voice/voice-diagnostic-reader.js";
 import { SpeechTrace, type CallDiagnosticCounts, type SpeechHandle } from "./speech-trace.js";
 import { bridgeTraceContext, synthesisTraceContext } from "./trace-context.js";
 
@@ -410,6 +410,71 @@ describe("speech lifecycle", () => {
     });
   });
 
+  it.each(["call_closed", "setup_failed"] as const)(
+    "keeps an associated bridge failure ahead of %s cleanup",
+    (cause) => {
+      const { rows, trace } = setup();
+      const handle = new FakeSpeechHandle(`speech-${cause}`);
+      trace.speechCreated(handle.asHandle(), "sdk_response", 1);
+      const bridge = trace.bridgeCreated(bridgeContext("call", `turn-${cause}`));
+      bridge.bind(handle.id);
+      bridge.fail("spawn_failed");
+      bridge.finish("failed", "unknown");
+
+      trace.close(cause);
+
+      expect(rows.find((row) => row.event === "speech_terminal")).toMatchObject({
+        outcome: "failed",
+        errorClass: "spawn_failed",
+      });
+      expect(trace.snapshot().speechOutcomes).toMatchObject({ failed: 1, cancelled: 0, incomplete: 0 });
+    },
+  );
+
+  it("keeps a known speech failure ahead of active-registry overflow cleanup", () => {
+    const { rows, trace } = setup();
+    const oldest = new FakeSpeechHandle("speech-overflow-failed");
+    trace.speechCreated(oldest.asHandle(), "sdk_response", 0);
+    const bridge = trace.bridgeCreated(bridgeContext("call", "turn-overflow-failed"));
+    bridge.bind(oldest.id);
+    bridge.fail("spawn_failed");
+    bridge.finish("failed", "unknown");
+    for (let index = 0; index < 256; index += 1) {
+      trace.speechCreated(new FakeSpeechHandle(`overflow-${index}`).asHandle(), "opening", index);
+    }
+
+    expect(rows.find((row) => row.event === "speech_terminal" && row.speechId === oldest.id)).toMatchObject({
+      outcome: "failed",
+      errorClass: "spawn_failed",
+    });
+    expect(trace.snapshot().speechOutcomes.failed).toBe(1);
+  });
+
+  it.each(["active", "terminated"] as const)(
+    "keeps successful bound speech incomplete while %s unbound synthesis coverage is unresolved",
+    (state) => {
+      const { trace } = setup();
+      const unknown = trace.synthesisCreated(synthesisContext("call", `synth-unbound-${state}`));
+      if (state === "terminated") {
+        unknown.fail("tts_provider_failed");
+        unknown.finish("failed", "unknown");
+      }
+
+      const handle = new FakeSpeechHandle(`speech-covered-${state}`);
+      trace.speechCreated(handle.asHandle(), "fallback", 0);
+      const bound = trace.synthesisCreated(synthesisContext("call", `synth-bound-${state}`));
+      bound.bind(handle.id);
+      bound.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+      bound.finish("completed", "unknown");
+      handle.settle();
+
+      expect(trace.snapshot()).toMatchObject({
+        speechOutcomes: { completed: 0, failed: 0, incomplete: 1 },
+        synthesisOutcomes: state === "terminated" ? { failed: 1, completed: 1 } : { failed: 0, completed: 1 },
+      });
+    },
+  );
+
   it("retains frame totals when a provider failure arrives after the first frame", () => {
     const { rows, trace } = setup();
     const handle = new FakeSpeechHandle("speech-frame-fail");
@@ -613,7 +678,81 @@ describe("bounded attempt registries and metrics", () => {
     const snapshot: CallDiagnosticCounts = trace.snapshot();
     expect(snapshot.bridgeOutcomes.completed).toBe(1);
     expect(snapshot.bridgeOutcomes.failed).toBe(0);
-    expect(snapshot.unbound).toBe(1);
+    expect(snapshot).toMatchObject({
+      unbound: 1,
+      unboundByAttemptKind: { speech: 0, bridge: 1, synthesis: 0 },
+      unboundObservations: 1,
+    });
     expect(snapshot.registry.activeBridge).toBe(0);
+  });
+
+  it("counts unbound attempts once per entity and separates synthesized from bound-speech audio", () => {
+    const { rows, trace } = setup();
+    const bridge = trace.bridgeCreated(bridgeContext("call", "unbound-bridge"));
+    bridge.finish("cancelled", "call_closed");
+    const synthesis = trace.synthesisCreated(synthesisContext("call", "unbound-synthesis"));
+    synthesis.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+    synthesis.finish("failed", "unknown");
+
+    expect(trace.snapshot()).toMatchObject({
+      synthesizedAudioObserved: 1,
+      generatedAudioObserved: 0,
+      unbound: 2,
+      unboundByAttemptKind: { speech: 0, bridge: 1, synthesis: 1 },
+      unboundObservations: 0,
+    });
+    const report = reduceVoiceDiagnostics(`${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "call");
+    expect(report).toMatchObject({
+      bridgeAttempts: 1,
+      synthesisAttempts: 1,
+      synthesizedAudioObserved: 1,
+      generatedAudioObserved: 0,
+      unbound: { total: 2, byEntity: { bridge: 1, synthesis: 1 } },
+      byOutcome: { bridge: { cancelled: 1 }, synthesis: { failed: 1 } },
+      incomplete: { total: 0 },
+    });
+    trace.close("call_closed");
+    expect(trace.snapshot().unboundByAttemptKind).toEqual({ speech: 0, bridge: 1, synthesis: 1 });
+  });
+
+  it("resolves genuine late bindings, counts conflicts once, and accounts final retention eviction", () => {
+    const late = setup();
+    const lateBridge = late.trace.bridgeCreated(bridgeContext("call", "late-bridge"));
+    lateBridge.finish("completed", "unknown");
+    lateBridge.bind("speech-late");
+    const lateSynthesis = late.trace.synthesisCreated(synthesisContext("call", "late-synthesis"));
+    lateSynthesis.finish("completed", "unknown");
+    lateSynthesis.bind("speech-late");
+    expect(late.trace.snapshot().unbound).toBe(0);
+
+    const conflict = setup();
+    const conflicting = conflict.trace.bridgeCreated(bridgeContext("call", "conflicting-bridge"));
+    conflicting.bind("speech-a");
+    conflicting.bind("speech-b");
+    conflicting.bind("speech-a");
+    expect(conflict.trace.snapshot().unboundByAttemptKind.bridge).toBe(1);
+
+    const speech = new FakeSpeechHandle("speech-synthesis-conflict");
+    conflict.trace.speechCreated(speech.asHandle(), "fallback", 0);
+    const conflictingSynthesis = conflict.trace.synthesisCreated(synthesisContext("call", "conflicting-synthesis"));
+    conflictingSynthesis.bind(speech.id);
+    conflictingSynthesis.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+    expect(conflict.trace.snapshot().generatedAudioObserved).toBe(1);
+    conflictingSynthesis.bind("speech-other");
+    expect(conflict.trace.snapshot()).toMatchObject({
+      synthesizedAudioObserved: 1,
+      generatedAudioObserved: 0,
+      unboundByAttemptKind: { bridge: 1, synthesis: 1 },
+    });
+
+    const eviction = setup();
+    for (let index = 0; index <= 256; index += 1) {
+      eviction.trace.bridgeCreated(bridgeContext("call", `evicted-${index}`)).finish("completed", "unknown");
+    }
+    expect(eviction.trace.snapshot()).toMatchObject({
+      unbound: 257,
+      unboundByAttemptKind: { speech: 0, bridge: 257, synthesis: 0 },
+      registry: { recentBridge: 256 },
+    });
   });
 });

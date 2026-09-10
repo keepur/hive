@@ -15,7 +15,7 @@ export class UnsupportedVoiceDiagnosticVersionError extends VoiceDiagnosticInput
 
 type EntityKind = "speech" | "bridge" | "synthesis" | "engineRequest" | "engineAttempt";
 type ReportOutcome = AttemptOutcome | "unknown";
-type IncompleteReason = "process_loss_or_missing_terminal" | "missing_start";
+type IncompleteReason = "process_loss_or_missing_terminal" | "missing_start" | "explicit_incomplete";
 
 const OUTCOMES = ["completed", "interrupted", "cancelled", "failed", "incomplete", "unknown"] as const;
 const ENTITY_KINDS = ["speech", "bridge", "synthesis", "engineRequest", "engineAttempt"] as const;
@@ -77,6 +77,7 @@ export interface VoiceDiagnosticReport {
   engineRequests: number;
   engineAttempts: number;
   byOutcome: Record<EntityKind, OutcomeCounts>;
+  synthesizedAudioObserved: number;
   generatedAudioObserved: number;
   playoutObserved: number;
   unbound: { total: number; byEntity: KindCounts };
@@ -403,6 +404,9 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
   let outputPlayback = 0;
   let falseInterruption = 0;
   const callObservationEventIds = new Set<string>();
+  const gapEventIds = new Set<string>();
+  const invalidatedBridgeBindings = new Set<string>();
+  const invalidatedSynthesisBindings = new Set<string>();
 
   const observe = (kind: EntityKind, key: string, row: VoiceDiagnosticEvent, start: boolean, terminal: boolean) => {
     let state = maps[kind].get(key);
@@ -436,9 +440,15 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
       else falseInterruption += 1;
     }
     if (row.event === "diagnostic_gap") {
+      if (gapEventIds.has(row.eventId)) continue;
+      gapEventIds.add(row.eventId);
       const count = row.count;
       gaps[row.reason] = (gaps[row.reason] ?? 0) + count;
       gapTotal += count;
+      if (row.reason === "binding_conflict" && row.workerBootId) {
+        if (row.turnId) invalidatedBridgeBindings.add(workerKey(row.workerBootId, row.turnId));
+        if (row.synthesisId) invalidatedSynthesisBindings.add(workerKey(row.workerBootId, row.synthesisId));
+      }
       continue;
     }
     if (isSpeechEvidence(row) && row.workerBootId && row.speechId) {
@@ -457,7 +467,12 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
           state.generatedAudio ||= row.generatedAudio === true;
           state.playout ||= row.knownPlayout === true;
         }
-        if (row.event === "handle_playout_item" || row.event === "output_playback") state.playout = true;
+        if (
+          (row.event === "handle_playout_item" && measureValue(row.startedSpeakingAt) !== null) ||
+          row.event === "output_playback"
+        ) {
+          state.playout = true;
+        }
       }
     }
     if (isBridgeEvidence(row) && row.workerBootId && row.turnId) {
@@ -520,6 +535,22 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
     }
   }
 
+  for (const key of invalidatedBridgeBindings) {
+    const bridge = maps.bridge.get(key);
+    if (bridge) bridge.boundSpeechId = "conflict";
+  }
+  for (const key of invalidatedSynthesisBindings) {
+    const synthesis = maps.synthesis.get(key);
+    if (synthesis) synthesis.boundSpeechId = "conflict";
+  }
+  const invalidatedGeneratedSpeech = new Set<string>();
+  for (const synthesis of maps.synthesis.values()) {
+    if (synthesis.boundSpeechId !== "conflict" || !synthesis.workerBootId) continue;
+    for (const binding of synthesis.bindings) {
+      invalidatedGeneratedSpeech.add(workerKey(synthesis.workerBootId, binding.speechId));
+    }
+  }
+
   // Explicit worker binding plus valid engine trace metadata is the only cross-process join.
   for (const request of maps.engineRequest.values()) {
     const received = engineReceived.get(request.key);
@@ -548,6 +579,7 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
   const incompleteByReason: Record<IncompleteReason, number> = {
     process_loss_or_missing_terminal: 0,
     missing_start: 0,
+    explicit_incomplete: 0,
   };
   const unboundByEntity = emptyKindCounts();
   const details = Object.fromEntries(ENTITY_KINDS.map((kind) => [kind, []])) as unknown as Record<
@@ -556,19 +588,13 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
   >;
   let incompleteTotal = 0;
   let unboundTotal = 0;
+  const effectiveStates = new Map<EntityState, EffectiveEntityState>();
 
   for (const kind of ENTITY_KINDS) {
     for (const state of maps[kind].values()) {
-      const incompleteReason: IncompleteReason | null = !state.started
-        ? "missing_start"
-        : state.terminal === null
-          ? "process_loss_or_missing_terminal"
-          : null;
-      const outcome: ReportOutcome = state.terminalConflict
-        ? "unknown"
-        : incompleteReason
-          ? "incomplete"
-          : terminalOutcome(state.terminal);
+      const effective = effectiveEntityState(state);
+      effectiveStates.set(state, effective);
+      const { incompleteReason, outcome } = effective;
       byOutcome[kind][outcome] += 1;
       if (incompleteReason) {
         incompleteTotal += 1;
@@ -599,6 +625,7 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
       speech,
       bridgesBySpeech.get(speech.key) ?? [],
       synthesesBySpeech.get(speech.key) ?? [],
+      effectiveStates,
     );
     if (typeof reason === "string") exclusions[reason] += 1;
     else samples.push(reason);
@@ -606,12 +633,14 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
   samples.sort((a, b) => a - b);
 
   const generatedSpeech = new Set<string>();
+  let synthesizedAudioObserved = 0;
   const playoutSpeech = new Set<string>();
   for (const speech of maps.speech.values()) {
-    if (speech.generatedAudio) generatedSpeech.add(speech.key);
+    if (speech.generatedAudio && !invalidatedGeneratedSpeech.has(speech.key)) generatedSpeech.add(speech.key);
     if (speech.playout) playoutSpeech.add(speech.key);
   }
   for (const synthesis of maps.synthesis.values()) {
+    if (synthesis.generatedAudio) synthesizedAudioObserved += 1;
     if (
       synthesis.generatedAudio &&
       synthesis.boundSpeechId &&
@@ -638,6 +667,7 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
     engineRequests: maps.engineRequest.size,
     engineAttempts: maps.engineAttempt.size,
     byOutcome,
+    synthesizedAudioObserved,
     generatedAudioObserved: generatedSpeech.size,
     playoutObserved: playoutSpeech.size,
     unbound: { total: unboundTotal, byEntity: unboundByEntity },
@@ -744,13 +774,10 @@ function latencyExclusion(
   speech: EntityState,
   boundBridges: EntityState[],
   boundSyntheses: EntityState[],
+  effectiveStates: Map<EntityState, EffectiveEntityState>,
 ): LatencyExclusionReason | number {
   if (speech.origin !== "sdk_response") return "not_applicable";
-  const outcome = speech.terminalConflict
-    ? "unknown"
-    : speech.terminal
-      ? terminalOutcome(speech.terminal)
-      : "incomplete";
+  const outcome = effectiveStates.get(speech)?.outcome ?? "incomplete";
   if (outcome === "cancelled") return "cancelled";
   if (outcome === "interrupted" || (speech.terminal?.event === "speech_terminal" && speech.terminal.sdkInterrupted))
     return "interrupted";
@@ -761,22 +788,44 @@ function latencyExclusion(
   const eou = speech.eouMetrics[0];
   if (!eou || eou.event !== "sdk_metric" || measureValue(eou.eouMs) === null) return "missing_eou";
   const bridge = boundBridges[0];
-  if (
-    !bridge ||
-    bridge.terminalConflict ||
-    terminalOutcome(bridge.terminal) !== "completed" ||
-    measureValue(bridge.bridgeFirstText) === null
-  ) {
+  const bridgeOutcome = bridge ? effectiveStates.get(bridge)?.outcome : null;
+  if (bridgeOutcome && bridgeOutcome !== "completed") return componentExclusion(bridgeOutcome);
+  if (!bridge || measureValue(bridge.bridgeFirstText) === null) {
     return "missing_bridge_first_text";
   }
   const synthesis = boundSyntheses[0];
-  if (!synthesis || synthesis.terminalConflict || terminalOutcome(synthesis.terminal) !== "completed")
-    return "missing_generated_audio";
+  const synthesisOutcome = synthesis ? effectiveStates.get(synthesis)?.outcome : null;
+  if (synthesisOutcome && synthesisOutcome !== "completed") return componentExclusion(synthesisOutcome);
+  if (!synthesis) return "missing_generated_audio";
   if (synthesis.ttsMetrics.length > 1) return "ambiguous_components";
   const tts = synthesis.ttsMetrics[0];
   if (!tts || tts.event !== "sdk_metric" || measureValue(tts.ttfbMs) === null) return "missing_tts_metric";
   if (!synthesis.generatedAudio) return "missing_generated_audio";
   return measureValue(eou.eouMs)! + measureValue(bridge.bridgeFirstText)! + measureValue(tts.ttfbMs)!;
+}
+
+interface EffectiveEntityState {
+  outcome: ReportOutcome;
+  incompleteReason: IncompleteReason | null;
+}
+
+function effectiveEntityState(state: EntityState): EffectiveEntityState {
+  if (state.terminalConflict) return { outcome: "unknown", incompleteReason: null };
+  if (!state.started) return { outcome: "incomplete", incompleteReason: "missing_start" };
+  if (state.terminal === null) {
+    return { outcome: "incomplete", incompleteReason: "process_loss_or_missing_terminal" };
+  }
+  const outcome = terminalOutcome(state.terminal);
+  return outcome === "incomplete"
+    ? { outcome, incompleteReason: "explicit_incomplete" }
+    : { outcome, incompleteReason: null };
+}
+
+function componentExclusion(outcome: ReportOutcome): LatencyExclusionReason {
+  if (outcome === "failed") return "failed";
+  if (outcome === "cancelled") return "cancelled";
+  if (outcome === "interrupted") return "interrupted";
+  return "incomplete";
 }
 
 function groupBoundEntities(entities: Map<string, EntityState>): Map<string, EntityState[]> {

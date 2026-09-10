@@ -78,12 +78,17 @@ function diagnostics(overrides: Partial<CallDiagnosticCounts> = {}): CallDiagnos
     bridgeOutcomes: { ...outcomes },
     synthesisAttempts: 0,
     synthesisOutcomes: { ...outcomes },
+    synthesizedAudioObserved: 0,
     generatedAudioObserved: 0,
     knownPlayoutObserved: 0,
     sdkInterruptions: 0,
     cancelledSpeechAttempts: 0,
     incomplete: 0,
+    incompleteByAttemptKind: { speech: 0, bridge: 0, synthesis: 0 },
+    incompleteObservations: 0,
     unbound: 0,
+    unboundByAttemptKind: { speech: 0, bridge: 0, synthesis: 0 },
+    unboundObservations: 0,
     diagnosticGaps: 0,
     latencyEstimateSamples: [],
     eligibleLatencyEstimateCount: 0,
@@ -277,12 +282,17 @@ describe("CallStats (KPR-322 Task 8)", () => {
       bridgeOutcomes: { completed: 3, interrupted: 0, cancelled: 1, failed: 0, incomplete: 0 },
       synthesisAttempts: 3,
       synthesisOutcomes: { completed: 2, interrupted: 0, cancelled: 0, failed: 1, incomplete: 0 },
+      synthesizedAudioObserved: 3,
       generatedAudioObserved: 2,
       knownPlayoutObserved: 1,
       sdkInterruptions: 2,
       cancelledSpeechAttempts: 1,
       incomplete: 1,
+      incompleteByAttemptKind: { speech: 1, bridge: 0, synthesis: 0 },
+      incompleteObservations: 2,
       unbound: 2,
+      unboundByAttemptKind: { speech: 0, bridge: 1, synthesis: 1 },
+      unboundObservations: 4,
       diagnosticGaps: 3,
       latencyEstimateSamples: [100, 200],
       eligibleLatencyEstimateCount: 2,
@@ -309,10 +319,15 @@ describe("CallStats (KPR-322 Task 8)", () => {
     expect(doc.speechOutcomes).toEqual(snapshot.speechOutcomes);
     expect(doc.bridgeAttempts).toBe(4);
     expect(doc.synthesisAttempts).toBe(3);
+    expect(doc.synthesizedAudioObserved).toBe(3);
     expect(doc.generatedAudioObserved).toBe(2);
     expect(doc.knownPlayoutObserved).toBe(1);
     expect(doc.incomplete).toBe(1);
+    expect(doc.incompleteByAttemptKind).toEqual({ speech: 1, bridge: 0, synthesis: 0 });
+    expect(doc.incompleteObservations).toBe(2);
     expect(doc.unbound).toBe(2);
+    expect(doc.unboundByAttemptKind).toEqual({ speech: 0, bridge: 1, synthesis: 1 });
+    expect(doc.unboundObservations).toBe(4);
     expect(doc.diagnosticGaps).toBe(3);
     expect(doc.loggingFailures).toBe(3);
     expect(doc.turns).toBe(2);

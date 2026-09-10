@@ -21,6 +21,7 @@ import {
   type VoiceTraceWriteCounts,
   type VoiceTraceWriter,
 } from "../voice/voice-trace.js";
+import { reduceVoiceDiagnostics } from "../voice/voice-diagnostic-reader.js";
 import { HiveLLM } from "./hive-llm.js";
 import { SpeechTrace } from "./speech-trace.js";
 import { TracedAgent } from "./traced-agent.js";
@@ -429,6 +430,72 @@ describe("public TTS observer seams", () => {
 });
 
 describe("public speech and LLM lifecycle seams", () => {
+  it("keeps real TTS-before-frame failure unbound and does not invent handle playout", async () => {
+    const callId = "call-real-before-frame-reader";
+    const { rows, trace } = traceHarness(callId);
+    const llm = new ControlledLLM();
+    llm.plans.push({ turnId: "before-frame-llm", text: "generated but not spoken" });
+    const tts = new ControlledTTS();
+    tts.plans.push({ mode: "error-before-frame" });
+    const output = new CaptureAudioOutput();
+    const call = new AbortController();
+    const session = new AgentSession({ llm, tts, vad: null, turnHandling: { turnDetection: null } });
+    session.output.audio = output;
+    const agent = new TracedAgent({
+      instructions: "offline capability fixture",
+      llm,
+      tts,
+      callId,
+      workerBootId: VOICE_PROCESS_ID,
+      callSignal: call.signal,
+      trace,
+      onAcceptedUserTurn: () => {},
+    });
+    session.on(AgentSessionEventTypes.SpeechCreated, ({ speechHandle }) =>
+      trace.speechCreated(speechHandle, "sdk_response", 1),
+    );
+    session.on(AgentSessionEventTypes.MetricsCollected, (event) => trace.metrics(event));
+    await startSession(session, agent);
+    try {
+      const handle = session.generateReply({ userInput: "trigger before-frame failure" });
+      await handle.waitForPlayout();
+      await until(
+        () => rows.some((event) => event.event === "synthesis_terminal" && event.outcome === "failed"),
+        "failed production synthesis terminal",
+      );
+
+      const report = reduceVoiceDiagnostics(`${rows.map((event) => JSON.stringify(event)).join("\n")}\n`, callId);
+      expect(output.frames).toHaveLength(0);
+      expect(trace.snapshot()).toMatchObject({
+        synthesisOutcomes: { failed: 1 },
+        synthesizedAudioObserved: 0,
+        generatedAudioObserved: 0,
+        knownPlayoutObserved: 0,
+        unboundByAttemptKind: { synthesis: 1 },
+      });
+      expect(report).toMatchObject({
+        playoutObserved: 0,
+        synthesizedAudioObserved: 0,
+        generatedAudioObserved: 0,
+        unbound: { byEntity: { synthesis: 1 } },
+        byOutcome: { synthesis: { failed: 1 } },
+      });
+      expect(
+        rows.filter(
+          (event) =>
+            event.event === "handle_playout_item" &&
+            event.startedSpeakingAt.value === null &&
+            event.startedSpeakingAt.reason === "not_observed",
+        ),
+      ).not.toHaveLength(0);
+    } finally {
+      call.abort();
+      agent.dispose();
+      trace.close("call_closed");
+      await closeSession(session);
+    }
+  });
+
   it("binds a real HiveLLM bridge turn to the exact handle from the genuine SDK metric", async () => {
     const server = createServer((req, res) => {
       req.resume();

@@ -1,6 +1,8 @@
-import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
@@ -15,6 +17,7 @@ import {
   VoiceDiagnosticInputError,
 } from "./voice-diagnostic-reader.js";
 import { percentile as summaryPercentile } from "../voice-worker/telemetry.js";
+import { SpeechTrace } from "../voice-worker/speech-trace.js";
 
 const COMPLETE_FIXTURE = readFileSync(
   fileURLToPath(new URL("../../docs/epics/kpr-462/fixtures/kpr-464-complete.jsonl", import.meta.url)),
@@ -63,6 +66,7 @@ describe("voice diagnostic reader fixtures", () => {
       synthesisAttempts: 2,
       engineRequests: 1,
       engineAttempts: 1,
+      synthesizedAudioObserved: 2,
       generatedAudioObserved: 2,
       playoutObserved: 2,
       malformedRows: 0,
@@ -104,6 +108,7 @@ describe("voice diagnostic reader fixtures", () => {
       synthesisAttempts: 3,
       engineRequests: 7,
       engineAttempts: 5,
+      synthesizedAudioObserved: 2,
       generatedAudioObserved: 2,
       playoutObserved: 1,
       gaps: { total: 2, byReason: { log_write_failed: 2 } },
@@ -135,6 +140,129 @@ describe("voice diagnostic reader fixtures", () => {
 });
 
 describe("voice diagnostic entity lifecycles", () => {
+  it("requires a finite handle playout measurement before counting observed playout", () => {
+    const speechId = "speech-playout-measurement";
+    const report = reduceVoiceDiagnostics(
+      jsonl([
+        row("start", { event: "speech_started", origin: "sdk_response", acceptedEpoch: 1 }, { speechId }),
+        row(
+          "unobserved-item",
+          {
+            event: "handle_playout_item",
+            source: "sdk_handle",
+            metric: "playout",
+            textLength: 8,
+            interrupted: false,
+            startedSpeakingAt: { value: null, reason: "not_observed" },
+          },
+          { speechId },
+        ),
+        row(
+          "end",
+          {
+            event: "speech_terminal",
+            origin: "sdk_response",
+            acceptedEpoch: 1,
+            outcome: "incomplete",
+            generatedAudio: false,
+            knownPlayout: false,
+          },
+          { speechId },
+        ),
+      ]),
+      "call-test",
+    );
+
+    expect(report.playoutObserved).toBe(0);
+    expect(report.incomplete).toMatchObject({ total: 1, byReason: { explicit_incomplete: 1 } });
+  });
+
+  it("invalidates producer-conflicted bindings across bridge and engine joins and deduplicates its gap event", () => {
+    const rows: VoiceDiagnosticEvent[] = [];
+    const writer = {
+      write: (event: VoiceDiagnosticEvent) => rows.push(event),
+      emit: (event: VoiceDiagnosticEvent) => rows.push(event),
+      snapshot: () => ({
+        attempted: rows.length,
+        acknowledged: rows.length,
+        filtered: 0,
+        failed: 0,
+        overflow: 0,
+        pending: 0,
+        unacknowledged: 0,
+        sinkErrors: 0,
+        complete: true,
+      }),
+      settleWrites: async () => ({
+        attempted: rows.length,
+        acknowledged: rows.length,
+        filtered: 0,
+        failed: 0,
+        overflow: 0,
+        pending: 0,
+        unacknowledged: 0,
+        sinkErrors: 0,
+        complete: true,
+      }),
+    };
+    const trace = new SpeechTrace({ callId: "call-test", workerBootId, writer });
+    const bridge = trace.bridgeCreated({ callId: "call-test", workerBootId, turnId: "turn-conflict" });
+    bridge.bind("speech-a");
+    bridge.bind("speech-b");
+    const synthesis = trace.synthesisCreated({ callId: "call-test", workerBootId, synthesisId: "synth-conflict" });
+    synthesis.bind("speech-a");
+    synthesis.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+    synthesis.bind("speech-b");
+    const conflict = rows.find(
+      (event) => event.event === "diagnostic_gap" && event.reason === "binding_conflict" && event.turnId !== null,
+    )!;
+    rows.push(
+      conflict,
+      row(
+        "speech-a-start",
+        { event: "speech_started", origin: "sdk_response", acceptedEpoch: 1 },
+        { speechId: "speech-a" },
+      ),
+      row(
+        "speech-a-end",
+        {
+          event: "speech_terminal",
+          origin: "sdk_response",
+          acceptedEpoch: 1,
+          outcome: "completed",
+          generatedAudio: true,
+          knownPlayout: false,
+        },
+        { speechId: "speech-a" },
+      ),
+      row("engine-received", { event: "engine_received", correlation: "worker" }, { turnId: "turn-conflict" }),
+      row(
+        "engine-attempt-start",
+        { event: "engine_attempt_started", continuity: "fresh" },
+        { turnId: "turn-conflict", engineAttemptSeq: 1 },
+      ),
+      row(
+        "engine-attempt-end",
+        { event: "engine_attempt_terminal", outcome: "completed" },
+        { turnId: "turn-conflict", engineAttemptSeq: 1 },
+      ),
+      row(
+        "engine-request-end",
+        { event: "engine_terminal", outcome: "completed", generatedAudio: "unknown" },
+        { turnId: "turn-conflict" },
+      ),
+    );
+
+    const report = reduceVoiceDiagnostics(jsonl(rows), "call-test");
+    expect(report.gaps).toMatchObject({ total: 4, byReason: { binding_conflict: 2, correlation_missing: 2 } });
+    expect(report.unbound.byEntity).toMatchObject({ bridge: 1, synthesis: 1, engineRequest: 1, engineAttempt: 1 });
+    expect(report).toMatchObject({ synthesizedAudioObserved: 1, generatedAudioObserved: 0 });
+    expect(report.details.bridge[0]).toMatchObject({ boundSpeechId: null });
+    expect(report.details.synthesis[0]).toMatchObject({ boundSpeechId: null });
+    expect(report.details.engineRequest[0]).toMatchObject({ boundSpeechId: null });
+    expect(report.details.engineAttempt[0]).toMatchObject({ boundSpeechId: null });
+  });
+
   it("retains unbound public playback and false-interruption observations at call level", () => {
     const playbackStarted = row("playback-started", {
       event: "output_playback",
@@ -332,6 +460,33 @@ describe("voice diagnostic entity lifecycles", () => {
       "speech_terminal",
     );
   });
+
+  it.each([
+    ["explicit incomplete speech", "c20", "explicit_incomplete"],
+    ["missing speech start", "c08", "missing_start"],
+    ["missing bridge start", "c09", "missing_start"],
+    ["missing synthesis start", "c13", "missing_start"],
+  ] as const)("excludes latency for %s", (_label, changedEventId, expectedReason) => {
+    const events = COMPLETE_FIXTURE.trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as VoiceDiagnosticEvent)
+      .flatMap((event) => {
+        if (changedEventId === "c20" && event.eventId === changedEventId) {
+          return [{ ...event, outcome: "incomplete" } as VoiceDiagnosticEvent];
+        }
+        return event.eventId === changedEventId ? [] : [event];
+      });
+    const report = reduceVoiceDiagnostics(jsonl(events), "call-fixture");
+
+    expect(report.complete).toBe(false);
+    expect(report.incomplete.total).toBe(1);
+    expect(report.incomplete.byReason[expectedReason]).toBe(1);
+    expect(report.distributions.estimatedEouToFirstGeneratedAudioMs).toMatchObject({
+      eligibleAttempts: 0,
+      samples: [],
+      excludedByReason: { incomplete: 1 },
+    });
+  });
 });
 
 describe("voice diagnostic input validation", () => {
@@ -457,5 +612,22 @@ describe("voice diagnostic CLI", () => {
     });
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("usage: read-voice-diagnostics");
+  });
+
+  it("runs through a symlinked entry path", () => {
+    const temp = realpathSync(mkdtempSync(join(tmpdir(), "voice-diagnostics-cli-")));
+    const linkedCli = join(temp, "read-voice-diagnostics.ts");
+    symlinkSync(CLI, linkedCli);
+    try {
+      const result = spawnSync(
+        process.execPath,
+        ["--import", "tsx", linkedCli, "--input", "-", "--call-id", "call-fixture"],
+        { encoding: "utf8", input: COMPLETE_FIXTURE },
+      );
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ complete: true, callId: "call-fixture" });
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
   });
 });
