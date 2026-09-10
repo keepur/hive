@@ -27,6 +27,7 @@ import { FakeDb } from "../ops/testing/fake-db.js";
 import { harness, sub } from "../ops/testing/notifier-harness.js";
 import { OpsNotifier } from "../ops/notifier.js";
 import type { OpsEvent } from "../ops/types.js";
+import type { OpsIntakeResult } from "../ops/notification-types.js";
 import type { ActivityRecord } from "../activity/types.js";
 import { runOps } from "./ops.js";
 import {
@@ -436,7 +437,7 @@ describe("AC7 — no error text, no receipts", () => {
 
 **Restore** and re-run before continuing.
 
-- [ ] **Step 7:** Append AC8 and AC16, then run NV2 and NV3 (Step 9 hosts both runs; the tests land here).
+- [ ] **Step 7:** Append AC8 and AC16. The tests land here; **[chunk 4b](kpr-455-plan-4b-acceptance.md) Step 9 hosts the NV2 and NV3 runs** — do not run them from this step.
 
 ```typescript
 describe("AC8 — matchedSubscriptions is rendered as a past-tense fact", () => {

@@ -1,6 +1,6 @@
 # KPR-455 chunk 4b — Acceptance suite, continued
 
-**Task 4 of 5, continued.** Read [the plan index](kpr-455-plan.md) and all eight chunk files before starting. **This chunk continues chunk 4's task: chunks 4 and 4b are ONE task and ONE commit**, and the commit block is at the end of this file. Read [chunk 4](kpr-455-plan-4-acceptance.md) first — the file this chunk appends to is created there, and every fixture these steps use (`ready`, `view`, `fixedClock`, `seedEvent`, `collectKeys`) is defined in its Step 1.
+**Task 4 of 5, continued.** Read [the plan index](kpr-455-plan.md) and all eight chunk files before starting. **This chunk continues chunk 4's task: chunks 4 and 4b are ONE task and ONE commit**, and the commit block is at the end of this file. Read [chunk 4](kpr-455-plan-4-acceptance.md) first — the file this chunk appends to is created there, and every fixture and import these steps use is defined in its Step 1: `NOW`, `ready`, `fixture`, `stampSentinel`, `deps`, `fixedClock`, `steppingClock`, `harness`, `sub`, `OpsNotifier`, `ProgrammedNotifier`, `FakeDb`, `readFileSync`, and the `OpsIntakeResult` type import Step 9's `outcomes` table is annotated with. (These steps use none of chunk 4's `view`, `seedEvent` or `collectKeys`.)
 
 **Files**
 
@@ -152,7 +152,7 @@ describe("AC10 — intake reached across processes, against the REAL CAS", () =>
 
 describe("AC11 — ten distinguishable outcomes, their exit codes and one JSON document", () => {
   const HANDLE = "65a1b2c3d4e5f60718293a4b";
-  const outcomes: Array<[string, Parameters<ProgrammedNotifier["accept"]> extends never ? never : any, number, (p: any) => void]> = [
+  const outcomes: Array<[string, OpsIntakeResult, number, (p: Record<string, unknown>) => void]> = [
     ["applied", { state: "applied", rowState: "seen" }, 0, (p) => expect(p.rowState).toBe("seen")],
     ["noop/already-applied", { state: "noop", reason: "already-applied" }, 0, (p) => expect(p.reason).toBe("already-applied")],
     ["noop/superseded", { state: "noop", reason: "superseded" }, 0, (p) => expect(p.reason).toBe("superseded")],
@@ -179,7 +179,9 @@ describe("AC11 — ten distinguishable outcomes, their exit codes and one JSON d
     extra(payload);
     // The contract token is DATA in the payload, never a thrown message that
     // src/cli.ts:178's /^[a-z_]+$/ guard would swallow.
-    if (outcome.reason) expect(JSON.stringify(payload)).toContain(outcome.reason);
+    // `"reason" in outcome` narrows the union to its `noop` and `refused` members,
+    // where `reason` is a string; `applied` and `unavailable` carry none.
+    if ("reason" in outcome) expect(JSON.stringify(payload)).toContain(outcome.reason);
   });
 
   it("counts ten outcomes, which is what the union actually has", () => {
