@@ -1,6 +1,6 @@
 # KPR-455 chunk 5 — Docs, AC15 and the final gate
 
-**Task 5 of 5.** Read [the plan index](kpr-455-plan.md) and all seven chunk files before starting.
+**Task 5 of 5.** Read [the plan index](kpr-455-plan.md) and all eight chunk files before starting.
 
 This chunk is small on purpose: it is the documentation commit, the one criterion whose subject is a file this task writes, and the whole-repo verification with the NV1–NV9 confirmation checklist that counts all nine mutations in one list.
 
@@ -82,14 +82,14 @@ Two regressions to read explicitly in that output rather than trusting the aggre
 | id | mutation | run in | confirmed? |
 | --- | --- | --- | --- |
 | NV1 | recovery keyed on `(tool, errorSig)` instead of `tool` | chunk 4 Step 4 | ☐ |
-| NV2 | `clearingIsLegal` ⇒ `class !== "informational"` | chunk 4 Step 9 (rehearsed chunk 1b Step 6) | ☐ |
-| NV3 | the same-producer clause deleted | chunk 4 Step 9 | ☐ |
+| NV2 | `clearingIsLegal` ⇒ `class !== "informational"` | chunk 4b Step 9 (rehearsed chunk 1b Step 6) | ☐ |
+| NV3 | the same-producer clause deleted | chunk 4b Step 9 | ☐ |
 | NV4 | the stale ⇒ `unknown` branch deleted | chunk 4 Step 3 | ☐ |
 | NV5 | `TURN_ACTIVITY_FILTER` spread deleted | chunk 4 Step 6 | ☐ |
 | NV6 | the union narrowed to `error` alone | chunk 4 Step 5 | ☐ |
 | NV7 | `at` re-minted inside the retry loop | chunk 4 Step 8 | ☐ |
 | NV8 | `setLogLevel("error")` deleted | chunk 2b Step 7 | ☐ |
-| NV9 | the doctor's `backlog` exclusion deleted | chunk 3 Step 7 | ☐ |
+| NV9 | the degraded warn widened to `reportedState !== "ok"` | chunk 3 Step 7 | ☐ |
 
 For each: **which tests went red, and did that match the prediction?** A mutation whose actual failure set differs from the predicted one is a finding to report — it usually means either the test is asserting something other than what its name claims, or the harness is doing the work the implementation was supposed to. **Do not adjust the prediction to match the run.**
 

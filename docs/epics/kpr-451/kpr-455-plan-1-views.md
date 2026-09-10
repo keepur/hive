@@ -1,6 +1,6 @@
 # KPR-455 chunk 1 — Views, bounds and resolvers
 
-**Task 1 of 5.** Read [the plan index](kpr-455-plan.md) and all seven chunk files before starting. This chunk creates the module every rendered outcome in this child comes from: the resolved bounds, the `(publishedAt, _id)` comparator, the class-legality predicate, the two view resolvers, the two bounded reads and the cursor codec. **Nothing in this chunk writes, calls `init()`, creates a collection or an index, or constructs an `OpsNotifier`.**
+**Task 1 of 5.** Read [the plan index](kpr-455-plan.md) and all eight chunk files before starting. This chunk creates the module every rendered outcome in this child comes from: the resolved bounds, the `(publishedAt, _id)` comparator, the class-legality predicate, the two view resolvers, the two bounded reads and the cursor codec. **Nothing in this chunk writes, calls `init()`, creates a collection or an index, or constructs an `OpsNotifier`.**
 
 **Split, and it is a STEP seam rather than a task seam — the recorded exception.** Chunks 1 and 1b are **one task and one commit**: this file carries Steps 1–2 (the re-verification and the module), [chunk 1b](kpr-455-plan-1b-view-tests.md) carries Steps 3–7 (the unit suite, the two empirical harness confirmations, the NV2 rehearsal and the commit). The module and its suite cannot be two commits without leaving a tree whose new module has no coverage; the combined file ran to ~1,250 lines, over this plan's own bound. Read 1 and 1b as one unit.
 
@@ -22,7 +22,7 @@
 # (a) The ops event envelope and the collection constant.
 grep -n "export interface OpsEvent" -A 32 src/ops/types.ts
 grep -n "OPS_EVENTS_COLLECTION" src/ops/types.ts
-# EXPECT: `_id?: ObjectId`, `publishedAt: Date`, `producer`, `reasonId`, `class`,
+# EXPECT: `_id?: ObjectId`, `schemaVersion: number`, `publishedAt: Date`, `producer`, `reasonId`, `class`,
 # `retry`, `waiting`, `subject: { kind, id }`, `generation`, `dedupeKey`,
 # `detail`, `evidence`, `matchedSubscriptions`, `matchedSubscriptionIds`, and
 # the two optional clearing fields `clears?` / `clearsFamily?`.
@@ -331,6 +331,8 @@ export interface ToolHealthRow {
   ageSeconds: number;
 }
 
+/** ⚠ `"none"` means NO EMPTINESS SHAPE APPLIES — never "nothing notable". A view
+ *  that is all `unknown` plus one `recovered` row lands here; read the counts. */
 export type ToolHealthEmptiness =
   | "none"
   | "no-ops-event-log"
@@ -751,18 +753,18 @@ const ageSeconds = (at: Date | null, now: Date): number | null =>
   at ? Math.round((now.getTime() - at.getTime()) / 1000) : null;
 
 /**
- * Edge case 4's rule, with ONE STATED DEPARTURE from "copy verbatim".
+ * Edge case 4's rule, applied to KPR-468's OWN liveness field — the faithful
+ * reading of "copy verbatim" rather than a departure from it.
  *
  * `ObligationReader.heartbeat()` (src/obligations/reader.ts:47-57) coerces the
  * reported state to `unknown` past 120 s keyed on `lastSuccessfulSweep`,
- * because that is its ONLY liveness field. KPR-468's heartbeat splits the two:
+ * because that is ITS only liveness field. KPR-468's heartbeat splits the two:
  * `timestamp` is written on EVERY tick including a degraded one
  * (kpr-468-plan-3b-notifier.md:352-357), `lastSuccessfulSweep` only after an
- * all-ok tick (:416, :424-426). Coercing on the latter would report a
- * PERSISTENTLY DEGRADED notifier as `unknown` after two minutes, which makes
- * the `state: "degraded"` warn unreachable for exactly the wedge this surface
- * exists to catch. The precedent is therefore copied onto the field that
- * carries the same MEANING, and both ages are rendered so the operator can see
+ * all-ok tick (:416, :424-426). Coercing on the latter would report a LIVE but
+ * PERSISTENTLY DEGRADED notifier as stale and `unknown`, firing the doctor's
+ * "engine may not be running" warn about an engine that is running fine and
+ * failing loudly. Both ages are rendered either way, so an operator can see
  * the difference themselves.
  */
 export async function readPipeline(db: Db, now: Date): Promise<PipelineFreshness> {

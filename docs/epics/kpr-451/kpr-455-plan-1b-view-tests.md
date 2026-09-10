@@ -1,6 +1,6 @@
 # KPR-455 chunk 1b — The view module's unit suite
 
-**Task 1 of 5, continued.** Read [the plan index](kpr-455-plan.md) and all seven chunk files before starting. **This chunk continues chunk 1's task: chunks 1 and 1b are ONE task and ONE commit**, and the commit block is at the end of this file. Read [chunk 1](kpr-455-plan-1-views.md) first — the module this suite drives is written there.
+**Task 1 of 5, continued.** Read [the plan index](kpr-455-plan.md) and all eight chunk files before starting. **This chunk continues chunk 1's task: chunks 1 and 1b are ONE task and ONE commit**, and the commit block is at the end of this file. Read [chunk 1](kpr-455-plan-1-views.md) first — the module this suite drives is written there.
 
 **Files**
 
@@ -10,20 +10,31 @@
 
 ---
 
-- [ ] **Step 3:** Create `src/cli/ops-views.test.ts` — the pure surface.
+- [ ] **Step 3:** Create `src/cli/ops-views.test.ts` — the pure surface **and the four bounded reads**. The db-backed half is covered here rather than only through the CLI so a defect names the function rather than a payload field, and because two of them — `readPipeline`'s staleness coercion and `resolveActivityRetentionDays`'s precedence chain — are the module's two stated departures from an existing precedent and neither is reachable from the pure surface.
 
 ```typescript
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ObjectId } from "mongodb";
+import { FakeDb } from "../ops/testing/fake-db.js";
+import { NOTIFIER_STATS_KIND } from "../ops/notification-store.js";
 import type { OpsEvent } from "../ops/types.js";
+import type { CliSelection } from "./obligations.js";
 import {
   clearingIsLegal,
   decodeOpsCursor,
   discoveryWindowMs,
   encodeOpsCursor,
   isAfter,
+  readOpsLogPresence,
+  readPipeline,
+  readQuietTurns,
+  resolveActivityRetentionDays,
   resolveOpenConditions,
   resolveToolHealth,
+  DEFAULT_ACTIVITY_RETENTION_DAYS,
   DEFAULT_LIMIT,
   DISCOVERY_WINDOW_FLOOR_MS,
   MAX_LIMIT,
@@ -310,6 +321,183 @@ describe("the resolved bounds", () => {
     expect(QUIET_TURN_DISJUNCTS[0]).toEqual({ error: { $exists: true, $ne: null } });
   });
 });
+
+// ── The four bounded reads, over KPR-454's in-memory double. Nothing here
+//    fabricates Mongo behaviour and nothing here writes to a collection this
+//    module reads: the double is the sibling's, used unchanged. ──
+
+async function seed(db: FakeDb, over: Partial<OpsEvent> = {}): Promise<void> {
+  const doc = { ...event(over) } as Record<string, unknown>;
+  delete doc._id; // let the double mint a real ObjectId, as production does
+  await db.collection("ops_events").insertOne(doc);
+}
+
+async function turn(db: FakeDb, over: Record<string, unknown> = {}): Promise<void> {
+  await db.collection("activity_log").insertOne({
+    agentId: "mokie",
+    threadId: "T1",
+    timestamp: ago(10),
+    sender: "human",
+    channel: "C1",
+    channelKind: "slack",
+    model: "claude-opus-5",
+    costUsd: 0,
+    durationMs: 1_000,
+    inputTokens: 10,
+    outputTokens: 10,
+    contextWindow: 200_000,
+    toolCalls: 0,
+    toolSummary: "",
+    compactions: 0,
+    streamed: true,
+    ...over,
+  });
+}
+
+describe("readOpsLogPresence", () => {
+  it("reports an absent log as absent rather than throwing — edge case 1's whole mechanism", async () => {
+    expect(await readOpsLogPresence(new FakeDb().db, NOW)).toMatchObject({
+      present: false,
+      newestEventAt: null,
+      newestEventAgeSeconds: null,
+    });
+  });
+
+  it("reports the newest event's instant and its age", async () => {
+    const db = new FakeDb();
+    await seed(db, { publishedAt: ago(120) });
+    await seed(db, { publishedAt: ago(5) });
+    const presence = await readOpsLogPresence(db.db, NOW);
+    expect(presence.present).toBe(true);
+    expect(presence.newestEventAt?.getTime()).toBe(ago(5).getTime());
+    expect(presence.newestEventAgeSeconds).toBe(300);
+  });
+});
+
+describe("readQuietTurns — the row mapper and the shaping", () => {
+  // The RECEIPT exclusion is AC7's, not this suite's: it owns both the
+  // behavioural and the structural half and NV5 is run against it. What is
+  // pinned here is the mapper — flags in, `error` string out — and the shaping.
+  it("renders WHICH FLAGS WERE SET and never the error string that produced one", async () => {
+    const db = new FakeDb();
+    await turn(db, { threadId: "ER0", error: "boom-secret" });
+    await turn(db, { threadId: "TO0", timedOut: true, error: null });
+    await turn(db, { threadId: "AB0", aborted: true, agentId: "hermi" });
+    await turn(db, { threadId: "OK0" });
+    const section = await readQuietTurns(db.db, { now: NOW, windowMs: 86_400_000, limit: 20, owner: "demo" });
+    expect(section).toMatchObject({ turnsInWindow: 4, matched: 3, measurable: true, groupsTruncated: false });
+    expect(section.recent.map((row) => row.flags.join("+")).sort()).toEqual(["aborted", "error", "timedOut"]);
+    // The double's project() is a NO-OP, so these rows arrive un-projected and
+    // this is the STRONGER assertion: the string is dropped by the mapper, not
+    // by the driver.
+    expect(JSON.stringify(section)).not.toContain("boom-secret");
+    for (const row of section.recent) expect(Object.keys(row)).not.toContain("error");
+    expect(section.byAgent.map((g) => `${g.agentId}/${g.channelKind}/${g.total}`)).toEqual([
+      "mokie/slack/2",
+      "hermi/slack/1",
+    ]);
+  });
+
+  it("reports an empty window as UNMEASURABLE with the window stated, never as no failures", async () => {
+    const section = await readQuietTurns(new FakeDb().db, { now: NOW, windowMs: 86_400_000, limit: 20, owner: "demo" });
+    expect(section).toMatchObject({ measurable: false, turnsInWindow: 0, matched: 0, ratio: null, windowMinutes: 1440 });
+    expect(section.recent).toEqual([]);
+  });
+});
+
+describe("readPipeline — edge case 4's coercion, on the field that carries its meaning", () => {
+  const beat = (db: FakeDb, doc: Record<string, unknown>) =>
+    db.collection("telemetry").insertOne({ kind: NOTIFIER_STATS_KIND, ...doc });
+
+  it("reports an absent heartbeat as unknown and stale, never as ok", async () => {
+    expect(await readPipeline(new FakeDb().db, NOW)).toMatchObject({
+      present: false,
+      state: "unknown",
+      reportedState: null,
+      stale: true,
+    });
+  });
+
+  it("⚠ THE DEPARTURE: a fresh timestamp beside a NEVER-SUCCEEDING sweep stays reportable as degraded", async () => {
+    // This is the case the stated departure exists for, and the only one that
+    // can tell the two rules apart. KPR-468 writes `timestamp` on EVERY tick
+    // including a degraded one and `lastSuccessfulSweep` only after an all-ok
+    // one, so coercing on the latter would render a live-but-persistently-
+    // degraded notifier `unknown` after two minutes and print "engine may not
+    // be running" about an engine that is running and failing. The 120 s rule
+    // is copied onto KPR-468's own liveness field, which is faithful to edge
+    // case 4 rather than a departure from it.
+    const db = new FakeDb();
+    await beat(db, {
+      timestamp: new Date(NOW.getTime() - 30_000),
+      lastSuccessfulSweep: null,
+      state: "degraded",
+      eventsBehind: 12,
+      ingestFaults: 0,
+      sweepFaults: 4,
+    });
+    const p = await readPipeline(db.db, NOW);
+    expect(p).toMatchObject({ stale: false, state: "degraded", reportedState: "degraded", sweepSucceeding: false });
+    expect(p.lastSuccessfulSweepAgeSeconds).toBeNull();
+  });
+
+  it("still coerces to unknown when the TIMESTAMP itself is stale, and keeps the reported value beside it", async () => {
+    const db = new FakeDb();
+    const old = new Date(NOW.getTime() - 600_000);
+    await beat(db, { timestamp: old, lastSuccessfulSweep: old, state: "ok" });
+    expect(await readPipeline(db.db, NOW)).toMatchObject({ stale: true, state: "unknown", reportedState: "ok" });
+  });
+
+  it("coerces a state this reader does not recognize to unknown", async () => {
+    const db = new FakeDb();
+    await beat(db, { timestamp: new Date(NOW.getTime() - 1_000), state: "sideways" });
+    const p = await readPipeline(db.db, NOW);
+    expect(p.state).toBe("unknown");
+    expect(p.reportedState).toBe("sideways");
+  });
+});
+
+describe("resolveActivityRetentionDays — selectInstance's precedence, minus the Keychain", () => {
+  // A LOCAL temp-dir fixture rather than `src/cli/testing/ops-cli-fixtures.ts`:
+  // that module lands with Task 2 and this suite ships with Task 1.
+  const roots: string[] = [];
+  function instance(yaml: string, envFile?: string): CliSelection {
+    const root = mkdtempSync(join(tmpdir(), "kpr455-retention-"));
+    roots.push(root);
+    const configPath = join(root, "hive.yaml");
+    writeFileSync(configPath, "instance:\n  id: demo\n" + yaml);
+    if (envFile !== undefined) writeFileSync(join(root, ".env"), envFile);
+    return { configPath, instanceId: "demo", uri: "mongodb://demo.invalid", dbName: "hive_demo" };
+  }
+  afterEach(() => {
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
+
+  it("falls back to src/config.ts:659's own default when nothing resolves", () => {
+    expect(resolveActivityRetentionDays(instance(""), {})).toBe(DEFAULT_ACTIVITY_RETENTION_DAYS);
+  });
+
+  it("reads hive.yaml's activity.retentionDays", () => {
+    expect(resolveActivityRetentionDays(instance("activity:\n  retentionDays: 14\n"), {})).toBe(14);
+  });
+
+  it("lets the instance's adjacent .env beat hive.yaml", () => {
+    const selection = instance("activity:\n  retentionDays: 14\n", "ACTIVITY_RETENTION_DAYS=21\n");
+    expect(resolveActivityRetentionDays(selection, {})).toBe(21);
+  });
+
+  it("lets the process env beat both", () => {
+    const selection = instance("activity:\n  retentionDays: 14\n", "ACTIVITY_RETENTION_DAYS=21\n");
+    expect(resolveActivityRetentionDays(selection, { ACTIVITY_RETENTION_DAYS: "30" })).toBe(30);
+  });
+
+  it("ignores a zero, a negative and a non-numeric value rather than propagating one", () => {
+    for (const bad of ["0", "-5", "soon"])
+      expect(resolveActivityRetentionDays(instance(""), { ACTIVITY_RETENTION_DAYS: bad })).toBe(
+        DEFAULT_ACTIVITY_RETENTION_DAYS,
+      );
+  });
+});
 ```
 
 - [ ] **Step 4:** Verify.
@@ -325,23 +513,30 @@ npx eslint src/cli/ops-views.ts src/cli/ops-views.test.ts
 
 - [ ] **Step 5:** Confirm the two harness divergences empirically, so the guard in Step 3 is evidence rather than assertion.
 
+⚠ **The specifier must be ABSOLUTE.** ESM resolves a relative specifier against the *importing module's* URL, so a probe written to `/tmp` that imports `./dist/...` resolves to `/tmp/dist/...` and dies on `ERR_MODULE_NOT_FOUND` — the step whose whole purpose is evidence would then produce neither evidence nor a divergence. The heredoc below is deliberately **unquoted** so `$PWD` expands into a `file://` URL at write time; run it from the worktree root.
+
 ```bash
-cat > /tmp/kpr455-probe.mjs <<'EOF'
-import { same } from "./dist/obligations/types.js";
-// The double's $ne arm is !same(actual, expected). A missing field arrives as
-// undefined; MongoDB's { $ne: null } EXCLUDES such a document.
+npm run build >/dev/null
+cat > /tmp/kpr455-probe.mjs <<EOF
+import { same } from "file://$PWD/dist/obligations/types.js";
+// The double's \$ne arm is !same(actual, expected). A missing field arrives as
+// undefined; MongoDB's { \$ne: null } EXCLUDES such a document.
 console.log("double would match a missing field:", !same(undefined, null));
 EOF
-npm run build >/dev/null && node /tmp/kpr455-probe.mjs && rm /tmp/kpr455-probe.mjs
+node /tmp/kpr455-probe.mjs && rm /tmp/kpr455-probe.mjs
 ```
 
 **Expected:** `double would match a missing field: true` — which is the divergence, confirmed rather than assumed. If it prints `false`, `same` has changed; re-read `src/obligations/types.ts:216-237`, and if `$ne: null` now agrees with MongoDB, keep `$exists: true` anyway (it is correct in both) and correct the comment in `ops-views.ts` and the index's harness-divergence section.
 
-- [ ] **Step 6:** Rehearse NV2 against this suite. This is a rehearsal, not the confirmation — chunk 4 Step 9 runs the same mutation against AC16 and that run is the one recorded.
+- [ ] **Step 6:** Rehearse NV2 against this suite. This is a rehearsal, not the confirmation — chunk 4b Step 9 runs the same mutation against AC16 and that run is the one recorded.
 
 In `src/cli/ops-views.ts`, replace `clearingIsLegal`'s `switch` block with `return condition.class !== "informational";`, then run `npx vitest run src/cli/ops-views.test.ts`.
 
-**Predicted failure — exactly three cases red:** `clearingIsLegal › judgment clears only with at least one evidence reference` (the zero-evidence assertion reports `true`), `clearingIsLegal › integrity clears only with at least one evidence reference` (same), and `resolveOpenConditions › renders an unrecognized class as unknown and leaves the condition open` (the row is gone — `rows[0]` is `undefined` and the `toMatchObject` throws on it). **Predicted green:** the `resource` case, the `informational` case, the different-producer case and the wrong-`dedupeKey` case — the mutation agrees with the rule on the first two and never reaches the switch on the last two. Record which cases actually went red; **a wrong prediction here is a finding about the harness or the fixture, not something to adjust the prediction to match.**
+**Predicted failure — exactly FOUR cases red.** Three in `clearingIsLegal` and one in `resolveOpenConditions`: `clearingIsLegal › judgment clears only with at least one evidence reference` (the zero-evidence assertion reports `true`); `clearingIsLegal › integrity clears only with at least one evidence reference` (same); `clearingIsLegal › an unrecognized class fails OPEN AS OPEN — the clearing fact is not legal` (`"catastrophic" !== "informational"` is `true`, so the predicate now accepts the clearing fact); and `resolveOpenConditions › renders an unrecognized class as unknown and leaves the condition open` (the row is gone — `rows[0]` is `undefined` and the `toMatchObject` throws on it).
+
+⚠ **Four, not three, and the difference is the point of running the rehearsal at all.** The unit suite tests the unrecognized class at BOTH levels — the predicate directly and the view that calls it — where AC16 (chunk 4b Step 9) reaches it only through the view and therefore correctly predicts **three** of its six limbs. The two counts are both right for their own suite; do not reconcile them by changing either.
+
+**Predicted green:** the `resource` case, the `informational` case, the different-producer case and the wrong-`dedupeKey` case — the mutation agrees with the rule on the first two and never reaches the switch on the last two. Record which cases actually went red; **a wrong prediction here is a finding about the harness or the fixture, not something to adjust the prediction to match.**
 
 **Restore the file** (`git checkout -- src/cli/ops-views.ts`) and re-run the suite to confirm green before committing.
 

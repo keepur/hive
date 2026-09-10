@@ -1,6 +1,6 @@
 # KPR-455 chunk 2b — The CLI's fixtures and its own suite
 
-**Task 2 of 5, continued.** Read [the plan index](kpr-455-plan.md) and all seven chunk files before starting. **This chunk continues chunk 2's task: chunks 2 and 2b are ONE task and ONE commit**, and the commit block is at the end of this file. Read [chunk 2](kpr-455-plan-2-cli.md) first — the module this suite drives is written there.
+**Task 2 of 5, continued.** Read [the plan index](kpr-455-plan.md) and all eight chunk files before starting. **This chunk continues chunk 2's task: chunks 2 and 2b are ONE task and ONE commit**, and the commit block is at the end of this file. Read [chunk 2](kpr-455-plan-2-cli.md) first — the module this suite drives is written there.
 
 **Files**
 
@@ -75,9 +75,16 @@ export class ProgrammedNotifier implements OpsNotifierLike {
     if (this.initThrows) throw new Error("ops_notifications identity index unavailable");
   }
   async accept(input: OpsAcknowledgement): Promise<OpsIntakeResult> {
-    // Stores the REFERENCE deliberately, so a test can prove the edge never
-    // rebuilds the tuple between attempts.
-    this.accepted.push(input);
+    // ⚠ A SNAPSHOT, not the caller's object. Storing the reference would make
+    // "every attempt carried the identical tuple" trivially true for an
+    // implementation that mutated one input object in place — all three stored
+    // entries would BE that object. The two Date fields are copied for the same
+    // reason.
+    this.accepted.push({
+      ...input,
+      at: new Date(input.at.getTime()),
+      ...(input.snoozedUntil ? { snoozedUntil: new Date(input.snoozedUntil.getTime()) } : {}),
+    });
     return this.outcomes[Math.min(this.accepted.length - 1, this.outcomes.length - 1)]!;
   }
 }
@@ -89,6 +96,15 @@ export function steppingClock(start = new Date("2026-01-10T12:00:00.000Z"), step
   return () => new Date(start.getTime() + stepMs * calls++);
 }
 
+/**
+ * ⚠ The returned `notifier` is the DEFAULT programmed notifier this helper
+ * built. When `over.makeNotifier` is supplied it is NOT the object the CLI
+ * receives — assert against the notifier the case constructed, never against
+ * `d.notifier`. (The `initCalls`/`accepted` assertions in the argument-parsing
+ * and identity-guard cases are correct precisely because those cases pass no
+ * override, so the default notifier IS the one that would have been handed
+ * over had the command got that far.)
+ */
 export function deps(
   db: FakeDb,
   selection: CliSelection,
@@ -123,6 +139,7 @@ export function deps(
 
 ```typescript
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
 import { FakeDb } from "../ops/testing/fake-db.js";
 import { runOps } from "./ops.js";
 import { cleanupFixtures, deps, fixture, ProgrammedNotifier, stampSentinel } from "./testing/ops-cli-fixtures.js";
@@ -194,7 +211,15 @@ describe("hive ops — argument parsing", () => {
       [["ops", "health", "--limit", "0"], /invalid_limit/],
       [["ops", "health", "--limit", "101"], /invalid_limit/],
       [["ops", "health", "--stale-after", "0"], /invalid_stale_after/],
-      [["ops", "stalled", "--window", "-5"], /invalid_window/],
+      // ⚠ `--window=-5`, NOT `--window -5`. MEASURED on this tree: under
+      // `strict: true`, `["--window", "-5"]` throws
+      // ERR_PARSE_ARGS_INVALID_OPTION_VALUE ("Option '--window' argument is
+      // ambiguous") INSIDE parseArgs, before `positiveMinutes` is ever reached,
+      // and runOps's catch-all renders that as `command_failed` — so the
+      // `invalid_window` assertion would fail. `=` is Node's own documented
+      // escape for a value starting with a dash.
+      [["ops", "stalled", "--window=-5"], /invalid_window/],
+      [["ops", "stalled", "--window", "0"], /invalid_window/],
     ] as Array<[string[], RegExp]>) {
       await expect(runOps([...argv, "--config", f.path], deps(db, f.selection))).rejects.toThrow(token);
     }
@@ -312,6 +337,12 @@ describe("hive ops ack — the edge", () => {
     const d = deps(db, f.selection, { makeNotifier: () => notifier });
     await runOps(["ops", "ack", "NOT-AN-OBJECTID", "--act", "seen", "--actor", "U1", "--config", f.path], d);
     expect(notifier.accepted[0]!.handle).toBe("NOT-AN-OBJECTID");
+    // The STRUCTURAL half, and the reason `src/cli/ops.ts` imports `mongodb`
+    // for its `Db` type only: the handle is opaque by contract, so this edge
+    // never constructs, validates or inspects an ObjectId. A behavioural
+    // assertion alone would pass an implementation that parsed the handle and
+    // happened to pass the original string through.
+    expect(readFileSync("src/cli/ops.ts", "utf8")).not.toContain("ObjectId");
   });
 
   it("reports a throwing init() as notifier_init_failed and makes NO accept call", async () => {

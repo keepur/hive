@@ -1,6 +1,6 @@
 # KPR-455 chunk 2 — The CLI and the acknowledgement edge
 
-**Task 2 of 5.** Read [the plan index](kpr-455-plan.md) and all seven chunk files before starting. This chunk creates the whole CLI in one file and one commit — the shell, the two read paths and the edge — plus its dispatch case in `src/cli.ts`. **The three subcommands and the `CliDependencies` seam they share are never separated**, which is the spec's own "Plan shape" constraint.
+**Task 2 of 5.** Read [the plan index](kpr-455-plan.md) and all eight chunk files before starting. This chunk creates the whole CLI in one file and one commit — the shell, the two read paths and the edge — plus its dispatch case in `src/cli.ts`. **The three subcommands and the `CliDependencies` seam they share are never separated**, which is the spec's own "Plan shape" constraint.
 
 **Split, and it is a STEP seam rather than a task seam — the second recorded exception.** Chunks 2 and 2b are **one task and one commit**: this file carries Steps 1–3 (`src/cli/ops.ts` and the two `src/cli.ts` edits), [chunk 2b](kpr-455-plan-2b-cli-tests.md) carries Steps 4–8 (the shared fixture module, the suite, verification, NV8 and the commit). A commit that added the dispatch case without its suite would ship an operator-facing command with no coverage; the combined file ran to ~1,100 lines, over this plan's own bound. Read 2 and 2b as one unit.
 
@@ -21,7 +21,7 @@
 
 ```typescript
 import { parseArgs } from "node:util";
-import { ObjectId, type Db } from "mongodb";
+import type { Db } from "mongodb";
 import { ZodError } from "zod";
 import { setLogLevel } from "../logging/logger.js";
 import { verifySentinel } from "../db/identity-sentinel.js";
@@ -301,7 +301,12 @@ function page<T>(
   key: (row: T) => string,
 ): { rows: T[]; nextCursor: string | null; truncated: boolean } {
   const after = decodeOpsCursor(cursor, section, owner);
-  const remaining = after ? rows.filter((row) => key(row) > after) : rows;
+  // ⚠ `localeCompare`, matching the SORT the rows arrived in
+  // (resolveToolHealth's own comparator). A `>` here would be a code-unit
+  // comparison against a locale-ordered list, and where the two disagree a page
+  // boundary drops or duplicates a row. ONE comparator for both, or neither is
+  // reliable.
+  const remaining = after ? rows.filter((row) => key(row).localeCompare(after) > 0) : rows;
   const slice = remaining.slice(0, limit);
   const truncated = remaining.length > slice.length;
   const last = slice.at(-1);
@@ -384,7 +389,7 @@ async function health(db: Db, opts: ReadOptions): Promise<unknown> {
       newestEventIsNotHealth:
         "`log.newestEventAt` is last-known publisher activity, NOT a health signal: a healthy fleet legitimately publishes nothing for days, and this reader cannot distinguish 'no tool failed' from 'the publisher was never set'.",
       recoveryClearsEveryErrorSig:
-        "A recovery carries no `errorSig`, so a recovery for a tool resolves every `errorSig` row for that tool.",
+        "A recovery carries no `errorSig`, so a recovery for a tool resolves every `errorSig` row for that tool. A recovery with no condition event anywhere in the discovery window produces no row at all rather than a `recovered` one: this reader does not synthesize a failure it cannot see.",
       limitIsNotAScanBound:
         "`--limit` caps output rows, not documents scanned. The discovery window and the ops-event retention are what bound this command.",
       discoveryWindow:
@@ -603,7 +608,7 @@ export function renderAck(
         },
         exit: outcome.reason === "row-cleared" ? 0 : 1,
       };
-    default:
+    case "unavailable":
       return {
         result: {
           ...base,
@@ -619,17 +624,19 @@ export function renderAck(
         },
         exit: 1,
       };
+    default: {
+      // Exhaustiveness, not defensiveness: a fifth `OpsIntakeResult` state added
+      // by KPR-468 fails HERE at compile time rather than falling silently into
+      // the `unavailable` rendering, which would tell an operator "may have
+      // applied" about an outcome nobody has read.
+      const unreachable: never = outcome;
+      return unreachable;
+    }
   }
-}
-
-/** Exported for the test that asserts a handle is copied VERBATIM and never
- *  parsed by this edge — the value is opaque by contract. */
-export function handleIsOpaqueTo(input: OpsAcknowledgement): boolean {
-  return typeof input.handle === "string" && !(input.handle as unknown as ObjectId | undefined)?.toHexString;
 }
 ```
 
-⚠ **`handleIsOpaqueTo` earns its place or it goes.** It exists so AC9's "the edge parses nothing out of the handle" limb has something to assert against rather than being a claim about code nobody reads. If the implementer finds a cleaner assertion — a source scan for `ObjectId(` inside `src/cli/ops.ts`, say — prefer that and delete this helper; do **not** keep both.
+⚠ **There is no `handleIsOpaqueTo` helper, deliberately, and this note is here so nobody re-adds one.** An earlier draft exported `typeof input.handle === "string" && !(input.handle as unknown as ObjectId)?.toHexString` — which, on a `string`-typed field, is `typeof handle === "string"` and returns `true` for every input including a hand-parsed one. It read as type safety and supplied none. The claim it was meant to carry — that this edge parses nothing out of the handle — is carried instead by the two assertions chunk 2b Step 5 makes: the verbatim round trip of a non-ObjectId handle through `accept`, and a **source scan** of `src/cli/ops.ts` for `ObjectId`. The scan is what makes the claim structural; that is why `mongodb` is imported here for its `Db` **type only**.
 
 - [ ] **Step 2:** Add the usage lines to `src/cli.ts`. Insert immediately after the existing `obligations deactivate` line (`:143` at this tree — key on the string, not the number).
 

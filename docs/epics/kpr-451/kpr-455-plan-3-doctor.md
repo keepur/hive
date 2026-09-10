@@ -1,6 +1,6 @@
 # KPR-455 chunk 3 — The `hive doctor` section
 
-**Task 3 of 5.** Read [the plan index](kpr-455-plan.md) and all seven chunk files before starting.
+**Task 3 of 5.** Read [the plan index](kpr-455-plan.md) and all eight chunk files before starting.
 
 This is the spec's **deliberate divergence from the KPR-456 precedent**, which shipped its CLI with no doctor section. It is declined for a reason specific to this epic rather than to taste: an ops pipeline that has stopped is invisible until somebody thinks to look at it, and "thinking to look" is exactly what fails in the incident this epic was filed about. KPR-468 names its own worst case — a deterministically-faulting event wedges ingest, `eventsBehind` and `oldestUnappliedAt` grow without bound, and if it stands long enough the queued events age past the event TTL and are lost — and states that the heartbeat is the only signal. Putting that signal on the surface an operator already runs is the epic's own thesis applied to the epic's own machinery.
 
@@ -12,7 +12,7 @@ This is the spec's **deliberate divergence from the KPR-456 precedent**, which s
 - Modify: `src/cli/doctor.ts` — one renderer after `renderOutageQueueSection` (`:252-273`), one call in the post-check block after the outage-queue section (`:770-774`), one line in the `config not loaded` else-branch (`:794-814`)
 - Create: `src/cli/ops-doctor.test.ts`
 
-**Tier: `capable`.** Two of its branches are judgment rather than mechanism: `backlog` renders informationally while `degraded` warns (collapsing them re-introduces exactly the noise this epic removes), and the staleness coercion keys on `timestamp` rather than on `lastSuccessfulSweep` — a stated departure from edge case 4's "copy verbatim", argued in the plan index.
+**Tier: `capable`.** Two of its branches are judgment rather than mechanism: `backlog` renders informationally while `degraded` warns (collapsing them re-introduces exactly the noise this epic removes), and the staleness coercion keys on `timestamp` rather than on `lastSuccessfulSweep` — which is edge case 4's rule applied to KPR-468's own liveness field, argued and ruled on in the plan index, and driven end to end by this chunk's own `opsPipelineForDoctor` case.
 
 ---
 
@@ -54,16 +54,10 @@ export async function opsPipelineForDoctor(uri: string, dbName: string): Promise
 Add to the imports at the top of `src/cli/doctor-checks.ts`:
 
 ```typescript
-import {
-  readOpsLogPresence,
-  readPipeline,
-  HEARTBEAT_STALE_MS,
-  type OpsLogPresence,
-  type PipelineFreshness,
-} from "./ops-views.js";
+import { readOpsLogPresence, readPipeline, type OpsLogPresence, type PipelineFreshness } from "./ops-views.js";
 ```
 
-⚠ `HEARTBEAT_STALE_MS` is imported here only if the file does not already re-export a 120 s constant of its own; check before adding it, and if the import is unused after Step 2, drop it rather than leaving a lint error.
+⚠ **No `HEARTBEAT_STALE_MS` import.** An earlier draft imported it here with a conditional instruction to drop it if unused; it *is* unused, because the 120 s coercion happens inside `readPipeline` and this file only reads the resolved `stale` boolean off the result. Importing it would be an unused-import lint error and, worse, would invite a second staleness test on this side of the seam.
 
 - [ ] **Step 2:** Add the renderer to `src/cli/doctor.ts`, immediately after `renderOutageQueueSection`'s closing brace (`:273` at this tree — key on the function name).
 
@@ -72,6 +66,14 @@ import {
  *  else-branch, because a section whose two spellings drift is a section an
  *  operator cannot grep for. */
 export const OPS_PIPELINE_SECTION_TITLE = "Ops event pipeline (KPR-455)";
+
+/** The doctor warns when the oldest unapplied event has aged past this fraction
+ *  of the event TTL — an age against an age, which is the one form of KPR-468
+ *  D5's TTL-outrun signal a SINGLE SAMPLE can see. Half leaves an operator the
+ *  same margin again to act. Declared ABOVE its only use: a `const` read from a
+ *  function declared earlier in the file is correct at runtime but reads as a
+ *  TDZ bug, and trips `no-use-before-define` if that rule is ever enabled. */
+const RETENTION_FRACTION_WARN = 0.5;
 
 /**
  * KPR-455 D2/D9: informational ops-pipeline liveness. NEVER affects the exit
@@ -136,12 +138,6 @@ export function renderOpsPipelineSection(
   emit("  (one read cannot see a rate: run twice a minute apart to tell a blip from a wedge)");
 }
 
-/** The doctor warns when the oldest unapplied event has aged past this fraction
- *  of the event TTL — an age against an age, which is the one form of KPR-468
- *  D5's TTL-outrun signal a SINGLE SAMPLE can see. Half leaves an operator the
- *  same margin again to act. */
-const RETENTION_FRACTION_WARN = 0.5;
-
 function ageLabel(seconds: number | null): string {
   if (seconds === null) return "?";
   if (seconds < 120) return `${seconds}s`;
@@ -181,10 +177,39 @@ import { opsPipelineForDoctor, type OpsPipelineStats } from "./doctor-checks.js"
 - [ ] **Step 5:** Create `src/cli/ops-doctor.test.ts`.
 
 ```typescript
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { renderOpsPipelineSection, OPS_PIPELINE_SECTION_TITLE } from "./doctor.js";
-import type { OpsPipelineStats } from "./doctor-checks.js";
+import { opsPipelineForDoctor, type OpsPipelineStats } from "./doctor-checks.js";
+import { FakeDb } from "../ops/testing/fake-db.js";
+import { NOTIFIER_STATS_KIND } from "../ops/notification-store.js";
 import type { PipelineFreshness } from "./ops-views.js";
+
+/* ⚠ `vi.hoisted`, not a bare top-level `const`: `vi.mock`'s factory is hoisted
+ * above the module's own initialisers, and a factory closing over a plain
+ * `const` fails with "cannot access before initialization". This slot is how
+ * each case programs the driver without re-mocking the module. */
+const driver = vi.hoisted(() => ({ db: null as unknown, connectThrows: false, closes: 0 }));
+
+/* Only `MongoClient` is replaced — `ObjectId` and everything else stay real,
+ * which matters because `ops-views.ts` and the double both import them. */
+vi.mock("mongodb", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("mongodb")>();
+  class FakeMongoClient {
+    async connect(): Promise<void> {
+      if (driver.connectThrows) throw new Error("ECONNREFUSED 127.0.0.1:27017");
+    }
+    db(): unknown {
+      return driver.db;
+    }
+    async close(): Promise<void> {
+      driver.closes += 1;
+    }
+  }
+  // The cast is the honest one: this stub implements the three members the
+  // fetcher uses and nothing else, and `typeof actual.MongoClient` is what the
+  // module's consumers are typed against.
+  return { ...actual, MongoClient: FakeMongoClient as unknown as typeof actual.MongoClient };
+});
 
 const RETENTION_DAYS = 90;
 
@@ -296,6 +321,66 @@ describe("the ops event pipeline doctor section", () => {
     expect(renderOpsPipelineSection(stats(), RETENTION_DAYS, () => {})).toBeUndefined();
   });
 });
+
+describe("opsPipelineForDoctor — the fetcher, not the renderer", () => {
+  beforeEach(() => {
+    driver.db = null;
+    driver.connectThrows = false;
+    driver.closes = 0;
+  });
+
+  it("returns null when Mongo is unreachable, and still closes the client", async () => {
+    // The fetcher's OWN null branch. `render(null)` exercises the RENDERER's
+    // null branch and says nothing about this one; without this case the
+    // fetcher has no test at all.
+    driver.connectThrows = true;
+    expect(await opsPipelineForDoctor("mongodb://demo.invalid", "hive_demo")).toBeNull();
+    expect(driver.closes).toBe(1);
+  });
+
+  it("⚠ THE DEPARTURE end to end: a fresh heartbeat beside a NEVER-SUCCEEDING sweep still reports degraded", async () => {
+    // The one case that distinguishes the two staleness rules through the
+    // doctor's own path. `readPipeline` coerces past 120 s on `timestamp` —
+    // KPR-468 writes it on EVERY tick including a degraded one — rather than on
+    // `lastSuccessfulSweep`, which advances only after an all-ok tick. Under
+    // the other rule this row would render `state: unknown` two minutes in and
+    // the section would print "engine may not be running" about an engine that
+    // is running and failing, which is this epic's own thesis inverted.
+    // (The coercion itself is unit-pinned in `ops-views.test.ts`; what this
+    // case adds is that the fetcher and the renderer preserve it.)
+    const db = new FakeDb();
+    await db.collection("telemetry").insertOne({
+      kind: NOTIFIER_STATS_KIND,
+      timestamp: new Date(Date.now() - 30_000),
+      lastSuccessfulSweep: null,
+      state: "degraded",
+      eventsBehind: 3,
+      cursorAt: new Date(Date.now() - 60_000),
+      ingestFaults: 0,
+      sweepFaults: 2,
+    });
+    driver.db = db.db;
+    const fetched = await opsPipelineForDoctor("mongodb://demo.invalid", "hive_demo");
+    expect(fetched).not.toBeNull();
+    expect(fetched!.pipeline).toMatchObject({
+      present: true,
+      stale: false,
+      state: "degraded",
+      reportedState: "degraded",
+      sweepSucceeding: false,
+    });
+    // ops_events was never written to, so the log reads absent — and that is
+    // reported as absent rather than as health.
+    expect(fetched!.log.present).toBe(false);
+    expect(driver.closes).toBe(1);
+    // And the renderer carries it through: the degraded warn fires, the
+    // stale-heartbeat warn does not, and the sweep reads "never".
+    const lines = render(fetched);
+    expect(lines.join("\n")).toContain("last successful sweep never");
+    expect(warns(lines).join("\n")).toContain("a sweep phase is failing");
+    expect(warns(lines).join("\n")).not.toContain("heartbeat is stale");
+  });
+});
 ```
 
 - [ ] **Step 6:** Verify.
@@ -316,7 +401,7 @@ grep -c "OPS_PIPELINE_SECTION_TITLE" src/cli/doctor.ts
 
 In `renderOpsPipelineSection`, change the degraded warn's condition from `p.reportedState === "degraded"` to `p.reportedState !== "ok"`, then run `npx vitest run src/cli/ops-doctor.test.ts`.
 
-**Predicted failure — exactly one case red:** `the ops event pipeline doctor section › state backlog renders informationally and produces NO warn`, with `warns(lines)` reporting one element (`"  ⚠ a sweep phase is failing — check engine logs (ops-notifier)"`) against an expected `[]`. **Predicted green: every other case**, including all four warn cases — the mutation only WIDENS the warn set, and each of those already expects a warn, so none of them can distinguish the two implementations. That asymmetry is exactly why the `backlog` case is written as a negative assertion on the warn count rather than as a positive assertion on the rendered line; a positive-only suite would go green under this mutation and prove nothing.
+**Predicted failure — exactly one case red:** `the ops event pipeline doctor section › state backlog renders informationally and produces NO warn`, with `warns(lines)` reporting one element (`"  ⚠ a sweep phase is failing — check engine logs (ops-notifier)"`) against an expected `[]`. **Predicted green: every other case**, including all four warn cases and both `opsPipelineForDoctor` cases — the mutation only WIDENS the warn set, each of the four already expects a warn, the fetcher's null case renders no state line at all, and the departure case's `reportedState` is already `"degraded"`, so none of them can distinguish the two implementations. That asymmetry is exactly why the `backlog` case is written as a negative assertion on the warn count rather than as a positive assertion on the rendered line; a positive-only suite would go green under this mutation and prove nothing.
 
 Note also the second-order prediction: `a backlog whose oldest unapplied event crosses the retention fraction DOES warn` **stays green for the wrong reason** under the mutation (two warns instead of one), which is why it asserts on the warn text rather than on the count.
 

@@ -1,15 +1,17 @@
 # KPR-455 chunk 4 — Acceptance suite
 
-**Task 4 of 5.** Read [the plan index](kpr-455-plan.md) and all seven chunk files before starting.
+**Task 4 of 5.** Read [the plan index](kpr-455-plan.md) and all eight chunk files before starting.
 
 Sixteen criteria as named `describe` blocks in one file, so they read as one list. **AC15 is hosted in chunk 5, not here** — its assertion is about `CLAUDE.md`, which Task 5 writes, and a test asserting a file the next commit creates would leave this commit red. Chunk 5 Step 2 appends it to this same file. Every other criterion has at least one real `it` here.
 
+**Split, and it is a STEP seam rather than a task seam — the third recorded exception.** Chunks 4 and 4b are **one task and one commit**: this file carries Steps 1–8 (AC1–AC9, AC12, AC13, AC16 and the runs of NV1, NV4, NV5, NV6 and NV7), [chunk 4b](kpr-455-plan-4b-acceptance.md) carries Steps 9–11 (AC10, AC11, AC14, the NV2 and NV3 runs, the whole-suite verification and the commit). One test file, one commit; the seam is where the file crossed this plan's own 900-line bound after round 2's additions. Read 4 and 4b as one unit.
+
 **Files**
 
-- Create: `src/cli/ops.integration.test.ts`
+- Create: `src/cli/ops.integration.test.ts` (appended to in [chunk 4b](kpr-455-plan-4b-acceptance.md))
 - Read-only: `src/ops/testing/fake-db.ts`, `src/ops/testing/notifier-harness.ts`, `src/cli/testing/ops-cli-fixtures.ts` (chunk 2b)
 
-**Tier: `capable`.** AC10 drives the single claim the spec asks a reviewer to press hardest — that intake's CAS, not the in-process latch, carries the no-blended-write property across processes — and it is the criterion most able to go green while asserting nothing.
+**Tier: `capable`.** AC10 (chunk 4b) drives the single claim the spec asks a reviewer to press hardest — that intake's CAS, not the in-process latch, carries the no-blended-write property across processes — and it is the criterion most able to go green while asserting nothing.
 
 ---
 
@@ -236,7 +238,9 @@ describe("AC3 — stale means unknown, and absence is never health", () => {
 
 In `resolveToolHealth`, delete the `latestAt.getTime() < horizonAt` branch so `outcome` falls through to `recovered ? "recovered" : "failing"`, then run `npx vitest run src/cli/ops.integration.test.ts -t "AC3"`.
 
-**Predicted failure — exactly one case red:** `AC3 › reports UNKNOWN for the same fact just outside the horizon`, reporting `"failing"` where `"unknown"` was expected, and the companion `summary` assertion failing on `{ failing: 1, unknown: 0 }`. **Predicted green:** limb 1 (inside the horizon — the mutation agrees with the rule there) and limb 3 (an absence, which no outcome branch can produce). Also predicted green: every AC16 case, because `resolveOpenConditions` holds its own staleness branch — **if an AC16 case goes red here, the two views have been collapsed onto one horizon and D8's "the horizon is a property of the view" has been violated; report that rather than adjusting the prediction.**
+**Predicted failure — exactly one case red:** `AC3 › reports UNKNOWN for the same fact just outside the horizon`, reporting `"failing"` where `"unknown"` was expected, and the companion `summary` assertion failing on `{ failing: 1, unknown: 0 }`. **Predicted green:** limb 1 (inside the horizon — the mutation agrees with the rule there) and limb 3 (an absence, which no outcome branch can produce), and every AC16 case — though AC16 is NOT the cross-check it looks like: its six limbs are the four classes plus the two negatives, none of them is about staleness, and they are green here for the trivial reason that they never exercise a horizon at all.
+
+⚠ **The real cross-check lives in the unit suite, so this mutation is a TWO-COMMAND run.** Also run `npx vitest run src/cli/ops-views.test.ts` and predict `resolveOpenConditions › marks a condition older than the horizon as unknown rather than dropping it` **stays green** — that is the OTHER view's own staleness branch, held by `resolveOpenConditions` rather than by `resolveToolHealth`. **If it goes red, the two views have been collapsed onto one horizon and D8's "the horizon is a property of the view" has been violated; report that rather than adjusting the prediction.**
 
 **Restore** and re-run before continuing.
 
@@ -426,7 +430,7 @@ describe("AC7 — no error text, no receipts", () => {
 
 **NV5 — `TURN_ACTIVITY_FILTER`.** Delete the `...TURN_ACTIVITY_FILTER` spread from `windowFilter` in `readQuietTurns`, then run `npx vitest run src/cli/ops.integration.test.ts -t "AC7"`.
 
-**Predicted failure — exactly one case red, and three assertions inside it:** `AC7 › excludes KPR-456 delivery receipts, behaviourally AND structurally`. The behavioural half reports `matched: 2` (the receipt's `error: "boom"` now satisfies the union) and `turnsInWindow: 3`, and `recent` reports `["(unset)", "ER0"]` — the receipt has no `threadId`, so the row mapper's total fallback renders `"(unset)"` rather than throwing. The structural half then fails too, because the recorded filter no longer contains `recordKind`.
+**Predicted failure — exactly one case red, and it aborts at its FIRST assertion:** `AC7 › excludes KPR-456 delivery receipts, behaviourally AND structurally`. Vitest throws out of a case on the first failing `expect`, so what is actually observed is one line — `expected 2 to be 1` on `payload.quietTurns.matched`, the receipt's `error: "boom"` now satisfying the union — and the `turnsInWindow`, `recent` and structural assertions in the same case **never execute**. Record that, not a three-assertion set. Stated for the record only, because a reader will otherwise expect to see them: had the case continued, `turnsInWindow` would report 3; `recent` would report `["ER0", "(unset)"]` (the page sorts `timestamp: -1`, and the `ago(10)` error row precedes the `ago(14)` receipt, whose absent `threadId` renders through the row mapper's total fallback rather than throwing); and the structural half would fail because the recorded filter no longer contains `recordKind`.
 
 **Predicted green — and each for its own reason, which is what makes the prediction checkable:** `AC7 › contains no substring of any fixture row's error value` (the mutation changes WHICH rows are read, never what is rendered from one, and that fixture seeds no receipt); **every AC6 case**, because AC6 seeds no receipt at all, so its `turnsInWindow` and `matched` counts are identical under both implementations; and every AC1/AC3/AC8 case, none of which reads `activity_log`. **If any AC6 case goes red, a receipt has leaked into a shared fixture** — the per-case `ready()` helper mints a fresh `FakeDb`, so that would mean the helper was changed to share one; report it rather than adjusting the prediction.
 
@@ -472,7 +476,7 @@ describe("AC8 — matchedSubscriptions is rendered as a past-tense fact", () => 
     const rendered = JSON.stringify(payload).toLowerCase();
     for (const phrase of ["claimed by nobody", "unclaimed", "nobody is on this", "is claimed", "claimed by"])
       expect(rendered).not.toContain(phrase);
-    expect(collectKeys(payload)).not.toContain("matchedSubscriptions");
+    expect([...collectKeys(payload)]).not.toContain("matchedSubscriptions");
     expect(payload.notes.matchedAtPublish).toContain("past-tense fact");
   });
 });
@@ -685,216 +689,4 @@ describe("AC13 — the identity guard", () => {
 
 **Restore** and re-run before continuing.
 
-- [ ] **Step 9:** Append AC10, AC11 and AC14, then run NV2 and NV3.
-
-```typescript
-describe("AC10 — intake reached across processes, against the REAL CAS", () => {
-  /**
-   * ⚠ ONE LEDGER ROW, DELIBERATELY. The in-memory double compares `_id` with
-   * `same()`, whose object branch compares enumerable own keys — and an
-   * ObjectId exposes none — so `{ _id: X }` can match ANY ObjectId row. With
-   * one row that is inert; a second row would make this criterion pass or fail
-   * for a reason unrelated to the CAS. Do not add one.
-   */
-  async function ledgerRow() {
-    const h = await harness({ subscriptions: [sub("s1")] });
-    const event = await h.seedEvent();
-    await h.tick();
-    const row = await h.row("s1", event.dedupeKey);
-    const handle = String(row._id);
-    // ⚠ The gate that keeps this criterion from going green while asserting
-    // nothing: intake resolves a handle through parseHandle, which admits ONLY
-    // a 24-character ObjectId-valid hex string that round-trips
-    // (kpr-468-plan-4-intake.md:78-82). Against a degraded `_id` — a `copy`
-    // that is bare structuredClone, i.e. KPR-468's fake-db extension (f)
-    // missing — this is "[object Object]", every accept below returns
-    // `refused: "unknown-handle"`, and the CAS this test exists to prove is
-    // never reached.
-    expect(handle).toMatch(/^[0-9a-f]{24}$/);
-    return { h, handle };
-  }
-
-  /** Moves the CAS precondition out from under intake, `times` times: an
-   *  after-hook on the ledger's own findOne flips `state` between the two
-   *  working values, so the row intake READ is not the row it writes against. */
-  function jostle(db: FakeDb, times: number): void {
-    for (let i = 0; i < times; i += 1) {
-      const gate = db.pause("ops_notifications", "findOne", () => true, true);
-      void gate.reached.then(() => {
-        const rows = db.collection("ops_notifications").rows;
-        for (const [id, row] of rows) rows.set(id, { ...row, state: row.state === "pending" ? "delivered" : "pending" });
-        gate.release();
-      });
-    }
-  }
-
-  it("returns unavailable after exactly one retry inside intake, with no partial write", async () => {
-    const { h, handle } = await ledgerRow();
-    const before = h.db.operations.filter((o) => o.collection === "ops_notifications" && o.operation === "updateOne").length;
-    jostle(h.db, 2);
-    const outcome = await h.notifier.accept({ handle, act: "seen", actorId: "U1", at: NOW });
-    expect(outcome).toEqual({ state: "unavailable" });
-    const attempts =
-      h.db.operations.filter((o) => o.collection === "ops_notifications" && o.operation === "updateOne").length - before;
-    expect(attempts).toBe(2); // the first CAS plus intake's ONE retry
-    const row = [...h.db.collection("ops_notifications").rows.values()][0]!;
-    expect(row.lastAckKey).toBeUndefined();
-    expect(row.lastAckAt).toBeUndefined();
-    expect(["pending", "delivered"]).toContain(row.state);
-    await h.notifier.stop?.();
-  });
-
-  it("the EDGE re-issues the identical tuple and the act lands once the interference stops", async () => {
-    const { h, handle } = await ledgerRow();
-    const f = fixture();
-    stampSentinel(h.db, f.selection);
-    jostle(h.db, 2); // consumes both findOnes of the edge's FIRST accept call
-    const d = deps(h.db, f.selection, {
-      clock: fixedClock(),
-      // The second process: the CLI constructs KPR-468's OWN notifier against
-      // the same database and calls accept(...) on it. Not the singleton — that
-      // lives in the engine.
-      makeNotifier: (db, days) => new OpsNotifier(db, days),
-    });
-    const exit = await runOps(
-      ["ops", "ack", handle, "--act", "seen", "--actor", "U1", "--config", f.path, "--json"],
-      d,
-    );
-    const payload = JSON.parse(d.emitted.at(-1)!);
-    expect(exit).toBe(0);
-    expect(payload.result).toBe("applied");
-    expect(payload.rowState).toBe("seen");
-    expect(payload.attempts).toBe(2);
-    await h.notifier.stop?.();
-  });
-
-  it("a landed first write makes the identical re-issue a noop, not a second transition", async () => {
-    const { h, handle } = await ledgerRow();
-    const applied = await h.notifier.accept({ handle, act: "seen", actorId: "U1", at: NOW });
-    expect(applied).toMatchObject({ state: "applied", rowState: "seen" });
-    const f = fixture();
-    stampSentinel(h.db, f.selection);
-    const d = deps(h.db, f.selection, { clock: fixedClock(), makeNotifier: (db, days) => new OpsNotifier(db, days) });
-    const exit = await runOps(["ops", "ack", handle, "--act", "seen", "--actor", "U1", "--config", f.path, "--json"], d);
-    const payload = JSON.parse(d.emitted.at(-1)!);
-    expect(exit).toBe(0);
-    expect(payload).toMatchObject({ result: "noop", reason: "already-applied", confirmed: true });
-    await h.notifier.stop?.();
-  });
-});
-
-describe("AC11 — ten distinguishable outcomes, their exit codes and one JSON document", () => {
-  const HANDLE = "65a1b2c3d4e5f60718293a4b";
-  const outcomes: Array<[string, Parameters<ProgrammedNotifier["accept"]> extends never ? never : any, number, (p: any) => void]> = [
-    ["applied", { state: "applied", rowState: "seen" }, 0, (p) => expect(p.rowState).toBe("seen")],
-    ["noop/already-applied", { state: "noop", reason: "already-applied" }, 0, (p) => expect(p.reason).toBe("already-applied")],
-    ["noop/superseded", { state: "noop", reason: "superseded" }, 0, (p) => expect(p.reason).toBe("superseded")],
-    ["refused/unknown-handle", { state: "refused", reason: "unknown-handle" }, 1, (p) => expect(p.reason).toBe("unknown-handle")],
-    ["refused/unattributed", { state: "refused", reason: "unattributed" }, 1, (p) => expect(p.reason).toBe("unattributed")],
-    ["refused/row-cleared", { state: "refused", reason: "row-cleared" }, 0, (p) => expect(p.benign).toBe(true)],
-    ["refused/integrity-dismissal", { state: "refused", reason: "integrity-dismissal" }, 1, (p) => expect(p.reason).toBe("integrity-dismissal")],
-    ["refused/snooze-not-future", { state: "refused", reason: "snooze-not-future" }, 1, (p) => expect(p.reason).toBe("snooze-not-future")],
-    ["refused/illegal-transition", { state: "refused", reason: "illegal-transition" }, 1, (p) => expect(p.reason).toBe("illegal-transition")],
-    ["unavailable", { state: "unavailable" }, 1, (p) => expect(p.confirmed).toBe(false)],
-  ];
-
-  it.each(outcomes)("renders %s with the contract token verbatim and the right exit code", async (name, outcome, exit, extra) => {
-    const { f, db } = await ready();
-    const notifier = new ProgrammedNotifier([outcome]);
-    const d = deps(db, f.selection, { clock: fixedClock(), makeNotifier: () => notifier });
-    const actual = await runOps(
-      ["ops", "ack", HANDLE, "--act", "seen", "--actor", "U1", "--config", f.path, "--json"],
-      d,
-    );
-    expect(actual).toBe(exit);
-    expect(d.emitted).toHaveLength(1);
-    const payload = JSON.parse(d.emitted[0]!);
-    extra(payload);
-    // The contract token is DATA in the payload, never a thrown message that
-    // src/cli.ts:178's /^[a-z_]+$/ guard would swallow.
-    if (outcome.reason) expect(JSON.stringify(payload)).toContain(outcome.reason);
-  });
-
-  it("counts ten outcomes, which is what the union actually has", () => {
-    expect(outcomes).toHaveLength(10);
-  });
-
-  it("unavailable renders as UNKNOWN with the act, handle and fixed at", async () => {
-    const { f, db } = await ready();
-    const notifier = new ProgrammedNotifier([{ state: "unavailable" }]);
-    const d = deps(db, f.selection, { clock: fixedClock(), makeNotifier: () => notifier });
-    const exit = await runOps(
-      ["ops", "ack", HANDLE, "--act", "seen", "--actor", "U1", "--config", f.path, "--json"],
-      d,
-    );
-    const payload = JSON.parse(d.emitted[0]!);
-    expect(exit).toBe(1);
-    expect(payload.message).toContain("UNKNOWN");
-    expect(payload.message).toContain("MAY have applied");
-    expect(payload.message).toContain("NOT CONFIRMED");
-    expect(payload.at).toBe(NOW.toISOString());
-    expect(payload.handle).toBe(HANDLE);
-    expect(payload.act).toBe("seen");
-  });
-});
-
-describe("AC14 — the doctor section is informational and complete", () => {
-  it("is re-driven in full by src/cli/ops-doctor.test.ts, and pinned here on the two properties that matter", async () => {
-    const { renderOpsPipelineSection, OPS_PIPELINE_SECTION_TITLE } = await import("./doctor.js");
-    // (1) It returns nothing, so no caller can route it into allPassed.
-    expect(renderOpsPipelineSection(null, 90, () => {})).toBeUndefined();
-    // (2) The config-not-loaded else-branch prints the SAME title the renderer
-    //     does — the entry a new section reliably forgets.
-    const doctor = readFileSync("src/cli/doctor.ts", "utf8");
-    expect(doctor.split("OPS_PIPELINE_SECTION_TITLE").length - 1).toBeGreaterThanOrEqual(3);
-    expect(OPS_PIPELINE_SECTION_TITLE.length).toBeGreaterThan(0);
-  });
-});
-```
-
-**NV2 — the class-legality switch.** Replace `clearingIsLegal`'s `switch` body with `return condition.class !== "informational";`, then run `npx vitest run src/cli/ops.integration.test.ts -t "AC16"`.
-
-**Predicted failure — exactly three of AC16's six cases red:** `judgment: cleared only with evidence, open with none` (the zero-evidence half reports `[]` where one row was expected), `integrity: cleared only with evidence, open with none` (same), and `an unrecognized class stays OPEN and renders class: unknown` (`rows` is `[]`, so the `toHaveLength(1)` fails before the `toMatchObject`). **Predicted green:** the `resource` case and the `informational` case (the mutation agrees with the rule on both) and — the prediction that separates NV2 from NV3 — `a clearing fact from a DIFFERENT producer does not clear`, because the producer test sits ABOVE the switch and this mutation does not touch it.
-
-**Restore**, re-run, then **NV3 — the same-producer clause.** Delete `if (clearing.producer !== condition.producer) return false;` and run the same command.
-
-**Predicted failure — exactly one case red:** `AC16 › a clearing fact from a DIFFERENT producer does not clear`, with `rows` reporting `[]`. **Predicted green: every other AC16 case**, including the two evidence cases the deleted clause is `&&`-ed with — dropping one conjunct of a passing test leaves it passing.
-
-**Restore** and re-run before committing.
-
-- [ ] **Step 10:** Verify the whole suite.
-
-```bash
-npx tsc --noEmit
-npx vitest run src/cli/ops.integration.test.ts
-npx vitest run src/cli src/ops
-npx vitest run src/boot-order.test.ts
-npx prettier --check src/cli/ops.integration.test.ts
-npx eslint src/cli/ops.integration.test.ts
-```
-
-**Expected:** `tsc` exits 0. The acceptance file passes with **fifteen criterion `describe` blocks** (AC1–AC14 and AC16; AC15 lands in chunk 5), zero skipped. `src/cli` and `src/ops` pass entire — the second is the standing evidence that this child changed neither sibling's behaviour through the shared doubles. `boot-order.test.ts` passes unchanged. Record actual test counts; do not invent them.
-
-- [ ] **Step 11:** Commit.
-
-```bash
-git add src/cli/ops.integration.test.ts
-git commit -m "$(cat <<'EOF'
-test(KPR-455): AC1–AC16 acceptance suite
-
-Fifteen criterion blocks (AC15 lands with the docs commit, since its assertion
-is about a file Task 5 writes). AC10 is the one to read first: it drives the
-edge against KPR-468's REAL intake and its real CAS across two notifier
-instances over one database — a moved precondition returns unavailable after
-exactly one retry inside intake with no partial write, the edge re-issues the
-identical tuple, and a landed first write makes that re-issue a noop. It guards
-itself with a handle-shape assertion, without which a degraded `_id` in the
-shared double would make the whole criterion green while asserting nothing.
-
-Six of the plan's nine negative-verify points are confirmed here (NV1–NV7 less
-NV8/NV9, which run in chunks 2 and 3).
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-EOF
-)"
-```
+**Continue in [chunk 4b](kpr-455-plan-4b-acceptance.md)** — Steps 9–11 (AC10, AC11, AC14, the NV2 and NV3 runs, the whole-suite verification and this task's single commit). Do not commit from here: the whole acceptance file lands in one commit.
