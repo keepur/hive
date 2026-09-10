@@ -474,3 +474,78 @@ Example subscription (shape only): *a subscriber that wants integrity and judgme
 - **⚠ Delegated and named residuals, each argued in full where it binds (all non-blocking):** a clearing fact carries its **own** registered reason and a `class: resource` reason cannot be *enabled* until some reason clears it — rationale, the deliberate `judgment`/`integrity` exemption, and the residual are in D4; the sweep's progress is a cursor held outside the immutable log and is not a fourth collection, its location the implementing child's choice — D12; a producer's open-condition set is in-process, so a restart costs at most one epoch boundary per open condition and never a lost fact, the per-success database read having been rejected against C15 — D2.
 - **Open, epic-level scoping (blocking for implementation, not for this contract) — two items, not one:** (i) the matcher–deliverer of D12 — ledger, delivery, nudge sweep, clearing application and acknowledgement intake, **not** match evaluation, which rides the publish insert and ships with the producer; and (ii) the inbound acknowledgement edge of D6 that calls intake. Both are chartered to no existing child — KPR-454 is a producer, KPR-455 a reader, and the epic's proposed-children list names nobody for either — and this document assigns neither. D12's closing paragraph holds the options (widen KPR-455, widen KPR-454, file a new child; the two need not land together), the honest interim (a producer alone is staged, not broken), and the one sequencing constraint the contract asserts: (i) must not ship without (ii).
 - **Open, deferred by the operator:** whether nudging should ever de-escalate or self-heal. Quoted in D1; not designed here, and the ledger carries the fields (`nudgeCount`, `state`, `stateAt`, dismiss rate) that would let that decision be made from evidence.
+
+---
+
+## Post-signoff addendum (2026-09-08)
+
+*Everything above this line is the artifact signed off at [KPR-458#comment-3f6e8a4a](https://linear.app/keepur/issue/KPR-458#comment-3f6e8a4a), committed at `3aa6d06`. Nothing above is edited. This addendum corrects by supersession, following the `docs/epics/kpr-415/kpr-417-spec.md` §12/§13 precedent: a body claim that later becomes false is superseded here and left standing there, so the signoff stays attached to a document that still exists.*
+
+### A.1 Scoping resolved: both unowned components now have owners
+
+The body reads, at thirteen lines in ten places — each one mapped in A.2 below, which is authoritative over this sentence — as though two components this contract requires are chartered to no child, and it closes by naming that as an open epic-level scoping item "blocking for implementation, not for this contract". **That item is closed.** The operator resolved it in the epic driver session immediately after spec review closed, recorded at [KPR-455#comment-1b79ee1a](https://linear.app/keepur/issue/KPR-455#comment-1b79ee1a):
+
+| Component | Body reference | Owner |
+| --- | --- | --- |
+| The matcher–deliverer: ledger upsert and renewal, calling the adapter, the nudge sweep, snooze expiry, clearing application, and acknowledgement intake | D12 | **KPR-468** — *Notifier — deliver, nudge, clear and accept acknowledgements over the ops-event ledger*, a new child filed for exactly this scope. Blocked by KPR-454 and KPR-458. |
+| The inbound acknowledgement edge: capturing an attributed act and handing it to intake as `(handle, act, actorId, at, snoozedUntil?)` | D6 | **KPR-455** — the reader, widened to carry it. |
+
+Three things the body says about these that the resolution does **not** change, and that both owners inherit unaltered:
+
+1. **Match evaluation is not KPR-468's.** It is pure, performs no I/O, and is stamped into the immutable publish insert as `matchedSubscriptionIds` on the accept path (D2, D12, C2). It ships with publishing — by the epic's list, **KPR-454** — together with the `ops_events` / `ops_subscriptions` initialization, their indexes, the loaded subscription set, and the above-the-boundary wiring D10 requires for all of it. A plan writer parcelling D12 to KPR-468 must not carry the matcher across with it.
+2. **The sequencing constraint stands.** D12's closing paragraph: the matcher–deliverer must not ship without the inbound edge, because notifications would go out and no acknowledgement could ever come back. With the split above, that reads: **KPR-468 must not ship without KPR-455's inbound edge.** The blocking edge KPR-468 already carries on KPR-454 does not express this one; it is stated here and belongs in KPR-468's own body.
+3. **A producer shipped alone is still staged, not broken.** KPR-454 alone accumulates durable events with a truthfully stamped `matchedSubscriptions: 0` and a queryable log while no notification exists. That remains the honest interim, and it remains D11's third column — subscription rows, transport bindings, cadence values, the nudge floor, staleness horizons, retention values — that gates anything becoming visible. This ticket ships zero rows of it.
+
+### A.2 Supersession map
+
+Each location below reads, at `3aa6d06`, as though ownership is open. Each is superseded by A.1 and is otherwise unchanged; the surrounding obligations, which are the load-bearing content, all stand.
+
+| Line(s) at `3aa6d06` | Body text superseded | Now reads as |
+| --- | --- | --- |
+| 5 | TL;DR: "Two components this contract requires are chartered to **no child**… neither is assigned" | Both assigned; see A.1. |
+| 9 | Key Points, "no fourth part" bullet, closing clause: "two pieces of that wire are chartered to nobody" | Both pieces owned; see A.1. The architectural claim the clause qualifies — that the wire is not a fourth part — is untouched. |
+| 10 | Key Points: "⚠ Unowned, blocking for implementation: the matcher–deliverer (D12)" | Owned by KPR-468. The ⚠ marker no longer applies; the exhaustive obligation list in that bullet does. |
+| 11 | Key Points: "⚠ Unowned: the inbound acknowledgement edge (D6)" | Owned by KPR-455. |
+| 33 | Scope and authority: "plan for a document, a Gate-1 conversation, and the two scoping decisions named below" | The two scoping decisions are made; the document and the Gate-1 conversation remain this ticket's work. |
+| 35 | Scope and authority: "this document assigns neither… that is a scoping decision for the epic driver with the operator" | The driver made it with the operator. The paragraph's statement of *what* is unowned remains an accurate statement of the two obligation sets. |
+| 260, 267 | D6: "owned by nobody"; "No child in the epic's list is chartered for this" | KPR-455. D6's four obligations on the edge — translate-only, no ledger or subscription access, attribute-or-refuse, idempotency/legality belong to intake — are unchanged and bind KPR-455. |
+| 377 | D11 table row: "Each carrying surface's own inbound edge — **⚠ chartered to no child**" | Chartered to KPR-455 for the surfaces it carries; the row's third column (which surfaces expose one) stays operator-registered data. |
+| 386, 388, 412 | D12 heading "ownership open"; "Placed last because it is the epic's open scoping item"; "Ownership is open, and this document does not close it — for two items, not one" | Closed, for both items, per A.1. D12 keeps its place and its name; its exhaustive "what it owns" list is unchanged and is KPR-468's scope statement. |
+| 475 | Assumptions: "Open, epic-level scoping (blocking for implementation, not for this contract) — two items, not one" | Resolved. Reclassify as closed. |
+
+Nothing else in the body is superseded. In particular the four operator rulings (D1), the three vocabularies (D3), the filter grammar (D5), the transport interface and its two closed reason sets (D6), the ledger transition table (D7), the retention posture (D9), the boundaries against `agent_events` / KPR-456 / KPR-457 (D10), the three-column split (D11), and C1–C19 stand exactly as signed off.
+
+### A.3 Runtime-anchor verification record
+
+The contract's evidence table, D3, D10 and C6/C12 cite live source by file and line. Re-verified against `epic/kpr-451` at `f377fe1` — the epic-branch head the verification actually read at, which is the parent of the commit that lands this addendum:
+
+| # | Anchor | Claim it supports | Result |
+| --- | --- | --- | --- |
+| A1 | `src/outage/outage-notices.ts:18-26` | D3's `policyFor` → `waiting` mapping; the stale "team DM" fallthrough comment; C6 | verified |
+| A2 | `src/agents/provider-adapters/turn-scaffold.ts:353` | literal `costUsd: 0` in the shared Lane B result builder; C12 | verified |
+| A3 | `src/agents/agent-manager.ts:2611-2612` | sparse `aborted` / `timedOut` flags (KPR-401) | verified |
+| A4 | `src/types/agent-definition.ts:65` | `subscribe?: string[]` is the event-bus domain list, not an ops subscription | verified |
+| A5 | `src/scheduler/scheduler.ts:322` | `checkEvents` turns a pending delivery into a turn-spawning `WorkItem` | verified |
+| A6 | `src/events/event-types.ts` | closed 13-type schema; `system:task_blocked` carries `{taskId, description, blockedBy}` | verified |
+| A7 | `src/index.ts` spawn-capable boundary marker; `src/boot-order.test.ts` superset sweep | D10's and D12's boot-order obligations on the consuming children | verified (observed `src/index.ts:474`, `src/boot-order.test.ts:84` — both unchanged from the `771c63c` observation) |
+
+The counts in "Problem and observed evidence" are deliberately **not** re-run: that table states its own window rule — *"The window slides, so absolute counts move between runs while the ratios hold… Cite the ratio and the date, never the bare count."* The 2026-09-08 measurement stands as recorded.
+
+### A.4 Canon — entries KPR-458 contributes to the KPR-451 Decision Register
+
+Drafted here so the driver can lift them verbatim at merge, in the register's existing one-line declarative style, following `docs/epics/kpr-415/kpr-417-spec.md` §12's precedent. They contradict no merged entry from KPR-453, KPR-456 or KPR-457.
+
+* KPR-458: Operational facts publish without recipient, destination, transport, owner, or severity; no severity axis exists and none may be added.
+* KPR-458: Interest lives only in subscriber-owned subscription rows; no default subscription, fallback recipient, or catch-all adapter, and `matchedSubscriptions: 0` stays reachable as the measured gap.
+* KPR-458: `class` and `retry` are registry-declared per `(producer, reasonId)` and stamped at accept; only `waiting` is per-publish, derived for the runtime from one prefix table shared with `policyFor`.
+* KPR-458: An unknown `(producer, reasonId)`, an undeclared `detail` key, an over-bound value, or a non-scalar rejects the publish and is counted; redaction is the write-time schema, never a scrub-after pass.
+* KPR-458: Notification identity is `(subscriptionId, dedupeKey)`; `generation` advances only on recurrence after a published class-legal clearing fact, never on repetition, retry, elapsed time, or an unanswered nudge.
+* KPR-458: Match evaluation is pure, rides the immutable publish insert as `matchedSubscriptionIds`, and is never re-evaluated downstream; everything after the insert runs on a bounded non-overlapping sweep off the turn path.
+* KPR-458: Transitions to `seen`/`dismissed`/`snoozed` require an attributed act through idempotent intake; every other transition records the reserved system principal, `integrity` refuses dismissal, and no bulk path exists.
+* KPR-458: Nudging has no terminal state; snooze is the only pause, and intake clamps it to the operator-set maximum rather than refusing the act.
+* KPR-458: Transport is an adapter returning accepted/rejected/unknown; only allow-listed `rejected` retries, the ops path never publishes about itself, and no delivery may synchronously spawn an agent turn.
+* KPR-458: Derived views return `unknown` past a required staleness horizon; failure is never inferred from `activity_log.error`, `costUsd`, or duration. `agent_events`, KPR-456's obligation path and KPR-457's watchdog keep their own contracts and become no part of this interface.
+
+### A.5 What this ticket did not ship
+
+Restating D11's third column and D1's collection rule as a checklist, because the next reader's most likely error is assuming a merged contract means a live surface. KPR-458 ships **no** code, collection, index, validator, reason-registry row, subscription row, transport binding, cadence value, nudge floor, staleness horizon, or retention value. `ops_events` and `ops_subscriptions` are created and documented in `CLAUDE.md` by KPR-454; `ops_notifications` by KPR-468. Until D11's third column is registered by the operator, a conforming deployment records every publish, delivers none, holds no ledger row, and measures how much nobody has claimed.
