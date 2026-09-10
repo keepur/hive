@@ -7,6 +7,7 @@ import {
   DEFAULT_API_CONNECT_OPTIONS,
   LLM,
   LLMStream,
+  USERDATA_TIMED_TRANSCRIPT,
   VAD,
   VADEventType,
   VADStream,
@@ -20,6 +21,8 @@ import {
 } from "@livekit/agents";
 import { AudioFrame } from "@livekit/rtc-node";
 
+export type NamedBarrier<T = void> = ReturnType<typeof gate<T>> & { readonly name: string };
+
 export function gate<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -28,6 +31,11 @@ export function gate<T = void>() {
     reject = no;
   });
   return { promise, resolve, reject };
+}
+
+/** A gate whose name is preserved in scenario evidence and assertion failures. */
+export function namedBarrier<T = void>(name: string): NamedBarrier<T> {
+  return { name, ...gate<T>() };
 }
 
 export type BridgePhase =
@@ -123,6 +131,14 @@ export class CaptureAudioOutput extends AudioOutput {
       this.onPlaybackStarted(Date.now());
       this.onPlaybackFinished({ playbackPosition: 0.02, interrupted: false });
     }
+  }
+
+  /** Text attached by Agent.default.ttsNode to frames that reached fake playout. */
+  transcriptTexts(): string[] {
+    return this.frames.flatMap((frame) => {
+      const timed = frame.userdata?.[USERDATA_TIMED_TRANSCRIPT] as Array<{ text?: string }> | undefined;
+      return timed?.map((entry) => entry.text ?? "") ?? [];
+    });
   }
 }
 
@@ -341,6 +357,7 @@ export class ControlledLLM extends LLM {
   readonly plans: LlmPlan[] = [];
   readonly streams: ControlledLLMStream[] = [];
   readonly events: Array<{ event: string; turnId: string | null }> = [];
+  readonly requests: Array<Array<{ role: string; text: string }>> = [];
 
   override label(): string {
     return "kpr464-controlled-llm";
@@ -357,6 +374,11 @@ export class ControlledLLM extends LLM {
   }): ControlledLLMStream {
     const plan = this.plans.shift();
     if (!plan) throw new Error("test did not supply an LLM plan");
+    this.requests.push(
+      chatCtx.items
+        .filter((item) => item.type === "message")
+        .map((item) => ({ role: item.role, text: item.textContent ?? "" })),
+    );
     return capabilityContext.run(Object.freeze({ turnId: plan.turnId }), () => {
       this.events.push({ event: "llm_constructed", turnId: plan.turnId });
       const stream = new ControlledLLMStream(

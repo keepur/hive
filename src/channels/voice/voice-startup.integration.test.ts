@@ -204,6 +204,14 @@ function body(callId: string) {
   };
 }
 
+function legacyBody(callId: string) {
+  return {
+    stream: true,
+    messages: [{ role: "user", content: callId }],
+    call: { id: callId, metadata: { hive_agent_id: "mokie" } },
+  };
+}
+
 function transcriptBody(callId: string) {
   const requestBody = body(callId);
   requestBody.messages = [
@@ -400,7 +408,7 @@ function expectNoLifecycleInternals(value: unknown): void {
   expect(serialized).not.toContain("AbortSignal");
 }
 
-function begin(port: number, requestBody: Record<string, unknown>) {
+function begin(port: number, requestBody: Record<string, unknown>, token = "bridge-token") {
   const payload = JSON.stringify(requestBody);
   let firstResolve!: (value: string) => void;
   let doneResolve!: (value: string) => void;
@@ -415,7 +423,7 @@ function begin(port: number, requestBody: Record<string, unknown>) {
       path: "/v1/chat/completions",
       method: "POST",
       headers: {
-        authorization: "Bearer bridge-token",
+        authorization: `Bearer ${token}`,
         "content-type": "application/json",
         "content-length": Buffer.byteLength(payload),
       },
@@ -559,6 +567,32 @@ describe("VoiceAdapter real manager ownership", () => {
     } finally {
       await session.close().catch(() => undefined);
     }
+  });
+
+  it("preserves bridge auth, SSE completion, and legacy no-trace correlation", async () => {
+    const fixture = makeFixture();
+    runnerControl.send.mockImplementation(
+      async (_prompt: string, _session: string | undefined, onStream?: (chunk: string) => void) => {
+        onStream?.("legacy successor");
+        return runResult("legacy successor");
+      },
+    );
+    const port = await start(fixture.adapter);
+
+    const unauthorized = begin(port, legacyBody("legacy-auth-denied"), "wrong-token");
+    expect(await unauthorized.done).toContain("Server secret not configured");
+    expect(runnerControl.send).not.toHaveBeenCalled();
+
+    const legacy = begin(port, legacyBody("legacy-no-trace"));
+    const response = await legacy.done;
+    expect(response).toContain("legacy successor");
+    expect(response).toContain("[DONE]");
+    expect(rows("legacy-no-trace", "engine_received")).toEqual([
+      expect.objectContaining({ correlation: "legacy", turnId: expect.stringMatching(/^[0-9a-f-]{36}$/) }),
+    ]);
+    expect(rows("legacy-no-trace", "engine_terminal")).toEqual([
+      expect.objectContaining({ outcome: "completed", textLength: "legacy successor".length }),
+    ]);
   });
 
   it("warm demux drops a cancelled queued request before provider input and a later independent request progresses", async () => {
