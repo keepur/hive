@@ -108,6 +108,8 @@ describe("AC15 — activity_log is not a failure oracle here (C12)", () => {
 import { harness, sub, t, failOn, failNth, BASE } from "./testing/notifier-harness.js";
 ```
 
+⚠ **That line is the harness import, not the file's whole import block.** Later fragments in this chunk additionally use `describe`/`it`/`expect` (vitest), `readFileSync` and `join`/`here` (the AC9 and CLAUDE.md scans), `STALL_RECHECK_MS` and the collection-name constants from `./notification-types.js`, `now`, `KEY` and `NOTIFIER_FILES` as file-local bindings, and `reason` from the harness. Add each where its first user appears; Step 11's completion check reads against the finished file, not against this line.
+
 The harness (chunk 3b Step 4, whose contract is the authority on every member used below) builds a `FakeDb`, seeds `ops_events` / `ops_subscriptions` / `ops_reasons` directly — never through KPR-454's publisher, since **AC16 is the one case that uses the real accept path** — constructs an `OpsNotifier` over a controllable clock and an immediate-resolve `sleep`, registers a `FakeTransport`, seeds the sweep cursor (defaulting to `t(-1)`, so a seeded event is ahead of it rather than swallowed by D3's cold-start arm), and exposes `tick()`.
 
 - **AC1 (C2, C3)** — with `ops_subscriptions` empty, ingesting any number of events creates **zero** `ops_notifications` documents and attempts zero deliveries; the event documents are byte-identical afterwards. A grep-shaped companion: no code path in the notifier's file set creates a default subscription, a fallback recipient or a fallback adapter (assert `transports.size === 0` after `init()` with no `registerTransport`, and that a due row with an unbound adapter stalls rather than falling back).

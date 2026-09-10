@@ -24,7 +24,7 @@ The ledger store and the ingest phase are still **one review unit** and are mean
 
 - [ ] **Step 1:** Re-verify KPR-454's three integration points against the **merged** code, before writing anything.
 
-This plan was written against KPR-454 as planned, not as built. Three facts it depends on:
+This plan was written against KPR-454 as planned, not as built. Three integration facts it depends on, plus two facts about the double Step 2 extends:
 
 ```bash
 # 1. OpsStore's read surface — the notifier constructs its own and calls only these.
@@ -35,19 +35,40 @@ grep -n "publishedAt: 1, _id: 1" src/ops/store.ts
 grep -n "matchedSubscriptionIds" src/ops/types.ts src/ops/publisher.ts
 # 4. Real ObjectId minting in the double (KPR-454's deliberate divergence from
 #    the obligations original's counter strings). `strictlyAfter` compares
-#    ops_events `_id`s DIRECTLY — the one place this child does — and the
-#    double's copy() is structuredClone (src/obligations/testing/fake-db.ts:6),
-#    which degrades a class instance to a plain object. If minting is a string,
-#    Step 2(d)'s `typeof a.toHexString === "function"` guard never fires and the
-#    tie-break case tests nothing.
+#    ops_events `_id`s DIRECTLY — the one place this child does. If minting is
+#    a string, Step 2(d)'s `typeof a.toHexString === "function"` guard never
+#    fires and the tie-break case tests nothing.
 grep -n "new ObjectId()" src/ops/testing/fake-db.ts
+# 5. Whether an `_id` SURVIVES A ROUND TRIP as an ObjectId. Minting one is not
+#    the same fact: the double's copy() is structuredClone
+#    (src/obligations/testing/fake-db.ts:6) and `operation()` returns
+#    `copy(action())`, so every document HANDED BACK from find/findOne/insertOne
+#    carries a degraded `_id`. Step 2(f) is the fix; this is how you see it.
+grep -n "const copy = \|copy(action())\|copy(result)" src/ops/testing/fake-db.ts
 ```
 
-Expected: (1) three collection handles plus both loaders; (2) one `createIndex({ publishedAt: 1, _id: 1 })` call; (3) `matchedSubscriptionIds: string[]` on `OpsEvent` and one write site in the accept path; (4) at least one `new ObjectId()` in `insertOne`'s id minting. **If (4) shows counter strings instead, do not proceed to Step 2(d)** — restore the divergence KPR-454's plan specifies (its chunk 3 Step 1, fourth harness bullet) as part of Step 2 and say so in the commit body, because a hex-string `_id` also inverts lexicographically at n ≥ 10. **A divergence on any of the three is a plan-revision trigger, not something to work around in an implementation file** — say so and stop. Chunk 6's AC-suite asserts the cursor index's presence rather than re-creating it (integration point 2).
+Expected: (1) three collection handles plus both loaders; (2) one `createIndex({ publishedAt: 1, _id: 1 })` call; (3) `matchedSubscriptionIds: string[]` on `OpsEvent` and one write site in the accept path; (4) at least one `new ObjectId()` in `insertOne`'s id minting; (5) a `copy` that is *not* bare `structuredClone`, or — the expected state before Step 2(f) — one that is.
 
-- [ ] **Step 2:** Extend `src/ops/testing/fake-db.ts` — **five** additive changes, nothing removed.
+**Assert (5) rather than eyeballing it.** Add this throwaway check (a scratch `.test.ts` or `npx tsx -e`) and record its output in the implementation report both before and after Step 2(f):
 
-The double is KPR-454's, created in that ticket's chunk 3 Task 4 Step 1 with real `ObjectId` minting and a `sort`-honouring `findOne`. Five things it does not yet do, each needed by this child. First read what is actually there, because two of the five may already be satisfied — and because Step 4 and the harness contract both read surfaces this grep must confirm exist rather than assume:
+```typescript
+const db = new FakeDb();
+await db.collection("probe").insertOne({ n: 1 });
+const [doc] = await db.collection("probe").find({}).toArray();
+console.log(String(doc._id), /^[0-9a-f]{24}$/.test(String(doc._id)));
+```
+
+Before 2(f) this prints `[object Object] false`; after it, a 24-char hex and `true`.
+
+⚠ **What the degradation does and does not break, because the two are easy to swap.** Filtering is **unaffected**: `matchesFilter` runs over `this.rows` un-copied (`visible()` returns the live row objects, `:190-197`) and `insertOne` attaches `_id` **by reference** rather than through `copy` (`:281`), so Step 2(d)'s `cmp` guard is reachable and the `$gt` tie-break works. What breaks is `String(_id)` on any **returned** document — which is every event reference the ledger stores (`firstEventId`, `latestEventId`, `appliedThroughId`, `stateEventId`, and `advanced.eventId` on the cursor). All of them become the same `"[object Object]"`, the watermark's `appliedThroughId` tie-break degenerates, and the next tick's `new ObjectId("[object Object]")` **throws** inside chunk 3b's containment frame — so multi-tick ingest silently applies nothing on tick 2 and every multi-tick case (AC13 limb 1, AC5, AC7) fails for the wrong reason. Downstream selectors degrade the same way in both operands and go **vacuously green**: AC13 limb 1's `ctx.document?.latestEventId === String(events[2]._id)` fires on the *first* event, and AC4's `latestEventId: String(e2._id)` asserts nothing.
+
+**If (4) shows counter strings instead, do not proceed to Step 2(d)** — restore the divergence KPR-454's plan specifies (its chunk 3 Step 1, fourth harness bullet) as part of Step 2 and say so in the commit body, because a hex-string `_id` also inverts lexicographically at n ≥ 10. **A divergence on any of (1)–(4) is a plan-revision trigger, not something to work around in an implementation file** — say so and stop. (5) is the exception: it is a *known* state this plan fixes in Step 2(f), not a divergence. Chunk 6's AC-suite asserts the cursor index's presence rather than re-creating it (integration point 2).
+
+⚠ **Cross-child note.** KPR-454 creates `src/ops/testing/fake-db.ts`, and its own `(publishedAt, _id)` tie-break case has the identical exposure — this defect is filed against that child too. If KPR-454's implementer lands an `ObjectId`-preserving clone when they create the file, Step 2(f) becomes a **no-op to verify** rather than a change to add: run the probe above, record `true`, and say so in the commit body. Do not remove or re-write a preserving clone that is already there.
+
+- [ ] **Step 2:** Extend `src/ops/testing/fake-db.ts` — **six** additive changes, nothing removed.
+
+The double is KPR-454's, created in that ticket's chunk 3 Task 4 Step 1 with real `ObjectId` minting and a `sort`-honouring `findOne`. Six things it does not yet do, each needed by this child. First read what is actually there, because three of the six may already be satisfied — and because Step 4 and the harness contract both read surfaces this grep must confirm exist rather than assume:
 
 ```bash
 grep -n "countDocuments\|private unique\|case \"\$lt\"\|case \"\$gt\"" src/ops/testing/fake-db.ts
@@ -106,7 +127,7 @@ const cmp = (a: any) => (a !== null && typeof a === "object" && typeof a.toHexSt
 // then in each of $lt/$lte/$gt/$gte: compare cmp(actual) against cmp(value)
 ```
 
-**(e) A PERSISTENT fault and a fault reset.** `failNext` pushes a one-shot hook that is spliced out when it fires (`src/obligations/testing/fake-db.ts:98-105`), so the same operation cannot be made to fault on two successive ticks — which is exactly what AC13 limb 3's wedge signature needs, and it is the only limb that pins D8(b)'s "no automatic skip, no quarantine" ruling. Add a persistent list beside `hooks`, and a reset that clears both:
+**(e) A PERSISTENT fault and a fault reset.** `failNext` pushes a one-shot hook that is spliced out when it fires (`src/obligations/testing/fake-db.ts:98-105`), so the same operation cannot be made to fault on two successive ticks — which is exactly what AC13 limb 3's wedge signature needs, and it is the only limb that pins D8(b)'s "no automatic skip, no quarantine" ruling. Add a persistent list beside `hooks`, and a reset that clears every armed fault:
 
 ```typescript
   private persistentFaults: Array<Pick<Hook, "collection" | "operation" | "when">> = [];
@@ -120,9 +141,15 @@ const cmp = (a: any) => (a !== null && typeof a === "object" && typeof a.toHexSt
     this.persistentFaults.push({ collection, operation, when });
   }
 
-  /** KPR-468: drop every armed fault, one-shot and persistent alike. */
+  /**
+   * KPR-468: drop every armed fault — the one-shot `hooks` (failNext, pause),
+   * the persistent list above, AND `localFaults` (localTimeoutNext's
+   * majority-timeout injector, `:75`/`:147`). All three, because a reset that
+   * left one class armed would be a reset nobody could reason about.
+   */
   clearFaults(): void {
     this.persistentFaults = [];
+    this.localFaults = [];
     this.hooks = [];
   }
 ```
@@ -137,12 +164,46 @@ and in `operation(...)`, immediately after the existing `await this.hook(collect
       }
 ```
 
-**The two spellings this plan does NOT add, because `failNext`'s existing `when` predicate already expresses them.** Both are written as one-line helpers in the harness module (chunk 3, "Harness contract"), not as double API:
+**(f) `copy` must preserve `ObjectId`.** The head-of-file `copy` is bare `structuredClone` (`src/obligations/testing/fake-db.ts:6`) and `operation()` returns `copy(action())` (`:89`) then `copy(result)` (`:96`), so **every document the double hands back** carries an `_id` degraded to `{ buffer }` — `instanceof ObjectId` false, `String(...)` `"[object Object]"` (measured on this tree; Step 1's grep #5 and its probe are how you see it). Step 1 records what that breaks and what it does not. Replace the one-liner with a structural clone that passes the class instances through:
+
+```typescript
+// KPR-468: structuredClone degrades an ObjectId to a plain `{ buffer }` — a
+// FALSE `instanceof`, and String(...) === "[object Object]". The ledger stores
+// every event reference as String(e._id) where `e` came out of a find(), so
+// under the bare clone all of firstEventId / latestEventId / appliedThroughId /
+// stateEventId and the cursor's own eventId collapse to one identical string:
+// the (publishedAt, _id) watermark's tie-break degenerates, and the NEXT tick's
+// `new ObjectId("[object Object]")` throws. ObjectId and the typed-array
+// families are treated as immutable and passed BY REFERENCE — which is exactly
+// what insertOne already does at the minting site (`:281`). Map and Set are
+// preserved because `operation()` clones a whole `rows` Map (`:88`).
+const clone = (value: any): any => {
+  if (value === null || typeof value !== "object") return value;
+  if (value instanceof Date) return new Date(value.getTime());
+  if (value instanceof Map) return new Map([...value].map(([k, v]) => [clone(k), clone(v)]));
+  if (value instanceof Set) return new Set([...value].map(clone));
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return value;
+  if (typeof value.toHexString === "function") return value; // ObjectId
+  if (Array.isArray(value)) return value.map(clone);
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(value)) out[k] = clone(v);
+  return out;
+};
+const copy = <T>(value: T): T => clone(value) as T;
+```
+
+⚠ **The three easy ways to get this wrong** — each is a plausible-looking fix that opens a new hole or leaves this one open:
+
+- **Dropping `Map`/`Set`.** `structuredClone` handles both, and `operation()` relies on it: `const before = fault < 0 ? undefined : copy(target.rows)` clones a `Map` (`:88`), and `stageLocal` reads it back as one. A clone that falls through to `Object.entries` returns `{}` and `localTimeoutNext` silently stops rolling anything back.
+- **Deep-cloning the `ObjectId` instead of passing it.** Reconstructing it is unnecessary and the buffer copy is what broke it in the first place; nothing in this plan mutates an `_id`.
+- **Verifying by minting rather than by round-tripping.** Step 1's grep #4 checks minting and passes either way. The probe in Step 1 — `/^[0-9a-f]{24}$/` on `String(doc._id)` after a `find()` — is the check that can actually fail.
+
+**The two spellings this plan does NOT add, because `failNext`'s existing `when` predicate already expresses them.** Both are written as one-line helpers in the harness module (`src/ops/testing/notifier-harness.ts`, **chunk 3b Step 4**, whose exported-surface table is the authority), not as double API:
 
 - **fault the *n*th call** — `let seen = 0; db.failNext(coll, op, false, () => ++seen === n)`. The predicate is evaluated once per matching call (`hook()`'s `findIndex`, `:98-101`) and the hook stays armed until it returns true, so the first `n − 1` calls pass and the *n*th throws.
 - **fault a call matching a predicate** — `db.failNext(coll, op, false, (ctx) => …)` directly; `ctx` is `{filter?, update?, document?, options?}` (`:62`), so an `insertOne` is selected on `ctx.document`.
 
-**Nothing is removed and KPR-454's own suites must stay green.** That is why `src/ops/publisher.integration.test.ts`, `src/ops/acceptance.integration.test.ts` and `src/ops/capture-points.integration.test.ts` are in this plan's Commands list — run them in Step 6 of this task, not only at the end.
+**Nothing is removed and KPR-454's own suites must stay green.** That is why `src/ops/publisher.integration.test.ts`, `src/ops/acceptance.integration.test.ts` and `src/ops/capture-points.integration.test.ts` are in this plan's Commands list — run them in **Step 5** of this task (Step 6 is the commit), not only at the end.
 
 - [ ] **Step 3:** Create `src/ops/notification-store.ts`.
 
@@ -461,6 +522,37 @@ npx tsc --noEmit
 
 Expected: the new suite passes; **KPR-454's three suites still pass** — that is the whole verification of Step 2's harness edits, and a regression there means an additive change was not additive.
 
+**Step 2(f) needs its own check, because no suite here would notice it.** Both KPR-454 suites and this one pass against the degraded clone — that is precisely why the defect survived a round. Add one case to `notification-store.test.ts` asserting the round trip directly, and it is the assertion, not the greps, that closes B-A:
+
+```typescript
+describe("the double round-trips an ObjectId (KPR-468 Step 2(f))", () => {
+  it("returns a real ObjectId from find, findOne and insertOne", async () => {
+    const db = new FakeDb();
+    const res = await db.collection("probe").insertOne({ n: 1 });
+    const [found] = await db.collection("probe").find({}).toArray();
+    const one = await db.collection("probe").findOne({});
+    // Not `instanceof ObjectId`: the assertion that matters is the one the
+    // ledger actually performs on every event reference it stores.
+    for (const id of [res.insertedId, found._id, one!._id]) expect(String(id)).toMatch(/^[0-9a-f]{24}$/);
+  });
+
+  it("still clones Maps, Sets and Dates, so localTimeoutNext still rolls back", async () => {
+    // The clone's own regression surface: `operation()` copies a whole `rows`
+    // Map for the majority-timeout rollback, and a clone that falls through to
+    // Object.entries returns {} and stages nothing.
+    const db = new FakeDb();
+    await db.collection("probe").insertOne({ _id: "a", at: new Date(1), tags: new Set(["x"]) });
+    db.localTimeoutNext("probe", "updateOne");
+    await expect(db.collection("probe").updateOne({ _id: "a" }, { $set: { n: 2 } })).rejects.toBeTruthy();
+    db.rollbackLocal("probe");
+    const row = await db.collection("probe").findOne({ _id: "a" });
+    expect(row!.n).toBeUndefined();
+    expect(row!.at).toBeInstanceOf(Date);
+    expect(row!.tags).toBeInstanceOf(Set);
+  });
+});
+```
+
 - [ ] **Step 6:** Commit.
 
 ```bash
@@ -478,11 +570,20 @@ correctness role, so its failure alone leaves the notifier unstarted.
 Extends KPR-454's test double additively: countDocuments honours limit
 (without which every saturating-count assertion is vacuous), updateOne
 rejects a $set/$unset path conflict as real MongoDB does, ObjectId
-comparison operands are String-coerced, and failAlways/clearFaults add a
+comparison operands are String-coerced, copy() preserves ObjectId instead
+of letting structuredClone degrade it to "[object Object]" on every
+document the double hands back, and failAlways/clearFaults add a
 PERSISTENT fault the existing one-shot failNext cannot express — AC13's
 wedge signature needs one event to fault on two successive ticks. The
 nth-call and predicate-scoped faults need no new API: both are failNext's
 existing `when` predicate.
+
+The clone is the one change no existing suite would have caught: the
+ledger stores every event reference as String(e._id) off a returned
+document, so under the bare structuredClone the whole (publishedAt, _id)
+watermark collapses to one identical string and the next tick's
+`new ObjectId("[object Object]")` throws inside the containment frame.
+Its own round-trip and Map/Set/Date regression cases ship with it.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 EOF

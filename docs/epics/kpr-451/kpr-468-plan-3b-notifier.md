@@ -52,7 +52,7 @@ import {
 } from "./notification-types.js";
 import { OpsNotificationStore } from "./notification-store.js";
 import { IngestPhase } from "./ingest.js";
-import { DeliveryPhase } from "./delivery.js";
+import { DeliveryPhase, type DeliveryResult } from "./delivery.js";
 
 const log = createLogger("ops-notifier");
 
@@ -332,6 +332,20 @@ export class OpsNotifier {
    * failing, there is nothing left to report WITH, and a throw here would
    * re-enter sweepOnce's catch and double-count. No gauges — they are among
    * the reads that may be throwing.
+   *
+   * ⚠ CONTRACT FOR KPR-455, WHICH IS THE READER OF THIS DOCUMENT. This is a
+   * `$set` upsert over a STRICT SUBSET of the ok-path fields, so every field
+   * it does not name — eventsBehind, oldestUnappliedAt, rowsPending,
+   * rowsNudgeDue, rowsSnoozed and the four saturating gauges — RETAINS THE
+   * PREVIOUS TICK'S VALUE and carries no staleness marker of its own. There is
+   * deliberately none: `state: "degraded"` plus `timestamp` is the tell, and a
+   * renderer must treat every gauge on a degraded document as as-of
+   * `lastSuccessfulSweep`, not as-of `timestamp`. Clearing them instead would
+   * be worse — an operator would read a real backlog as zero.
+   *
+   * `cursorAt: this.lastCursorAt` is `undefined` when the FIRST tick of a
+   * process degrades (nothing has set it yet); the driver writes that as
+   * `null`, which is the same shape a clock-initialized cursor produces.
    */
   private async writeDegradedHeartbeat(now: Date): Promise<void> {
     try {
@@ -391,7 +405,7 @@ export class OpsNotifier {
     // nothing is pushed forward. A tick whose read SUCCEEDED and returned null
     // has a retained result and runs NORMALLY, which is every tick of the
     // shipped default and the state AC11 drives.
-    let delivery = { ok: true, attempted: 0, deferred: false };
+    let delivery: DeliveryResult;
     if (!policyOk && this.policy === undefined) {
       delivery = { ok: false, attempted: 0, deferred: false };
     } else {
@@ -413,6 +427,20 @@ export class OpsNotifier {
       cursorAt: ingest.cursorAt,
       eventsBehind: ingest.eventsBehind,
       oldestUnappliedAt: ingest.oldestUnappliedAt,
+      // ⚠ THESE THREE CARRY NO `limit` AND ARE EXACT, deliberately, and it is
+      // the one place in the tick where an unbounded count is accepted.
+      // `rowsNudgeDue` is named in chunk 3's delivery phase as THE exact answer
+      // the `deferred` heuristic must not be mistaken for, so saturating it
+      // would falsify a claim already made at its point of use; the other two
+      // are its peers and a mixed posture across three adjacent depths would be
+      // worse than either uniform one. The cost is bounded and it is not
+      // bounded by traffic: all three are covered by `ensureIndexes` (chunk 2)
+      // — index 3 or 5 for the first two, index 8 for the third, every one of
+      // them leading on `state` — so each is an index count restricted to the
+      // WORKING-row set — the operator's own subscriber × open
+      // condition surface, the same bound the clearing fan-out already accepts —
+      // and never a collection scan. If that set is ever large enough to matter,
+      // saturate them and correct chunk 3's sentence in the same change.
       rowsPending: await nf.countDocuments({ state: "pending" }),
       rowsNudgeDue: await nf.countDocuments({ state: working, nextNudgeAt: { $lte: now } }),
       rowsSnoozed: await nf.countDocuments({ state: "snoozed" }),
@@ -513,6 +541,26 @@ export class OpsNotifier {
 
 Persistent faults and the reset are **methods on the double**, not harness helpers: `db.failAlways(collection, operation, when?)` and `db.clearFaults()` (chunk 2 Task 3 Step 2(e)).
 
+**Seeding defaults — the contract, not an implementation detail.** Five chunk-6 cases are "seed, tick, assert a row", which is only true if the seeded event actually matches a subscription; leaving that to the implementer's judgement is how those cases end up asserting against an empty ledger. Every default below is fixed:
+
+| what | default | why it is this |
+| --- | --- | --- |
+| the injected clock's initial value | `BASE` | `cursorAt: t(-1)` and `advance()` are both defined relative to it. `now()` returns it until `advance()` moves it. |
+| `seedEvent().publishedAt` | `t(0)` | One minute after the seeded cursor, so a single seeded event is unambiguously ahead of it. |
+| `seedEvent().dedupeKey` | `` `p:tool:gog:tool-failed:${n}` `` , `n` a per-harness counter | Distinct per call, so `seedEvents(5)` produces five rows rather than five renewals of one. |
+| **`seedEvent().matchedSubscriptionIds`** | **the `_id`s of `options.subscriptions`, in order** | ⚠ **The load-bearing one.** Ingest reads the stamped list and never re-evaluates a filter (AC3), so an unstamped event creates nothing. AC4, AC7, AC11 and AC13 limbs 1 and 3 all depend on this default; AC3's own cases override it explicitly, which is the whole point of that criterion. |
+| `seedEvent().producer` | `"tool"` | Matches the default `dedupeKey`'s prefix and satisfies clearing provenance's same-producer clause without a per-case override. |
+| `seedEvent().class` / `retry` | `"integrity"` / `"deterministic"` | ⚠ Both are UNIONS (`OpsClass`, `OpsRetry` — KPR-454's contract), so the value has to be one of theirs. The pair is the cadence table's key (`` `${class}:${retry}` ``), and this one is what the policy fixtures in the cadence cases seed. |
+| `seedEvent().waiting` | `"nobody"` | Also a union (`Waiting`), not a boolean. The stall and view-shape cases that care set it. |
+| `seedEvent().reasonId` | `"r1"` | The id `reason("r1")` mints, so `options.reasons: [reason("r1")]` is the whole wiring. |
+| `seedEvent().subject` | `{ kind: "workItem", id: "w1" }` | `OpsSubject` is `{kind, id}` and both are required. |
+| `seedEvent().schemaVersion` / `generation` / `detail` / `evidence` / `matchedSubscriptions` | `1` / `1` / `{}` / `[]` / `matchedSubscriptionIds.length` | All five are **required** on `OpsEvent`; `detail` and `evidence` are inert to every phase here and AC12's view-shape cases set them. |
+| `seedEvents(n, over)` | `over` applied to all `n`, `publishedAt` overridden to `t(0) … t(n-1)` | An explicit `publishedAt` in `over` is **ignored** for this reason; pass individual `seedEvent` calls if a case needs one. |
+
+Any case that depends on one of these rather than setting it should say so in a comment — AC13 limb 3 is the model (it passes `cursorAt: t(-1)` explicitly *because* it depends on it).
+
+**Teardown.** `harness({ start: true })` arms two real `setInterval`s (`SWEEP_INTERVAL_MS`, `SUBSCRIPTION_RELOAD_MS`). **Every case that passes `start: true`, or calls `notifier.start()` itself, must `await h.notifier.stop()` before it ends** — in the case body or an `afterEach`, either is fine, but it is not optional and `unref()` is not a substitute under a live vitest runner. The default `start: false` arms nothing, which is the other reason it is the default.
+
 **`NotifierHarness` — every member, because chunks 3, 4 and 6 use all of them.**
 
 ```typescript
@@ -572,6 +620,17 @@ export interface NotifierHarness {
 export class FakeTransport implements OpsTransport {
   /** Every view handed to deliver(), in order. AC12 reads this. */
   readonly views: NotificationView[] = [];
+  /**
+   * Runs INSIDE deliver(), after the view is recorded and before the outcome
+   * is returned — i.e. at the one instant in the component where an
+   * irreversible external side effect has happened and the ledger has not been
+   * written yet. Assigned per case (`h.transport.onDeliver = …`); it is part of
+   * this contract, not a monkeypatch. The `deliveryRecordLost` case is its only
+   * caller today and cannot be written without it: `record()`'s CAS is
+   * `{_id, state, attemptCount}`, and moving the row out from under it is only
+   * possible from in here.
+   */
+  onDeliver?: (view: NotificationView) => Promise<void> | void;
   private readonly queue: Array<DeliveryOutcome | "throw"> = [];
   constructor(
     readonly adapterId = "fake",
@@ -588,6 +647,7 @@ export class FakeTransport implements OpsTransport {
   }
   async deliver(view: NotificationView): Promise<DeliveryOutcome> {
     this.views.push(view);
+    await this.onDeliver?.(view);
     const next = this.queue.length > 1 ? this.queue.shift()! : this.queue[0];
     if (next === "throw") throw new Error("fake transport fault");
     return next ?? { status: "accepted", reference: { kind: "fake", id: view.handle }, at: this.clock() };
@@ -612,10 +672,46 @@ Cover, at minimum, each of the following as a named case, driving a real `OpsNot
 - **The stall:** each of the three decline branches writes its own `stalledReason`, increments its own counter, and pushes `nextNudgeAt` into `(now + 0.8·STALL_RECHECK_MS, now + 1.2·STALL_RECHECK_MS)`; **`nextNudgeAt` is never unset**; the stall write does **not** land on a row that left the working states between the scan and the write.
 - **The no-interval attempt branch** sets `stalledAt`/`stalledReason: "cadence"` in the same update that unsets `forceDeliver` — and, run with mutation **NV6** (the plan index's Verification Rules), **throws** against the extended double.
 - **Snooze expiry** returns a row with a `deliveryReference` to `delivered` and one without to `pending`, sets `forceDeliver: true` and `nextNudgeAt = now`, unsets `snoozedUntil` and `expiresAt`, and **runs before delivery in the same tick** (assert the expired row is *attempted* on that tick).
-- **The record CAS that loses:** drive an attempt whose `record()` update matches nothing — `failOn(h.db, "ops_notifications", "updateOne", (ctx) => ctx.update?.$inc?.attemptCount === 1)` is the wrong instrument (it throws); instead move the row out from under the CAS, by programming the transport's `deliver` to mutate the row's `attemptCount` directly before returning. Assert: **no throw**, `deliveryRecordLost === 1`, one warn line, and the row's `attempts[]`/`lastOutcome`/`deliveryReference` **unchanged**. This is the one CAS in the component that runs after an irreversible external side effect, so the case exists to pin that the miss is *counted* rather than silent — it is unreachable through the latch today, which is exactly why nothing else would catch a future latch change.
+- **The record CAS that loses:** drive an attempt whose `record()` update matches nothing — `failOn(h.db, "ops_notifications", "updateOne", (ctx) => ctx.update?.$inc?.attemptCount === 1)` is the wrong instrument (it throws); instead move the row out from under the CAS from **inside** `deliver()`, through the harness's `onDeliver` hook (Step 4's `FakeTransport` contract — the row is written *between* the side effect and the CAS, which is the whole point and is not reachable any other way):
+
+  ```typescript
+  h.transport.onDeliver = async () => {
+    // The CAS is { _id, state, attemptCount }. Moving attemptCount is enough
+    // and is the smallest change that models a concurrent writer.
+    await h.store.notifications.updateOne({ dedupeKey: KEY }, { $inc: { attemptCount: 1 } });
+    h.transport.onDeliver = undefined; // once, or the next attempt loses too
+  };
+  ```
+
+  Assert: **no throw**, `deliveryRecordLost === 1`, one warn line, and the row's `attempts[]`/`lastOutcome`/`deliveryReference` **unchanged**. This is the one CAS in the component that runs after an irreversible external side effect, so the case exists to pin that the miss is *counted* rather than silent — it is unreachable through the latch today, which is exactly why nothing else would catch a future latch change.
 - **The heartbeat** carries every gauge and every counter, `state` is `ok`/`backlog`/`degraded` on the three drivable conditions, and the four saturating gauges **saturate** at `GAUGE_COUNT_LIMIT` (the case the harness extension made real).
 - **A heartbeat is written even when a phase read THROWS** — the containment frame from Step 3. Drive it on a read that is deliberately **outside** every inner `try`: `failOn(h.db, "ops_events", "find", () => true)` (the ingest page read) and, separately, `failOn(h.db, "ops_notifications", "countDocuments", () => true)` (a gauge). Each must leave `h.tick()` **resolved, not rejected**, `sweepFaults` incremented once, and `(await h.heartbeat()).state === "degraded"`. ⚠ **Able-to-fail:** against an implementation whose `run()` is unwrapped, the throw reaches `sweepOnce`'s `.catch`, `sweepFaults` still increments — so the counter assertion alone passes — and **no heartbeat document exists at all**, which is the assertion that goes red. Include a third limb where the heartbeat write itself fails (`failOn(h.db, "telemetry", "updateOne", …)`): the tick still resolves and nothing is left half-written.
-- **The stopped latch between phases:** with a notifier whose `stop()` has begun, a tick performs the ingest phase and then **neither** expiry nor delivery — assert zero `ops_notifications` `find` operations after the ingest reads, and no heartbeat write for that tick. Drive the same at the ingest seam by stopping before the tick: no `ops_events` `find` at all.
+- **The stopped latch between phases.** ⚠ **The latch must flip DURING the tick, and there is exactly one way to arrange that.** `sweepOnce()` opens `if (this.flight) return this.flight; if (this.stopping) return Promise.resolve();` and `__tickForTests()` is a bare forward to it, so on an already-stopping notifier **no phase runs at all** and `runPhases`' two seams are unreachable. Use the double's existing `pause` to hold the tick open at a point *after* ingest has finished its work, flip the latch from the test, then release:
+
+  ```typescript
+  const h = await harness({ subscriptions: [sub("s1")] });
+  await h.seedEvent();
+  // IngestPhase.run's writeCursor is the tick's FIRST `telemetry` updateOne and
+  // it runs after the page has fully applied — so this seam is "ingest done,
+  // expiry and delivery not yet entered". (The heartbeat write is the same
+  // collection+operation, but this tick never reaches it, and `pause` is
+  // one-shot regardless.) Arming it AFTER harness() matters: harness() seeds
+  // the cursor through the same write.
+  const gate = h.db.pause("telemetry", "updateOne");
+  const tick = h.tick();
+  await gate.reached;
+  const stopped = h.notifier.stop(); // sets `stopping` SYNCHRONOUSLY, then awaits this tick
+  const mark = h.db.operations.length;
+  gate.release();
+  await Promise.all([tick, stopped]);
+
+  expect(await h.ledgerCount()).toBe(1); // the ingest phase DID run
+  const after = h.db.operations.slice(mark);
+  expect(after.filter((o) => o.collection === OPS_NOTIFICATIONS_COLLECTION && o.operation === "find")).toHaveLength(0);
+  await expect(h.heartbeat()).rejects.toBeTruthy(); // a stop is not a tick outcome
+  ```
+
+  ⚠ **Able-to-fail:** against an implementation missing the post-ingest `if (this.stopping) return`, the expiry scan's `ops_notifications` `find` lands after `mark` and the length assertion goes red. Drive the second seam the same way one phase later — `h.db.pause("ops_notifications", "find", (ctx) => ctx.filter?.state === "snoozed")`, which `expire()` always issues exactly once whether or not any row is snoozed — so the post-**expiry** checkpoint is covered too rather than inferred from the first, and assert no delivery-arm `find` after the mark. **Then, separately, stop before the tick and assert no `ops_events` `find` at all** — that limb is real but it exercises `sweepOnce`'s own guard, not either between-phases checkpoint, and must not be labelled as the latter.
 - **Policy posture:** a read that returns `null` runs the delivery phase normally; a read that **throws** on a process's first tick **skips** the delivery phase, counts `policyReadFaults`, writes `degraded`, and leaves every row's `nextNudgeAt` and stall markers untouched; a read that throws on a **later** tick uses the retained copy and marks nothing.
 - **`init()`/`start()`/`stop()`:** a unique-index failure throws out of `init()` **and leaves `initialized === false`** (the statement placement, not just the throw); any other index failure does not throw; a reason-map failure leaves `initialized === true` and `startable === false`; a first-subscription-load failure leaves `started === false` without throwing; `start()` performs **no** `ops_subscriptions` read during `init()` (assert against the double's `operations` log); `stop()` clears both timers and awaits the in-flight tick. (These are the cases that use `harness({ start: true })` or drive `init()`/`start()` themselves — see the harness contract.)
 - **`validateTarget` at load:** a subscription whose registered adapter rejects its target is unloaded, warned once, counted, and **not mutated in the database**; one whose `adapterId` names no registered adapter **loads normally**; an adapter whose `validateTarget` **throws** is treated as `false` and the remaining subscriptions still load.

@@ -52,7 +52,21 @@ const log = createLogger("ops-ingest");
 
 export interface IngestResult {
   ok: boolean;
-  /** D5/D10: the phase left work in hand because stop() was requested. */
+  /**
+   * D5/D10: the phase left work in hand because stop() was requested.
+   *
+   * ⚠ NOTHING IN PRODUCTION READS THIS. `OpsNotifier.runPhases` re-reads its
+   * own `this.stopping` at both between-phase seams rather than branching on
+   * this field, and in production the two are the same latch, so the field is
+   * bookkeeping — the phase's honest self-report, asserted by chunk 2b's own
+   * stopped-checkpoint case and by nobody else. Read the "reconciled claim
+   * sites" as three *statements of the same fact*, not three consumers. Making
+   * `runPhases` branch on it instead would be defensible (the phase is the
+   * thing that knows it stopped short) and is deliberately not done: the seam
+   * after `expire()` has no equivalent field to branch on, and one seam reading
+   * a returned flag while its neighbour reads the latch is worse than both
+   * reading the latch.
+   */
   stoppedEarly: boolean;
   cursorAt: Date;
   /** Saturating at GAUGE_COUNT_LIMIT; read as "at least N". */
@@ -332,8 +346,14 @@ export class IngestPhase {
           // unset so no delivery arm's index range contains it; every stall
           // gauge's index carries state ∈ {pending, delivered}; and the expiry
           // scan keys on state: "snoozed". A reopen re-sets forceDeliver and
-          // unsets the stall markers explicitly, so nothing is inherited
-          // across the boundary either.
+          // unsets the stall markers explicitly. ⚠ It does NOT touch
+          // snoozedUntil — so `snoozed → cleared → reopened` carries a stale
+          // snoozedUntil into `pending`, and that residue is inert for the same
+          // reason as above (the expiry scan keys on state: "snoozed", and
+          // buildView's ledger block omits the field) but it IS inherited
+          // across the boundary. Named rather than fixed: unsetting it in the
+          // reopen arm would be a fourth thing that write does for a field no
+          // reader consults.
           $unset: { nextNudgeAt: "" },
         },
         WRITE,
@@ -487,7 +507,7 @@ Cover, at minimum, each of the following as a named case. Chunk 6 re-drives the 
 - An absent cursor initializes to `now`, counts `cursorReinitialized`, and creates **zero** rows over a log seeded with 50 pre-existing events.
 - Event-level containment: a fault on the third of five leaves the cursor at the second, events 3–5 unapplied, `ingestFaults` at 1, `ok: false`; the next tick applies 3, 4 and 5.
 - `eventsBehind` saturates at `GAUGE_COUNT_LIMIT` and `oldestUnappliedAt` is non-null on every non-drained stop.
-- **The stopped checkpoint:** with a `stopped` callback that returns `true` from the third event onward, a five-event page applies exactly two events, returns `stoppedEarly: true` with `ok: true` (a stop is not a fault, so `ingestFaults` stays 0), writes the cursor at the second event, and a following run with `stopped` back to `false` applies 3, 4 and 5. Drive the same with `stopped` true from the outset and assert **zero** `ops_events` `find` operations in the double's `operations` log — the between-pages checkpoint, which is what keeps a drain from paying even one page read.
+- **The stopped checkpoint:** with a `stopped` callback that returns `true` from the third event onward, a five-event page applies exactly two events, returns `stoppedEarly: true` with `ok: true` (a stop is not a fault, so `ingestFaults` stays 0), writes the cursor at the second event, and a following run with `stopped` back to `false` applies 3, 4 and 5. Drive the same with `stopped` true from the outset and assert **zero** `ops_events` `find` operations in the double's `operations` log — the between-pages checkpoint, which is what keeps a drain from paying even one **page** read. ⚠ It does not keep the phase from touching the collection at all, and the assertion must not be read that way: with no page applied the run is neither drained nor faulted, so it still falls through to the always-paid `findOne` + `countDocuments` (the `oldestUnappliedAt`/`eventsBehind` pair, whose "always reported" invariant is deliberate). The double logs `find`, `findOne` and `countDocuments` as **distinct** operation names (`src/obligations/testing/fake-db.ts:81-82` records `operation` verbatim), which is the only reason the narrow assertion is both true and writable.
 
 - [ ] **Step 3:** Verify and commit.
 
