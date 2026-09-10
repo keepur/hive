@@ -10,6 +10,7 @@ import {
   type CancellationCause,
   type SpeechOrigin,
   type VoiceErrorClass,
+  type VoiceDiagnosticPayload,
   type VoiceTraceWriteCounts,
   type VoiceTraceWriter,
 } from "../voice/voice-trace.js";
@@ -95,6 +96,23 @@ export interface CallDiagnosticCounts {
 }
 
 export interface SpeechTracePort {
+  call(
+    event: Extract<
+      VoiceDiagnosticPayload,
+      {
+        event:
+          | "call_started"
+          | "session_started"
+          | "sip_answered"
+          | "participant_available"
+          | "caller_state"
+          | "caller_final_input"
+          | "caller_turn_accepted"
+          | "opening_decision"
+          | "call_closed";
+      }
+    >,
+  ): void;
   speechCreated(handle: SpeechHandle, origin: SpeechOrigin, acceptedEpoch: number): void;
   bridgeCreated(context: BridgeTraceContext): BridgeAttempt;
   synthesisCreated(context: SynthesisTraceContext): SynthesisAttempt;
@@ -108,6 +126,7 @@ export interface SpeechTracePort {
   metrics(event: MetricsCollectedEvent): void;
   actionGap(reason: ActionGapReason, speechId: string, turnId?: string): void;
   actionGap(reason: ActionGapReason, speechId: string | null, turnId: string): void;
+  startupPending(): void;
   teardown(result: "closed" | "failed" | "timeout", reason: "call_close" | "late_start" | "late_start_failed"): void;
   summaryPersistence(
     status: "acknowledged" | "failed",
@@ -235,6 +254,8 @@ export class SpeechTrace implements SpeechTracePort {
   #eligibleLatencyEstimateCount = 0;
   #diagnosticGaps = 0;
   #unbound = 0;
+  #teardownIncomplete = 0;
+  #startupPendingRecorded = false;
   #closed = false;
   #bindingListener: ((turnId: string) => void) | null = null;
 
@@ -242,6 +263,26 @@ export class SpeechTrace implements SpeechTracePort {
     this.#callId = options.callId;
     this.#workerBootId = options.workerBootId;
     this.#writer = options.writer ?? createVoiceTraceWriter();
+  }
+
+  call(
+    event: Extract<
+      VoiceDiagnosticPayload,
+      {
+        event:
+          | "call_started"
+          | "session_started"
+          | "sip_answered"
+          | "participant_available"
+          | "caller_state"
+          | "caller_final_input"
+          | "caller_turn_accepted"
+          | "opening_decision"
+          | "call_closed";
+      }
+    >,
+  ): void {
+    this.#safe(() => this.#emit({}, event));
   }
 
   speechCreated(handle: SpeechHandle, origin: SpeechOrigin, acceptedEpoch: number): void {
@@ -522,8 +563,23 @@ export class SpeechTrace implements SpeechTracePort {
     });
   }
 
+  startupPending(): void {
+    this.#safe(() => {
+      if (this.#startupPendingRecorded) return;
+      this.#startupPendingRecorded = true;
+      this.#teardownIncomplete += 1;
+      this.#gap("start_pending", {});
+    });
+  }
+
   teardown(result: "closed" | "failed" | "timeout", reason: "call_close" | "late_start" | "late_start_failed"): void {
-    this.#safe(() => this.#emit({}, { event: "teardown", result, reason }));
+    this.#safe(() => {
+      this.#emit({}, { event: "teardown", result, reason });
+      if (result !== "closed") {
+        this.#teardownIncomplete += 1;
+        this.#gap(result === "failed" ? "teardown_failed" : "teardown_timeout", {});
+      }
+    });
   }
 
   summaryPersistence(
@@ -593,7 +649,10 @@ export class SpeechTrace implements SpeechTracePort {
 
   snapshot(): CallDiagnosticCounts {
     const incomplete =
-      this.#speechOutcomes.incomplete + this.#bridgeOutcomes.incomplete + this.#synthesisOutcomes.incomplete;
+      this.#speechOutcomes.incomplete +
+      this.#bridgeOutcomes.incomplete +
+      this.#synthesisOutcomes.incomplete +
+      this.#teardownIncomplete;
     return {
       speechAttempts: this.#speechAttempts,
       speechOutcomes: { ...this.#speechOutcomes },
@@ -1223,7 +1282,10 @@ export class SpeechTrace implements SpeechTracePort {
       | "correlation_missing"
       | "listener_failed"
       | "late_error_observed"
-      | "provider_context_missing",
+      | "provider_context_missing"
+      | "start_pending"
+      | "teardown_failed"
+      | "teardown_timeout",
     ids: { speechId?: string | null; turnId?: string | null; synthesisId?: string | null },
   ): void {
     this.#diagnosticGaps += 1;

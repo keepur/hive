@@ -48,14 +48,40 @@ export interface HiveLLMOptions {
   goal: string;
   context: string;
   trace: SpeechTracePort;
+  callSignal?: AbortSignal;
 }
 
 export class HiveLLM extends llm.LLM {
   /** Set by the session layer when the previous agent turn was interrupted. */
   interruptedSpokenText: string | null = null;
+  readonly #ownedFailures = new Map<string, BridgeError>();
+  readonly callSignal: AbortSignal;
 
   constructor(private readonly opts: HiveLLMOptions) {
     super();
+    this.callSignal = opts.callSignal ?? new AbortController().signal;
+    this.prependListener("error", (event) => {
+      const failure = event.error;
+      if (failure instanceof BridgeError && this.#ownedFailures.get(failure.turnId) === failure) {
+        event.recoverable = true;
+        this.#ownedFailures.delete(failure.turnId);
+      }
+    });
+  }
+
+  ownFailure(failure: BridgeError): void {
+    const previous = this.#ownedFailures.get(failure.turnId);
+    if (previous && previous !== failure) {
+      this.opts.trace.actionGap("action_ownership_unproved", null, failure.turnId);
+      return;
+    }
+    while (this.#ownedFailures.size >= 256) {
+      const oldest = this.#ownedFailures.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.#ownedFailures.delete(oldest);
+      this.opts.trace.actionGap("action_overflow", null, oldest);
+    }
+    this.#ownedFailures.set(failure.turnId, failure);
   }
 
   label(): string {
@@ -153,21 +179,25 @@ export class HiveLLMStream extends llm.LLMStream {
 
   protected async run(): Promise<void> {
     this.runEntered = true;
-    if (this.abortController.signal.aborted) {
+    if (this.abortController.signal.aborted || this.parent.callSignal.aborted) {
       this.abortController.signal.removeEventListener("abort", this.onLifecycleAbort);
+      this.attempt.finish("cancelled", this.parent.callSignal.aborted ? "call_closed" : "framework_cancelled");
       return;
     }
 
     const controller = new AbortController();
     const onFetchAbort = () => controller.abort();
+    const onCallAbort = () => controller.abort();
     this.abortController.signal.addEventListener("abort", onFetchAbort, { once: true });
+    this.parent.callSignal.addEventListener("abort", onCallAbort, { once: true });
     if (this.abortController.signal.aborted) onFetchAbort();
+    if (this.parent.callSignal.aborted) onCallAbort();
 
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let yielded = false;
     let responseStatus: number | undefined;
     let outcome: "completed" | "cancelled" | "failed" = "completed";
-    let cause: "framework_cancelled" | "unknown" = "unknown";
+    let cause: "framework_cancelled" | "call_closed" | "unknown" = "unknown";
     this.attempt.started();
     try {
       // Snapshot once so a second toBridgeMessages() in this run cannot
@@ -242,9 +272,9 @@ export class HiveLLMStream extends llm.LLMStream {
       // Degenerate zero-content turn (§5.1): stream ends empty — no-reply,
       // the session synthesizes nothing.
     } catch (err) {
-      if (controller.signal.aborted || this.abortController.signal.aborted) {
+      if (controller.signal.aborted || this.abortController.signal.aborted || this.parent.callSignal.aborted) {
         outcome = "cancelled";
-        cause = "framework_cancelled";
+        cause = this.parent.callSignal.aborted ? "call_closed" : "framework_cancelled";
         log.info("Bridge request aborted", {
           callId: this.opts.callId,
           turnId: this.traceContext.turnId,
@@ -264,9 +294,11 @@ export class HiveLLMStream extends llm.LLMStream {
         failureClass: failure.failureClass,
         status: responseStatus,
       });
+      this.parent.ownFailure(failure);
       throw failure;
     } finally {
       this.abortController.signal.removeEventListener("abort", onFetchAbort);
+      this.parent.callSignal.removeEventListener("abort", onCallAbort);
       this.abortController.signal.removeEventListener("abort", this.onLifecycleAbort);
       if (reader) {
         try {

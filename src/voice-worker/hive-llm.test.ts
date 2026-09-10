@@ -151,6 +151,32 @@ afterEach(async () => {
 });
 
 describe("HiveLLM (KPR-322)", () => {
+  it("marks only its exact recorded BridgeError recoverable before later listeners run", () => {
+    const hive = makeHive("http://127.0.0.1:9/v1/chat/completions");
+    const owned = new BridgeError("engine_unreachable", "turn-owned", false);
+    const unrelated = new BridgeError("engine_unreachable", "turn-other", false);
+    const observed: boolean[] = [];
+    hive.on("error", (event) => observed.push(event.recoverable));
+
+    hive.ownFailure(owned);
+    hive.emit("error", {
+      type: "llm_error",
+      timestamp: Date.now(),
+      label: "hive-llm",
+      error: owned,
+      recoverable: false,
+    });
+    hive.emit("error", {
+      type: "llm_error",
+      timestamp: Date.now(),
+      label: "other",
+      error: unrelated,
+      recoverable: false,
+    });
+
+    expect(observed).toEqual([true, false]);
+  });
+
   it("allocates immutable turn identity before run and streams every nonempty delta under it", async () => {
     const stub = await listen((_req, res) => {
       _req.resume();

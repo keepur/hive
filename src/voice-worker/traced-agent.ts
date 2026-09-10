@@ -156,12 +156,14 @@ export class TracedAgent extends voice.Agent {
   override onUserTurnCompleted(
     ...args: Parameters<voice.Agent["onUserTurnCompleted"]>
   ): ReturnType<voice.Agent["onUserTurnCompleted"]> {
+    if (this.#callSignal.aborted) return Promise.resolve();
     const [, newMessage] = args;
     if (newMessage.textContent?.trim()) this.#onAcceptedUserTurn();
     return Promise.resolve();
   }
 
   override async ttsNode(...args: Parameters<voice.Agent["ttsNode"]>): ReturnType<voice.Agent["ttsNode"]> {
+    if (this.#callSignal.aborted) return null;
     const context: SynthesisTraceContext = Object.freeze({
       workerBootId: this.#workerBootId,
       callId: this.#callId,

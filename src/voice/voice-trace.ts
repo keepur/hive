@@ -137,7 +137,10 @@ export type DiagnosticGapReason =
   | "cancel_failed"
   | "action_ownership_unproved"
   | "action_overflow"
-  | "provider_context_missing";
+  | "provider_context_missing"
+  | "start_pending"
+  | "teardown_failed"
+  | "teardown_timeout";
 
 type CallPayload = {
   event:
