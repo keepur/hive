@@ -323,68 +323,74 @@ describe("StartupActionOwnership", () => {
     });
   });
 
-  it("retains a queued retry's chain after the routine and interrupts it on later binding loss", async () => {
-    let retry!: Handle;
-    const fixture = ownershipFixture(async (chain, _error, actions) => {
-      retry = new Handle("retry-1");
-      actions.scheduleOwned(
-        "retry",
-        () => {
-          actions.registerSpeech(retry);
-          return retry;
-        },
-        chain,
-      );
-    });
-    admitSdk(fixture);
-    fixture.trace.bind("turn-1", "speech-1");
-    fixture.ownership.captureError(new Failure("turn-1"));
-    await drain();
-    expect(fixture.ownership.activeRecoveryCount).toBe(0);
-    expect(fixture.ownership.applicationHandleCount).toBe(1);
-    fixture.trace.unavailable("turn-1", "evicted");
-    expect(retry.interrupts).toBe(1);
-    fixture.trace.unavailable("turn-1", "conflict");
-    expect(retry.interrupts).toBe(1);
-    expect(
-      fixture.trace.gaps.filter((gap) => gap.reason === "action_ownership_unproved" && gap.turnId === "turn-1"),
-    ).toHaveLength(1);
-    retry.finish();
-    expect(fixture.ownership.applicationHandleCount).toBe(0);
-  });
+  it.each(["conflict", "evicted", "closed"] as const)(
+    "retains a queued retry's chain after the routine and interrupts it on later %s binding loss",
+    async (reason) => {
+      let retry!: Handle;
+      const fixture = ownershipFixture(async (chain, _error, actions) => {
+        retry = new Handle("retry-1");
+        actions.scheduleOwned(
+          "retry",
+          () => {
+            actions.registerSpeech(retry);
+            return retry;
+          },
+          chain,
+        );
+      });
+      admitSdk(fixture);
+      fixture.trace.bind("turn-1", "speech-1");
+      fixture.ownership.captureError(new Failure("turn-1"));
+      await drain();
+      expect(fixture.ownership.activeRecoveryCount).toBe(0);
+      expect(fixture.ownership.applicationHandleCount).toBe(1);
+      fixture.trace.unavailable("turn-1", reason);
+      expect(retry.interrupts).toBe(1);
+      fixture.trace.unavailable("turn-1", "conflict");
+      expect(retry.interrupts).toBe(1);
+      expect(
+        fixture.trace.gaps.filter((gap) => gap.reason === "action_ownership_unproved" && gap.turnId === "turn-1"),
+      ).toHaveLength(1);
+      retry.finish();
+      expect(fixture.ownership.applicationHandleCount).toBe(0);
+    },
+  );
 
-  it("retains a prior-aborted fallback for later binding invalidation", async () => {
-    let fallback!: Handle;
-    let chainRef!: RecoveryChain<Failure>;
-    const fixture = ownershipFixture(async (chain, _error, actions) => {
-      chainRef = chain;
-      fallback = new Handle("fallback-1");
-      actions.scheduleOwned(
-        "fallback",
-        () => {
-          actions.registerSpeech(fallback);
-          return fallback;
-        },
-        chain,
-      );
-      await actions.waitOwned(chain, () => fallback.waitForPlayout());
-    });
-    admitSdk(fixture);
-    fixture.trace.bind("turn-1", "speech-1");
-    fixture.ownership.captureError(new Failure("turn-1"));
-    await drain();
-    fixture.ownership.registerSpeech(new Handle("speculative"));
-    await drain();
-    expect(chainRef.abort.signal.aborted).toBe(true);
-    expect(chainRef.bindingInvalidationHandled).toBe(false);
-    expect(fallback.interrupts).toBe(0);
-    expect(fixture.ownership.activeRecoveryCount).toBe(0);
-    fixture.trace.unavailable("turn-1", "conflict");
-    expect(chainRef.bindingInvalidationHandled).toBe(true);
-    expect(fallback.interrupts).toBe(1);
-    fallback.failPlayout();
-    await drain();
-  });
+  it.each(["conflict", "evicted", "closed"] as const)(
+    "retains a prior-aborted fallback for later %s binding invalidation",
+    async (reason) => {
+      let fallback!: Handle;
+      let chainRef!: RecoveryChain<Failure>;
+      const fixture = ownershipFixture(async (chain, _error, actions) => {
+        chainRef = chain;
+        fallback = new Handle("fallback-1");
+        actions.scheduleOwned(
+          "fallback",
+          () => {
+            actions.registerSpeech(fallback);
+            return fallback;
+          },
+          chain,
+        );
+        await actions.waitOwned(chain, () => fallback.waitForPlayout());
+      });
+      admitSdk(fixture);
+      fixture.trace.bind("turn-1", "speech-1");
+      fixture.ownership.captureError(new Failure("turn-1"));
+      await drain();
+      fixture.ownership.registerSpeech(new Handle("speculative"));
+      await drain();
+      expect(chainRef.abort.signal.aborted).toBe(true);
+      expect(chainRef.bindingInvalidationHandled).toBe(false);
+      expect(fallback.interrupts).toBe(0);
+      expect(fixture.ownership.activeRecoveryCount).toBe(0);
+      fixture.trace.unavailable("turn-1", reason);
+      expect(chainRef.bindingInvalidationHandled).toBe(true);
+      expect(fallback.interrupts).toBe(1);
+      fallback.failPlayout();
+      await drain();
+    },
+  );
 
   it("aborts an independent delay immediately on call close", async () => {
     let passedDelay = false;
@@ -542,5 +548,87 @@ describe("StartupActionOwnership", () => {
           (row as { speechId?: string }).speechId === speech.id,
       ),
     ).toHaveLength(1);
+  });
+
+  it("interrupts a post-routine retry on true real-trace recent-cache eviction", async () => {
+    const trace = new SpeechTrace({
+      callId: "call-real-eviction",
+      workerBootId: VOICE_PROCESS_ID,
+      writer: {
+        write: () => {},
+        emit: () => {},
+        snapshot: () => ({
+          attempted: 0,
+          acknowledged: 0,
+          filtered: 0,
+          failed: 0,
+          overflow: 0,
+          pending: 0,
+          unacknowledged: 0,
+          sinkErrors: 0,
+          complete: true,
+        }),
+        settleWrites: async () => ({
+          attempted: 0,
+          acknowledged: 0,
+          filtered: 0,
+          failed: 0,
+          overflow: 0,
+          pending: 0,
+          unacknowledged: 0,
+          sinkErrors: 0,
+          complete: true,
+        }),
+      },
+    });
+    const arbiter = new StartupArbiter({ requestOpening: () => new Handle("unused"), observe: () => {} });
+    let retry!: Handle;
+    const ownership = new StartupActionOwnership<Failure>({
+      arbiter,
+      trace,
+      recover: async (chain, _error, actions) => {
+        retry = new Handle("retry-after-routine");
+        actions.scheduleOwned(
+          "retry",
+          () => {
+            trace.speechCreated(retry as never, "retry", chain.owner.acceptedEpoch);
+            actions.registerSpeech(retry);
+            return retry;
+          },
+          chain,
+        );
+      },
+    });
+    const speech = new Handle("speech-origin");
+    trace.speechCreated(speech as never, "sdk_response", 0);
+    ownership.registerSpeech(speech);
+    ownership.acceptCallerTurn();
+    ownership.admitEou(speech.id);
+    const originTurn = randomUUID();
+    const origin = trace.bridgeCreated({
+      workerBootId: VOICE_PROCESS_ID,
+      callId: "call-real-eviction",
+      turnId: originTurn,
+    });
+    origin.bind(speech.id);
+    origin.finish("failed", "unknown");
+    ownership.captureError(new Failure(originTurn));
+    await drain();
+    expect(ownership.activeRecoveryCount).toBe(0);
+    expect(retry.interrupts).toBe(0);
+
+    for (let index = 0; index < 256; index += 1) {
+      const attempt = trace.bridgeCreated({
+        workerBootId: VOICE_PROCESS_ID,
+        callId: "call-real-eviction",
+        turnId: randomUUID(),
+      });
+      attempt.finish("completed", "unknown");
+    }
+
+    expect(trace.bridgeBinding(originTurn)).toEqual({ state: "unavailable", reason: "evicted" });
+    expect(retry.interrupts).toBe(1);
+    ownership.close();
+    trace.close("call_closed");
   });
 });
