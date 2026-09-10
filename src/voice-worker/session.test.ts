@@ -74,11 +74,16 @@ vi.mock("@livekit/agents", () => {
       this.tts = options.tts;
     }
   }
+  class AudioOutput extends Emitter {
+    static readonly EVENT_PLAYBACK_STARTED = "playbackStarted";
+    static readonly EVENT_PLAYBACK_FINISHED = "playbackFinished";
+    clearBuffer = vi.fn();
+  }
   class AgentSession extends Emitter {
     input = { audioEnabled: true, setAudioEnabled: vi.fn((enabled: boolean) => (this.input.audioEnabled = enabled)) };
     output = {
       audioEnabled: true,
-      audio: { clearBuffer: vi.fn() },
+      audio: new AudioOutput(),
       setAudioEnabled: vi.fn((enabled: boolean) => (this.output.audioEnabled = enabled)),
     };
     start = vi.fn(async (options: unknown) => {
@@ -128,7 +133,9 @@ vi.mock("@livekit/agents", () => {
         ConversationItemAdded: "conversation_item_added",
         Error: "error",
         Close: "close",
+        AgentFalseInterruption: "agent_false_interruption",
       },
+      AudioOutput,
     },
     llm: { LLM, LLMStream },
   };
@@ -598,6 +605,8 @@ describe("runCallSession startup ownership and teardown", () => {
     const session = sdkState.sessions[0] as {
       generateReply: ReturnType<typeof vi.fn>;
       emit(event: string, value?: unknown): void;
+      listeners: Map<string, Array<(...args: unknown[]) => void>>;
+      output: { audio: { emit(event: string, value?: unknown): void; listeners: Map<string, unknown[]> } };
     };
     expect(sdkState.createdAtStart).toEqual(
       expect.arrayContaining([
@@ -608,6 +617,7 @@ describe("runCallSession startup ownership and teardown", () => {
         "conversation_item_added",
         "error",
         "close",
+        "agent_false_interruption",
       ]),
     );
     expect(sdkState.startOptions[0]).toMatchObject({
@@ -618,7 +628,17 @@ describe("runCallSession startup ownership and teardown", () => {
       waitUntilAnswered: true,
     });
     expect(session.generateReply).toHaveBeenCalledOnce();
+    expect(session.output.audio.listeners.get("playbackStarted")).toHaveLength(1);
+    expect(session.output.audio.listeners.get("playbackFinished")).toHaveLength(1);
+    expect(() => session.emit("agent_false_interruption", { resumed: true })).not.toThrow();
+    expect(() => session.output.audio.emit("playbackStarted", { createdAt: Date.now() })).not.toThrow();
+    expect(() =>
+      session.output.audio.emit("playbackFinished", { playbackPosition: 0.125, interrupted: false }),
+    ).not.toThrow();
     session.emit("close");
+    expect(session.listeners.get("agent_false_interruption")).toHaveLength(0);
+    expect(session.output.audio.listeners.get("playbackStarted")).toHaveLength(0);
+    expect(session.output.audio.listeners.get("playbackFinished")).toHaveLength(0);
     await fixture.shutdown();
   });
 
@@ -698,7 +718,7 @@ describe("runCallSession startup ownership and teardown", () => {
     await fixture.shutdown();
   });
 
-  it("waits for an in-flight pre-start close before issuing the mandatory post-start close", async () => {
+  it("issues the mandatory post-start close independently while the pre-start close is hung", async () => {
     const start = gate<void>();
     const firstClose = gate<void>();
     let closeCount = 0;
@@ -718,12 +738,10 @@ describe("runCallSession startup ownership and teardown", () => {
     fixture.room.emit("disconnected");
     await until(() => closeCount === 1);
     start.resolve();
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(closeCount).toBe(1);
-    firstClose.resolve();
     await running;
     await until(() => closeCount === 2);
     expect(sipState.calls).toHaveLength(0);
+    firstClose.resolve();
     await fixture.shutdown();
   });
 

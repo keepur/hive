@@ -332,6 +332,18 @@ export async function runCallSession(
   const onSessionClose = () => {
     void closeCall("call_close");
   };
+  const onFalseInterruption = () => {
+    speechTrace.falseInterruption();
+  };
+  const onOutputPlaybackStarted = () => {
+    speechTrace.outputPlayback();
+  };
+  const onOutputPlaybackFinished = (event: { playbackPosition: number; interrupted: boolean }) => {
+    const durationMs = Number.isFinite(event.playbackPosition)
+      ? Math.max(0, event.playbackPosition * 1_000)
+      : undefined;
+    speechTrace.outputPlayback(durationMs, event.interrupted);
+  };
   const onParticipantConnected = (participant: RemoteParticipant) => {
     if (participant.identity === intendedIdentity) {
       speechTrace.call({ event: "participant_available", intendedParticipant: true });
@@ -351,6 +363,7 @@ export async function runCallSession(
   session.on(voice.AgentSessionEventTypes.ConversationItemAdded, onConversationItem);
   session.on(voice.AgentSessionEventTypes.Error, onSessionError);
   session.on(voice.AgentSessionEventTypes.Close, onSessionClose);
+  session.on(voice.AgentSessionEventTypes.AgentFalseInterruption, onFalseInterruption);
   ctx.room.on(RoomEvent.ParticipantConnected, onParticipantConnected);
   ctx.room.on(RoomEvent.ParticipantDisconnected, onParticipantDisconnected);
   ctx.room.on(RoomEvent.Disconnected, onRoomDisconnected);
@@ -360,9 +373,24 @@ export async function runCallSession(
     callClosedResolve = resolve;
   });
   let startSettled = false;
-  let sdkCloseInFlight: Promise<void> | null = null;
-  let sdkCloseEpoch = -1;
+  let preStartCloseInFlight: Promise<void> | null = null;
+  let postStartCloseInFlight: Promise<void> | null = null;
+  let attachedAudioOutput: voice.AudioOutput | null = null;
   let cleanupPromise: Promise<void> | null = null;
+
+  const detachOutputListeners = () => {
+    attachedAudioOutput?.off(voice.AudioOutput.EVENT_PLAYBACK_STARTED, onOutputPlaybackStarted);
+    attachedAudioOutput?.off(voice.AudioOutput.EVENT_PLAYBACK_FINISHED, onOutputPlaybackFinished);
+    attachedAudioOutput = null;
+  };
+  const attachOutputListeners = () => {
+    const output = session.output.audio;
+    if (!output || output === attachedAudioOutput) return;
+    detachOutputListeners();
+    attachedAudioOutput = output;
+    output.on(voice.AudioOutput.EVENT_PLAYBACK_STARTED, onOutputPlaybackStarted);
+    output.on(voice.AudioOutput.EVENT_PLAYBACK_FINISHED, onOutputPlaybackFinished);
+  };
 
   const detachListeners = () => {
     session.off(voice.AgentSessionEventTypes.SpeechCreated, onSpeechCreated);
@@ -372,6 +400,8 @@ export async function runCallSession(
     session.off(voice.AgentSessionEventTypes.ConversationItemAdded, onConversationItem);
     session.off(voice.AgentSessionEventTypes.Error, onSessionError);
     session.off(voice.AgentSessionEventTypes.Close, onSessionClose);
+    session.off(voice.AgentSessionEventTypes.AgentFalseInterruption, onFalseInterruption);
+    detachOutputListeners();
     ctx.room.off(RoomEvent.ParticipantConnected, onParticipantConnected);
     ctx.room.off(RoomEvent.ParticipantDisconnected, onParticipantDisconnected);
     ctx.room.off(RoomEvent.Disconnected, onRoomDisconnected);
@@ -388,16 +418,16 @@ export async function runCallSession(
     } catch {}
   };
   const closeSdkAgain = (): Promise<void> => {
-    const epoch = startSettled ? 1 : 0;
-    const previous = sdkCloseInFlight;
-    if (previous && sdkCloseEpoch < epoch) return previous.catch(() => {}).then(() => closeSdkAgain());
+    const postStart = startSettled;
+    const previous = postStart ? postStartCloseInFlight : preStartCloseInFlight;
     if (previous) return previous;
     const task = Promise.resolve().then(() => session.close());
-    sdkCloseEpoch = epoch;
-    sdkCloseInFlight = task;
+    if (postStart) postStartCloseInFlight = task;
+    else preStartCloseInFlight = task;
     void task
       .finally(() => {
-        if (sdkCloseInFlight === task) sdkCloseInFlight = null;
+        if (postStartCloseInFlight === task) postStartCloseInFlight = null;
+        if (preStartCloseInFlight === task) preStartCloseInFlight = null;
       })
       .catch(() => {});
     return task;
@@ -461,6 +491,7 @@ export async function runCallSession(
     await Promise.race([observedStart, callClosed]);
     if (arbiter.closed) return;
     await observedStart;
+    attachOutputListeners();
     speechTrace.call({ event: "session_started" });
 
     if (dest) {

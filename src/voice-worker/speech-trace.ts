@@ -124,6 +124,8 @@ export interface SpeechTracePort {
   synthesisFailure(synthesisId: string, errorClass: "tts_provider_failed"): void;
   unboundProviderFailure(kind: "tts" | "llm", errorClass: "tts_provider_failed" | "llm_provider_failed"): void;
   metrics(event: MetricsCollectedEvent): void;
+  outputPlayback(durationMs?: number, interrupted?: boolean): void;
+  falseInterruption(): void;
   actionGap(reason: ActionGapReason, speechId: string, turnId?: string): void;
   actionGap(reason: ActionGapReason, speechId: string | null, turnId: string): void;
   startupPending(): void;
@@ -139,6 +141,7 @@ export interface SpeechTracePort {
 
 interface SpeechOwner {
   readonly handle: SpeechHandle;
+  readonly doneCallback: (handle: SpeechHandle) => void;
   readonly speechId: string;
   readonly origin: SpeechOrigin;
   readonly acceptedEpoch: number;
@@ -295,6 +298,7 @@ export class SpeechTrace implements SpeechTracePort {
       this.#evictActiveSpeechIfNeeded();
       const owner: SpeechOwner = {
         handle,
+        doneCallback: (settled: SpeechHandle) => this.#safe(() => this.#speechSettled(owner, settled)),
         speechId: handle.id,
         origin,
         acceptedEpoch,
@@ -326,7 +330,7 @@ export class SpeechTrace implements SpeechTracePort {
           knownPlayout: false,
         },
       );
-      handle.addDoneCallback((settled) => this.#safe(() => this.#speechSettled(owner, settled)));
+      handle.addDoneCallback(owner.doneCallback);
     });
   }
 
@@ -551,6 +555,29 @@ export class SpeechTrace implements SpeechTracePort {
           },
         );
       }
+    });
+  }
+
+  outputPlayback(durationMs?: number, interrupted?: boolean): void {
+    this.#safe(() => {
+      if (this.#closed) return;
+      this.#emit(
+        {},
+        {
+          event: "output_playback",
+          source: "media_output",
+          metric: "playout",
+          durationMs: measure(finiteNonnegative(durationMs), "not_observed"),
+          ...(interrupted === undefined ? {} : { interrupted }),
+        },
+      );
+    });
+  }
+
+  falseInterruption(): void {
+    this.#safe(() => {
+      if (this.#closed) return;
+      this.#emit({}, { event: "false_interruption", source: "sdk_wall" });
     });
   }
 
@@ -954,6 +981,7 @@ export class SpeechTrace implements SpeechTracePort {
   }
 
   #speechSettled(owner: SpeechOwner, handle: SpeechHandle): void {
+    if (this.#closed) return;
     let errorClass = owner.errorClass;
     try {
       if (handle.exception() != null) errorClass ??= "speech_handle_failed";
@@ -1094,6 +1122,7 @@ export class SpeechTrace implements SpeechTracePort {
     startedSpeakingAt: number | undefined,
   ): void {
     if (owner.terminalEmitted) return;
+    this.#detachSpeechHandle(owner);
     if (sdkInterrupted) this.#sdkInterruptions += 1;
     if (outcome === "cancelled") this.#cancelledSpeechAttempts += 1;
     this.#recordLatency(owner, outcome, sdkInterrupted);
@@ -1225,6 +1254,14 @@ export class SpeechTrace implements SpeechTracePort {
     const oldestId = this.#recentSpeech.keys().next().value as string;
     this.#recentSpeech.delete(oldestId);
     this.#gap("recent_cache_evicted", { speechId: oldestId });
+  }
+
+  #detachSpeechHandle(owner: SpeechOwner): void {
+    try {
+      owner.handle.removeDoneCallback(owner.doneCallback);
+    } catch {
+      this.#gap("listener_failed", { speechId: owner.speechId });
+    }
   }
 
   #addRecentBridge(owner: BridgeOwner): void {

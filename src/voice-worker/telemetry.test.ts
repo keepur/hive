@@ -451,8 +451,8 @@ describe("CallStats (KPR-322 Task 8)", () => {
 describe("percentile (KPR-322 Task 8)", () => {
   it("computes nearest-rank percentiles on a known array", () => {
     const samples = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-    // floor(0.50 * 10) = 5 → sorted[5] = 6; floor(0.95 * 10) = 9 → 10
-    expect(percentile(samples, 50)).toBe(6);
+    // nearest rank: ceil(0.50 * 10) - 1 = 4 → sorted[4] = 5
+    expect(percentile(samples, 50)).toBe(5);
     expect(percentile(samples, 95)).toBe(10);
     expect(percentile([], 50)).toBe(-1);
     expect(percentile([42], 50)).toBe(42);

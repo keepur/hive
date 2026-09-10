@@ -322,7 +322,7 @@ export class VoiceAdapter {
     const latchWriteFailure = (): void => {
       if (writeFailed) return;
       writeFailed = true;
-      requestErrorClass = "midstream_error";
+      requestErrorClass = "sse_write_failed";
       requestAbort.abort();
     };
     const trackResponseWrite = (): ((error?: Error | null) => void) => {
@@ -623,7 +623,7 @@ export class VoiceAdapter {
                 ? "cancelled"
                 : "completed";
           const errorClass: VoiceErrorClass | null = writeFailed
-            ? "midstream_error"
+            ? "sse_write_failed"
             : attemptFailure
               ? attemptFailure.circuitOpen
                 ? "llm_provider_failed"
@@ -806,7 +806,7 @@ export class VoiceAdapter {
           reason: outcome.reason,
           bytesSent: outcome.bytesSent,
         });
-        requestErrorClass = writeFailed ? "midstream_error" : "spawn_failed";
+        requestErrorClass = writeFailed ? "sse_write_failed" : "spawn_failed";
         if (!outcome.bytesSent) {
           if (sendHeaders(500, { "Content-Type": "application/json" })) {
             endResponse(JSON.stringify({ error: "Internal error" }));
@@ -888,7 +888,7 @@ export class VoiceAdapter {
     } catch (err) {
       if (writeFailed) {
         requestOutcome = "failed";
-        requestErrorClass = "midstream_error";
+        requestErrorClass = "sse_write_failed";
       } else if (err instanceof VoiceRequestCancelledError || requestAbort.signal.aborted) {
         requestOutcome = "cancelled";
       } else {
@@ -916,7 +916,7 @@ export class VoiceAdapter {
       const responseWritesSettled = await settleResponseWrites();
       if (writeFailed) {
         requestOutcome = "failed";
-        requestErrorClass = "midstream_error";
+        requestErrorClass = "sse_write_failed";
       } else if (!responseWritesSettled) {
         requestOutcome = "incomplete";
       }

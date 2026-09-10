@@ -14,6 +14,7 @@ import {
   UnsupportedVoiceDiagnosticVersionError,
   VoiceDiagnosticInputError,
 } from "./voice-diagnostic-reader.js";
+import { percentile as summaryPercentile } from "../voice-worker/telemetry.js";
 
 const COMPLETE_FIXTURE = readFileSync(
   fileURLToPath(new URL("../../docs/epics/kpr-462/fixtures/kpr-464-complete.jsonl", import.meta.url)),
@@ -134,6 +135,111 @@ describe("voice diagnostic reader fixtures", () => {
 });
 
 describe("voice diagnostic entity lifecycles", () => {
+  it("retains unbound public playback and false-interruption observations at call level", () => {
+    const playbackStarted = row("playback-started", {
+      event: "output_playback",
+      source: "media_output",
+      metric: "playout",
+      durationMs: { value: null, reason: "not_observed" },
+    });
+    const report = reduceVoiceDiagnostics(
+      jsonl([
+        playbackStarted,
+        playbackStarted,
+        row("playback-finished", {
+          event: "output_playback",
+          source: "media_output",
+          metric: "playout",
+          durationMs: { value: 125, reason: null },
+          interrupted: false,
+        }),
+        row("false-interruption", { event: "false_interruption", source: "sdk_wall" }),
+      ]),
+      "call-test",
+    );
+
+    expect(report.callLevelObservations).toEqual({ outputPlayback: 2, falseInterruption: 1 });
+    expect(report.speechAttempts).toBe(0);
+    expect(report.playoutObserved).toBe(0);
+  });
+
+  it("uses the summary's shared nearest-rank contract for an even sample set", () => {
+    const rows: VoiceDiagnosticEvent[] = [];
+    for (const [index, eouMs] of [90, 190].entries()) {
+      const speechId = `speech-percentile-${index}`;
+      const turnId = `turn-percentile-${index}`;
+      const synthesisId = `synth-percentile-${index}`;
+      rows.push(
+        row(
+          `${index}-speech-start`,
+          { event: "speech_started", origin: "sdk_response", acceptedEpoch: 1 },
+          { speechId },
+        ),
+        row(
+          `${index}-eou`,
+          { event: "sdk_metric", source: "sdk_wall", metric: "eou", eouMs: { value: eouMs, reason: null } },
+          { speechId },
+        ),
+        row(`${index}-bridge-start`, { event: "bridge_created" }, { turnId }),
+        row(`${index}-bridge-bind`, { event: "bridge_bound", source: "sdk_metrics_context" }, { turnId, speechId }),
+        row(
+          `${index}-bridge-text`,
+          { event: "bridge_first_text", textLength: 1, firstTextMs: { value: 5, reason: null }, late: false },
+          { turnId },
+        ),
+        row(
+          `${index}-bridge-end`,
+          { event: "bridge_terminal", outcome: "completed", firstTextMs: { value: 5, reason: null } },
+          { turnId },
+        ),
+        row(`${index}-synth-start`, { event: "synthesis_started" }, { synthesisId }),
+        row(
+          `${index}-synth-bind`,
+          { event: "synthesis_bound", source: "sdk_metrics_context" },
+          { synthesisId, speechId },
+        ),
+        row(
+          `${index}-tts`,
+          { event: "sdk_metric", source: "sdk_metrics_context", metric: "tts", ttfbMs: { value: 5, reason: null } },
+          { synthesisId, speechId },
+        ),
+        row(
+          `${index}-frame`,
+          {
+            event: "synthesis_first_frame",
+            frameCount: 1,
+            sampleCount: 1,
+            sampleRate: 1,
+            generatedDurationMs: { value: 1, reason: null },
+          },
+          { synthesisId },
+        ),
+        row(
+          `${index}-synth-end`,
+          { event: "synthesis_terminal", frameCount: 1, outcome: "completed" },
+          { synthesisId },
+        ),
+        row(
+          `${index}-speech-end`,
+          {
+            event: "speech_terminal",
+            origin: "sdk_response",
+            acceptedEpoch: 1,
+            outcome: "completed",
+            generatedAudio: true,
+          },
+          { speechId },
+        ),
+      );
+    }
+    const report = reduceVoiceDiagnostics(jsonl(rows), "call-test");
+    const distribution = report.distributions.estimatedEouToFirstGeneratedAudioMs;
+
+    expect(distribution.samples).toEqual([100, 200]);
+    expect(distribution.p50).toBe(100);
+    expect(summaryPercentile(distribution.samples, 50)).toBe(distribution.p50);
+  });
+
   it("keeps request and attempt terminals separate when engine_terminal carries the final sequence", () => {
     const turnId = "engine-one";
     const rows = [
@@ -235,6 +341,15 @@ describe("voice diagnostic input validation", () => {
     ).not.toBeNull();
     expect(
       parseVoiceDiagnosticEvent(row("persistence", { event: "summary_persistence", status: "acknowledged" })),
+    ).not.toBeNull();
+    expect(
+      parseVoiceDiagnosticEvent(
+        row(
+          "sse-write",
+          { event: "engine_terminal", outcome: "failed", errorClass: "sse_write_failed" },
+          { turnId: "turn" },
+        ),
+      ),
     ).not.toBeNull();
   });
 

@@ -8,6 +8,7 @@ import { ProviderCircuitOpenError } from "../../agents/provider-circuit-breaker.
 import { VOICE_OUTAGE_SPOKEN_NOTICE } from "../../outage/outage-notices.js";
 import { VOICE_TOOL_ACK_PHRASES } from "../../agents/voice-tool-ack.js";
 import { buildVoiceSystemPrompt } from "../../agents/prompt-builder.js";
+import { parseVoiceDiagnosticEvent } from "../../voice/voice-diagnostic-reader.js";
 
 // ---------------------------------------------------------------------------
 // Mocks shared across the file
@@ -401,6 +402,33 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     expect(fields).not.toHaveProperty("warmTurnSeq");
   });
 
+  it("emits full engine rows that the offline reader accepts", async () => {
+    const am = makeAgentManager({
+      finalMessage: "diagnostic response",
+      warmPath: true,
+      toolCalls: 2,
+      toolMs: 17,
+      toolAckInjected: 1,
+    });
+    const adapter = makeVoiceAdapter(am);
+    await callHandle(adapter, makeRequest({ stream: false }), new MockServerResponse());
+
+    const rows = [
+      ...engineTraceRows("engine_received"),
+      ...engineTraceRows("engine_attempt_started"),
+      ...engineTraceRows("engine_attempt_terminal"),
+      ...engineTraceRows("engine_terminal"),
+    ];
+    expect(rows.map(parseVoiceDiagnosticEvent)).not.toContain(null);
+    expect(engineTraceRows("engine_terminal")[0]).toMatchObject({
+      textLength: 19,
+      warm: true,
+      toolCount: 2,
+      toolMs: 17,
+      toolAckInjected: true,
+    });
+  });
+
   // The populated branch of the same two spreads. Without this, every
   // assertion above runs against a TurnResult carrying NO stageTimings and no
   // warmTurnSeq, so nothing proves the coordinator's C1 numbers — the exact
@@ -667,9 +695,11 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     });
     await callHandle(adapter, makeRequest({ stream: true }), res);
     expect(res.destroy).toHaveBeenCalledTimes(1);
-    expect(engineTraceRows("engine_attempt_terminal")).toHaveLength(1);
+    expect(engineTraceRows("engine_attempt_terminal")).toEqual([
+      expect.objectContaining({ outcome: "failed", errorClass: "sse_write_failed" }),
+    ]);
     expect(engineTraceRows("engine_terminal")).toHaveLength(1);
-    expect(engineTraceRows("engine_terminal")[0]).toMatchObject({ outcome: "failed", errorClass: "midstream_error" });
+    expect(engineTraceRows("engine_terminal")[0]).toMatchObject({ outcome: "failed", errorClass: "sse_write_failed" });
   });
 
   it("latches an asynchronous response write callback failure before the request terminal", async () => {
@@ -703,7 +733,7 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     });
     await callHandle(adapter, makeRequest({ stream: true }), res);
     expect(engineTraceRows("engine_terminal")).toHaveLength(1);
-    expect(engineTraceRows("engine_terminal")[0]).toMatchObject({ outcome: "failed", errorClass: "midstream_error" });
+    expect(engineTraceRows("engine_terminal")[0]).toMatchObject({ outcome: "failed", errorClass: "sse_write_failed" });
   });
 
   it("non-streaming path: TurnResult.finalMessage rendered via formatNonStreamingResponse", async () => {

@@ -4,6 +4,7 @@ import type { MetricsCollectedEvent } from "@livekit/agents";
 import { describe, expect, it } from "vitest";
 
 import type { VoiceDiagnosticEvent, VoiceTraceWriter } from "../voice/voice-trace.js";
+import { parseVoiceDiagnosticEvent } from "../voice/voice-diagnostic-reader.js";
 import { SpeechTrace, type CallDiagnosticCounts, type SpeechHandle } from "./speech-trace.js";
 import { bridgeTraceContext, synthesisTraceContext } from "./trace-context.js";
 
@@ -53,6 +54,15 @@ class FakeSpeechHandle {
   }
   addDoneCallback(callback: (handle: SpeechHandle) => void): void {
     this.#callbacks.push(callback);
+  }
+  removeDoneCallback(callback: (handle: SpeechHandle) => void): void {
+    this.#callbacks = this.#callbacks.filter((candidate) => candidate !== callback);
+  }
+  get callbackCount(): number {
+    return this.#callbacks.length;
+  }
+  callbacksSnapshot(): Array<(handle: SpeechHandle) => void> {
+    return [...this.#callbacks];
   }
   exception(): unknown {
     return this.#error;
@@ -267,6 +277,63 @@ describe("schema-v2 latency eligibility", () => {
 });
 
 describe("speech lifecycle", () => {
+  it("removes the exact public handle callback on settlement, active eviction, and close", () => {
+    const settled = setup("settled");
+    const settledHandle = new FakeSpeechHandle("speech-settled");
+    settled.trace.speechCreated(settledHandle.asHandle(), "opening", 0);
+    expect(settledHandle.callbackCount).toBe(1);
+    settledHandle.settle();
+    expect(settledHandle.callbackCount).toBe(0);
+
+    const evicted = setup("evicted");
+    const oldest = new FakeSpeechHandle("speech-oldest");
+    evicted.trace.speechCreated(oldest.asHandle(), "opening", 0);
+    for (let index = 0; index < 256; index += 1) {
+      evicted.trace.speechCreated(new FakeSpeechHandle(`speech-${index}`).asHandle(), "opening", 0);
+    }
+    expect(oldest.callbackCount).toBe(0);
+
+    const closed = setup("closed");
+    const closedHandle = new FakeSpeechHandle("speech-closed");
+    closed.trace.speechCreated(closedHandle.asHandle(), "opening", 0);
+    const queuedCallback = closedHandle.callbacksSnapshot()[0]!;
+    closed.trace.close("call_closed");
+    expect(closedHandle.callbackCount).toBe(0);
+    const rowsAfterClose = closed.rows.length;
+    queuedCallback(closedHandle.asHandle());
+    closedHandle.settle();
+    expect(closed.rows).toHaveLength(rowsAfterClose);
+  });
+
+  it("emits producer-shaped rows accepted by the reader, including call-level public SDK observations", () => {
+    const { rows, trace } = setup("producer-reader");
+    const handle = new FakeSpeechHandle("speech-producer");
+    trace.speechCreated(handle.asHandle(), "opening", 0);
+    const bridge = trace.bridgeCreated(bridgeContext("producer-reader", "turn-producer"));
+    bridge.started();
+    bridge.response(200);
+    bridge.finish("completed", "unknown");
+    handle.chatItems.push({
+      type: "message",
+      role: "assistant",
+      textContent: "content is counted only",
+      interrupted: false,
+      metrics: { startedSpeakingAt: 1 },
+    });
+    handle.settle();
+    trace.outputPlayback();
+    trace.outputPlayback(125, false);
+    trace.falseInterruption();
+
+    expect(rows.map(parseVoiceDiagnosticEvent)).not.toContain(null);
+    expect(rows.filter((row) => row.event === "output_playback")).toEqual([
+      expect.objectContaining({ speechId: null }),
+      expect.objectContaining({ speechId: null }),
+    ]);
+    expect(rows.find((row) => row.event === "false_interruption")).toMatchObject({ speechId: null });
+    expect(JSON.stringify(rows)).not.toContain("content is counted only");
+  });
+
   it("records cancellation before metrics and finalizes a duplicate callback once", () => {
     const { rows, trace } = setup();
     const handle = new FakeSpeechHandle("speech-cancel");

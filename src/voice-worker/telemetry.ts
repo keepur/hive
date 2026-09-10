@@ -8,6 +8,7 @@
  */
 import { MongoClient, type Collection } from "mongodb";
 import { createLogger } from "../logging/logger.js";
+import { nearestRankPercentile } from "../voice/percentile.js";
 import type { VendorCell } from "./cells.js";
 import type { BridgeFailureClass } from "./error-map.js";
 import type { CallDiagnosticCounts } from "./speech-trace.js";
@@ -23,10 +24,7 @@ export type CallDirection = "inbound" | "outbound";
  * without a live Mongo round-trip.
  */
 export function percentile(samples: number[], p: number): number {
-  if (samples.length === 0) return -1;
-  const sorted = [...samples].sort((a, b) => a - b);
-  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
-  return sorted[idx]!;
+  return nearestRankPercentile(samples, p) ?? -1;
 }
 
 export class VoiceWorkerHeartbeat {

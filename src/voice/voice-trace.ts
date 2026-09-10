@@ -118,6 +118,7 @@ export type VoiceErrorClass =
   | "engine_unreachable"
   | "budget_saturated"
   | "spawn_failed"
+  | "sse_write_failed"
   | "midstream_error"
   | "llm_provider_failed"
   | "tts_provider_failed"

@@ -6,6 +6,7 @@ import type {
   VoiceDiagnosticEvent,
   VoiceDiagnosticEventName,
 } from "./voice-trace.js";
+import { nearestRankPercentile } from "./percentile.js";
 
 export const MAX_VOICE_DIAGNOSTIC_BYTES = 32 * 1024 * 1024;
 
@@ -89,6 +90,10 @@ export interface VoiceDiagnosticReport {
   truncatedRows: number;
   conflictingTerminals: number;
   callerConfirmation: "unknown";
+  callLevelObservations: {
+    outputPlayback: number;
+    falseInterruption: number;
+  };
   distributions: {
     estimatedEouToFirstGeneratedAudioMs: {
       description: "stage sum: EOU + matching bridge first text + matching TTS TTFB; not measured end-to-end";
@@ -177,7 +182,7 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
   caller_turn_accepted: ["acceptedEpoch", "hasFinalInput"],
   opening_decision: ["decision", "reason", "acceptedEpoch", "hasFinalInput"],
   call_closed: ["reason"],
-  speech_started: ["origin", "acceptedEpoch", "source"],
+  speech_started: ["origin", "acceptedEpoch", "source", "generatedAudio", "knownPlayout"],
   speech_terminal: [
     "origin",
     "acceptedEpoch",
@@ -194,8 +199,8 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
     "errorClass",
   ],
   bridge_created: [],
-  bridge_started: [],
-  bridge_response: ["status"],
+  bridge_started: ["late"],
+  bridge_response: ["status", "late"],
   bridge_first_text: ["textLength", "firstTextMs", "late"],
   bridge_terminal: ["status", "textLength", "firstTextMs", "maximumGapMs", "outcome", "cause", "errorClass", "late"],
   bridge_bound: ["source"],
@@ -228,8 +233,16 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
     "interrupted",
     "errorClass",
   ],
-  handle_playout_item: ["source", "textLength", "interrupted", "startedSpeakingAt", "durationMs", "errorClass"],
-  output_playback: ["source", "durationMs", "errorClass"],
+  handle_playout_item: [
+    "source",
+    "metric",
+    "textLength",
+    "interrupted",
+    "startedSpeakingAt",
+    "durationMs",
+    "errorClass",
+  ],
+  output_playback: ["source", "metric", "durationMs", "interrupted", "errorClass"],
   false_interruption: ["source", "durationMs", "errorClass"],
   engine_received: ["correlation"],
   engine_attempt_started: ["continuity"],
@@ -270,6 +283,11 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
     "continuityAttempted",
     "stopped",
     "generatedAudio",
+    "textLength",
+    "warm",
+    "toolCount",
+    "toolMs",
+    "toolAckInjected",
   ],
   diagnostic_gap: ["reason", "count"],
   teardown: ["result", "reason"],
@@ -382,6 +400,9 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
   const engineReceived = new Map<string, VoiceDiagnosticEvent>();
   let gapTotal = 0;
   let conflictingTerminals = 0;
+  let outputPlayback = 0;
+  let falseInterruption = 0;
+  const callObservationEventIds = new Set<string>();
 
   const observe = (kind: EntityKind, key: string, row: VoiceDiagnosticEvent, start: boolean, terminal: boolean) => {
     let state = maps[kind].get(key);
@@ -405,6 +426,15 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
   };
 
   for (const row of parsed.events) {
+    if (
+      row.speechId === null &&
+      (row.event === "output_playback" || row.event === "false_interruption") &&
+      !callObservationEventIds.has(row.eventId)
+    ) {
+      callObservationEventIds.add(row.eventId);
+      if (row.event === "output_playback") outputPlayback += 1;
+      else falseInterruption += 1;
+    }
     if (row.event === "diagnostic_gap") {
       const count = row.count;
       gaps[row.reason] = (gaps[row.reason] ?? 0) + count;
@@ -617,6 +647,7 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
     truncatedRows: parsed.truncatedRows,
     conflictingTerminals,
     callerConfirmation: "unknown",
+    callLevelObservations: { outputPlayback, falseInterruption },
     distributions: {
       estimatedEouToFirstGeneratedAudioMs: {
         description: "stage sum: EOU + matching bridge first text + matching TTS TTFB; not measured end-to-end",
@@ -624,8 +655,8 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
         eligibleAttempts: samples.length,
         samples,
         min: samples[0] ?? null,
-        p50: percentile(samples, 50),
-        p95: percentile(samples, 95),
+        p50: nearestRankPercentile(samples, 50),
+        p95: nearestRankPercentile(samples, 95),
         max: samples.at(-1) ?? null,
         excludedByReason: exclusions,
       },
@@ -827,11 +858,6 @@ function emptyLatencyExclusions(): Record<LatencyExclusionReason, number> {
   };
 }
 
-function percentile(sorted: number[], p: number): number | null {
-  if (sorted.length === 0) return null;
-  return sorted[Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1)]!;
-}
-
 function measureValue(value: Measure | null | undefined): number | null {
   return value?.value !== null && value?.value !== undefined && finiteNonnegative(value.value) ? value.value : null;
 }
@@ -941,6 +967,7 @@ function validatePayload(value: Record<string, unknown>, event: VoiceDiagnosticE
       "engine_unreachable",
       "budget_saturated",
       "spawn_failed",
+      "sse_write_failed",
       "midstream_error",
       "llm_provider_failed",
       "tts_provider_failed",
