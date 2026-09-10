@@ -72,25 +72,35 @@ const NONACCEPTANCE: Record<string, NonacceptanceReason> = {
 };
 
 /**
- * Slack channel ids only. The check's job is to catch a channel NAME
+ * Slack CONVERSATION ids only. The check's job is to catch a channel NAME
  * ("#ops"), a URL, or a user handle pasted where an id belongs — the actual
  * mis-registration — not to re-derive Slack's id grammar, because a check
  * stricter than the vendor UNLOADS a legitimate operator subscription (D6).
+ *
+ * `U…`/`W…` USER ids are deliberately OUT, and the remedy is registration
+ * rather than a wider regex: to deliver to a person, register the `D…`
+ * conversation id `conversations.open` returns for them, not their user id.
+ * Stated here because the operator's only symptom is the unloaded-subscription
+ * warn in reloadSubscriptions, and that warn's reader needs the fix at hand.
  */
 const CHANNEL_ID = /^[CDG][A-Z0-9]{1,99}$/;
 
 /** Bounded body. Not one of the spec's delegated numerics — an adapter payload bound. */
 const MAX_BODY = 2_000;
 
+// No cast: `src/obligations/slack-post.ts:34-42` type-checks the same literal
+// without one, so the arrow-property form below is assignable to the SDK's
+// Logger as written. If a future SDK bump breaks that, fix the shape rather
+// than restoring `as unknown as`, which would hide the breakage.
 const silentLogger = {
-  debug() {},
-  info() {},
-  warn() {},
-  error() {},
-  setLevel() {},
+  debug: () => {},
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+  setLevel: () => {},
   getLevel: () => LogLevel.ERROR,
-  setName() {},
-} as unknown as WebClientOptions["logger"];
+  setName: () => {},
+};
 
 const object = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" ? (value as Record<string, unknown>) : {};
@@ -100,7 +110,13 @@ function escapeSlack(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-type Fetcher = (url: string | URL, init?: RequestInit) => Promise<Response>;
+/**
+ * Taken from the SDK's own option type rather than hand-rolled — it is what
+ * GUARANTEES the injected fetcher is assignable to `WebClientOptions.fetch`,
+ * and it survives an SDK signature change instead of drifting from it.
+ * `src/obligations/slack-post.ts:31` spells it the same way.
+ */
+type Fetcher = NonNullable<WebClientOptions["fetch"]>;
 
 export class SlackOpsTransport implements OpsTransport {
   readonly adapterId = "slack";
@@ -236,6 +252,13 @@ export class SlackOpsTransport implements OpsTransport {
         data.ok === false &&
         data.error === rawRefusalCode;
       if (proven) return { status: "rejected", reason: NONACCEPTANCE[rawRefusalCode!] };
+      // A STRING HEURISTIC, kept deliberately: the SDK collapses every
+      // transport failure onto one RequestError code, so "timeout" vs.
+      // "transport-fault" is only separable from the message. Its failure mode
+      // is benign in BOTH directions — both branches return `unknown`, which is
+      // the same C8 treatment (never re-sent, surfaced as uncertainty), so a
+      // mis-classification changes a diagnostic label and nothing else. Do not
+      // grow this into a second string test that decides anything real.
       if (error.code === ErrorCode.RequestError && String(error.message ?? "").includes("timeout")) {
         return { status: "unknown", reason: "timeout" };
       }
@@ -255,7 +278,9 @@ grep -n "SLACK_POST_TIMEOUT_MS" src/ops/notification-types.ts
 
 - [ ] **Step 2:** Create `src/ops/slack-transport.test.ts`.
 
-The suite drives the class through its injected `fetcher`, exactly as `src/obligations/slack-post.test.ts` drives KPR-456's poster — read that file for the response-shaping helpers before writing this one.
+The suite drives the class through its injected `fetcher`, on the same shape as `src/obligations/slack-post.test.ts` (which drives KPR-456's poster).
+
+⚠ **`slackResponse` below is DELIBERATELY RE-DECLARED, not imported, and its signature deliberately differs.** That file exports its own `slackResponse` (`src/obligations/slack-post.test.ts:9-21`, positional `(body, status, provenance, retryAfter, url)`); this one takes `(body, { status, origin })`. Same rule as `escapeSlack` and `NONACCEPTANCE`: the separation is the point, and an import here would be doubly wrong — it would cross the `src/ops/**` → `src/obligations/**` line that chunk 6's isolation scan forbids, **and** that scan excludes only `/testing/`, so `slack-post.test.ts` is not exempt from it. Read that file if you want the shaping idiom; do not import from it. The differing signature is a feature: two shapes cannot be silently unified by a later DRY pass.
 
 ```typescript
 import { describe, it, expect, vi } from "vitest";
@@ -474,7 +499,7 @@ grep -rn "obligations" src/ops/ || echo "OK — src/ops/ imports nothing from sr
 Expected: the `OK` line. A hit means the `escapeSlack`/`NONACCEPTANCE`/`PostOutcome` re-declaration was short-circuited by an import, which chunk 6's `notifier-isolation.test.ts` will fail on.
 
 ```bash
-git add src/ops/slack-transport.ts src/ops/slack-transport.test.ts src/ops/notification-types.ts
+git add src/ops/slack-transport.ts src/ops/slack-transport.test.ts
 git commit -m "$(cat <<'EOF'
 feat(KPR-468): the Slack ops transport — vendor mapping, hardening, echo registration
 

@@ -1,15 +1,8 @@
 # KPR-468 plan — chunk 3: delivery, nudging, the stall, snooze expiry, and the notifier
 
-Implements design **D5** (cadence, the three scan arms, the attempt gate, the stall, snooze expiry, the heartbeat and its gauges), **D6**'s subscription-load and `validateTarget` rules, **D8** (single-flight, the delivery/expiry containment rule, the counters) and **D10**'s `init()`/`start()`/`stop()` postures. One task, one commit.
+Implements design **D5** (cadence, the three scan arms, the attempt gate, the stall, snooze expiry, the heartbeat and its gauges), **D6**'s subscription-load and `validateTarget` rules, **D8** (single-flight, the delivery/expiry containment rule, the counters) and **D10**'s `init()`/`start()`/`stop()` postures. One task, one commit — **Steps 3–8 are in [chunk 3b](kpr-468-plan-3b-notifier.md)**, split at the Step 2 | Step 3 seam because the combined file ran past this plan's 1,000-line bound. It is a step seam rather than a task seam (both earlier splits were task seams) because `DeliveryPhase` and `OpsNotifier` are one commit and a tree with only the first would not compile; the exception is recorded in the plan index.
 
-**Two constants must be added to `src/ops/notification-types.ts`** alongside the ones Task 1 wrote (`SLACK_POST_TIMEOUT_MS` was the first such addition, in chunk 1 Task 1 Step 1). Add both in this task's Step 1 rather than hunting for them later:
-
-```typescript
-/** Bounds the READ per delivery arm. Far larger than a tick can attempt
- *  (DELIVERY_BUDGET_MS / ATTEMPT_SPACING_MS ≈ 10), so it never decides what is
- *  delivered — it only keeps an arm's scan from materializing a huge ledger. */
-export const DELIVERY_ARM_PAGE_SIZE = 200;
-```
+**No constant is added here — two are CONFIRMED.** `DELIVERY_ARM_PAGE_SIZE` and `SLACK_POST_TIMEOUT_MS` both live in chunk 1 Task 1 Step 1's constant block with every other bound this ticket fixes. (Round 2 moved `DELIVERY_ARM_PAGE_SIZE` there: a "complete new-file payload" that a later chunk appends to is the one place this plan's completeness rule would have bent, and it bought nothing.) Step 1 is a grep, not an edit.
 
 **Three things in D5 are decided against a named alternative and must not be re-derived at the keyboard.**
 
@@ -27,14 +20,16 @@ export const DELIVERY_ARM_PAGE_SIZE = 200;
 
 - Create: `src/ops/delivery.ts`
 - Create: `src/ops/notifier.ts`
-- Modify: `src/ops/notification-types.ts` (add `DELIVERY_ARM_PAGE_SIZE`)
+- Create: `src/ops/testing/notifier-harness.ts` (the shared harness — see "Harness contract" in Step 4)
 - Create: `src/ops/delivery.integration.test.ts`
 
-- [ ] **Step 1:** Add `DELIVERY_ARM_PAGE_SIZE` to `src/ops/notification-types.ts` (payload above), and confirm `SLACK_POST_TIMEOUT_MS` from chunk 1 Task 1 Step 1 is present:
+- [ ] **Step 1:** Confirm both constants from chunk 1 Task 1 Step 1 are present. No edit.
 
 ```bash
 grep -n "SLACK_POST_TIMEOUT_MS\|DELIVERY_ARM_PAGE_SIZE" src/ops/notification-types.ts
 ```
+
+Expected: one declaration each. A miss means chunk 1's payload was truncated — fix it there, not here.
 
 - [ ] **Step 2:** Create `src/ops/delivery.ts`.
 
@@ -283,6 +278,15 @@ export class DeliveryPhase {
     }
     if (!deferred) {
       // Rows still due beyond an arm's page bound are backlog too.
+      //
+      // A HEURISTIC, deliberately, and named as one: `seen` spans all three
+      // arms, so this conflates "one arm's page was full" with "work remains",
+      // and it can read `true` when the three arms happened to sum to a full
+      // page between them with nothing left behind. It feeds only the
+      // heartbeat's `backlog` vs `ok` label — never a control decision — and
+      // both of its failure directions cost an operator one 30 s tick of a
+      // slightly pessimistic label. Do not build anything on it that needs the
+      // exact answer; the exact answer is `rowsNudgeDue`.
       deferred = seen.size >= DELIVERY_ARM_PAGE_SIZE;
     }
     return { ok, attempted, deferred };
@@ -371,6 +375,18 @@ export class DeliveryPhase {
    * which is the most common configuration there is. Chunk 2 Task 3 Step 2
    * taught the test double to reject it too, which is what makes this rule
    * checked rather than merely written down.
+   *
+   * ⚠ AND THE ONE CAS IN THIS COMPONENT WHOSE MISS MUST BE COUNTED. This is
+   * the only write that happens AFTER an irreversible external side effect —
+   * the message is posted and its ts is already registered as an echo. If the
+   * CAS misses, attempts[], attemptCount, lastOutcome and deliveryReference
+   * are all lost and the row is re-attempted on the next tick: a DUPLICATE
+   * POST WITH NO TRACE. Every other CAS in this ticket inspects matchedCount
+   * (applyClearing → rowsCleared, both renewal arms, intake → LOST), because
+   * D8's standard is that a lost race is DETECTED rather than blended — and
+   * blending it here is the one place with a side effect already spent. The
+   * in-process per-row latch makes it unreachable today; it is counted anyway
+   * precisely because the latch is the thing a future edit changes.
    */
   private async record(
     row: OpsNotification,
@@ -417,6 +433,14 @@ export class DeliveryPhase {
         set.stateAt = now;
         set.principal = OPS_SYSTEM_PRINCIPAL;
         set.principalAt = now;
+        // D9's state invariant, written as the ONE pattern every
+        // state-changing write in this ticket uses. ⚠ The `if` half is
+        // UNREACHABLE HERE: `delivered` is a working state, so expiresAtFor
+        // returns undefined by construction and only the unset ever runs. The
+        // pattern is kept whole anyway — it is a total map over D7's six
+        // states, and an enumeration of the reachable arms is exactly the form
+        // that missed `seen → snoozed`. Do not delete the `if` half as dead
+        // code; delete it and the next state added here writes no expiresAt.
         const expires = expiresAtFor("delivered", now, this.retentionDays);
         if (expires) set.expiresAt = expires;
         else unset.expiresAt = "";
@@ -435,7 +459,7 @@ export class DeliveryPhase {
       this.counters.deliveriesUnknown += 1;
     }
 
-    await this.notifications.updateOne(
+    const res = await this.notifications.updateOne(
       { _id: row._id, state: row.state, attemptCount: row.attemptCount },
       {
         $set: set,
@@ -449,6 +473,18 @@ export class DeliveryPhase {
       },
       WRITE,
     );
+    if (res.matchedCount === 0) {
+      // See the ⚠ above. Nothing is re-attempted here and nothing is repaired:
+      // the attempt HAPPENED, the record did not land, and inventing a second
+      // write against a row another writer just moved is how a half-applied
+      // state gets created. The honest surface is the counter plus this line,
+      // and the counter is what a reviewer of a future latch change reads.
+      this.counters.deliveryRecordLost += 1;
+      log.warn("ops delivery record lost a CAS after an external side effect — the attempt is unrecorded", {
+        adapterId,
+        outcome: outcome.status,
+      });
+    }
   }
 
   /** D6. Structured, carrying the RESOLVED target; never a rendered string. */
@@ -490,446 +526,6 @@ export class DeliveryPhase {
 }
 ```
 
-⚠ **The one named residual in this file, carried from D5 verbatim: the snooze-expiry arm does NOT unset `stalledAt`/`stalledReason`.** It is the only arm that returns a row to a working state without clearing the marker — the `cleared → pending` reopen unsets both explicitly (chunk 2), and every other transition out of a working state takes the row out of the gauges' `state ∈ {pending, delivered}` clause immediately. So a row that was stalled, then snoozed, then expired over-counts in the three gauges for **at most one tick**, because it arrives with `nextNudgeAt = now` and is attempted on the very next delivery phase. **Do not reconcile this paragraph with either of the two unsets that do exist by deleting one of them.**
+⚠ **The one named residual in this file, carried from D5 verbatim: the snooze-expiry arm does NOT unset `stalledAt`/`stalledReason`.** It is the only arm that returns a row to a working state without clearing the marker — the `cleared → pending` reopen unsets both explicitly ([chunk 2b](kpr-468-plan-2b-ingest.md)), and every other transition out of a working state takes the row out of the gauges' `state ∈ {pending, delivered}` clause immediately. So a row that was stalled, then snoozed, then expired over-counts in the three gauges for **at most one tick**, because it arrives with `nextNudgeAt = now` and is attempted on the very next delivery phase. **Do not reconcile this paragraph with either of the two unsets that do exist by deleting one of them.**
 
-- [ ] **Step 3:** Create `src/ops/notifier.ts`.
-
-```typescript
-/**
- * KPR-468 D8/D10: the notifier runtime — lifecycle, the bounded
- * non-overlapping sweep, the subscription map, the retained policy copy, the
- * per-row latch, the counters and the heartbeat.
- *
- * Shaped on src/obligations/runtime.ts (init/start/stop, a transport bound at
- * start, a single-flight sweeper). NOTHING here is imported from
- * src/obligations/ — see chunk 1.
- */
-import type { Db } from "mongodb";
-import { createLogger } from "../logging/logger.js";
-import { OpsStore, type LoadedReason } from "./store.js";
-import type { OpsSubscription } from "./types.js";
-import type { OpsTransport } from "./transport.js";
-import {
-  GAUGE_COUNT_LIMIT,
-  OPS_NUDGE_STATES,
-  SUBSCRIPTION_RELOAD_MS,
-  SWEEP_INTERVAL_MS,
-  freshCounters,
-  ledgerRetentionDays,
-  type OpsAcknowledgement,
-  type OpsIntakeResult,
-  type OpsNotifierCounters,
-  type OpsPolicy,
-} from "./notification-types.js";
-import { OpsNotificationStore } from "./notification-store.js";
-import { IngestPhase } from "./ingest.js";
-import { DeliveryPhase } from "./delivery.js";
-
-const log = createLogger("ops-notifier");
-
-const unloadWarned = new Set<string>();
-
-export class OpsNotifier {
-  private readonly opsStore: OpsStore;
-  private readonly store: OpsNotificationStore;
-  private readonly ingestPhase: IngestPhase;
-  private readonly deliveryPhase: DeliveryPhase;
-  private readonly counters: OpsNotifierCounters = freshCounters();
-  private readonly transports = new Map<string, OpsTransport>();
-  private readonly locks = new Map<string, Promise<void>>();
-
-  private subscriptions = new Map<string, OpsSubscription>();
-  private reasons = new Map<string, LoadedReason>();
-  /**
-   * D5's three-valued policy state, and the third value is load-bearing.
-   * `undefined` means NO findOne HAS RETURNED YET in this process — the cold
-   * path, reachable only on a first tick whose read threw. `null` means a read
-   * SUCCEEDED and nothing is registered, which is a RETAINED RESULT and is
-   * every tick of the shipped default.
-   */
-  private policy: OpsPolicy | null | undefined = undefined;
-
-  private initialized = false;
-  private startable = true;
-  private started = false;
-  private stopping = false;
-  private timer?: ReturnType<typeof setInterval>;
-  private reloadTimer?: ReturnType<typeof setInterval>;
-  private flight?: Promise<void>;
-  private lastSuccessfulSweep?: Date;
-  private lastCursorAt?: Date;
-
-  constructor(
-    db: Db,
-    activityRetentionDays: number,
-    private readonly clock: () => Date = () => new Date(),
-    private readonly sleep: (ms: number) => Promise<void> = (ms) =>
-      new Promise((resolve) => setTimeout(resolve, ms).unref?.()),
-  ) {
-    // Integration point 1: the notifier constructs its OWN OpsStore and never
-    // calls ensureIndexes() or upsertReasons() on it. KPR-454 owns ops_events,
-    // ops_subscriptions and ops_reasons and their indexes.
-    this.opsStore = new OpsStore(db, activityRetentionDays);
-    this.store = new OpsNotificationStore(db);
-    const retention = ledgerRetentionDays(activityRetentionDays);
-    this.ingestPhase = new IngestPhase(
-      this.opsStore.events,
-      this.store,
-      this.counters,
-      () => this.subscriptions,
-      retention,
-    );
-    this.deliveryPhase = new DeliveryPhase(this.store.notifications, this.counters, retention);
-  }
-
-  /**
-   * D10. Non-fatal to boot, with a SPLIT posture, and the split is drawn one
-   * line differently from KPR-454's because this child's unique index carries
-   * a correctness role:
-   *
-   *  - The (subscriptionId, dedupeKey) UNIQUE index failing THROWS. index.ts
-   *    then never runs setOpsNotifier, so the singleton stays unset, every
-   *    intake call returns { state: "unavailable" }, and the sweep never
-   *    starts. Running the ledger without its identity guarantee is worse than
-   *    not running it — an intake CAS could resolve a handle against one of
-   *    two rows for the same condition.
-   *  - Every other index fault is contained and counted and keeps the notifier
-   *    usable.
-   *  - A REASON-MAP fault does NOT throw. It leaves the notifier UNSTARTABLE
-   *    but INITIALIZED, so index.ts still runs setOpsNotifier and intake is
-   *    LIVE: reasons are consumed only to attach `remediation` at delivery,
-   *    intake consumes none of them, and an acknowledgement arriving against
-   *    an existing ledger row is a legitimate write whether or not this
-   *    process could read ops_reasons.
-   *
-   * init() deliberately does NOT load subscriptions and does not arm the
-   * reload timer — both move to start(), because adapters are registered BELOW
-   * the spawn-capable boundary and a load running here would have no adapter
-   * to validate any target against (D6, D10).
-   */
-  async init(): Promise<void> {
-    const { uniqueOk, failures } = await this.store.ensureIndexes();
-    this.counters.indexFailures = failures;
-    if (!uniqueOk) throw new Error("ops_notifications identity index unavailable");
-    this.initialized = true;
-    try {
-      // ⚠ A heavier borrow than "read-only reuse" implies: loadReasons()
-      // re-runs KPR-454's per-row auditReasonRow warnings and re-compiles a
-      // zod schema per row, neither of which the notifier needs. ACCEPTED,
-      // MEASURED: init() runs exactly once per boot and reasons never reload,
-      // so the cost is one extra warn set and one extra compile pass per
-      // PROCESS — not per turn, not per tick — and the duplicated lines are
-      // identical text from a second module. The additive alternative
-      // (integration point 1) is a cross-child edit and is not worth spending.
-      this.reasons = (await this.opsStore.loadReasons()).map;
-    } catch (err) {
-      this.startable = false;
-      log.error("ops reason map load failed — the sweep will not start; intake stays live", {
-        error: String(err),
-      });
-    }
-  }
-
-  /** D6/D10. Called BELOW the boundary, before start(). */
-  registerTransport(transport: OpsTransport): void {
-    this.transports.set(transport.adapterId, transport);
-  }
-
-  /**
-   * D10. Does the first subscription load — which is what puts every
-   * validateTarget AFTER every registerTransport — arms the 60 s reload timer,
-   * and begins the sweep. Contained: a first-load fault leaves the notifier
-   * unstarted with intake live, never throwing into boot.
-   */
-  async start(): Promise<void> {
-    if (this.started || this.stopping || !this.initialized || !this.startable) return;
-    try {
-      await this.reloadSubscriptions(true);
-    } catch (err) {
-      log.error("ops notifier first subscription load failed — sweep off, intake live", { error: String(err) });
-      return;
-    }
-    this.started = true;
-    this.reloadTimer = setInterval(() => void this.reloadSubscriptions(), SUBSCRIPTION_RELOAD_MS);
-    this.reloadTimer.unref?.();
-    await this.sweepOnce();
-    if (this.stopping || this.timer) return;
-    this.timer = setInterval(() => void this.sweepOnce(), SWEEP_INTERVAL_MS);
-    this.timer.unref?.();
-  }
-
-  async stop(): Promise<void> {
-    this.stopping = true;
-    this.started = false;
-    if (this.timer) clearInterval(this.timer);
-    if (this.reloadTimer) clearInterval(this.reloadTimer);
-    this.timer = undefined;
-    this.reloadTimer = undefined;
-    await this.flight;
-  }
-
-  /**
-   * D6/D9. Refreshed on a 60 s timer and on the existing SIGUSR1 handler. A
-   * fault leaves the previous set IN PLACE and counts — it NEVER empties it.
-   *
-   * ⚠ This reload is deliberately DUPLICATED with KPR-454's, not a missed DRY
-   * opportunity: the publisher needs compiled FILTERS and loads in its own
-   * init(); the notifier needs TRANSPORT BINDINGS validated against registered
-   * adapters and therefore cannot load before start(). A shared loader would
-   * have to be either the union — dragging filter compilation above the
-   * boundary into a component that must never evaluate a match (AC2) — or a
-   * cache with two shapes and two readiness points.
-   */
-  async reloadSubscriptions(rethrow = false): Promise<void> {
-    try {
-      const rows = await this.opsStore.loadSubscriptions();
-      const next = new Map<string, OpsSubscription>();
-      for (const sub of rows) {
-        const adapter = this.transports.get(sub.transport.adapterId);
-        if (adapter) {
-          let valid = false;
-          try {
-            valid = adapter.validateTarget(sub.transport.target);
-          } catch {
-            // An adapter that cannot decide is not a reason to load a target
-            // nobody judged — and it must never abort the load of the rest.
-            valid = false;
-          }
-          if (!valid) {
-            this.counters.subscriptionUnloaded += 1;
-            // Never mutated in the database: operator data is not the
-            // engine's to rewrite. Warn-once PER PROCESS on subscriptionId —
-            // the map reloads every 60 s, so per-load would be one line per
-            // rejected subscription per minute.
-            if (!unloadWarned.has(sub._id)) {
-              unloadWarned.add(sub._id);
-              log.warn("ops subscription target rejected by its adapter — unloaded in memory", {
-                subscriptionId: sub._id,
-                adapterId: sub.transport.adapterId,
-              });
-            }
-            continue;
-          }
-        }
-        // No registered adapter ⇒ LOADS NORMALLY, UNVALIDATED. It is not an
-        // invalid target; it is a target nobody can judge yet (D6). Its rows
-        // are created and left to delivery-time transportUnbound.
-        next.set(sub._id, sub);
-      }
-      this.subscriptions = next;
-    } catch (err) {
-      this.counters.subscriptionReloadFaults += 1;
-      log.warn("ops subscription reload failed — retaining the previous set", { error: String(err) });
-      if (rethrow) throw err;
-    }
-  }
-
-  /** D8: one in-flight promise, so ticks never overlap (KPR-456's sweeper.ts:106-117). */
-  sweepOnce(): Promise<void> {
-    if (this.flight) return this.flight;
-    if (this.stopping) return Promise.resolve();
-    this.flight = this.run()
-      .catch((err) => {
-        this.counters.sweepFaults += 1;
-        log.warn("ops sweep unavailable", { error: String(err) });
-      })
-      .finally(() => {
-        this.flight = undefined;
-      });
-    return this.flight;
-  }
-
-  /** Test barrier: one full tick, resolved after the heartbeat write. */
-  __tickForTests(): Promise<void> {
-    return this.sweepOnce();
-  }
-
-  private async run(): Promise<void> {
-    const now = this.clock();
-
-    // D5's policy read: ONE small findOne per tick, so it is always fresh and
-    // needs no reload timer. `null` and `throw` are DISTINGUISHABLE and only
-    // the first resolves as "no policy".
-    let policyOk = true;
-    try {
-      this.policy = await this.store.readPolicy();
-    } catch (err) {
-      policyOk = false;
-      this.counters.policyReadFaults += 1;
-      log.warn("ops policy read failed — using the retained copy", { error: String(err) });
-    }
-
-    // Phase order is fixed: ingest (so a fresh row is deliverable on this
-    // tick), then snooze expiry (D5: BEFORE delivery), then delivery.
-    const ingest = await this.ingestPhase.run(now);
-    this.lastCursorAt = ingest.cursorAt;
-
-    const ctx = {
-      subscriptions: this.subscriptions,
-      transports: this.transports,
-      reasons: this.reasons,
-      policy: this.policy ?? null,
-      lock: <T>(rowId: string, fn: () => Promise<T>) => this.withRowLock(rowId, fn),
-      stopped: () => this.stopping,
-      clock: this.clock,
-      sleep: this.sleep,
-    };
-
-    const expiryOk = await this.deliveryPhase.expire(now, ctx);
-
-    // D5: a tick whose read THREW and which has NO retained result — the first
-    // tick of a process — skips the delivery phase ENTIRELY. No row is marked,
-    // nothing is pushed forward. A tick whose read SUCCEEDED and returned null
-    // has a retained result and runs NORMALLY, which is every tick of the
-    // shipped default and the state AC11 drives.
-    let delivery = { ok: true, attempted: 0, deferred: false };
-    if (!policyOk && this.policy === undefined) {
-      delivery = { ok: false, attempted: 0, deferred: false };
-    } else {
-      delivery = await this.deliveryPhase.run(now, ctx);
-    }
-
-    const allOk = ingest.ok && expiryOk && delivery.ok;
-    if (allOk) this.lastSuccessfulSweep = now;
-    const backlog = ingest.eventsBehind > 0 || delivery.deferred;
-
-    const nf = this.store.notifications;
-    const working = { $in: [...OPS_NUDGE_STATES] };
-    const stallGauge = (reason: string) =>
-      nf.countDocuments({ stalledReason: reason, state: working }, { limit: GAUGE_COUNT_LIMIT });
-
-    await this.store.writeHeartbeat({
-      timestamp: now,
-      lastSuccessfulSweep: this.lastSuccessfulSweep,
-      cursorAt: ingest.cursorAt,
-      eventsBehind: ingest.eventsBehind,
-      oldestUnappliedAt: ingest.oldestUnappliedAt,
-      rowsPending: await nf.countDocuments({ state: "pending" }),
-      rowsNudgeDue: await nf.countDocuments({ state: working, nextNudgeAt: { $lte: now } }),
-      rowsSnoozed: await nf.countDocuments({ state: "snoozed" }),
-      // The four saturating gauges — DEPTHS, not rates, and never to be read
-      // as incident counts. Each is an equality on its index's leading key and
-      // carries `state` IN the index rather than as a residual filter over it,
-      // because a saturating limit over a residual filter does not saturate.
-      rowsUnknownOutcome: await nf.countDocuments({ lastOutcome: "unknown", state: working }, { limit: GAUGE_COUNT_LIMIT }),
-      rowsSubscriptionUnresolved: await stallGauge("subscription"),
-      rowsTransportUnbound: await stallGauge("transport"),
-      rowsCadenceUnresolved: await stallGauge("cadence"),
-      ...this.counters,
-      state: allOk ? (backlog ? "backlog" : "ok") : "degraded",
-    });
-  }
-
-  /**
-   * D8's per-row latch: a Map<rowId, Promise> chain with entries deleted on
-   * settle, so the map is bounded by IN-FLIGHT work.
-   *
-   * ⚠ SCOPE, and it is forced rather than chosen. The latch keys on the row's
-   * `_id`, because that is the only handle intake has. INGEST'S RENEWAL ARMS
-   * ADDRESS ROWS BY (subscriptionId, dedupeKey) BEFORE ANY _id IS KNOWN, so
-   * they cannot take an _id-keyed latch at all — and they do not need one:
-   * every ingest write is a per-row CAS on the precondition it depends on (the
-   * apply-if-newer watermark, plus a state clause), so a lost race there is
-   * DETECTED rather than blended, which is D8's own standard. The latch
-   * therefore covers delivery, snooze expiry and intake.
-   */
-  withRowLock<T>(rowId: string, fn: () => Promise<T>): Promise<T> {
-    const prior = this.locks.get(rowId) ?? Promise.resolve();
-    const run = prior.then(fn, fn);
-    const tail = run.then(
-      () => {},
-      () => {},
-    );
-    this.locks.set(rowId, tail);
-    void tail.then(() => {
-      if (this.locks.get(rowId) === tail) this.locks.delete(rowId);
-    });
-    return run;
-  }
-
-  getSnapshot(): Record<string, unknown> {
-    return {
-      initialized: this.initialized,
-      startable: this.startable,
-      started: this.started,
-      stopping: this.stopping,
-      subscriptions: this.subscriptions.size,
-      adapters: [...this.transports.keys()],
-      lastSuccessfulSweep: this.lastSuccessfulSweep,
-      cursorAt: this.lastCursorAt,
-      ...this.counters,
-    };
-  }
-
-  /** Chunk 4 replaces this stub with the real intake. */
-  accept(_input: OpsAcknowledgement): Promise<OpsIntakeResult> {
-    return Promise.resolve({ state: "unavailable" });
-  }
-}
-```
-
-⚠ **The `accept` stub is deliberate and is replaced whole in chunk 4 Task 6 Step 2.** It exists so Task 5 type-checks and so `notifier.ts` is complete at this commit; leaving it out would make chunk 4 a two-file edit for no gain. The stub's `{ state: "unavailable" }` is also the correct answer for every state it currently represents, so an accidental ship of this commit alone is inert rather than wrong.
-
-- [ ] **Step 4:** Create `src/ops/delivery.integration.test.ts`.
-
-Cover, at minimum, each of the following as a named case, driving a real `OpsNotifier` over the extended double with a fixed clock, a `FakeTransport`, and `__tickForTests()` as the barrier.
-
-- **Cadence resolution** (unit-shaped, via the exported `resolveCadence`): the `(class, retry)` key is read exactly as D8 keys it; a `cadenceProfile` substitutes the table **wholesale** and an **unknown** profile resolves `undefined` **without** consulting the table; a below-floor profile clamps up and warns exactly once per `(name, value)`; a below-floor *table* entry clamps up **without** a warning; a `null` policy and a zero/negative/non-finite interval all resolve `undefined`; a profile named `constructor` does not read the prototype chain.
-- **The three outcomes:** `accepted` transitions `pending → delivered`, sets `deliveryReference`, and sets `nextNudgeAt` from the resolved cadence; `rejected` and `unknown` leave `state` unchanged; `unknown` never reaches `delivered`; an adapter that **throws** is recorded as `unknown`/`transport-fault` and `transportFaults` increments.
-- **An accepted nudge on an already-`delivered` row does not advance `stateAt`/`principalAt`** but does refresh `deliveryReference`.
-- **`nudgeCount` excludes the first attempt** while `attemptCount` counts it; `attempts[]` never exceeds `ATTEMPTS_RING_CAP` across ten attempts while `attemptCount` reaches 10; the document count is unchanged across those ten.
-- **The stall:** each of the three decline branches writes its own `stalledReason`, increments its own counter, and pushes `nextNudgeAt` into `(now + 0.8·STALL_RECHECK_MS, now + 1.2·STALL_RECHECK_MS)`; **`nextNudgeAt` is never unset**; the stall write does **not** land on a row that left the working states between the scan and the write.
-- **The no-interval attempt branch** sets `stalledAt`/`stalledReason: "cadence"` in the same update that unsets `forceDeliver` — and, run with the mutation from Verification Rule 5, **throws** against the extended double.
-- **Snooze expiry** returns a row with a `deliveryReference` to `delivered` and one without to `pending`, sets `forceDeliver: true` and `nextNudgeAt = now`, unsets `snoozedUntil` and `expiresAt`, and **runs before delivery in the same tick** (assert the expired row is *attempted* on that tick).
-- **The heartbeat** carries every gauge and every counter, `state` is `ok`/`backlog`/`degraded` on the three drivable conditions, and the four saturating gauges **saturate** at `GAUGE_COUNT_LIMIT` (the case the harness extension made real).
-- **Policy posture:** a read that returns `null` runs the delivery phase normally; a read that **throws** on a process's first tick **skips** the delivery phase, counts `policyReadFaults`, writes `degraded`, and leaves every row's `nextNudgeAt` and stall markers untouched; a read that throws on a **later** tick uses the retained copy and marks nothing.
-- **`init()`/`start()`/`stop()`:** a unique-index failure throws out of `init()`; any other index failure does not; a reason-map failure leaves `initialized === true` and `startable === false`; a first-subscription-load failure leaves `started === false` without throwing; `start()` performs **no** `ops_subscriptions` read during `init()` (assert against the double's `operations` log); `stop()` clears both timers and awaits the in-flight tick.
-- **`validateTarget` at load:** a subscription whose registered adapter rejects its target is unloaded, warned once, counted, and **not mutated in the database**; one whose `adapterId` names no registered adapter **loads normally**; an adapter whose `validateTarget` **throws** is treated as `false` and the remaining subscriptions still load.
-- **Ticks never overlap:** a second `sweepOnce()` started while the first is in flight returns the same promise and performs no second set of phase reads.
-- **The latch:** two concurrent `withRowLock` calls on one id run in series; on two different ids they interleave; the map is empty after both settle.
-
-- [ ] **Step 5:** Verify.
-
-```bash
-npx vitest run src/ops/delivery.integration.test.ts src/ops/ingest.integration.test.ts src/ops/notification-store.test.ts
-npx tsc --noEmit
-```
-
-- [ ] **Step 6:** **Negative-verify the `$set`/`$unset` guard — both halves.** This is Verification Rule 5 and it is the only mutation in the plan whose *evidence* is that it behaves differently against the two harness versions.
-
-In `record()`'s no-interval branch, additionally emit `unset.stalledAt = ""` and `unset.stalledReason = ""`.
-
-- Against the **extended** double: `npx vitest run src/ops/delivery.integration.test.ts` must fail on the no-interval case with a `would create a conflict` error. Record the message.
-- Then revert only the harness change from chunk 2 Task 3 Step 2(b) and re-run: the same case must go **green**, while production would throw on the first tick of the shipped default. Record that too — it is the evidence the harness addition was load-bearing.
-
-Restore both.
-
-- [ ] **Step 7:** Commit.
-
-```bash
-git add src/ops/delivery.ts src/ops/notifier.ts src/ops/notification-types.ts src/ops/delivery.integration.test.ts
-git commit -m "$(cat <<'EOF'
-feat(KPR-468): delivery, nudging, the stall, snooze expiry and the notifier sweep
-
-D5/D6/D8/D10: cadence resolved from operator data with a profile
-substituting the table wholesale and no fallback from an unknown profile;
-the three-disjunct attempt gate (attemptCount === 0, forceDeliver, or a
-resolved cadence); the three-armed scan whose first two arms are
-index-immune to the cadence-stall backlog; the stall that pushes a
-declined row forward on a bounded jittered re-check rather than unsetting
-nextNudgeAt (invisible to the due-scan) or leaving it due (an ever-growing
-never-TTL'd prefix at the head of the scan).
-
-No retry ladder: rejected is recorded and the next attempt is the next
-ordinary nudge, because D6 supplies no retry hint to schedule from.
-unknown never reaches delivered.
-
-The notifier's init/start split is D6's: subscriptions load in start(),
-after registerTransport, so validateTarget has adapters to run against. A
-unique-index fault leaves the notifier unstarted with the singleton unset;
-a reason-map fault leaves intake live and the sweep off.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-EOF
-)"
-```
+**Continue in [chunk 3b](kpr-468-plan-3b-notifier.md)** — Step 3 (`notifier.ts`), Step 4 (the shared harness and its contract), Step 5 (the delivery suite), Steps 6–8 (verify, negative-verify NV6, commit).

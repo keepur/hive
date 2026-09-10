@@ -34,6 +34,16 @@ Read the inline comments as normative — four of them record a decision against
  */
 import type { ObjectId } from "mongodb";
 import type { OpsClass, OpsDetail, OpsEvidence, OpsRetry, OpsSubject, Waiting } from "./types.js";
+// D6's two closed reason sets, imported so `NotificationAttempt.reason` can be
+// typed CLOSED rather than as an open string — see that field's comment. This
+// makes transport.ts ↔ notification-types.ts a cycle, and it is inert: both
+// edges are `import type`, which this repo's tsconfig erases entirely (no
+// `verbatimModuleSyntax`, `module: Node16`), so no runtime import is emitted in
+// either direction. The alternative — declaring the two unions here and
+// re-exporting them from transport.ts — was declined to keep D6's three closed
+// sets transcribed verbatim in ONE file, which is what chunk 1's second
+// prohibition is about.
+import type { NonacceptanceReason, UncertaintyReason } from "./transport.js";
 
 export const OPS_NOTIFICATIONS_COLLECTION = "ops_notifications";
 export const OPS_POLICY_COLLECTION = "ops_policy";
@@ -97,11 +107,18 @@ export type AttemptOutcome = "accepted" | "rejected" | "unknown";
  * raw transport error — `reason` is only ever a member of D6's two closed
  * reason sets (C13, and the KPR-457 canon that raw diagnostics stay out of
  * allow-listed fields).
+ *
+ * The field is therefore TYPED closed, not merely documented closed. It is the
+ * one field on this row an adapter's own output flows into verbatim
+ * (`record()` writes `outcome.reason`), so an open `string` here would make
+ * C13 a convention rather than a compile error — the same argument
+ * `StalledReason` is closed for, applied to the field that actually receives
+ * adapter data.
  */
 export interface NotificationAttempt {
   at: Date;
   outcome: AttemptOutcome;
-  reason?: string;
+  reason?: NonacceptanceReason | UncertaintyReason;
   adapterId: string;
 }
 
@@ -250,6 +267,16 @@ export interface OpsNotifierCounters {
   deliveriesRejected: number;
   deliveriesUnknown: number;
   transportFaults: number;
+  /**
+   * D8: the record-CAS that lost. It counts the one write in this component
+   * that happens AFTER an irreversible external side effect (a posted Slack
+   * message, its ts already registered), so a miss loses the attempt's whole
+   * record and re-attempts the row next tick — a duplicate post with no trace.
+   * The in-process per-row latch makes it unreachable today, which is exactly
+   * why it is COUNTED rather than left silent: the latch is the thing a future
+   * edit changes.
+   */
+  deliveryRecordLost: number;
   subscriptionUnresolved: number;
   transportUnbound: number;
   cadenceUnresolved: number;
@@ -259,6 +286,8 @@ export interface OpsNotifierCounters {
   intakeNoop: number;
   intakeRefused: number;
   intakeUnavailable: number;
+  /** D7: an `at` that was not a usable Date and was substituted with `now`. */
+  intakeInvalidAt: number;
   cursorReinitialized: number;
   ingestFaults: number;
   sweepFaults: number;
@@ -280,6 +309,7 @@ export function freshCounters(): OpsNotifierCounters {
     deliveriesRejected: 0,
     deliveriesUnknown: 0,
     transportFaults: 0,
+    deliveryRecordLost: 0,
     subscriptionUnresolved: 0,
     transportUnbound: 0,
     cadenceUnresolved: 0,
@@ -289,6 +319,7 @@ export function freshCounters(): OpsNotifierCounters {
     intakeNoop: 0,
     intakeRefused: 0,
     intakeUnavailable: 0,
+    intakeInvalidAt: 0,
     cursorReinitialized: 0,
     ingestFaults: 0,
     sweepFaults: 0,
@@ -307,6 +338,15 @@ export const INGEST_PAGE_SIZE = 200;
 export const INGEST_EVENT_BUDGET = 1_000;
 export const EXPIRY_PAGE_SIZE = 200;
 export const DELIVERY_BUDGET_MS = 10_000;
+/**
+ * Bounds the READ per delivery arm. Far larger than a tick can attempt
+ * (DELIVERY_BUDGET_MS / ATTEMPT_SPACING_MS ≈ 10), so it never decides WHAT is
+ * delivered — it only keeps an arm's scan from materializing a huge ledger.
+ * Declared here with every other bound rather than being appended by chunk 3:
+ * a "complete new-file payload" a later chunk edits is the one place this
+ * plan's completeness rule would have bent, for no gain.
+ */
+export const DELIVERY_ARM_PAGE_SIZE = 200;
 export const ATTEMPT_SPACING_MS = 1_000;
 /** Half of KPR-456's 20 s: a 20 s hang would let one row consume two-thirds of a 30 s tick. */
 export const SLACK_POST_TIMEOUT_MS = 10_000;

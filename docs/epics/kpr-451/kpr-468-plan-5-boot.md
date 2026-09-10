@@ -148,9 +148,13 @@ In the `shutdown` function, add `await opsNotifier.stop();` **immediately after*
 ```typescript
     await obligations.stop();
     // KPR-468 D10: sets the stopped latch, clears the reload and sweep timers,
-    // stops accepting new intake, and awaits the in-flight tick, which exits at
-    // its next inter-row checkpoint. Bounded by one adapter deadline rather
-    // than being open-ended.
+    // stops accepting new intake, and awaits the in-flight tick. The tick exits
+    // at its next checkpoint — between events inside ingest, between rows
+    // inside expiry and delivery, and between the three phases — so the wait is
+    // bounded by whichever unit of work is in hand: one event's application, or
+    // one attempt at the adapter's own deadline. NOT open-ended, and NOT a full
+    // ingest budget (which is what an ingest phase with no stopped latch would
+    // have made it — see IngestPhase's `stopped` parameter).
     await opsNotifier.stop();
 ```
 
@@ -170,19 +174,22 @@ Add to `(a)`'s presence pass, after KPR-454's two entries:
 
 Add the **same two** `offsetOf(...)` entries to `(b)`'s `wiringOffsets` array and to `(c)`'s `wiringStart` `Math.max(...)` set. **All three, not one** — `(a)` is presence-only and adding to it alone is the exact failure mode the guard exists to catch; `(b)` is what fails if the wiring moves below the marker; and `(c)`'s superset sweep must be bounded by the **latest** wiring anchor or a surface introduced *between* two wiring calls passes green.
 
-`await opsNotifier.start()` sits **after** `wiringStart`, so `(c)`'s sweep does not see it and its `allowlist` needs **no** entry. Pin that property so a later refactor has to argue with it — inside the **first** `describe`, the one that defines `codeOnly` and `offsetOf`:
+`await opsNotifier.start()` sits **after** `wiringStart`, so `(c)`'s sweep does not see it and its `allowlist` needs **no** entry. Pin that property so a later refactor has to argue with it — inside the **first** `describe`, the one that defines `codeOnly` and `offsetOf`. **The label is `(d)`**: that file's existing cases are `(a)`, `(b)` and `(c)` only, and the labels are how this plan's own Verification Rules refer to them.
 
 ```typescript
-  it("(e) opsNotifier.start( follows the wiring, so (c)'s allowlist needs no entry (KPR-468 AC14)", () => {
+  it("(d) opsNotifier.start( follows the wiring, so (c)'s allowlist needs no entry (KPR-468 AC14)", () => {
     // Scope: this scans index.ts, not src/ops/. A later refactor that moves
     // `await opsNotifier.start()` above the wiring must either move it back or
     // add it to (c)'s allowlist under the reviewed-classification discipline
     // that list's own comment demands.
-    const wiringStart = Math.max(
-      codeOnly.indexOf("await opsNotifier.init()"),
-      codeOnly.indexOf("setOpsNotifier("),
-    );
-    expect(codeOnly.indexOf("await opsNotifier.start()")).toBeGreaterThan(wiringStart);
+    //
+    // offsetOf(), not codeOnly.indexOf(): a missing anchor still fails either
+    // way (-1 > -1 is false), but a bare indexOf reports "expected -1 to be
+    // greater than -1", while offsetOf reports the file's own "anchor not
+    // found: … update this test's anchors" — which is the difference between
+    // a reader who knows what happened and one who goes looking.
+    const wiringStart = Math.max(offsetOf("await opsNotifier.init()"), offsetOf("setOpsNotifier("));
+    expect(offsetOf("await opsNotifier.start()")).toBeGreaterThan(wiringStart);
   });
 ```
 
@@ -234,7 +241,7 @@ describe("KPR-468 ops notifier readiness and drain order", () => {
 });
 ```
 
-- [ ] **Step 7:** Verify, then **negative-verify** (Verification Rule 7).
+- [ ] **Step 7:** Verify, then **negative-verify** — mutation **NV8** (the plan index's Verification Rules; the only one hosted in this chunk).
 
 ```bash
 npx vitest run src/boot-order.test.ts
@@ -243,11 +250,12 @@ npx tsc --noEmit
 
 Expected: every case passes.
 
-**Negative-verify (required):** move the whole `opsNotifier` wiring block from above the boundary marker to **immediately after `await bgTaskManager.scanOrphans();`**, re-run, and confirm **both `(b)` and `(c)` fail while `(a)` stays green** — predict all three before running.
+**Negative-verify (required):** move the whole `opsNotifier` wiring block from above the boundary marker to **immediately after `await bgTaskManager.scanOrphans();`**, re-run, and confirm **both `(b)` and `(c)` fail while `(a)` and the new `(d)` stay green** — predict all four before running.
 
 - `(b)` bounds `Math.max(wiringOffsets) < Math.min(surfaceOffsets)`, and its offsets are **named surfaces**, not the marker (which is a comment the test never reads). The earliest named surface is `await bgTaskManager.start()`, so the relocated anchors now exceed it.
 - `(c)` sweeps the region **before** `wiringStart`, which is a `Math.max` over the wiring anchors, so relocating pulls `bgTaskManager.start(` and `bgTaskManager.scanOrphans(` into that region and both surface as unallowlisted offenders. **That second red test reads as a mis-applied mutation and invites an implementer to "fix" it by widening `(c)`'s allowlist. Do not.** Record both offenders in the implementation report.
 - `(a)` is presence-only, so it stays green — which is precisely why adding to `(a)` alone is the failure mode the guard exists to catch.
+- `(d)` also stays green, and that is correct rather than a gap: it bounds `await opsNotifier.start()` against the **wiring**, and the relocated wiring still precedes `start()` (which sits after `await obligations.start(`, far below `scanOrphans`). `(d)` is about the allowlist argument; `(b)` and `(c)` are the boundary's guards.
 
 **"Just below the marker" is NOT a valid mutation target.** KPR-454's plan measured that case: `(b)` bounds against named surfaces rather than against the marker, so a block relocated to just below the marker still sits above `bgTaskManager.start()` and `(b)` **passes** — the mutation never crosses the boundary the check enforces.
 

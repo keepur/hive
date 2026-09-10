@@ -20,7 +20,7 @@ Implements design **D7** in full — the seam KPR-455's inbound edge calls — p
 
 - Create: `src/ops/intake.ts`
 - Create: `src/ops/notifier-singleton.ts`
-- Modify: `src/ops/notifier.ts` (replace the chunk-3 `accept` stub; add the deadline wrapper)
+- Modify: `src/ops/notifier.ts` (replace the chunk-3b `accept` stub; add the deadline wrapper)
 - Create: `src/ops/intake.integration.test.ts`
 
 - [ ] **Step 1:** Create `src/ops/intake.ts`.
@@ -63,6 +63,17 @@ const LOST = Symbol("cas-lost");
  * D7: the handle is the ledger row's `_id` rendered as a hex string, opaque by
  * contract. `ObjectId.isValid` also accepts 12-byte strings, so the hex
  * round-trip is what makes this total.
+ *
+ * The `.toLowerCase()` is deliberate and is the one widening here: an
+ * ALL-UPPERCASE valid hex handle is ACCEPTED, because it names the same
+ * twelve bytes and therefore the same row. The handle confers no authority
+ * (D7, D9) — attribution is `actorId`'s job and every act is re-checked
+ * against the row's own state — so a case-insensitive parse widens nothing
+ * that matters, and refusing it would turn a vendor round-trip that upcased a
+ * callback value into an `unknown-handle` refusal for a real act. What the
+ * round-trip DOES reject is everything `ObjectId.isValid` admits that is not
+ * 24 hex characters, which is the actual hazard (it accepts any 12-byte
+ * string).
  */
 export function parseHandle(handle: unknown): ObjectId | undefined {
   if (typeof handle !== "string" || handle.length !== 24) return undefined;
@@ -123,6 +134,16 @@ export class OpsIntake {
     }
 
     const now = this.clock();
+    // ⚠ AN UNUSABLE `at` IS SUBSTITUTED WITH `now`, AND THE SUBSTITUTION IS
+    // COUNTED AT THE SEAM (OpsNotifier.accept, Step 2) rather than being made
+    // silently here. It matters because `lastAckKey` is derived from the RAW
+    // `at`: a caller that passes an invalid Date derives a DIFFERENT key on
+    // every retry, so a duplicated callback double-applies — precisely the
+    // residual D7's idempotence rule exists to prevent. Substituting rather
+    // than refusing is still right (an edge that mis-serializes a timestamp
+    // must not lose a human's acknowledgement), but the operator gets a
+    // counter and a warn instead of silence. Recorded in the plan index's
+    // Assumptions as a named edge this child owes forward to KPR-455.
     const at = input.at instanceof Date && !Number.isNaN(input.at.getTime()) ? input.at : now;
     // The one derived value that governs every clock-bearing write.
     const anchorAt = new Date(Math.min(at.getTime(), now.getTime()));
@@ -202,7 +223,15 @@ export class OpsIntake {
     // working, which is why arm 2's index carries no `state` key.
     const unset: Record<string, string> = { nextNudgeAt: "" };
     if (input.act === "snoozed") {
-      set.snoozedUntil = snoozedUntil;
+      // `snoozedUntil!` rather than the bare local: on this branch step 7 has
+      // provably assigned it (every other path there RETURNS), but TypeScript
+      // cannot narrow across the two blocks. Written with the assertion rather
+      // than left to `set`'s `Record<string, unknown>` index signature to
+      // swallow — that signature accepts `undefined` happily, which would
+      // serialize to `null` and silently break "every write that sets
+      // state: snoozed also sets snoozedUntil" the day `set` is given a real
+      // type.
+      set.snoozedUntil = snoozedUntil!;
       // The snoozed arm deliberately does NOT clear forceDeliver — the
       // re-delivery is still owed after the pause.
     } else {
@@ -255,7 +284,7 @@ import { INTAKE_DEADLINE_MS } from "./notification-types.js";
 import { OpsIntake, parseHandle } from "./intake.js";
 ```
 
-Construct the intake in the constructor, beside `deliveryPhase`:
+Construct the intake in the constructor, on the line **immediately after** `this.deliveryPhase = new DeliveryPhase(this.store.notifications, this.counters, retention);` (chunk 3b Step 3's payload — that exact line is the insertion anchor, and `retention` is the local it already binds):
 
 ```typescript
     this.intake = new OpsIntake(this.store.notifications, retention, this.clock);
@@ -267,15 +296,44 @@ with the field `private readonly intake: OpsIntake;`. Then replace the stub whol
   /**
    * D6/D7/D10: the seam KPR-455's inbound edge calls. NEVER THROWS.
    *
-   * `{ state: "unavailable" }` means exactly three things and no others: the
+   * `{ state: "unavailable" }` means exactly four things and no others: the
    * singleton is unset (pre-wiring, or a bare test construction — handled in
-   * notifier-singleton.ts), init() did not complete, or stop() has begun.
+   * notifier-singleton.ts), init() did not complete, stop() has begun, or the
+   * work did not finish inside INTAKE_DEADLINE_MS.
    * It is deliberately NOT gated on start(): intake depends on nothing start()
    * provides, and gating it there would widen its dead window across the whole
    * Slack connect for no gain.
+   *
+   * ⚠ THE ONE SENTENCE KPR-455's EDGE NEEDS: `unavailable` means UNKNOWN, NOT
+   * "did not apply", and it is SAFE TO RETRY. The deadline below abandons the
+   * work rather than cancelling it, so a write can land after the caller has
+   * already been told `unavailable` — and a retry of the SAME
+   * (actorId, act, at) is the correct response, because `lastAckKey` makes it
+   * return `{ state: "noop", reason: "already-applied" }` if it did land and
+   * apply it if it did not. An edge that treats `unavailable` as a failure and
+   * surfaces an error to the human is reading it wrong.
+   *
+   * ⚠ AND ONE DETERMINISTIC INTERACTION, named because it is a property of
+   * this seam rather than a race: `withDeadline` wraps `withRowLock`, so the
+   * 5 s INTAKE_DEADLINE_MS covers LATCH ACQUISITION as well as the work. The
+   * delivery phase holds that same per-row latch across
+   * ATTEMPT_SPACING_MS + the adapter's own SLACK_POST_TIMEOUT_MS (up to 11 s),
+   * so an acknowledgement landing on a row whose delivery is slow returns
+   * `unavailable` EVERY TIME, not occasionally — and the act it names will
+   * then apply on the retry the sentence above already asks for. The
+   * alternative — taking the deadline INSIDE the lock — would make the
+   * deadline unbounded from the caller's side, which is worse for a Slack
+   * interaction callback that must answer its vendor in 3 s.
    */
   async accept(input: OpsAcknowledgement): Promise<OpsIntakeResult> {
     if (!this.initialized || this.stopping) return this.tallyIntake({ state: "unavailable" });
+    if (!(input.at instanceof Date) || Number.isNaN(input.at.getTime())) {
+      // Counted at the seam; intake.ts substitutes `now`. See its step-3
+      // comment: the cost is a per-retry lastAckKey, so this is a real signal
+      // about a mis-serializing edge, not noise.
+      this.counters.intakeInvalidAt += 1;
+      log.warn("ops intake received an unusable `at` — substituting the server clock", { act: input.act });
+    }
     // Step 1 of D7's order is split across two files ON PURPOSE: the parsed id
     // is the per-row latch's key, so it must be resolved before the lock is
     // taken. Intake re-uses the parsed value rather than re-parsing.
@@ -367,9 +425,9 @@ export function acceptOpsAcknowledgement(input: OpsAcknowledgement): Promise<Ops
 
 - [ ] **Step 4:** Create `src/ops/intake.integration.test.ts`.
 
-Cover, at minimum, each of the following as a named case. Chunk 6 re-drives the subset that maps to AC8/AC10; these are the module's own.
+Driven through chunk 3b Step 4's shared harness (`harness(...)`, `h.notifier.accept(...)`, `h.db.operations` for the read assertions) — this file constructs no `FakeDb` and no `OpsNotifier` of its own. Cover, at minimum, each of the following as a named case. Chunk 6 re-drives the subset that maps to AC8/AC10; these are the module's own.
 
-- `parseHandle` accepts a 24-char lowercase hex string and rejects: a 12-char string (`ObjectId.isValid` accepts it), a 23- or 25-char string, a non-hex string, a non-string, `undefined`, and an uppercase-hex handle round-tripping to a different literal.
+- `parseHandle` accepts a 24-char lowercase hex string **and an all-uppercase hex one — it names the same row** (assert both resolve to the same `ObjectId`); it rejects a 12-char string (`ObjectId.isValid` accepts it), a 23- or 25-char string, a non-hex string, a non-string and `undefined`.
 - **Step order:** a duplicated `dismissed` returns `{ state: "noop", reason: "already-applied" }` and **not** `refused: "illegal-transition"` — the case that proves the replay check precedes legality.
 - **Monotonicity:** `seen` at `t1`, `snoozed` at `t2 > t1`, then a replay of the `seen` ⇒ `{ state: "noop", reason: "superseded" }`, with `state`, `snoozedUntil` and `expiresAt` byte-identical.
 - **The anchor choice:** a system transition (a delivery, a snooze expiry) between a human's act and its callback does **not** supersede that callback — false of any implementation guarding on `principalAt`.
@@ -382,6 +440,8 @@ Cover, at minimum, each of the following as a named case. Chunk 6 re-drives the 
 - **D9's invariant:** `seen` sets `expiresAt`; `dismissed` sets it; `snoozed` **unsets** it, including on the `seen → snoozed` arm where the row arrives carrying a live one.
 - **`forceDeliver`:** `snoozed` on a row carrying `forceDeliver: true` **retains** the flag and unsets `nextNudgeAt`; `seen` and `dismissed` clear both.
 - **Re-snoozing** an already-`snoozed` row moves `snoozedUntil` and nothing else beyond the attribution and idempotence marks.
+- **An unusable `at`:** an `at` of `new Date("nonsense")` (and one that is not a `Date` at all) applies with `stateAt ≈ now`, increments **`intakeInvalidAt`**, and warns — and the **named consequence is asserted**: two such calls with otherwise identical input derive **different** `lastAckKey`s, so the second is `applied`, not `already-applied`. That is the residual, pinned rather than hidden; an edge that mis-serializes its timestamp double-applies, and the counter is how an operator sees it.
+- **The deadline:** an `accept` whose work outlives `INTAKE_DEADLINE_MS` returns `{ state: "unavailable" }` **without throwing**, the abandoned write still lands, and a retry of the same `(actorId, act, at)` then returns `{ state: "noop", reason: "already-applied" }` — the sentence `accept()`'s doc block promises KPR-455. Drive it with `h.db.pause("ops_notifications", "findOne")`: call `accept` without awaiting, `await gate.reached`, advance vitest's fake timers past `INTAKE_DEADLINE_MS` (the wrapper is a `setTimeout`, **not** the injected clock — the injected clock drives the ledger's arithmetic, not this deadline), await the call for `unavailable`, then `gate.release()` and await the row.
 - **The CAS:** a filter built for a row with no `lastAckAt` uses `{ $exists: false }` — assert against the double's `operations` log, because a literal `undefined` passes today only by accident; a lost CAS retries once and then returns `unavailable`.
 - **Availability:** `accept` before `init()` completes, after `stop()`, and through `acceptOpsAcknowledgement` with the singleton unset all return `{ state: "unavailable" }` and never throw; with `init()` complete and `start()` **never called**, an act on an existing row **applies**.
 - **No policy read:** driving an `accept` asserts **zero** `ops_policy` reads in the double's `operations` log (the retained-copy rule, D5).
@@ -394,7 +454,7 @@ npx vitest run src/ops/intake.integration.test.ts src/ops/delivery.integration.t
 npx tsc --noEmit
 ```
 
-- [ ] **Step 6:** **Negative-verify the monotonicity guard and its anchor** (Verification Rule 6).
+- [ ] **Step 6:** **Negative-verify the monotonicity guard and its anchor** — mutation **NV7**, rehearsed here against this module's own suite and run again in chunk 6 Step 9 against the acceptance suite. It is ONE numbered point with TWO mutations, run in sequence.
 
 - Delete the `lastAckAt` check from step 3 **and** its clause from the step-8 CAS filter. Re-run: `a delayed duplicate of an older act is superseded, not applied` must **fail** — the replayed `seen` applies, the row leaves `snoozed`, `snoozedUntil` is unset. Predict and confirm that `a duplicated dismissal returns noop/already-applied` **stays green**; that is exactly why the two cases are written separately.
 - Restore, then change the guard's anchor from `row.lastAckAt` to `row.principalAt`. Re-run: the **inverse** pair — the delayed-duplicate case goes green again, and `a system transition between a human act and its callback does not supersede that callback` **fails**, with the callback returning `superseded` and a real act lost.
@@ -414,6 +474,10 @@ what makes C9 true rather than assumed), the idempotence replay check
 BEFORE legality with a lastAckAt monotonicity guard beside it, the
 cleared refusal, the integrity-dismissal refusal, legality, snooze
 validation and the clamp, then one CAS.
+
+An `at` that is not a usable Date is substituted with the server clock and
+COUNTED (intakeInvalidAt) rather than substituted silently, because
+lastAckKey derives from the raw `at` and a per-retry key double-applies.
 
 Every clock-bearing write is anchored at min(at, now), so a caller cannot
 buy an unbounded snooze, stretch or shorten a per-person retention
