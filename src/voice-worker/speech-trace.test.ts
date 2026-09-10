@@ -450,6 +450,94 @@ describe("speech lifecycle", () => {
     expect(trace.snapshot().speechOutcomes.failed).toBe(1);
   });
 
+  it.each([
+    ["bridge", "spawn_failed"],
+    ["synthesis", "tts_provider_failed"],
+  ] as const)("removes only a conflicted %s failure attribution before speech settlement", (kind, errorClass) => {
+    const { rows, trace } = setup();
+    const handle = new FakeSpeechHandle(`speech-${kind}-conflict`);
+    trace.speechCreated(handle.asHandle(), "fallback", 0);
+
+    if (kind === "bridge") {
+      const failed = trace.bridgeCreated(bridgeContext("call", "turn-failed"));
+      failed.bind(handle.id);
+      failed.fail(errorClass);
+      failed.finish("failed", "unknown");
+      failed.bind("speech-other");
+    } else {
+      const failed = trace.synthesisCreated(synthesisContext("call", "synth-failed"));
+      failed.bind(handle.id);
+      failed.fail(errorClass);
+      failed.finish("failed", "unknown");
+      failed.bind("speech-other");
+    }
+    handle.settle();
+
+    expect(rows.find((row) => row.event === `${kind}_terminal`)).toMatchObject({ outcome: "failed" });
+    expect(rows.find((row) => row.event === "speech_terminal")).toMatchObject({
+      outcome: "incomplete",
+      errorClass: null,
+    });
+    expect(trace.snapshot().speechOutcomes).toMatchObject({ failed: 0, incomplete: 1 });
+    expect(trace.snapshot().unboundByAttemptKind[kind]).toBe(1);
+    const report = reduceVoiceDiagnostics(`${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "call");
+    expect(report.byOutcome.speech).toMatchObject({ failed: 0, incomplete: 1 });
+    expect(report.unbound.byEntity[kind]).toBe(1);
+  });
+
+  it("retains another valid failure source when a failed owner later conflicts", () => {
+    const { rows, trace } = setup();
+    const handle = new FakeSpeechHandle("speech-two-errors");
+    trace.speechCreated(handle.asHandle(), "sdk_response", 0);
+    const first = trace.bridgeCreated(bridgeContext("call", "turn-first-error"));
+    first.bind(handle.id);
+    first.fail("spawn_failed");
+    const second = trace.bridgeCreated(bridgeContext("call", "turn-second-error"));
+    second.bind(handle.id);
+    second.fail("engine_unreachable");
+    first.bind("speech-conflict");
+    handle.settle();
+
+    expect(rows.find((row) => row.event === "speech_terminal")).toMatchObject({
+      outcome: "failed",
+      errorClass: "engine_unreachable",
+    });
+  });
+
+  it.each(["bridge", "synthesis"] as const)(
+    "keeps a settled speech outcome immutable when a failed %s owner later conflicts",
+    (kind) => {
+      const { rows, trace } = setup();
+      const handle = new FakeSpeechHandle(`speech-settled-${kind}`);
+      trace.speechCreated(handle.asHandle(), "fallback", 0);
+      if (kind === "bridge") {
+        const failed = trace.bridgeCreated(bridgeContext("call", "turn-settled"));
+        failed.bind(handle.id);
+        failed.fail("spawn_failed");
+        failed.finish("failed", "unknown");
+        handle.settle();
+        failed.fail("unknown");
+        failed.bind("speech-other");
+      } else {
+        const failed = trace.synthesisCreated(synthesisContext("call", "synth-settled"));
+        failed.bind(handle.id);
+        failed.fail("tts_provider_failed");
+        failed.finish("failed", "unknown");
+        handle.settle();
+        failed.fail("tts_node_failed");
+        failed.bind("speech-other");
+      }
+
+      expect(rows.filter((row) => row.event === "speech_terminal")).toHaveLength(1);
+      expect(rows.find((row) => row.event === "speech_terminal")).toMatchObject({ outcome: "failed" });
+      expect(rows.some((row) => row.event === "sdk_metric" && row.source === "late_observation")).toBe(true);
+      expect(rows.some((row) => row.event === "diagnostic_gap" && row.reason === "binding_conflict")).toBe(true);
+      const report = reduceVoiceDiagnostics(`${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "call");
+      expect(report.byOutcome.speech).toMatchObject({ failed: 1 });
+      expect(report.details.speech[0]?.lateSupplements).toHaveLength(1);
+    },
+  );
+
   it.each(["active", "terminated"] as const)(
     "keeps successful bound speech incomplete while %s unbound synthesis coverage is unresolved",
     (state) => {
@@ -754,5 +842,79 @@ describe("bounded attempt registries and metrics", () => {
       unboundByAttemptKind: { speech: 0, bridge: 257, synthesis: 0 },
       registry: { recentBridge: 256 },
     });
+  });
+
+  it("keeps producer and reader generated-audio totals consistent after a terminal late binding", () => {
+    const { rows, trace } = setup();
+    const handle = new FakeSpeechHandle("speech-late-audio");
+    trace.speechCreated(handle.asHandle(), "fallback", 0);
+    handle.settle();
+    const synthesis = trace.synthesisCreated(synthesisContext("call", "synth-late-audio"));
+    synthesis.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+    synthesis.finish("completed", "unknown");
+    synthesis.bind(handle.id);
+
+    const report = reduceVoiceDiagnostics(`${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "call");
+    expect(trace.snapshot()).toMatchObject({ synthesizedAudioObserved: 1, generatedAudioObserved: 1 });
+    expect(report).toMatchObject({ synthesizedAudioObserved: 1, generatedAudioObserved: 1 });
+  });
+
+  it("counts generated audio once per speech while retaining independent synthesis totals", () => {
+    const { trace } = setup();
+    const handle = new FakeSpeechHandle("speech-multiple-syntheses");
+    trace.speechCreated(handle.asHandle(), "fallback", 0);
+    const first = trace.synthesisCreated(synthesisContext("call", "synth-first"));
+    first.bind(handle.id);
+    first.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+    const second = trace.synthesisCreated(synthesisContext("call", "synth-second"));
+    second.bind(handle.id);
+    second.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+
+    expect(trace.snapshot()).toMatchObject({ synthesizedAudioObserved: 2, generatedAudioObserved: 1 });
+    first.bind("speech-conflict-a");
+    expect(trace.snapshot()).toMatchObject({ synthesizedAudioObserved: 2, generatedAudioObserved: 1 });
+    second.bind("speech-conflict-b");
+    expect(trace.snapshot()).toMatchObject({ synthesizedAudioObserved: 2, generatedAudioObserved: 0 });
+  });
+
+  it("finalizes generated-audio accounting when its retained synthesis owner is evicted and on close", () => {
+    const { rows, trace } = setup();
+    const handle = new FakeSpeechHandle("speech-finalized-audio");
+    trace.speechCreated(handle.asHandle(), "fallback", 0);
+    const synthesis = trace.synthesisCreated(synthesisContext("call", "synth-finalized-audio"));
+    synthesis.bind(handle.id);
+    synthesis.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+    synthesis.finish("completed", "unknown");
+    handle.settle();
+    for (let index = 0; index <= 256; index += 1) {
+      trace.synthesisCreated(synthesisContext("call", `synth-empty-${index}`)).finish("completed", "unknown");
+    }
+
+    expect(trace.snapshot()).toMatchObject({ generatedAudioObserved: 1, registry: { recentSynthesis: 256 } });
+    trace.close("call_closed");
+    const report = reduceVoiceDiagnostics(`${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "call");
+    expect(trace.snapshot()).toMatchObject({ generatedAudioObserved: 1, registry: { recentSynthesis: 0 } });
+    expect(report.generatedAudioObserved).toBe(1);
+  });
+
+  it("reverses retained generated-audio contribution after speech-cache eviction and binding conflict", () => {
+    const { rows, trace } = setup();
+    const target = new FakeSpeechHandle("speech-evicted-audio");
+    trace.speechCreated(target.asHandle(), "fallback", 0);
+    const synthesis = trace.synthesisCreated(synthesisContext("call", "synth-evicted-audio"));
+    synthesis.bind(target.id);
+    synthesis.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+    synthesis.finish("completed", "unknown");
+    target.settle();
+    for (let index = 0; index <= 256; index += 1) {
+      const handle = new FakeSpeechHandle(`settled-${index}`);
+      trace.speechCreated(handle.asHandle(), "opening", index);
+      handle.settle();
+    }
+    synthesis.bind("speech-conflict");
+
+    const report = reduceVoiceDiagnostics(`${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "call");
+    expect(trace.snapshot()).toMatchObject({ synthesizedAudioObserved: 1, generatedAudioObserved: 0 });
+    expect(report).toMatchObject({ synthesizedAudioObserved: 1, generatedAudioObserved: 0 });
   });
 });

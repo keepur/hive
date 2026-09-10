@@ -25,6 +25,7 @@ const ACTIVE_LIMIT = 256;
 const RECENT_LIMIT = 256;
 const SPEECH_BRIDGE_LIMIT = 16;
 const SPEECH_SYNTHESIS_LIMIT = 32;
+const SPEECH_FAILURE_SOURCE_LIMIT = SPEECH_BRIDGE_LIMIT + SPEECH_SYNTHESIS_LIMIT;
 const LATENCY_SAMPLE_LIMIT = 1_024;
 
 export type BridgeBinding =
@@ -158,6 +159,8 @@ interface SpeechOwner {
   readonly acceptedEpoch: number;
   terminalEmitted: boolean;
   errorClass: VoiceErrorClass | null;
+  directErrorClass: VoiceErrorClass | null;
+  readonly associatedFailures: Map<string, VoiceErrorClass>;
   cancellationCause: CancellationCause | null;
   generatedAudio: boolean;
   generatedDurationMs: number;
@@ -170,6 +173,11 @@ interface SpeechOwner {
   eouMetricCount: number;
   eouDelayMs: number | null;
   latencyRecorded: boolean;
+}
+
+interface AudioContribution {
+  readonly speechId: string;
+  finalized: boolean;
 }
 
 interface BridgeOwner {
@@ -202,6 +210,7 @@ interface SynthesisOwner {
   associationCounted: boolean;
   metricCount: number;
   ttfbMs: number | null;
+  audioContribution: AudioContribution | null;
 }
 
 function emptyOutcomes(): OutcomeCounts {
@@ -325,6 +334,8 @@ export class SpeechTrace implements SpeechTracePort {
         acceptedEpoch,
         terminalEmitted: false,
         errorClass: null,
+        directErrorClass: null,
+        associatedFailures: new Map(),
         cancellationCause: null,
         generatedAudio: false,
         generatedDurationMs: 0,
@@ -420,6 +431,7 @@ export class SpeechTrace implements SpeechTracePort {
         associationCounted: false,
         metricCount: 0,
         ttfbMs: null,
+        audioContribution: null,
       };
       this.#activeSynthesis.set(context.synthesisId, owner);
       this.#synthesisAttempts += 1;
@@ -840,7 +852,7 @@ export class SpeechTrace implements SpeechTracePort {
         speechId: this.#boundId(owner.binding),
       });
     const speech = this.#speechForBinding(owner.binding);
-    if (speech) this.#applySpeechFailure(speech, errorClass);
+    if (speech) this.#applySpeechFailure(speech, this.#bridgeFailureSource(owner.turnId), errorClass);
   }
 
   #finishBridge(owner: BridgeOwner, outcome: AttemptOutcome, cause: CancellationCause): void {
@@ -904,6 +916,7 @@ export class SpeechTrace implements SpeechTracePort {
     if (owner.sampleRate === null) owner.sampleRate = sampleRate;
     else if (owner.sampleRate !== sampleRate) owner.mixedSampleRates = true;
     const speech = this.#speechForBinding(owner.binding);
+    this.#attachAudioContribution(owner);
     if (speech && !speech.terminalEmitted) {
       speech.audioBySynthesis.set(owner.synthesisId, owner.generatedDurationMs);
       this.#refreshSpeechAudio(speech);
@@ -930,7 +943,7 @@ export class SpeechTrace implements SpeechTracePort {
         speechId: this.#boundId(owner.binding),
       });
     const speech = this.#speechForBinding(owner.binding);
-    if (speech) this.#applySpeechFailure(speech, errorClass);
+    if (speech) this.#applySpeechFailure(speech, this.#synthesisFailureSource(owner.synthesisId), errorClass);
   }
 
   #finishSynthesis(owner: SynthesisOwner, outcome: AttemptOutcome, cause: CancellationCause): void {
@@ -971,6 +984,11 @@ export class SpeechTrace implements SpeechTracePort {
     if (owner.binding === "conflict") return;
     if (owner.binding !== null) {
       if (owner.binding === speechId) return;
+      const priorSpeech = this.#speechById(owner.binding);
+      if (priorSpeech && !priorSpeech.terminalEmitted) {
+        priorSpeech.bridgeIds.delete(turnId);
+        this.#removeSpeechFailure(priorSpeech, this.#bridgeFailureSource(turnId));
+      }
       owner.binding = "conflict";
       this.#countUnboundAssociation("bridge", owner);
       this.#gap("binding_conflict", { turnId, speechId: null });
@@ -982,7 +1000,7 @@ export class SpeechTrace implements SpeechTracePort {
     this.#emit({ turnId, speechId }, { event: "bridge_bound", source });
     if (owner.errorClass) {
       const speech = this.#speechById(speechId);
-      if (speech) this.#applySpeechFailure(speech, owner.errorClass);
+      if (speech) this.#applySpeechFailure(speech, this.#bridgeFailureSource(turnId), owner.errorClass);
     }
     this.#notifyBinding(turnId);
   }
@@ -998,12 +1016,17 @@ export class SpeechTrace implements SpeechTracePort {
     if (owner.binding !== null) {
       if (owner.binding === speechId) return;
       const priorSpeechId = owner.binding;
+      this.#detachAudioContribution(owner);
       owner.binding = "conflict";
       this.#countUnboundAssociation("synthesis", owner);
       const priorSpeech = this.#speechById(priorSpeechId);
       if (priorSpeech) {
-        priorSpeech.audioBySynthesis.delete(synthesisId);
-        this.#refreshSpeechAudio(priorSpeech);
+        if (!priorSpeech.terminalEmitted) {
+          priorSpeech.synthesisIds.delete(synthesisId);
+          this.#removeSpeechFailure(priorSpeech, this.#synthesisFailureSource(synthesisId));
+          priorSpeech.audioBySynthesis.delete(synthesisId);
+          this.#refreshSpeechAudio(priorSpeech);
+        }
       }
       this.#gap("binding_conflict", { synthesisId, speechId: null });
       return;
@@ -1012,7 +1035,9 @@ export class SpeechTrace implements SpeechTracePort {
     this.#associateSynthesis(speechId, synthesisId);
     this.#emit({ synthesisId, speechId }, { event: "synthesis_bound", source });
     const speech = this.#speechById(speechId);
-    if (speech && owner.errorClass) this.#applySpeechFailure(speech, owner.errorClass);
+    this.#attachAudioContribution(owner);
+    if (speech && owner.errorClass)
+      this.#applySpeechFailure(speech, this.#synthesisFailureSource(synthesisId), owner.errorClass);
     if (speech && !speech.terminalEmitted && owner.frameCount > 0) {
       speech.audioBySynthesis.set(owner.synthesisId, owner.generatedDurationMs);
       this.#refreshSpeechAudio(speech);
@@ -1023,13 +1048,17 @@ export class SpeechTrace implements SpeechTracePort {
 
   #speechSettled(owner: SpeechOwner, handle: SpeechHandle): void {
     if (this.#closed) return;
-    let errorClass = owner.errorClass;
+    let directErrorClass: VoiceErrorClass | null = null;
     try {
-      if (handle.exception() != null) errorClass ??= "speech_handle_failed";
+      if (handle.exception() != null) directErrorClass = "speech_handle_failed";
     } catch {
-      errorClass ??= "speech_handle_failed";
+      directErrorClass = "speech_handle_failed";
     }
-    if (errorClass) owner.errorClass ??= errorClass;
+    if (directErrorClass) {
+      owner.directErrorClass ??= directErrorClass;
+      this.#refreshSpeechFailure(owner);
+    }
+    const errorClass = owner.errorClass;
 
     let interrupted = false;
     let knownPlayout = false;
@@ -1209,9 +1238,32 @@ export class SpeechTrace implements SpeechTracePort {
     );
   }
 
-  #applySpeechFailure(speech: SpeechOwner, errorClass: VoiceErrorClass): void {
-    if (!speech.terminalEmitted) speech.errorClass ??= errorClass;
-    else this.#lateSpeechEvidence(speech, errorClass);
+  #applySpeechFailure(speech: SpeechOwner, source: string, errorClass: VoiceErrorClass): void {
+    if (speech.terminalEmitted) {
+      this.#lateSpeechEvidence(speech, errorClass);
+      return;
+    }
+    if (!speech.associatedFailures.has(source) && speech.associatedFailures.size >= SPEECH_FAILURE_SOURCE_LIMIT) return;
+    speech.associatedFailures.set(source, errorClass);
+    this.#refreshSpeechFailure(speech);
+  }
+
+  #removeSpeechFailure(speech: SpeechOwner, source: string): void {
+    if (speech.terminalEmitted) return;
+    speech.associatedFailures.delete(source);
+    this.#refreshSpeechFailure(speech);
+  }
+
+  #refreshSpeechFailure(speech: SpeechOwner): void {
+    speech.errorClass = speech.directErrorClass ?? speech.associatedFailures.values().next().value ?? null;
+  }
+
+  #bridgeFailureSource(turnId: string): string {
+    return `bridge:${turnId}`;
+  }
+
+  #synthesisFailureSource(synthesisId: string): string {
+    return `synthesis:${synthesisId}`;
   }
 
   #associateBridge(speechId: string, turnId: string): void {
@@ -1328,6 +1380,7 @@ export class SpeechTrace implements SpeechTracePort {
     const evicted = this.#recentSynthesis.get(oldestId);
     this.#recentSynthesis.delete(oldestId);
     if (evicted) {
+      if (evicted.audioContribution) evicted.audioContribution.finalized = true;
       this.#countUnboundAssociation("synthesis", evicted);
       if (evicted.binding === null || evicted.binding === "conflict") this.#unresolvedEvictedSynthesisCoverage = true;
     }
@@ -1375,10 +1428,41 @@ export class SpeechTrace implements SpeechTracePort {
   #refreshSpeechAudio(speech: SpeechOwner): void {
     const generatedAudio = speech.audioBySynthesis.size > 0;
     const generatedDurationMs = [...speech.audioBySynthesis.values()].reduce((sum, duration) => sum + duration, 0);
-    if (speech.generatedAudio && !generatedAudio) this.#generatedAudioObserved -= 1;
-    else if (!speech.generatedAudio && generatedAudio) this.#generatedAudioObserved += 1;
     speech.generatedAudio = generatedAudio;
     speech.generatedDurationMs = generatedDurationMs;
+  }
+
+  #attachAudioContribution(owner: SynthesisOwner): void {
+    if (owner.audioContribution || owner.frameCount === 0 || owner.binding === null || owner.binding === "conflict") {
+      return;
+    }
+    const retained = [...this.#activeSynthesis.values(), ...this.#recentSynthesis.values()].find(
+      (candidate) =>
+        candidate !== owner &&
+        candidate.audioContribution !== null &&
+        candidate.audioContribution.speechId === owner.binding,
+    );
+    if (retained?.audioContribution) {
+      owner.audioContribution = retained.audioContribution;
+      return;
+    }
+    const speech = this.#speechById(owner.binding);
+    if (speech?.generatedAudio) {
+      owner.audioContribution = { speechId: owner.binding, finalized: true };
+      return;
+    }
+    owner.audioContribution = { speechId: owner.binding, finalized: false };
+    this.#generatedAudioObserved += 1;
+  }
+
+  #detachAudioContribution(owner: SynthesisOwner): void {
+    const contribution = owner.audioContribution;
+    if (!contribution) return;
+    owner.audioContribution = null;
+    const retained = [...this.#activeSynthesis.values(), ...this.#recentSynthesis.values()].some(
+      (candidate) => candidate !== owner && candidate.audioContribution === contribution,
+    );
+    if (!contribution.finalized && !retained) this.#generatedAudioObserved -= 1;
   }
 
   #validBridgeContext(context: BridgeTraceContext): boolean {

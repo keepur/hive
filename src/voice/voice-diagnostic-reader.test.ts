@@ -461,6 +461,90 @@ describe("voice diagnostic entity lifecycles", () => {
     );
   });
 
+  it.each(["bridge", "synthesis"] as const)(
+    "materializes a conservative missing speech lifecycle from binding-only %s evidence",
+    (kind) => {
+      const speechId = `speech-binding-${kind}`;
+      const ownerId = kind === "bridge" ? { turnId: "turn-binding" } : { synthesisId: "synth-binding" };
+      const terminal = row(
+        "owner-terminal",
+        kind === "bridge"
+          ? { event: "bridge_terminal", textLength: 0, outcome: "completed", cause: "unknown" }
+          : { event: "synthesis_terminal", frameCount: 0, sampleCount: 0, outcome: "completed", cause: "unknown" },
+        { ...ownerId, speechId },
+      );
+      const binding = row(
+        "owner-binding",
+        { event: kind === "bridge" ? "bridge_bound" : "synthesis_bound", source: "sdk_metrics_context" },
+        { ...ownerId, speechId },
+      );
+      const report = reduceVoiceDiagnostics(jsonl([terminal, binding, binding]), "call-test");
+
+      expect(report).toMatchObject({
+        complete: false,
+        speechAttempts: 1,
+        incomplete: { byReason: { missing_start: 2 } },
+      });
+      expect(report.details.speech[0]).toMatchObject({
+        speechId,
+        started: false,
+        terminalEventId: null,
+        outcome: "incomplete",
+        incompleteReason: "missing_start",
+      });
+      expect(report.distributions.estimatedEouToFirstGeneratedAudioMs).toMatchObject({
+        eligibleAttempts: 0,
+        excludedByReason: { not_applicable: 1 },
+      });
+    },
+  );
+
+  it("keeps a bound speech with a retained start and missing terminal incomplete across row order and duplicates", () => {
+    const speechId = "speech-bound-missing-terminal";
+    const binding = row(
+      "binding",
+      { event: "bridge_bound", source: "sdk_metrics_context" },
+      { turnId: "turn-bound-missing-terminal", speechId },
+    );
+    const started = row(
+      "speech-start",
+      { event: "speech_started", origin: "sdk_response", acceptedEpoch: 1 },
+      { speechId },
+    );
+    const report = reduceVoiceDiagnostics(jsonl([binding, binding, started]), "call-test");
+
+    expect(report).toMatchObject({
+      complete: false,
+      speechAttempts: 1,
+      incomplete: { byReason: { process_loss_or_missing_terminal: 1, missing_start: 1 } },
+    });
+    expect(report.details.speech[0]).toMatchObject({
+      started: true,
+      terminalEventId: null,
+      incompleteReason: "process_loss_or_missing_terminal",
+    });
+  });
+
+  it("does not mint speech attempts from unassociated action gaps or invalid worker identities", () => {
+    const gap = row(
+      "gap-only",
+      { event: "diagnostic_gap", reason: "action_ownership_unproved", count: 1 },
+      { speechId: "speech-gap", turnId: "turn-gap" },
+    );
+    const invalidBinding = {
+      ...row(
+        "invalid-binding",
+        { event: "bridge_bound", source: "sdk_metrics_context" },
+        { speechId: "speech-invalid", turnId: "turn-invalid" },
+      ),
+      workerBootId: "not-a-worker-boot-id",
+    } as VoiceDiagnosticEvent;
+    const report = reduceVoiceDiagnostics(jsonl([gap, invalidBinding]), "call-test");
+
+    expect(report.speechAttempts).toBe(0);
+    expect(report.gaps).toMatchObject({ total: 1, byReason: { action_ownership_unproved: 1 } });
+  });
+
   it.each([
     ["explicit incomplete speech", "c20", "explicit_incomplete"],
     ["missing speech start", "c08", "missing_start"],

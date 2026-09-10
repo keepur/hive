@@ -847,10 +847,13 @@ function terminalOutcome(row: VoiceDiagnosticEvent | null): ReportOutcome {
 }
 
 function isSpeechEvidence(row: VoiceDiagnosticEvent): boolean {
-  return (
-    row.speechId !== null &&
+  if (row.speechId === null || row.workerBootId === null || !UUID.test(row.workerBootId)) return false;
+  if (
     ["speech_started", "speech_terminal", "sdk_metric", "handle_playout_item", "output_playback"].includes(row.event)
-  );
+  ) {
+    return true;
+  }
+  return row.event.startsWith("bridge_") || row.event.startsWith("synthesis_");
 }
 
 function isBridgeEvidence(row: VoiceDiagnosticEvent): boolean {
