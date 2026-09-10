@@ -361,6 +361,12 @@ export class OpsPublisher {
     this.reasons = loaded.map;
     this.counters.reasonRowAnomalies = loaded.anomalies;
     await this.reloadSubscriptions();
+    // init() is RE-ENTRANT BY DESIGN: Step 6's own second-init case and chunk
+    // 5's AC16 both call it on an already-initialized publisher, so without
+    // this clear each re-entry abandons a live interval (unref()'d, so it
+    // never fails a test loudly — it just keeps reloading subscriptions from
+    // a publisher the case has moved past).
+    if (this.reloadTimer) clearInterval(this.reloadTimer);
     // unref()'d: an ops-diagnostics timer must never be the thing holding the
     // process open (the outage-replay-processor.ts:44 precedent).
     this.reloadTimer = setInterval(() => void this.reloadSubscriptions(), SUBSCRIPTION_RELOAD_MS);

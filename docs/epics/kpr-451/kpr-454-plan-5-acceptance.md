@@ -77,6 +77,42 @@ const clearingFactsNaming = async (clears: string) =>
 
 `familyOf` imports from `./publisher.js`, `HIVE_RUNTIME_PRODUCER`/`REASON_TOOL_FAILED` from `./reasons.js` — the same modules chunk 3's `observe.ts` reads them from.
 
+**10. `extractHunk(file, startMarker, endAnchor)` — the capture-point slicer AC15 reads through, declared here because AC15 is its only caller and nothing else introduces it.** It takes **two literal anchors, never one**. "From the marker to the end of the enclosing block" is not implementable under this plan's own rule — stated for the boot-order anchors and equally binding here — that *a brace has no stable textual form to search for, and an implementer left to find one will invent an anchor that reads green regardless*. So the end of each hunk is a **literal string that already exists in the target file**, verified at this tree:
+
+| file | `startMarker` | `endAnchor` | verified |
+| --- | --- | --- | --- |
+| `src/agents/agent-runner.ts` | `"KPR-454 D2: runtime tool-failure observation"` | `"\n    return hooks;"` (four-space indent, the `buildHooks` tail chunk 4 Step 1 inserts above) | exactly **one** occurrence in the file today (`agent-runner.ts:1973`) |
+| `src/agents/provider-adapters/tool-bridge.ts` | `"KPR-454 D3, the failure half"` | `` "return `Tool execution failed (" `` — the last statement of the `catch` arm, which chunk 4 Step 4 leaves in place | exactly **one** occurrence of that literal (the `:302` comment mentions the phrase but not the `return`-plus-backtick prefix) |
+
+Declare it at module scope beside the two constants of item 7 — it reads `root` from there:
+
+```typescript
+// Slice one KPR-454 insertion out of a capture-point module. TWO literal
+// anchors: `agent-runner.ts` and `tool-bridge.ts` both legitimately mention
+// the forbidden words elsewhere, so a whole-module scan would fail against
+// correct code, and a "scan to the closing brace" would need an anchor that
+// has no stable textual form. Both anchors are strings that exist in the
+// tree; if either stops existing this throws rather than silently narrowing.
+const extractHunk = (file: string, startMarker: string, endAnchor: string): string => {
+  const source = readFileSync(`${root}${file}`, "utf8"); // item 7: `root` ENDS WITH A SLASH
+  const start = source.indexOf(startMarker);
+  expect(start, `${file}: start marker not found`).toBeGreaterThanOrEqual(0);
+  const end = source.indexOf(endAnchor, start);
+  expect(end, `${file}: end anchor not found after the start marker`).toBeGreaterThan(start);
+  const hunk = source.slice(start, end + endAnchor.length);
+  // ABLE-TO-FAIL GUARDS, asserted HERE rather than at each call site so that
+  // adding a third capture point cannot forget them. Without these, a hunk
+  // that came back empty (anchors adjacent) or one that swallowed the whole
+  // module would make every `not.toContain` in AC15 pass for the wrong
+  // reason — the exact vacuous-green shape this whole harness contract
+  // exists to prevent. 200 is comfortably below either real hunk (both run
+  // past a kilobyte) and comfortably above any degenerate slice.
+  expect(hunk.length, `${file}: hunk suspiciously short — anchors probably moved`).toBeGreaterThan(200);
+  expect(hunk.length, `${file}: hunk is the whole module — end anchor is not bounding`).toBeLessThan(source.length);
+  return hunk;
+};
+```
+
 - [ ] **Step 1:** AC1–AC3 — the envelope, the zero-match fact, and reject-versus-omit.
 
 **AC1 (C1, C4) — the exact stored key set.**
@@ -653,10 +689,16 @@ it("no code path in this diff reads costUsd, a duration threshold, or a tool_res
   // and `tool-bridge.ts` both legitimately mention `costUsd` and
   // `tool_response` elsewhere — so bound each hunk by its own anchor comment.
   // Both hunks open with a `// ── KPR-454` / `// KPR-454 D3` marker (chunk 4,
-  // Steps 1 and 4); extract from that marker to the end of the enclosing
-  // block and scan only that slice:
-  for (const hunk of [extractHunk("src/agents/agent-runner.ts", "KPR-454 D2: runtime tool-failure observation"),
-                      extractHunk("src/agents/provider-adapters/tool-bridge.ts", "KPR-454 D3, the failure half")]) {
+  // Steps 1 and 4) and close on a literal that already exists in the file —
+  // NOT on "the enclosing block", which has no searchable textual form.
+  // `extractHunk` (harness contract item 10) takes both anchors and carries
+  // its own able-to-fail length guards, so neither is repeated here:
+  for (const hunk of [extractHunk("src/agents/agent-runner.ts",
+                                  "KPR-454 D2: runtime tool-failure observation",
+                                  "\n    return hooks;"),
+                      extractHunk("src/agents/provider-adapters/tool-bridge.ts",
+                                  "KPR-454 D3, the failure half",
+                                  "return `Tool execution failed (")]) {
     expect(hunk).not.toContain("costUsd");
     expect(hunk).not.toContain("tool_response");
   }

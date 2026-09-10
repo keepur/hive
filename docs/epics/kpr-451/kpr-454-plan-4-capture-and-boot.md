@@ -77,10 +77,12 @@ Replace the tail of `buildHooks` — the `return hooks;` at `agent-runner.ts:197
     }];
     // The SUCCESS hook — the shipped CLI's own hook table describes
     // PostToolUse as "Run after successful tool", so this is the RECOVERY
-    // signal D2 makes an obligation, never a failure signal. The SDK's
-    // success payload is read for nothing (C12/AC15: outcome is published,
-    // never inferred — and chunk 5's hunk scan runs over this insertion, so
-    // this comment must stay clean of that payload field's name).
+    // signal D2 makes an obligation, never a failure signal. NO FIELD of the
+    // SDK's success payload beyond the tool's name is read: the outcome is
+    // carried by WHICH hook event fired, and is never inferred from what the
+    // tool returned or from what the turn spent (C12/AC15). Chunk 5's hunk
+    // scan runs over this insertion, so keep the result field's own name out
+    // of this comment too.
     hooks.PostToolUse = [{
       hooks: [async (input: HookInput) => {
         if (this.wasAborted) return {};
@@ -287,7 +289,7 @@ Classes to enumerate, one run each:
 
 Do **not**, under either branch, suppress by inferring "this looks like a policy message" from `failure.error` text — that is a C12 inference, and this producer's whole discipline is that outcome is published, never inferred. If class 6 does not fire at all, record that and leave the matcher as written.
 
-Record, in the implementation report, a table of class → fired/did-not-fire, plus `node -p "require('@anthropic-ai/claude-agent-sdk/package.json').version"`.
+Record, in the implementation report, a table of class → fired/did-not-fire, plus the **resolved** SDK version — `npm ls @anthropic-ai/claude-agent-sdk` (prints `@anthropic-ai/claude-agent-sdk@0.3.258` against this tree today). ⚠ The obvious `node -p "require('@anthropic-ai/claude-agent-sdk/package.json').version"` **does not work here** and must not be used: the package's `exports` map declares no `./package.json` subpath, so it dies with `ERR_PACKAGE_PATH_NOT_EXPORTED`. If a machine-readable string is wanted instead of `npm ls`'s tree, read the file directly, bypassing `exports`: `node -p "JSON.parse(require('fs').readFileSync('node_modules/@anthropic-ai/claude-agent-sdk/package.json','utf8')).version"`. Both forms were run in this worktree; both print `0.3.258`.
 
 **The rule on a class that does not fire (C12/AC15): it is left UNCAPTURED on the Claude lane in this ticket.** It is not papered over by inferring failure from a `PostToolUse` `tool_response`, from `costUsd`, from a duration or from an elapsed-time threshold. If a class does not fire, add one line to the `CLAUDE.md` bullet in Task 6 Step 4 naming it, so the next reader knows the coverage boundary rather than assuming totality.
 
