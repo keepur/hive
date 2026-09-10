@@ -60,7 +60,7 @@ console.log(String(doc._id), /^[0-9a-f]{24}$/.test(String(doc._id)));
 
 Before 2(f) this prints `[object Object] false`; after it, a 24-char hex and `true`.
 
-⚠ **What the degradation does and does not break, because the two are easy to swap.** Filtering is **unaffected**: `matchesFilter` runs over `this.rows` un-copied (`visible()` returns the live row objects, `:190-197`) and `insertOne` attaches `_id` **by reference** rather than through `copy` (`:281`), so Step 2(d)'s `cmp` guard is reachable and the `$gt` tie-break works. What breaks is `String(_id)` on any **returned** document — which is every event reference the ledger stores (`firstEventId`, `latestEventId`, `appliedThroughId`, `stateEventId`, and `advanced.eventId` on the cursor). All of them become the same `"[object Object]"`, the watermark's `appliedThroughId` tie-break degenerates, and the next tick's `new ObjectId("[object Object]")` **throws** inside chunk 3b's containment frame — so multi-tick ingest silently applies nothing on tick 2 and every multi-tick case (AC13 limb 1, AC5, AC7) fails for the wrong reason. Downstream selectors degrade the same way in both operands and go **vacuously green**: AC13 limb 1's `ctx.document?.latestEventId === String(events[2]._id)` fires on the *first* event, and AC4's `latestEventId: String(e2._id)` asserts nothing.
+⚠ **What the degradation does and does not break, because the two are easy to swap.** **The first and loudest symptom is not a degraded string — it is a DUPLICATED ROW.** With an `ObjectId` `_id`, `updateOne` does `const row = old ? copy(old) : …` (`:291`) and then `this.rows.set(row._id, row)` (`:300`); under the bare clone `copy(old)._id` is a **fresh plain object**, so the `set` inserts under a different Map key instead of replacing the original. Measured on this tree: one insert plus one `updateOne` takes `rows.size` from 1 to 2 and `countDocuments({})` returns 2, with both rows stringifying to `"[object Object]"`. Everything below is the second-order damage. Three more surfaces are hit by the same degraded string and are named here because none of them is an event reference: `OpsNotification._id` is the D6 **acknowledgement handle** (chunk 1; `handle: String(row._id)`, chunk 3), so every row hands out the same handle; `ctx.lock(String(row._id))` collapses every row onto one latch key; and the delivery arms' `seen` set (`const id = String(row._id)`) admits at most one row per tick. All of it is fixed by Step 2(f), and Step 1's probe is decisive either way. Filtering itself is **unaffected**: `matchesFilter` runs over `this.rows` un-copied (`visible()` returns the live row objects, `:190-197`) and `insertOne` attaches `_id` **by reference** rather than through `copy` (`:281`), so Step 2(d)'s `cmp` guard is reachable and the `$gt` tie-break works. What breaks is `String(_id)` on any **returned** document — which is every event reference the ledger stores (`firstEventId`, `latestEventId`, `appliedThroughId`, `stateEventId`, and `advanced.eventId` on the cursor). All of them become the same `"[object Object]"`, the watermark's `appliedThroughId` tie-break degenerates, and the next tick's `new ObjectId("[object Object]")` **throws** inside chunk 3b's containment frame — so multi-tick ingest silently applies nothing on tick 2 and every multi-tick case (AC13 limb 1, AC5, AC7) fails for the wrong reason. Downstream selectors degrade the same way in both operands and go **vacuously green**: AC13 limb 1's `ctx.document?.latestEventId === String(events[2]._id)` fires on the *first* event, and AC4's `latestEventId: String(e2._id)` asserts nothing.
 
 **If (4) shows counter strings instead, do not proceed to Step 2(d)** — restore the divergence KPR-454's plan specifies (its chunk 3 Step 1, fourth harness bullet) as part of Step 2 and say so in the commit body, because a hex-string `_id` also inverts lexicographically at n ≥ 10. **A divergence on any of (1)–(4) is a plan-revision trigger, not something to work around in an implementation file** — say so and stop. (5) is the exception: it is a *known* state this plan fixes in Step 2(f), not a divergence. Chunk 6's AC-suite asserts the cursor index's presence rather than re-creating it (integration point 2).
 
@@ -198,10 +198,12 @@ const copy = <T>(value: T): T => clone(value) as T;
 - **Deep-cloning the `ObjectId` instead of passing it.** Reconstructing it is unnecessary and the buffer copy is what broke it in the first place; nothing in this plan mutates an `_id`.
 - **Verifying by minting rather than by round-tripping.** Step 1's grep #4 checks minting and passes either way. The probe in Step 1 — `/^[0-9a-f]{24}$/` on `String(doc._id)` after a `find()` — is the check that can actually fail.
 
+**Two `structuredClone` behaviours this clone deliberately does not reproduce — recorded so nobody re-derives them as a defect.** (1) **No cycle handling:** `structuredClone` resolves a self-referencing value; this one recurses until the stack blows. (2) **No `DataCloneError` on functions:** `structuredClone` throws on one, this one passes it through by reference via the non-object branch. Neither is reachable from a Mongo document or from anything `operation()` clones (a `rows` Map of BSON-shaped rows, a filter, an update, an options bag), so neither is worth the guard — but they are real differences and this is where they are written down.
+
 **The two spellings this plan does NOT add, because `failNext`'s existing `when` predicate already expresses them.** Both are written as one-line helpers in the harness module (`src/ops/testing/notifier-harness.ts`, **chunk 3b Step 4**, whose exported-surface table is the authority), not as double API:
 
 - **fault the *n*th call** — `let seen = 0; db.failNext(coll, op, false, () => ++seen === n)`. The predicate is evaluated once per matching call (`hook()`'s `findIndex`, `:98-101`) and the hook stays armed until it returns true, so the first `n − 1` calls pass and the *n*th throws.
-- **fault a call matching a predicate** — `db.failNext(coll, op, false, (ctx) => …)` directly; `ctx` is `{filter?, update?, document?, options?}` (`:62`), so an `insertOne` is selected on `ctx.document`.
+- **fault a call matching a predicate** — `db.failNext(coll, op, false, (ctx) => …)` directly; `ctx` is `{filter?, update?, document?, options?}` (`:63`), so an `insertOne` is selected on `ctx.document`.
 
 **Nothing is removed and KPR-454's own suites must stay green.** That is why `src/ops/publisher.integration.test.ts`, `src/ops/acceptance.integration.test.ts` and `src/ops/capture-points.integration.test.ts` are in this plan's Commands list — run them in **Step 5** of this task (Step 6 is the commit), not only at the end.
 
@@ -512,16 +514,6 @@ describe("readPolicy distinguishes absent from faulted (D5)", () => {
 
 (Fault injection above is `failNext(collection, operation, after, when)` — KPR-454's double as copied from the obligations original, whose signature Step 2's third grep verifies. Nothing in this file needs an nth-call or predicate variant of its own: both are the same call with a different `when`, and the only genuinely new capability this ticket needs — a **persistent** fault — is Step 2(e).)
 
-- [ ] **Step 5:** Verify.
-
-```bash
-npx vitest run src/ops/notification-store.test.ts
-npx vitest run src/ops/publisher.integration.test.ts src/ops/acceptance.integration.test.ts src/ops/capture-points.integration.test.ts
-npx tsc --noEmit
-```
-
-Expected: the new suite passes; **KPR-454's three suites still pass** — that is the whole verification of Step 2's harness edits, and a regression there means an additive change was not additive.
-
 **Step 2(f) needs its own check, because no suite here would notice it.** Both KPR-454 suites and this one pass against the degraded clone — that is precisely why the defect survived a round. Add one case to `notification-store.test.ts` asserting the round trip directly, and it is the assertion, not the greps, that closes B-A:
 
 ```typescript
@@ -552,6 +544,16 @@ describe("the double round-trips an ObjectId (KPR-468 Step 2(f))", () => {
   });
 });
 ```
+
+- [ ] **Step 5:** Verify.
+
+```bash
+npx vitest run src/ops/notification-store.test.ts
+npx vitest run src/ops/publisher.integration.test.ts src/ops/acceptance.integration.test.ts src/ops/capture-points.integration.test.ts
+npx tsc --noEmit
+```
+
+Expected: the new suite passes; **KPR-454's three suites still pass** — that is the whole verification of Step 2's harness edits, and a regression there means an additive change was not additive.
 
 - [ ] **Step 6:** Commit.
 

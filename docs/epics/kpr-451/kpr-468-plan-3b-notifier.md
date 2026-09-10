@@ -436,8 +436,11 @@ export class OpsNotifier {
       // worse than either uniform one. The cost is bounded and it is not
       // bounded by traffic: all three are covered by `ensureIndexes` (chunk 2)
       // — index 3 or 5 for the first two, index 8 for the third, every one of
-      // them leading on `state` — so each is an index count restricted to the
-      // WORKING-row set — the operator's own subscriber × open
+      // them leading on `state` — so each is an index count restricted by its
+      // leading `state` key to the operator's OPEN-CONDITION set (`rowsPending`
+      // is one working state, `rowsNudgeDue` is both, `rowsSnoozed` is a state
+      // outside OPS_NUDGE_STATES entirely — the bound is the leading key, not
+      // membership of the working pair) — the operator's own subscriber × open
       // condition surface, the same bound the clearing fan-out already accepts —
       // and never a collection scan. If that set is ever large enough to matter,
       // saturate them and correct chunk 3's sentence in the same change.
@@ -533,7 +536,7 @@ export class OpsNotifier {
 | `BASE` | `Date` | The fixed epoch every fixture is derived from. `2026-01-01T00:00:00.000Z`. |
 | `t(minutes: number)` | `Date` | `BASE + minutes · 60 000`. Negative is allowed and is how a cursor is placed before the first seeded event. |
 | `sub(id, over?)` | `OpsSubscription` | A minimal enabled subscription: `_id: id`, `subscriberId: \`${id}-owner\``, `transport: { adapterId: "fake", target: "C0000001" }`, a filter that matches nothing (**the notifier never evaluates it** — AC2 — so its content is deliberately inert). `over` shallow-merges. |
-| `reason(id, over?)` | the `ops_reasons` row shape KPR-454 defines | Only `remediationTemplate` is read by this child. |
+| `reason(id, over?)` | the `ops_reasons` row shape KPR-454 defines | `producer` defaults to `"tool"` — **pinned, not incidental**: the notifier's only reason read is ``reasons.get(`${row.producer}:${row.reasonId}`)`` (chunk 3) against a map KPR-454 keys `` `${producer}:${reasonId}` ``, so a `reason()` whose producer differs from `seedEvent()`'s `"tool"` never resolves. Only `remediationTemplate` is read by this child. |
 | `FakeTransport` | class implementing `OpsTransport` | Below. |
 | `harness(options?)` | `Promise<NotifierHarness>` | Below. |
 | `failNth(db, collection, operation, n)` | `void` | `let seen = 0; db.failNext(collection, operation, false, () => (seen += 1) === n)`. Named here so three chunks spell it one way. |
@@ -547,14 +550,14 @@ Persistent faults and the reset are **methods on the double**, not harness helpe
 | --- | --- | --- |
 | the injected clock's initial value | `BASE` | `cursorAt: t(-1)` and `advance()` are both defined relative to it. `now()` returns it until `advance()` moves it. |
 | `seedEvent().publishedAt` | `t(0)` | One minute after the seeded cursor, so a single seeded event is unambiguously ahead of it. |
-| `seedEvent().dedupeKey` | `` `p:tool:gog:tool-failed:${n}` `` , `n` a per-harness counter | Distinct per call, so `seedEvents(5)` produces five rows rather than five renewals of one. |
+| `seedEvent().dedupeKey` | `` `tool:workItem:w1:r1:${n}` `` , `n` a per-harness counter | Distinct per call, so `seedEvents(5)` produces five rows rather than five renewals of one. Under KPR-454's `producer:subjectKind:subjectId:reasonId:generation` (chunk 2b) its four leading components agree with the `producer`, `subject` and `reasonId` defaults below, and the counter occupies the generation slot — the one component that legitimately varies within a family (so `seedEvents(5)` reads as five generations, not five unrelated keys); the `generation` **field**'s own default of `1` coincides with the counter only at `n === 1`, which is inert because **nothing in KPR-468 parses a dedupeKey at all** (the D6 acknowledgement handle is `String(row._id)`, chunk 3). Readability, not function — but a fixture that contradicts its own table is what a later reader trips on. |
 | **`seedEvent().matchedSubscriptionIds`** | **the `_id`s of `options.subscriptions`, in order** | ⚠ **The load-bearing one.** Ingest reads the stamped list and never re-evaluates a filter (AC3), so an unstamped event creates nothing. AC4, AC7, AC11 and AC13 limbs 1 and 3 all depend on this default; AC3's own cases override it explicitly, which is the whole point of that criterion. |
-| `seedEvent().producer` | `"tool"` | Matches the default `dedupeKey`'s prefix and satisfies clearing provenance's same-producer clause without a per-case override. |
+| `seedEvent().producer` | `"tool"` | Matches the default `dedupeKey`'s producer component, matches `reason()`'s own default (below), and satisfies clearing provenance's same-producer clause without a per-case override. |
 | `seedEvent().class` / `retry` | `"integrity"` / `"deterministic"` | ⚠ Both are UNIONS (`OpsClass`, `OpsRetry` — KPR-454's contract), so the value has to be one of theirs. The pair is the cadence table's key (`` `${class}:${retry}` ``), and this one is what the policy fixtures in the cadence cases seed. |
 | `seedEvent().waiting` | `"nobody"` | Also a union (`Waiting`), not a boolean. The stall and view-shape cases that care set it. |
-| `seedEvent().reasonId` | `"r1"` | The id `reason("r1")` mints, so `options.reasons: [reason("r1")]` is the whole wiring. |
+| `seedEvent().reasonId` | `"r1"` | The id `reason("r1")` mints, so `options.reasons: [reason("r1")]` is the whole wiring — true only because both default `producer` to `"tool"` and the lookup is keyed on the pair. A mismatch is loud (`reasonUnknown` plus a red AC12 remediation assertion), not silent, but it is a class of implementer judgement this table exists to remove. |
 | `seedEvent().subject` | `{ kind: "workItem", id: "w1" }` | `OpsSubject` is `{kind, id}` and both are required. |
-| `seedEvent().schemaVersion` / `generation` / `detail` / `evidence` / `matchedSubscriptions` | `1` / `1` / `{}` / `[]` / `matchedSubscriptionIds.length` | All five are **required** on `OpsEvent`; `detail` and `evidence` are inert to every phase here and AC12's view-shape cases set them. |
+| `seedEvent().schemaVersion` / `generation` / `detail` / `evidence` / `matchedSubscriptions` | `1` / `1` / `{}` / `[]` / `matchedSubscriptionIds.length` | All five are **required** on `OpsEvent`. `detail` is inert. `evidence` is inert for a **non-clearing** event and is the **provenance gate** for a `judgment`/`integrity` clearing — `clearingProvenanceOk` reads `e.evidence.length >= 1` for both classes (chunk 2b) — so with this default (`class: "integrity"`, `evidence: []`) a clearing event seeded through the default is **refused** and counted `clearRefused`. AC6's clearing rows set it, as AC6 independently specifies; AC12's view-shape cases set both. |
 | `seedEvents(n, over)` | `over` applied to all `n`, `publishedAt` overridden to `t(0) … t(n-1)` | An explicit `publishedAt` in `over` is **ignored** for this reason; pass individual `seedEvent` calls if a case needs one. |
 
 Any case that depends on one of these rather than setting it should say so in a comment — AC13 limb 3 is the model (it passes `cursorAt: t(-1)` explicitly *because* it depends on it).
@@ -604,6 +607,15 @@ export interface NotifierHarness {
   seedEvents(n: number, over?: Partial<OpsEvent>): Promise<OpsEvent[]>;
   /** The one ledger row for a (subscriptionId, dedupeKey). THROWS if absent. */
   row(subscriptionId: string, dedupeKey: string): Promise<OpsNotification>;
+  /**
+   * PINNED to `notifications.countDocuments({})` — NOT `find({}).toArray().length`.
+   * The stop-seam case (Step 5) marks `db.operations`, then asserts that no
+   * `ops_notifications` `find` follows; a `find`-based ledgerCount() lands its
+   * own operation inside that window and turns the assertion red for the wrong
+   * reason, whose obvious "fix" is a widened filter that quietly weakens the
+   * seam. The double logs `find` and `countDocuments` as distinct operation
+   * names, so the pinned spelling is invisible to that assertion.
+   */
   ledgerCount(): Promise<number>;
   /** `notifier.getSnapshot()` — counters included. */
   snapshot(): Record<string, unknown>;
