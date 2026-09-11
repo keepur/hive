@@ -147,6 +147,30 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     // own comment demands. Scope: this scans index.ts, not src/ops/.
     expect(codeOnly).not.toContain("opsPublisher.start(");
   });
+
+  it("(e) the ops queue drains BEFORE Slack and Mongo close (KPR-454 D10)", () => {
+    // The other end of the publisher's lifecycle, and the half nothing held.
+    // `stop()`'s OWN bound — reload timer cleared first, drain within
+    // SHUTDOWN_DRAIN_MS, stops accepting — is pinned in
+    // publisher.integration.test.ts; "before slackAdapter.stop() and
+    // mongoClient.close()" is an index.ts ORDERING fact that no test read, so
+    // relocating the call below `await mongoClient.close()` left the whole
+    // suite green (measured). It matters because the drain's queued inserts
+    // need a live Mongo client: after the close they would all fault, turning
+    // a bounded drain into a silent loss of every queued event.
+    //
+    // Sliced from the shutdown handler, so an `opsPublisher.stop()` written
+    // anywhere else in the file could not satisfy it. Modelled on the KPR-456
+    // group's drain case below.
+    const shutdown = codeOnly.slice(offsetOf("const shutdown = async"));
+    const stop = shutdown.indexOf("await opsPublisher.stop()");
+    expect(stop, "opsPublisher.stop() is not called from the shutdown handler").toBeGreaterThanOrEqual(0);
+    for (const later of ["await slackAdapter.stop()", "await mongoClient.close()"]) {
+      const at = shutdown.indexOf(later);
+      expect(at, `shutdown anchor not found: ${later}`).toBeGreaterThanOrEqual(0);
+      expect(at, `${later} must run AFTER the ops queue drains`).toBeGreaterThan(stop);
+    }
+  });
 });
 
 describe("KPR-456 obligation readiness and drain order", () => {

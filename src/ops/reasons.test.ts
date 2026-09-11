@@ -44,6 +44,17 @@ describe("HIVE_RUNTIME_REASONS + assertReasonTableLegal (KPR-454 D5, AC10)", () 
     );
   });
 
+  it("refuses an EMPTY remediationTemplate — the other half of D4's `required, no default`", () => {
+    // The case above drives only the `> OPS_REMEDIATION_MAX` arm of the gate's
+    // single `length === 0 || length > MAX` predicate. A row spelled
+    // `remediationTemplate: ""` reaches the other arm, and with no case here
+    // the whole `length === 0 ||` disjunct can be deleted with the suite still
+    // green (measured). D4 says required with no default: a row that declares
+    // nothing to do about its own condition is a development-time defect, not
+    // a row to publish and let KPR-468 render an empty remediation from.
+    expect(() => assertReasonTableLegal(patch({ remediationTemplate: "" }))).toThrow(/remediationTemplate/);
+  });
+
   it("refuses the two silent normalizations the compiler would otherwise perform", () => {
     const badType = patch({ detailKeys: [{ key: "when", type: "date" } as unknown as DetailKeySpec] });
     expect(() => assertReasonTableLegal(badType)).toThrow(/unrecognized type/);

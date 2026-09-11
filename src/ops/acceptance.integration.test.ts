@@ -1718,3 +1718,43 @@ describe("AC16 (C16) — a new reason and a new producer are DATA, not an engine
     expect(doc.matchedSubscriptionIds).toEqual(["sub-late"]);
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// Regression surface — NOT an AC. The plan's Testing Contract lists
+// `agent_events`, `EVENT_SCHEMAS`, `Scheduler.checkEvents`, `activity_log`,
+// delivery routing and KPR-456's obligation path as "all unchanged AND
+// ASSERTED SO". Two members already have cases — `activity_log` under AC15,
+// `dispatcher`/`agent-manager` under AC7 — and the rest had none: they were
+// true only because this diff happens not to touch them, which a later
+// refactor inside `src/ops/**` can change without any test noticing. Same
+// source-scan form as its two siblings, for the same reason: it survives a
+// refactor that stops exercising a code path.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("Regression surface — no adjacent substrate is read or written", () => {
+  it("the producer's sources name no existing event, scheduler-delivery or obligation substrate", () => {
+    // Able-to-fail guard on the scan itself (AC7/AC15's precedent): an empty
+    // or mis-rooted `opsSources` would make every expectation below vacuously
+    // true.
+    expect(opsSources.length, "the src/ops source scan matched no files").toBeGreaterThan(5);
+    expect(opsSources.some((s) => s.includes("class OpsPublisher"))).toBe(true);
+
+    // Each name is a MECHANISM this producer deliberately does not reuse —
+    // D1's whole premise is a separate substrate with its own three
+    // collections, not a second writer onto the event bus or the obligation
+    // ledger. None is plausibly needed by a correct future change in
+    // `src/ops/**`, which is what keeps this from forbidding a sibling
+    // ticket's legitimate edit the way AC14's dropped `ops_notifications`
+    // clause would have.
+    for (const s of opsSources) {
+      for (const forbidden of [
+        "agent_events", // the event bus's collection
+        "EVENT_SCHEMAS", // its schema registry
+        "checkEvents", // Scheduler's event-delivery loop
+        "delivery_obligations", // KPR-456's collection
+      ]) {
+        expect(s, `an src/ops source references ${forbidden}`).not.toContain(forbidden);
+      }
+    }
+  });
+});
