@@ -51,7 +51,7 @@ Agents don't see Slack messages and Slack delivery fails.
 
 **Fix:** regenerate tokens and reinstall the app.
 
-1. Go to <https://api.slack.com/apps> → your Hive app → **OAuth & Permissions** → reinstall to workspace.
+1. Go to <https://api.slack.com/apps> → your Hive app → **OAuth & Permissions**. Compare the **Bot Token Scopes** against the `bot:` list in `setup/slack-manifest.yaml` (the source of truth — the engine's declared subset is `REQUIRED_BOT_SCOPES` in `src/slack/slack-scope-preflight.ts`, incl. `chat:write.customize`, `im:write`, `users:read.email`), add any that are missing, then **reinstall to workspace**. The boot log's "Slack bot token missing recommended scopes" warning lists exactly what to add.
 2. Copy the new **Bot User OAuth Token** (`xoxb-...`) and **App-Level Token** (`xapp-...`).
 3. Update your instance's `.env` (at `~/services/hive/<your-instance>/.env`):
    ```

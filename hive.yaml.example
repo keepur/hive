@@ -38,7 +38,7 @@ business:
 # Slack audit channel — receives app/SMS notifications
 # slack:
 #   auditChannel: jessica
-#   localMcpServer: true    # default: local bot-token Slack MCP (self-echo-safe). Set false to fall back to the hosted cloud MCP (user-OAuth identity — not recommended; see KPR-97).
+#   localMcpServer: true    # default (KPR-492): local bot-token Slack MCP — agent posts wear the agent's own name/icon. `false` falls back to the hosted MCP on SLACK_MCP_TOKEN, a USER token: every agent post is then attributed to that token's human owner. Keep false only as a rollback lever.
 
 # slackInternal:
 #   # port auto-derived from instance portBase if omitted

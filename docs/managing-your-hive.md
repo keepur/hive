@@ -132,6 +132,14 @@ Two files at your instance root (`~/services/hive/<your-instance>/`). The CLI ma
 - On an agent definition, `maxConcurrent` is **deprecated** in favor of `spawnBudget` (both control how many in-flight spawns the agent can have at once, across different threads). The engine reads `agent.spawnBudget` first, falls back to `agent.maxConcurrent`, then to the engine default (5). `hive doctor`'s "Spawn coordinator" section shows which fallback fired per agent so you can migrate definitions one at a time.
 - Reflection (end-of-conversation memory writes) trigger changed from queue-drain to post-quiescence debounce — reflection fires 30s after the most recent non-reflection turn on a thread. Setting `memory.reflectionMinTurns: 0` now disables reflection entirely. If you previously relied on `reflectionMinTurns: 0` as "off", behavior is unchanged; if you previously relied on it as "fire every turn", that semantics is gone (it was a footgun under the new debounce model).
 
+### Migration notes (KPR-492 — Slack transport default)
+
+- `slack.localMcpServer` now defaults to **`true`**. If your `hive.yaml` does not set the key, agents move from the hosted Slack MCP (a user token, which attributes every agent post to that token's owner) to the local server on your bot token, with per-agent name and icon. An explicit `slack.localMcpServer: false` is unchanged by the upgrade.
+- **Precondition before you flip:** the bot must be a member of every channel your agents post to — the bot transport does not post to channels it has not joined, and `chat:write.public` is deliberately not granted. The engine warns at boot listing any agent `homeBase` or audit channel the bot is missing from. Reconcile your Slack app's bot scopes against `setup/slack-manifest.yaml` (the manifest has carried `im:write` for a while; `users:read.email` is new to it) and reinstall the app first, or DM sends fail `missing_scope` — loudly, with the scope named in the tool error.
+- **Tool-surface change:** the local server exposes four tools (`slack_send_message`, `slack_read_channel`, `slack_list_channels`, `slack_read_user_profile`). The hosted server's canvas, draft, scheduled-message, thread-read and search tools are not available on it. Check your agent prompts and skills for any tool name that disappears.
+- `slack_search_messages` is removed on the local server — Slack's `search.messages` is user-token-only, so it never had a bot-transport implementation.
+- **Rollback:** set `slack.localMcpServer: false` and restart. Config-only, no redeploy.
+
 ### `<instance>/.env`
 
 Core secrets:
