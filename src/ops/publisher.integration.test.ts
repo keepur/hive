@@ -14,7 +14,7 @@ import { __resetOpsPublisherForTests, setOpsPublisher } from "./publisher-single
 import { observeToolFailure, observeToolSuccess, type ToolFailureObservation } from "./observe.js";
 import { HIVE_RUNTIME_PRODUCER, REASON_TOOL_FAILED, REASON_TOOL_RECOVERED } from "./reasons.js";
 import { OPS_CLEARS_MAX_LENGTH, OPS_ID_MAX_LENGTH } from "./ids.js";
-import { OPS_EVENTS_COLLECTION, OPS_REASONS_COLLECTION } from "./types.js";
+import { OPS_EVENTS_COLLECTION, OPS_REASONS_COLLECTION, OPS_SUBSCRIPTIONS_COLLECTION } from "./types.js";
 
 /**
  * KPR-454 chunk 3, Step 6 — mechanism-level coverage for the publisher the
@@ -311,6 +311,35 @@ describe("OpsPublisher boot and registry", () => {
     expect(publisher.getSnapshot().rejected).toBe(0);
   });
 
+  it("bounds the per-row anomaly log's WIDTH as well as its count — the boot-log surface", async () => {
+    // The COUNT sibling above is only half the bound: each of those five lines
+    // interpolates `producer`, `reasonId`, `key` and `type` out of a document
+    // nothing on the load path validates, so before the clip one hand-edited
+    // collection wrote arbitrary megabytes to the log on EVERY boot.
+    const huge = "k".repeat(200_000);
+    await fakeDb.collection(OPS_REASONS_COLLECTION).insertOne({
+      _id: "acme:wide",
+      producer: "acme",
+      reasonId: "wide",
+      class: "informational",
+      retry: "transient",
+      remediationTemplate: "trim the row",
+      detailKeys: [{ key: huge, type: huge, optional: true }],
+      enabled: true,
+    });
+
+    await expect(publisher.init()).resolves.toBeUndefined();
+
+    const lines = mockLog.warn.mock.calls.filter((c) => String(c[0]).includes("ops reason row normalized"));
+    expect(lines.length).toBeGreaterThan(0); // able-to-fail: the audit really ran
+    for (const line of lines) {
+      // The whole call — message AND context object — is what reaches the log.
+      const bytes = `${String(line[0])} ${JSON.stringify(line[1] ?? {})}`;
+      expect(bytes.length, bytes.slice(0, 160)).toBeLessThan(1000);
+      expect(bytes).not.toContain("k".repeat(200));
+    }
+  });
+
   it("log.errors once when the LOADED registry leaves an enabled class:resource reason unclearable", async () => {
     await publisher.init();
     // The healthy registry says nothing — the gate only speaks when breached.
@@ -532,6 +561,64 @@ describe("OpsPublisher accept path and epoch", () => {
     expect(events().at(-1)!.generation).toBe(0);
     expect(publisher.getSnapshot().epochResolveFaults).toBe(1);
   });
+});
+
+describe("OpsPublisher survives a malformed subscription row", () => {
+  /**
+   * THE CONSEQUENCE CASE, and the reason the container guard is a SHOULD-FIX
+   * rather than a tidy-up. `match.test.ts` pins the evaluator's answer; this
+   * pins what the answer is worth. Before the guard, a single row whose
+   * `filter` was missing or `null` threw out of the "pure" evaluator, out of
+   * `accept()` (no try of its own), out of `runJob`, and into the drainer's
+   * catch — so accept step 8 never ran, NO ops_events document was written for
+   * ANY event, no open-condition entry was created so no recovery was ever
+   * enqueued either, and the 60 s reload kept re-loading the row, so it
+   * survived reloads, SIGUSR1 and restarts. Plus one `Ops publish job failed`
+   * warn per tool failure AND per recovery: the flood the `overflowWarned`
+   * latch exists to prevent, on a path with no latch.
+   *
+   * Inserted through the collection API so the row really arrives via
+   * `loadSubscriptions()`'s `find({enabled:true})`, which is the surface that
+   * applies no shape check.
+   */
+  const badRow = (filter: unknown) => ({
+    _id: "sub-malformed",
+    subscriberId: "ops-team",
+    subscriberKind: "human",
+    enabled: true,
+    filter,
+    transport: { adapterId: "slack", target: "C1" },
+  });
+
+  it.each([
+    ["filter missing", undefined],
+    ["filter null", null],
+    ["filter a string", "producer"],
+    ["filter an array", [{ producer: ["hive-runtime"] }]],
+  ])(
+    "%s: failures AND recoveries still publish, with no publishFault and no per-event warn",
+    async (_label, filter) => {
+      await publisher.init();
+      await fakeDb.collection(OPS_SUBSCRIPTIONS_COLLECTION).insertOne(badRow(filter) as never);
+      await publisher.reloadSubscriptions();
+      expect(publisher.getSnapshot().subscriptions).toBe(1); // the row really loaded
+
+      driveFailure("Bash");
+      await publisher.__drainForTests();
+      driveSuccess("Bash");
+      await publisher.__drainForTests();
+
+      expect(events().map((e) => e.reasonId)).toEqual([REASON_TOOL_FAILED, REASON_TOOL_RECOVERED]);
+      // Fail-CLOSED on selection: the row that could not be evaluated is not a
+      // match, and the string/array rows are no longer fail-OPEN matches either.
+      expect(events()[0]!.matchedSubscriptionIds).toEqual([]);
+      expect(events()[0]!.matchedSubscriptions).toBe(0);
+      const snapshot = publisher.getSnapshot();
+      expect(snapshot.publishFaults).toBe(0);
+      expect(snapshot.rejected).toBe(0);
+      expect(warnsMatching("Ops publish job failed")).toBe(0);
+    },
+  );
 });
 
 describe("OpsPublisher recovery and the openSeq identity", () => {

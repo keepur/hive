@@ -10,6 +10,7 @@ const mockLog = vi.hoisted(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn()
 vi.mock("../logging/logger.js", () => ({ createLogger: () => mockLog }));
 
 import { registerArchetype, __resetRegistryForTests } from "../archetypes/registry.js";
+import { __resetToolHookPayloadWarnForTests } from "../agents/agent-runner.js";
 import { setOpsPublisher } from "./publisher-singleton.js";
 import type { OpsPublisher } from "./publisher.js";
 import { OPS_EVENTS_COLLECTION } from "./types.js";
@@ -352,6 +353,100 @@ describe("D3 — recovery", () => {
     await harness.fireSuccess(SUCCESS_INPUT);
     await fixture.drain();
     expect(fixture.events()).toHaveLength(0);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// The SDK-shape guard. `error-tokens.ts` is hardened for SDK drift above the
+// lockfile (`^0.3.258`); the hook BODIES read `tool_name` / `error` in
+// `observeToolFailure`'s ARGUMENT LIST, i.e. outside its containment, so they
+// needed the same treatment. Two distinct harms: a non-object payload throws
+// out of the callback INTO THE SDK (the one uncontained throw in the diff), and
+// an absent `tool_name` degrades to a publishFault plus ONE WARN PER TOOL CALL
+// — a flood in exactly the drift scenario the classifier was hardened against.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("the hook payload's own fields are read behind a shape guard", () => {
+  const warnsMatching = (fragment: string) =>
+    mockLog.warn.mock.calls.filter((call) => String(call[0]).includes(fragment)).length;
+
+  beforeEach(() => {
+    // The drift warn is latched per PROCESS (the condition is a property of the
+    // resolved CLI, so a line per call is the flood), so each case needs it
+    // re-armed to see its own first line.
+    __resetToolHookPayloadWarnForTests();
+  });
+
+  it.each([
+    ["undefined", undefined],
+    ["null", null],
+    ["a primitive", 7],
+    ["a string", "PostToolUseFailure"],
+  ])("%s payload: both hooks resolve to {} rather than throwing into the SDK", async (_label, payload) => {
+    const harness = buildClaudeLaneHarness();
+    await expect(harness.fireFailure(payload as never)).resolves.toEqual({});
+    await expect(harness.fireSuccess(payload as never)).resolves.toEqual({});
+    await fixture.drain();
+    expect(fixture.events()).toHaveLength(0);
+    expect(fixture.publisher.getSnapshot().publishFaults).toBe(0);
+  });
+
+  it("an absent tool_name: nothing published, NO publishFault, and no per-call log line", async () => {
+    const harness = buildClaudeLaneHarness();
+    const { tool_name: _dropped, ...noName } = FAILURE_INPUT;
+    for (let i = 0; i < 4; i += 1) await expect(harness.fireFailure(noName)).resolves.toEqual({});
+    await fixture.drain();
+
+    expect(fixture.events()).toHaveLength(0);
+    // Unguarded, each of the four reached accept step 2 with `subject.id`
+    // undefined, threw on `.length`, and landed in the drainer's catch.
+    expect(fixture.publisher.getSnapshot().publishFaults).toBe(0);
+    expect(warnsMatching("Ops publish job failed")).toBe(0);
+    // The drift is still REPORTED — once for the process, not once per call.
+    expect(warnsMatching("carried no string tool_name")).toBe(1);
+  });
+
+  it("a non-string tool_name is drift too — the guard is a type test, not a presence test", async () => {
+    const harness = buildClaudeLaneHarness();
+    for (let i = 0; i < 3; i += 1) {
+      await expect(harness.fireFailure({ ...FAILURE_INPUT, tool_name: { name: "Bash" } })).resolves.toEqual({});
+      // The success half is benign either way: an object `tool_name` composes a
+      // family key naming "[object Object]", which no open condition matches.
+      await expect(harness.fireSuccess({ ...SUCCESS_INPUT, tool_name: 42 })).resolves.toEqual({});
+    }
+    await fixture.drain();
+    expect(fixture.events()).toHaveLength(0);
+    expect(fixture.publisher.getSnapshot().publishFaults).toBe(0);
+    // THE able-to-fail assertion for this shape. Unguarded, an object
+    // `tool_name` survives the subject-id bounds (`.length` is `undefined`, so
+    // neither comparison fires) and is caught one step later by the detail
+    // schema — so it spends `rejected`, D9's mis-integrated-PRODUCER signal, on
+    // SDK drift, and warns once per tool call while doing it.
+    expect(fixture.publisher.getSnapshot().rejected).toBe(0);
+    expect(warnsMatching("Ops publish rejected")).toBe(0);
+  });
+
+  it("a well-formed payload is unaffected, and `error` needs no guard of its own", async () => {
+    const harness = buildClaudeLaneHarness();
+    // `classifyToolError` is documented TOTAL for a non-string message
+    // (`classifierText`), so drift in `error` costs the TOKEN and not the
+    // failure record — the guard deliberately does not test it.
+    await expect(harness.fireFailure({ ...FAILURE_INPUT, error: undefined })).resolves.toEqual({});
+    await fixture.drain();
+    expect(failures()).toHaveLength(1);
+    expect(failures()[0]!.detail.errorSig).toBe("unclassified");
+    expect(failures()[0]!.subject.id).toBe(FAILURE_INPUT.tool_name);
+    expect(warnsMatching("carried no string tool_name")).toBe(0);
+  });
+
+  it("the recovery half still closes a condition when the payload is well-formed", async () => {
+    const harness = buildClaudeLaneHarness();
+    await harness.fireFailure(FAILURE_INPUT);
+    await fixture.drain();
+    expect(failures()).toHaveLength(1);
+    await harness.fireSuccess(SUCCESS_INPUT);
+    await fixture.drain();
+    expect(recoveries()).toHaveLength(1);
   });
 });
 

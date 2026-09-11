@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
+import { ObjectId } from "mongodb";
 import { evaluateMatches, matchesFilter } from "./match.js";
+import { OPS_ID_MAX_LENGTH } from "./ids.js";
 import type { OpsFilter, OpsSubscription } from "./types.js";
 
 const EVENT = {
@@ -87,5 +89,80 @@ describe("the D5 filter grammar (KPR-454 AC5, C7)", () => {
   it("zero matches returns [] and is not an error", () => {
     expect(evaluateMatches(EVENT, [])).toEqual([]);
     expect(evaluateMatches(EVENT, [sub("x", { producer: ["florist"] })])).toEqual([]);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// The row-admissibility gate. `ops_subscriptions` is operator-writable and
+// `loadSubscriptions()` applies no shape check, so `OpsSubscription` is a
+// compile-time claim about a runtime document. The rule these cases pin is the
+// one chunk 3 states for `loadReasons`: one malformed operator row must cost
+// THAT ROW, never the producer.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("a malformed subscription row is skipped, never fatal (the container guard)", () => {
+  // Each of these four was independently broken before the guard: the first
+  // two THREW out of the "pure" evaluator (`filter.producer` on
+  // undefined/null), and the last two matched EVERYTHING — every
+  // `filter.<key>` read on a string or an array is `undefined`, so `term()`
+  // answered true six times and the row was fail-OPEN, inverting the posture
+  // `term()`'s own comment claims.
+  const MALFORMED: ReadonlyArray<readonly [string, unknown]> = [
+    ["filter missing", undefined],
+    ["filter null", null],
+    ["filter a string (was fail-OPEN: matched every event)", "producer"],
+    ["filter an array (was fail-OPEN)", [{ producer: ["hive-runtime"] }]],
+  ];
+
+  it.each(MALFORMED)("%s: the row matches nothing and evaluateMatches still answers", (_label, filter) => {
+    const bad = { ...sub("bad", {}), filter } as unknown as OpsSubscription;
+    expect(evaluateMatches(EVENT, [bad])).toEqual([]);
+  });
+
+  it.each(MALFORMED)("%s: a legitimate sibling row still matches — the producer survives", (_label, filter) => {
+    const bad = { ...sub("bad", {}), filter } as unknown as OpsSubscription;
+    // Both orders: the malformed row must not shadow a good row behind it, and
+    // must not be able to abort the loop before one ahead of it is reached.
+    expect(evaluateMatches(EVENT, [bad, sub("good", { producer: ["hive-runtime"] })])).toEqual(["good"]);
+    expect(evaluateMatches(EVENT, [sub("good", { producer: ["hive-runtime"] }), bad])).toEqual(["good"]);
+  });
+
+  it("an object the grammar recognizes nothing in still matches — {} is the legal match-all row", () => {
+    expect(evaluateMatches(EVENT, [sub("all", {})])).toEqual(["all"]);
+    expect(
+      evaluateMatches(EVENT, [{ ...sub("weird", {}), filter: { $or: [] } } as unknown as OpsSubscription]),
+    ).toEqual(["weird"]);
+  });
+});
+
+describe("a subscription _id is bounded before it is stored (C2)", () => {
+  const idOf = (value: unknown) => ({ ...sub("placeholder", {}), _id: value }) as unknown as OpsSubscription;
+
+  it("a maximum-length _id matches — the bound is not off by one", () => {
+    const id = "s".repeat(OPS_ID_MAX_LENGTH);
+    expect(evaluateMatches(EVENT, [idOf(id)])).toEqual([id]);
+  });
+
+  it.each([
+    ["one over the bound", "s".repeat(OPS_ID_MAX_LENGTH + 1)],
+    ["grossly over the bound", "s".repeat(100_000)],
+    ["empty", ""],
+  ])("%s: skipped from the match list, never truncated", (_label, id) => {
+    const matched = evaluateMatches(EVENT, [idOf(id)]);
+    expect(matched).toEqual([]);
+    // The "never truncated" half, stated as an assertion rather than as prose:
+    // no prefix of the over-bound id appears anywhere in the answer.
+    expect(matched.join("")).not.toContain("s");
+  });
+
+  it("a real auto-minted ObjectId _id is skipped — matchedSubscriptionIds is string[] and must not lie", () => {
+    const oid = new ObjectId();
+    const matched = evaluateMatches(EVENT, [idOf(oid)]);
+    expect(matched).toEqual([]);
+    expect(JSON.stringify(matched)).not.toContain(oid.toHexString());
+  });
+
+  it("an inadmissible _id does not suppress a good sibling", () => {
+    expect(evaluateMatches(EVENT, [idOf("s".repeat(OPS_ID_MAX_LENGTH + 1)), sub("good", {})])).toEqual(["good"]);
   });
 });

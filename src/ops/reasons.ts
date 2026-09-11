@@ -1,6 +1,12 @@
 import { z } from "zod";
 import type { DetailKeySpec, OpsReason } from "./types.js";
-import { OPS_DETAIL_STRING_MAX, OPS_REMEDIATION_MAX, OPS_TOKEN_RE } from "./ids.js";
+import {
+  OPS_DETAIL_STRING_MAX,
+  OPS_LOG_ANOMALY_VALUE_MAX,
+  OPS_REMEDIATION_MAX,
+  OPS_TOKEN_RE,
+  clipForLog,
+} from "./ids.js";
 
 /** D1: the engine itself, reporting what it observed. A bounded token, never an enum member. */
 export const HIVE_RUNTIME_PRODUCER = "hive-runtime";
@@ -92,21 +98,60 @@ const DETAIL_KEY_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
  * publishing). All three already fail CLOSED, so this is strictly diagnostic:
  * it separates "this row declares something the engine narrows" from "the
  * producer is mis-integrated", which the bare `rejected` counter cannot.
+ *
+ * ⚠ EVERY INTERPOLATED VALUE IS CLIPPED, AT THE SOURCE (C13). All of them —
+ * `row.producer`, `row.reasonId`, `spec.key`, `spec.type`, and `spec.maxLength`
+ * on the clamp arm — come from an `ops_reasons` document this engine did not
+ * author, and NOTHING on the load path validates them (deliberately: D5 loads
+ * whatever the collection holds). `loadReasons` writes these strings into the
+ * boot log up to `REASON_ROW_ANOMALY_LOG_MAX` times per row, and row count is
+ * unbounded, so bounding the COUNT of those lines (round 2) while leaving their
+ * WIDTH open still let one hand-edited collection write arbitrary megabytes to
+ * the log on every boot. The internal inconsistency that named it: the tally
+ * line two statements later in `loadReasons` is annotated "C13: ... No anomaly
+ * text." and clips `row._id`, while the five lines above it printed unbounded
+ * foreign text.
+ *
+ * ⚠ AND CLIPPING HERE COSTS `assertReasonTableLegal`'s THROWS NOTHING — the
+ * tension an earlier round escalated rather than resolved. Both clipped values
+ * have code-declared legal maxima well under the bound: `DETAIL_KEY_NAME_RE`
+ * admits at most 64 characters, and `type` is one of three literals (<= 7). So
+ * for every input where the throw's actionability matters the value is already
+ * legal and `OPS_LOG_ANOMALY_VALUE_MAX` (80) never fires; where it DOES fire the
+ * name is by definition illegal and the message already says so ("key NAME
+ * fails /^[A-Za-z].../"), and its first 80 characters identify it completely.
+ * No input costs a developer anything.
  */
 export function auditReasonRow(row: OpsReason): string[] {
   const anomalies: string[] = [];
   for (const spec of row.detailKeys) {
-    const id = `${row.producer}:${row.reasonId} key ${JSON.stringify(spec.key)}`;
+    // Clipped BEFORE `JSON.stringify`, not after: stringifying first would
+    // materialise the whole foreign value as a new string only to throw it
+    // away, and `clipForLog` is `String()`-total for the non-string a
+    // hand-edited row can put here. `JSON.stringify` still runs — it is doing
+    // the QUOTING/ESCAPING, so a key bearing a newline or a quote cannot
+    // reshape the log line.
+    const keyText = JSON.stringify(clipForLog(spec.key, OPS_LOG_ANOMALY_VALUE_MAX));
+    const id = `${clipForLog(row.producer)}:${clipForLog(row.reasonId)} key ${keyText}`;
     if (!DETAIL_KEY_NAME_RE.test(spec.key)) {
       anomalies.push(`${id}: key NAME fails ${String(DETAIL_KEY_NAME_RE)}`);
     }
     if (spec.type !== "string" && spec.type !== "number" && spec.type !== "boolean") {
       // compileDetailSchema's if/else chain has no default arm, so a foreign
       // "date" or a typo'd "String" silently compiles to z.boolean().
-      anomalies.push(`${id}: unrecognized type ${JSON.stringify(spec.type)} — compiled as boolean`);
+      anomalies.push(
+        `${id}: unrecognized type ${JSON.stringify(clipForLog(spec.type, OPS_LOG_ANOMALY_VALUE_MAX))} — compiled as boolean`,
+      );
     }
     if (spec.type === "string" && spec.maxLength !== undefined && spec.maxLength > OPS_DETAIL_STRING_MAX) {
-      anomalies.push(`${id}: declares maxLength ${spec.maxLength}, clamped to ${OPS_DETAIL_STRING_MAX}`);
+      // `maxLength` is typed `number` and is not one either: a digit-string
+      // from a hand-edited row passes the `>` comparison by numeric coercion
+      // (a long one coerces to Infinity), so this arm is reachable carrying an
+      // arbitrarily wide value.
+      anomalies.push(
+        `${id}: declares maxLength ${clipForLog(spec.maxLength, OPS_LOG_ANOMALY_VALUE_MAX)}, ` +
+          `clamped to ${OPS_DETAIL_STRING_MAX}`,
+      );
     }
   }
   return anomalies;

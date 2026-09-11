@@ -43,7 +43,16 @@
 /** D2: producer / reasonId / subject.kind / evidence[].kind. */
 export const OPS_TOKEN_RE = /^[a-z][a-z0-9-]{0,39}$/;
 
-/** D4: subject.id and evidence[].id. Generous against the real population (`mcp__<server>__<tool>`). */
+/**
+ * D4: subject.id and evidence[].id. Generous against the real population
+ * (`mcp__<server>__<tool>`).
+ *
+ * ⚠ ALSO the bound on a subscription row's `_id` in `evaluateMatches`
+ * (match.ts) — by ADJACENCY, not derivation, and with the OTHER breach
+ * behaviour: there a breach SKIPS the row from the match list rather than
+ * rejecting the publish, because a malformed subscription row must not be able
+ * to suppress a real failure record. Either use may move without the other.
+ */
 export const OPS_ID_MAX_LENGTH = 200;
 
 /** D2: at most 4 references per event. This producer never emits more than one. */
@@ -105,7 +114,7 @@ export const ADMISSIBLE_ID_RE = /^[A-Za-z0-9_.:#+@-]{1,200}$/;
  * is STORED (and reject or omit on breach), this one only shortens what is
  * PRINTED and never changes a decision.
  *
- * It exists because two of the THREE places that name such a value are reached
+ * It exists because two of the FOUR places that name such a value are reached
  * PRECISELY when it failed its own bound — the accept path's `bad-token` /
  * `bad-subject-kind` rejections (publisher.ts), and the registry loader's
  * unusable-row skip and per-row anomaly tally (store.ts) — so logging them raw
@@ -117,8 +126,37 @@ export const ADMISSIBLE_ID_RE = /^[A-Za-z0-9_.:#+@-]{1,200}$/;
  * same reason. 64 is long enough to identify a legitimate token (the token
  * bound is 40) and short enough that a megabyte of foreign input costs one log
  * line of it.
+ *
+ * ⚠ THE FOURTH, added late and formerly MISSED BY THIS ENUMERATION: the
+ * anomaly TEXT `auditReasonRow` composes (reasons.ts), which `loadReasons`
+ * writes into the boot log up to `REASON_ROW_ANOMALY_LOG_MAX` times per row.
+ * Round 2 bounded the COUNT of those lines and left their WIDTH open, and the
+ * enumeration above asserted a coverage the code lacked — a row's `producer`
+ * and `reasonId` are clipped at this bound there, and its `key` / `type` /
+ * `maxLength` at `OPS_LOG_ANOMALY_VALUE_MAX` below.
  */
 export const OPS_LOG_VALUE_MAX = 64;
+
+/**
+ * C13: the same log group as `OPS_LOG_VALUE_MAX`, at a SECOND bound, because
+ * the value it governs has a second legal maximum.
+ *
+ * `auditReasonRow` names a `detailKeys` entry's `key` and `type`, both from a
+ * document this engine did not author and neither validated on the load path.
+ * Their CODE-DECLARED legal maxima are `DETAIL_KEY_NAME_RE`'s 64 characters
+ * (reasons.ts) and the three literals `"string" | "number" | "boolean"` — so a
+ * bound ABOVE 64 never fires on a legal value, which is what makes clipping at
+ * the SOURCE lossless for `assertReasonTableLegal`'s developer-facing throws
+ * too: where the clip fires, the name is by definition illegal and the message
+ * already says so (`key NAME fails /^[A-Za-z].../`), and its first 80
+ * characters identify it completely.
+ *
+ * 80 rather than `OPS_LOG_VALUE_MAX`: 64 is sized against `OPS_TOKEN_RE`'s 40
+ * and would fire at EXACTLY the key-name bound, an adjacency that would start
+ * silently clipping legal names the day `DETAIL_KEY_NAME_RE` widened. The
+ * headroom states the relationship instead of coinciding with it.
+ */
+export const OPS_LOG_ANOMALY_VALUE_MAX = 80;
 
 export function isOpsToken(value: string): boolean {
   return OPS_TOKEN_RE.test(value);
@@ -129,10 +167,14 @@ export function isOpsToken(value: string): boolean {
  * accept/load path, where the value is typed `string` but arrives from a
  * document this engine did not author, so a non-string must shorten to a
  * marker rather than throw out of a log statement.
+ *
+ * `max` is a parameter rather than a second function because there is one clip
+ * PREDICATE and two bounds (see `OPS_LOG_ANOMALY_VALUE_MAX`); a second copy of
+ * three lines is how the two drift.
  */
-export function clipForLog(value: unknown): string {
+export function clipForLog(value: unknown, max: number = OPS_LOG_VALUE_MAX): string {
   const text = typeof value === "string" ? value : String(value);
-  return text.length > OPS_LOG_VALUE_MAX ? `${text.slice(0, OPS_LOG_VALUE_MAX)}…` : text;
+  return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 /**

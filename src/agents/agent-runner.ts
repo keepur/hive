@@ -350,6 +350,38 @@ function warnIfToolSearchForceDisabled(): void {
   );
 }
 
+/**
+ * KPR-454: the SDK tool-hook payload did not carry a string `tool_name`, so the
+ * ops capture point skipped this observation. WARNED ONCE PER PROCESS, and the
+ * latch is the point rather than tidiness: the condition is a property of the
+ * resolved CLI, so it holds for EVERY tool call of every turn for the life of
+ * the process, and a line per call is the same flood the observation's own
+ * guard exists to prevent (OpsPublisher's `overflowWarned`,
+ * `warnedToolSearchForceDisabled` above — the standing idiom). One line still
+ * has to exist: without it the whole producer goes silent fleet-wide on an SDK
+ * bump with nothing in the log saying so.
+ *
+ * Returns `{}` so the two hook callbacks can `return warnDrifted...(...)` in one
+ * statement and keep C15's "both matchers return an empty object" visibly
+ * true on this arm too.
+ */
+let warnedDriftedToolHookPayload = false;
+export function __resetToolHookPayloadWarnForTests(): void {
+  warnedDriftedToolHookPayload = false;
+}
+function warnDriftedToolHookPayload(event: "PostToolUseFailure" | "PostToolUse"): Record<string, never> {
+  if (!warnedDriftedToolHookPayload) {
+    warnedDriftedToolHookPayload = true;
+    log.warn(
+      "SDK tool hook payload carried no string tool_name — ops tool-failure observation skipped for this and every " +
+        "further such payload this process (KPR-454). The SDK floats ^0.3.258; a renamed or absent field is the drift " +
+        "signature.",
+      { event },
+    );
+  }
+  return {};
+}
+
 /** KPR-346: optional per-spawn runner options (currently Lane A only). */
 export interface AgentRunnerOptions {
   /** Set by AgentManager.createProviderAdapter for Lane A routes
@@ -1998,6 +2030,29 @@ export class AgentRunner {
         // detector for.
         if (this.wasAborted) return {};
         const failure = input as PostToolUseFailureHookInput;
+        // Rule 1b: THE SDK-SHAPE GUARD, and it is not belt-and-braces — these
+        // are the only reads in this diff that sit OUTSIDE
+        // `observeToolFailure`'s containment, because they are in its ARGUMENT
+        // LIST. `error-tokens.ts` was deliberately hardened for SDK drift above
+        // the lockfile (`^0.3.258`, so deployed instances resolve higher); the
+        // hook bodies were not. Unguarded, an absent or renamed `tool_name`
+        // sends `undefined` into `subject.id`, where accept step 2's
+        // `.length` throws — contained, but as a publishFault AND ONE
+        // `log.warn` PER TOOL CALL, the flood in exactly the drift scenario the
+        // classifier was hardened against. And a non-object `input` makes
+        // `failure.tool_name` itself throw, out of the callback into the SDK —
+        // the one throw in this diff that nothing contains.
+        //
+        // `failure?.tool_name` covers both: optional chaining answers
+        // `undefined` for a null/undefined/primitive `input`, so the one test
+        // is total and no separate `typeof input` branch is needed.
+        //
+        // ONLY `tool_name` is tested. `error` needs no guard — `classifyToolError`
+        // is documented TOTAL for a non-string message, by way of
+        // `classifierText`, precisely so drift there costs the token and not the
+        // failure record. `duration_ms`/`is_interrupt` read off any object yield
+        // `undefined`, which both destinations already accept as absent.
+        if (typeof failure?.tool_name !== "string") return warnDriftedToolHookPayload("PostToolUseFailure");
         // Rule 2: identity is read AT FIRE TIME, never captured at build
         // time — this.workItemContextRef.current is KPR-453's live reference
         // and this.agentConfig.id is the stable slug (never the display
@@ -2030,7 +2085,14 @@ export class AgentRunner {
     hooks.PostToolUse = [{
       hooks: [async (input: HookInput) => {
         if (this.wasAborted) return {};
-        observeToolSuccess({ tool: (input as PostToolUseHookInput).tool_name, lane: "claude" });
+        // The same SDK-shape guard, same reason — see the failure hook above.
+        // A non-object `input` would throw out of this callback into the SDK;
+        // an absent `tool_name` would compose a `familyOf` key naming the
+        // literal "undefined", which no open condition can ever match, so the
+        // recovery half would go quietly dead.
+        const success = input as PostToolUseHookInput;
+        if (typeof success?.tool_name !== "string") return warnDriftedToolHookPayload("PostToolUse");
+        observeToolSuccess({ tool: success.tool_name, lane: "claude" });
         return {};
       }],
     }];

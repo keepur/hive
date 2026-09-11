@@ -1,3 +1,4 @@
+import { OPS_ID_MAX_LENGTH } from "./ids.js";
 import type { OpsEvent, OpsFilter, OpsSubscription } from "./types.js";
 
 /**
@@ -27,6 +28,17 @@ export function matchesFilter(
   // satisfied, and yields no match: fail-closed on SELECTION (nobody is
   // notified) rather than fail-open or fail-loud. Unknown keys (`$or` and
   // friends) are simply not read — ignored, never interpreted (C7).
+  //
+  // ⚠ THE TERM VALUES ARE GUARDED HERE; THE CONTAINER IS GUARDED IN
+  // `evaluateMatches`, and it has to be — the two failures are not the same
+  // failure. A missing or `null` `filter` makes `filter.producer` THROW before
+  // `term()` is ever called, and a STRING `filter` makes every
+  // `filter.<key>` read `undefined`, so `term()` returns true six times and
+  // the malformed row matches EVERYTHING — fail-OPEN, the exact inversion of
+  // the posture this comment claims. Both are container shapes, not term
+  // shapes, so the ONE guard for them sits at the row-admissibility gate in
+  // `evaluateMatches` (a second predicate here would be the drift this file's
+  // one-evaluator discipline forbids).
   const term = <T extends string>(values: readonly T[] | undefined, actual: string): boolean => {
     if (values === undefined) return true;
     if (!Array.isArray(values)) return false;
@@ -46,6 +58,20 @@ export function matchesFilter(
  * its length. Zero is a stored, queryable FACT and never a failure (C2/C3):
  * this function has no fallback, no catch-all and no default subscription,
  * and none may be added.
+ *
+ * ⚠ THE ROW-ADMISSIBILITY GATE, and it is load-bearing. `OpsSubscription` is a
+ * compile-time claim about a document `loadSubscriptions()` read out of
+ * `ops_subscriptions` with no shape check (store.ts — a bare
+ * `find({enabled:true})`, by design: validating there would let one operator
+ * row disable the reload). Everything below therefore treats a row as
+ * UNTRUSTED and SKIPS one it cannot evaluate — the same rule chunk 3 states for
+ * `loadReasons`: one malformed operator row must cost THAT ROW, never the
+ * producer.
+ *
+ * A per-row try/catch would contain the throw but still cost a log line per
+ * EVENT; skipping costs nothing and is the honest answer, because a row that
+ * cannot be evaluated cannot have been satisfied and a row that cannot be
+ * NAMED cannot be delivered to.
  */
 export function evaluateMatches(
   event: Parameters<typeof matchesFilter>[0],
@@ -54,6 +80,55 @@ export function evaluateMatches(
   const matched: string[] = [];
   for (const sub of subscriptions) {
     if (!sub.enabled) continue;
+    // THE CONTAINER GUARD. Without it a row whose `filter` is missing or
+    // `null` makes `matchesFilter`'s first read throw — out of the "pure"
+    // evaluator, out of `accept()` (which has no try of its own), out of
+    // `runJob`, and into the drainer's catch, where it is counted as a
+    // publishFault and warned. Every event, for as long as the row exists:
+    // accept step 8 never runs, so NO ops_events document is written for ANY
+    // event, no open-condition entry is created so no recovery is ever
+    // enqueued either, and the 60 s reload keeps re-loading the row, so it
+    // survives reloads, SIGUSR1 and restarts. Plus one warn line per tool
+    // failure AND per recovery — the flood the `overflowWarned` latch exists
+    // to prevent, on a path that has no latch. One row, the whole producer.
+    //
+    // Fail-CLOSED on selection, matching `term()`'s stated posture: a string
+    // `filter` is skipped rather than (as it was) matching every event. The
+    // guard is a PLAIN-OBJECT test, not a `!== null` test —
+    // `typeof null === "object"` and `typeof [] === "object"` both pass a
+    // naive one.
+    //
+    // An object carrying no recognized key still matches everything. That is
+    // NOT a hole: `filter: {}` is the legal match-all row, so "an object the
+    // grammar recognizes nothing in" is by design, not by accident.
+    if (!sub.filter || typeof sub.filter !== "object" || Array.isArray(sub.filter)) continue;
+    // THE ID BOUND (C2). `_id` is written VERBATIM into
+    // `matchedSubscriptionIds` on every matching stored event, and accept
+    // step 2 bounds subject/evidence/detail only — so an `ObjectId` or a
+    // 100 KB string `_id` from a hand-written row rides into every document
+    // this producer stores, forever. Bounded like `clears` is: rejected,
+    // never truncated, since a truncated id names a different subscriber.
+    //
+    // SKIPPED FROM THE MATCH LIST rather than rejecting the publish, decided
+    // explicitly. Rejecting would let one malformed SUBSCRIPTION row suppress
+    // a real FAILURE record — precisely the "one row kills the producer"
+    // posture the container guard above exists to close — and it would spend
+    // `rejected`, D9's mis-integrated-PRODUCER signal, on an operator's typo
+    // in a different collection. Skipping loses only a delivery that could
+    // not have been addressed anyway.
+    //
+    // ⚠ CONSEQUENCE, stated rather than softened: a row whose `_id` was
+    // auto-minted as an `ObjectId` (i.e. inserted without an explicit string
+    // `_id`) is silently never matched. `OpsSubscription._id: string` is the
+    // contract — a subscription id is an operator-authored slug, and storing
+    // an ObjectId into `matchedSubscriptionIds: string[]` would make the
+    // stored document lie about its own type. A registration path (KPR-468)
+    // must mint the slug.
+    //
+    // `OPS_ID_MAX_LENGTH` by ADJACENCY, not derivation: 200 is generous for a
+    // slug and the two may move independently. This is the omit-on-breach
+    // group (ids.ts), not the reject-and-count group.
+    if (typeof sub._id !== "string" || sub._id.length < 1 || sub._id.length > OPS_ID_MAX_LENGTH) continue;
     if (matchesFilter(event, sub.filter)) matched.push(sub._id);
   }
   return matched;
