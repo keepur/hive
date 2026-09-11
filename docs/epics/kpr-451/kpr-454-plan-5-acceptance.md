@@ -160,7 +160,7 @@ it("stamps class and retry from the registry row, and the observe API cannot sup
 it("carries clears/clearsFamily on a tool-recovered and neither on a tool-failed", () => { /* … */ });
 
 it("pins evidence CONTENTS, not merely its presence (D6)", () => {
-  // [{kind:"workItem", id}] on a failure carrying a work item;
+  // [{kind:"work-item", id}] on a failure carrying a work item;
   // [] on a failure without one;
   // [] on every tool-recovered.
   // `evidence` is ALWAYS present — [] is written, never omitted — so this
@@ -335,7 +335,7 @@ describe("AC3 (C5) — the ADMIT path, on the same footing", () => {
     const doc = await db.collection("ops_events").findOne({});
     if (admissible) {
       expect(doc!.detail.workItemId).toBe(id);
-      expect(doc!.evidence).toEqual([{ kind: "workItem", id }]);
+      expect(doc!.evidence).toEqual([{ kind: "work-item", id }]);
     } else {
       expect(doc!.detail).not.toHaveProperty("workItemId");
       expect(doc!.evidence).toEqual([]);
