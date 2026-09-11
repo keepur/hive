@@ -13,7 +13,7 @@ import {
 import type { BridgeFailureClass } from "./error-map.js";
 import { BridgeError, HiveLLM, type HiveLLMStream } from "./hive-llm.js";
 import { applyInterruptionMarker } from "./interruption-marker.js";
-import { SpeechTrace } from "./speech-trace.js";
+import { SpeechTrace, type SpeechHandle } from "./speech-trace.js";
 
 beforeAll(() => {
   initializeLogger({ pretty: false, level: "silent" });
@@ -139,6 +139,19 @@ function expectBridge(bridge: BridgeError | undefined, failureClass: BridgeFailu
   expect(bridge).toBeInstanceOf(BridgeError);
   expect(bridge!.failureClass).toBe(failureClass);
   if (bytesReceived !== undefined) expect(bridge!.bytesReceived).toBe(bytesReceived);
+}
+
+function unsettledSpeechHandle(id: string): SpeechHandle {
+  const callbacks = new Set<(handle: SpeechHandle) => void>();
+  const handle = {
+    id,
+    interrupted: false,
+    chatItems: [],
+    addDoneCallback: (callback: (settled: SpeechHandle) => void) => callbacks.add(callback),
+    removeDoneCallback: (callback: (settled: SpeechHandle) => void) => callbacks.delete(callback),
+    exception: () => null,
+  };
+  return handle as unknown as SpeechHandle;
 }
 
 const openServers: Server[] = [];
@@ -327,6 +340,73 @@ describe("HiveLLM (KPR-322)", () => {
         outcome: "failed",
         cause: "call_closed",
         errorClass: "engine_auth",
+      }),
+    ]);
+  });
+
+  it("refines a partial held-open failure body before abort and trace terminalization", async () => {
+    const bodyWritten = gate();
+    const closed = gate();
+    const stub = await listen((req, res) => {
+      req.resume();
+      res.once("close", () => closed.resolve());
+      res.writeHead(503, { "Content-Type": "text/plain" });
+      res.write("Voice temporarily unavailable", () => bodyWritten.resolve());
+      // Deliberately leave the response open after the distinguishing body chunk.
+    });
+    openServers.push(stub.server);
+
+    const callAbort = new AbortController();
+    const { trace, rows } = traceHarness();
+    const speech = unsettledSpeechHandle("speech-partial-503");
+    trace.speechCreated(speech, "sdk_response", 1);
+    const hive = makeHive(stub.url, trace, callAbort.signal);
+    const ownFailure = vi.spyOn(hive, "ownFailure");
+    const emittedFailures: Error[] = [];
+    hive.on("error", (event) => emittedFailures.push(event.error));
+    const stream = hive.chat({ chatCtx: userCtx("hello") });
+    trace.bindBridge(stream.traceContext.turnId, speech.id);
+    const consuming = (async () => {
+      const chunks: llm.ChatChunk[] = [];
+      let thrown: unknown;
+      try {
+        for await (const chunk of stream) chunks.push(chunk);
+      } catch (error) {
+        thrown = error;
+      }
+      return { chunks, thrown };
+    })();
+
+    await bodyWritten.promise;
+    await until(() => ownFailure.mock.calls.length === 1, "owned status failure");
+    const originalFailure = ownFailure.mock.calls[0]![0];
+    await until(() => originalFailure.failureClass === "budget_saturated", "body-based failure refinement");
+
+    callAbort.abort();
+    trace.close("call_closed");
+    await closed.promise;
+    const result = await consuming;
+
+    expect(result.chunks).toEqual([]);
+    expect(result.thrown).toBeUndefined();
+    expect(emittedFailures).toEqual([originalFailure]);
+    expect(originalFailure.failureClass).toBe("budget_saturated");
+    expect(terminalRows(rows)).toEqual([
+      expect.objectContaining({
+        turnId: originalFailure.turnId,
+        speechId: speech.id,
+        status: 503,
+        outcome: "failed",
+        cause: "call_closed",
+        errorClass: "budget_saturated",
+      }),
+    ]);
+    expect(rows.filter((row) => row.event === "speech_terminal")).toEqual([
+      expect.objectContaining({
+        speechId: speech.id,
+        outcome: "failed",
+        cause: "call_closed",
+        errorClass: "budget_saturated",
       }),
     ]);
   });

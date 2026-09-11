@@ -30,12 +30,13 @@ const log = createLogger("hive-llm");
 const MAX_FAILURE_BODY_BYTES = 800;
 const MAX_FAILURE_SNIPPET_CHARS = 200;
 
-async function readFailureSnippet(res: Response): Promise<string> {
-  if (!res.body) return "";
+async function readFailureSnippet(res: Response, observe: (snippet: string) => void): Promise<void> {
+  if (!res.body) return;
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let byteCount = 0;
   let snippet = "";
+  const observeBounded = () => observe(snippet.slice(0, MAX_FAILURE_SNIPPET_CHARS));
   try {
     while (byteCount < MAX_FAILURE_BODY_BYTES && snippet.length < MAX_FAILURE_SNIPPET_CHARS) {
       const { done, value } = await reader.read();
@@ -44,8 +45,13 @@ async function readFailureSnippet(res: Response): Promise<string> {
       const bounded = value.subarray(0, remaining);
       byteCount += bounded.byteLength;
       snippet += decoder.decode(bounded, { stream: byteCount < MAX_FAILURE_BODY_BYTES });
+      // Refine before the next read can block. A call abort/trace close may
+      // happen while that read is pending, and must see the same class as the
+      // exact BridgeError that already owns this status failure.
+      observeBounded();
     }
     snippet += decoder.decode();
+    observeBounded();
   } catch {
     // Headers/status already own the failure; body diagnostics are optional.
   } finally {
@@ -60,7 +66,6 @@ async function readFailureSnippet(res: Response): Promise<string> {
       // A failed release is cleanup-only.
     }
   }
-  return snippet.slice(0, MAX_FAILURE_SNIPPET_CHARS);
 }
 
 const bridgeErrorFailureClasses = new WeakMap<BridgeError, BridgeFailureClass>();
@@ -292,10 +297,13 @@ export class HiveLLMStream extends llm.LLMStream {
         this.attempt.fail(observedFailure.failureClass);
         this.parent.ownFailure(observedFailure);
         if (!res.ok) {
-          const snippet = await readFailureSnippet(res);
-          const refinedClass = classifyHttpFailure(res.status, snippet);
-          refineFailureClass(observedFailure, refinedClass);
-          this.attempt.refineFailure(refinedClass);
+          const failure = observedFailure;
+          await readFailureSnippet(res, (snippet) => {
+            const refinedClass = classifyHttpFailure(res.status, snippet);
+            if (refinedClass === failure.failureClass) return;
+            refineFailureClass(failure, refinedClass);
+            this.attempt.refineFailure(refinedClass);
+          });
         }
         throw observedFailure;
       }
