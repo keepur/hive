@@ -77,10 +77,21 @@ describe("one reserved-prefix predicate (KPR-454 AC4, C6)", () => {
     //
     // The second `it` below pins the same literal by substring; this pins it
     // through THIS test's own regex, which is the thing that can rot.
+    //
+    // ⚠ SORTED, and the expected list is kept in sorted order too. `hits` is
+    // accumulated in `globSync` order, which is not a documented-stable
+    // ordering across platforms or tinyglobby versions — harmless while there
+    // is one element, a flake the day a second legitimate allowlisted hit
+    // lands. `sort()` makes the comparison depend on the SET, which is what
+    // this pins.
     expect(files.length, "the source glob stopped reaching the tree").toBeGreaterThan(100);
-    expect(hits, "the reserved-prefix regex no longer matches its one known real occurrence").toEqual([
-      'src/agents/provider-adapters/sse.ts: startsWith("event:")',
-    ]);
+    expect(
+      hits.sort(),
+      "the pre-allowlist hit set changed: either the reserved-prefix regex no longer matches its one known real " +
+        "occurrence (this test guards nothing — fix the regex), or a NEW hit appeared. If the new hit is a real " +
+        "second predicate it also shows in `offenders` above; if it is an allowlisted one (e.g. outage-notices.ts's " +
+        "own predicate rewritten with a literal startsWith) add it to the expected list here with its reason.",
+    ).toEqual(['src/agents/provider-adapters/sse.ts: startsWith("event:")']);
   });
 
   it("every allowlist entry still corresponds to a real occurrence (no stale entries)", () => {

@@ -216,6 +216,101 @@ describe("OpsPublisher boot and registry", () => {
     expect(events()[0]!.producer).toBe(HIVE_RUNTIME_PRODUCER);
   });
 
+  it("skips a STRING detailKeys — the one malformed shape `for…of` does not throw on", async () => {
+    // `detailKeys: "tool"` is the plausible operator/plugin typo, and a string
+    // is ITERABLE: without the explicit `Array.isArray` test neither
+    // `auditReasonRow` nor `compileDetailSchema` throws, so the row LOADS with
+    // a garbage schema while `auditReasonRow` yields one anomaly per CHARACTER
+    // (`spec.key` is `undefined`, which DETAIL_KEY_NAME_RE accepts as the
+    // literal "undefined", so only the unrecognized-type arm fires) — four
+    // warn lines and four anomalies here, unbounded in general.
+    await fakeDb.collection(OPS_REASONS_COLLECTION).insertOne({
+      _id: "acme:stringly",
+      producer: "acme",
+      reasonId: "stringly",
+      class: "informational",
+      retry: "transient",
+      remediationTemplate: "fix the row",
+      detailKeys: "tool",
+      enabled: true,
+    });
+
+    await expect(publisher.init()).resolves.toBeUndefined();
+
+    // ONE anomaly for the row, on the unusable path — not one per character on
+    // the normalized path.
+    expect(publisher.getSnapshot().reasonRowAnomalies).toBe(1);
+    expect(publisher.getSnapshot().rejected).toBe(0);
+    expect(warnsMatching("ops reason row unusable")).toBe(1);
+    expect(warnsMatching("ops reason row normalized")).toBe(0);
+
+    // The row is absent from the map, so it fails closed at accept step 1…
+    publisher.enqueueFailure({
+      producer: "acme",
+      reasonId: "stringly",
+      waiting: "nobody",
+      subject: { kind: "widget", id: "w-1" },
+      detail: {},
+      evidence: [],
+    });
+    await publisher.__drainForTests();
+    expect(events()).toHaveLength(0);
+    expect(publisher.getSnapshot().rejected).toBe(1);
+
+    // …and the engine's own rows loaded past it.
+    driveFailure("Bash");
+    await publisher.__drainForTests();
+    expect(events()).toHaveLength(1);
+  });
+
+  it("bounds the per-row anomaly LOG without bounding the anomaly COUNT", async () => {
+    // `detailKeys` is operator-controlled and unbounded in length, so a single
+    // oversized row must not write a warn line per element into the boot log.
+    // 40 unrecognized-type keys ⇒ 40 anomalies counted, 5 logged, one tally
+    // line naming the remainder.
+    // `optional: true` only so the publish below can carry an empty `detail`;
+    // the unrecognized-type anomaly fires either way.
+    const detailKeys = Array.from({ length: 40 }, (_, i) => ({ key: `k${i}`, type: "date", optional: true }));
+    await fakeDb.collection(OPS_REASONS_COLLECTION).insertOne({
+      _id: "acme:verbose",
+      producer: "acme",
+      reasonId: "verbose",
+      class: "informational",
+      retry: "transient",
+      remediationTemplate: "trim the row",
+      detailKeys,
+      enabled: true,
+    });
+
+    await expect(publisher.init()).resolves.toBeUndefined();
+
+    // The counter stays truthful — it is the operator's signal.
+    expect(publisher.getSnapshot().reasonRowAnomalies).toBe(40);
+    expect(warnsMatching("ops reason row normalized — the row declares")).toBe(5);
+    expect(warnsMatching("further anomalies on this row not logged")).toBe(1);
+
+    // C13: the tally line carries the row's `_id` and two counts, no anomaly
+    // text and nothing from the row body.
+    const tally = mockLog.warn.mock.calls.find((c) => String(c[0]).includes("further anomalies on this row"))!;
+    expect(tally[1]).toMatchObject({ id: "acme:verbose", logged: 5, suppressed: 35 });
+    expect(JSON.stringify(tally[1])).not.toContain("trim the row");
+
+    // The row still LOADS — every normalization fails closed, so warn-and-count
+    // must never become refuse-the-row.
+    expect(publisher.getSnapshot().rejected).toBe(0);
+    publisher.enqueueFailure({
+      producer: "acme",
+      reasonId: "verbose",
+      waiting: "nobody",
+      subject: { kind: "widget", id: "w-1" },
+      detail: {},
+      evidence: [],
+    });
+    await publisher.__drainForTests();
+    expect(events()).toHaveLength(1);
+    expect(publisher.getSnapshot().rejected).toBe(0);
+  });
+
   it("log.errors once when the LOADED registry leaves an enabled class:resource reason unclearable", async () => {
     await publisher.init();
     // The healthy registry says nothing — the gate only speaks when breached.

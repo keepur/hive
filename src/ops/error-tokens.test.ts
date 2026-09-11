@@ -73,6 +73,50 @@ describe("classifyToolError (KPR-454 D6)", () => {
     expect(classifyToolError("z".repeat(100_000), { mcpErrorCode: -32001 })).toBe("timeout");
   });
 
+  it("stays TOTAL for a non-string message — classifies, never throws", () => {
+    // `message` is typed `string` and validated nowhere on the way here: the
+    // Claude lane arrives through an unchecked `input as
+    // PostToolUseFailureHookInput` on a repo whose SDK floats above the
+    // lockfile. A throw here would be contained by `observeToolFailure` into a
+    // warn and NO RECORDED FAILURE — a silent coverage hole in the producer
+    // that exists to close silent coverage holes — so the cap must not have
+    // introduced one. Each case asserts a TOKEN, not merely "did not throw".
+    const nonStrings: ReadonlyArray<[string, unknown, string]> = [
+      ["undefined", undefined, "unclassified"],
+      ["null", null, "unclassified"],
+      ["a number", 500, "unclassified"],
+      ["a plain object", {}, "unclassified"],
+      // Coercion is preserved rather than short-circuited to "", so an SDK that
+      // hands the Error instead of its `.message` still classifies off it —
+      // exactly what `pattern.test(message)` did before the cap existed.
+      ["an Error", new Error("ECONNREFUSED 127.0.0.1:27017"), "transport-unavailable"],
+      // The clamp runs AFTER coercion, so a long toString() cannot escape it.
+      [
+        "an object whose toString is past the cap",
+        { toString: () => `${"x".repeat(5000)} ECONNREFUSED 127.0.0.1:27017` },
+        "unclassified",
+      ],
+      // No primitive conversion at all: unclassifiable, still not a throw.
+      ["a null-prototype object", Object.create(null), "unclassified"],
+      [
+        "a throwing toString",
+        {
+          toString: () => {
+            throw new Error("nope");
+          },
+        },
+        "unclassified",
+      ],
+    ];
+    for (const [label, value, expected] of nonStrings) {
+      expect(() => classifyToolError(value as unknown as string), label).not.toThrow();
+      expect(classifyToolError(value as unknown as string), label).toBe(expected);
+    }
+    // The typed signals are read before the text is touched at all, so they
+    // survive a non-string message too.
+    expect(classifyToolError(undefined as unknown as string, { isInterrupt: true })).toBe("interrupted");
+  });
+
   it("returns a member of the closed nine-value set, so no input byte can ride out (C13)", () => {
     for (const input of [
       "auth failed for sk-ant-api03-DEADBEEF at /Users/mokie/.env",

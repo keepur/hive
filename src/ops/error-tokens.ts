@@ -100,10 +100,47 @@ const TEXT_RULES: ReadonlyArray<readonly [RegExp, ToolErrorToken]> = [
 const CLASSIFIER_TEXT_MAX = 4096;
 
 /**
- * TOTAL: every input returns exactly one member of TOOL_ERROR_TOKENS. The
- * message is read here and DISCARDED — no substring of it is ever returned,
- * which is what a test asserts against a credential-shaped and a path-shaped
- * input (AC6).
+ * The text the rules below actually run over: `message`, clamped to
+ * `CLASSIFIER_TEXT_MAX`.
+ *
+ * ⚠ TOTAL FOR A NON-STRING `message`, DELIBERATELY — the cap is the reason
+ * this helper exists rather than one inline expression. `message` is typed
+ * `string` but is not validated anywhere on the way here: the Claude lane
+ * reaches this through an unchecked `input as PostToolUseFailureHookInput`
+ * (agent-runner.ts), on a repo whose SDK floats above the lockfile
+ * (`^0.3.258`). Before the cap the only touch was `pattern.test(message)`,
+ * which COERCES, so a runtime `undefined` classified `unclassified` and the
+ * failure was still recorded; a bare `message.length` would instead throw
+ * `TypeError`, which `observeToolFailure`'s containment turns into a warn and
+ * NO RECORDED FAILURE — a silent coverage hole in the one producer that exists
+ * to close silent coverage holes. Coercion (rather than an early `""`) keeps
+ * the pre-cap behaviour exactly: an SDK that hands an `Error` still classifies
+ * off `String(err)`. The clamp is applied AFTER coercion so a long `toString()`
+ * cannot escape it, and a value with no primitive conversion at all (a
+ * null-prototype object, a throwing `toString`) is unclassifiable rather than a
+ * throw.
+ */
+function classifierText(message: string): string {
+  let text: string;
+  if (typeof message === "string") {
+    text = message;
+  } else {
+    try {
+      text = String(message ?? "");
+    } catch {
+      text = "";
+    }
+  }
+  return text.length > CLASSIFIER_TEXT_MAX ? text.slice(0, CLASSIFIER_TEXT_MAX) : text;
+}
+
+/**
+ * TOTAL: every input returns exactly one member of TOOL_ERROR_TOKENS — for a
+ * non-string `message` too (see `classifierText`), because the only caller is a
+ * capture point whose containment would otherwise swallow the whole failure
+ * record. The message is read here and DISCARDED — no substring of it is ever
+ * returned, which is what a test asserts against a credential-shaped and a
+ * path-shaped input (AC6).
  */
 export function classifyToolError(message: string, signals: ToolErrorSignals = {}): ToolErrorToken {
   // 1. Typed signals first — they are facts, the text is an inference.
@@ -119,7 +156,7 @@ export function classifyToolError(message: string, signals: ToolErrorSignals = {
   // 2. A small fixed set of text tests, over a BOUNDED prefix, then honest
   //    ignorance. The typed signals above are read first and short-circuit, so
   //    a capped text never costs a fact.
-  const text = message.length > CLASSIFIER_TEXT_MAX ? message.slice(0, CLASSIFIER_TEXT_MAX) : message;
+  const text = classifierText(message);
   for (const [pattern, token] of TEXT_RULES) {
     if (pattern.test(text)) return token;
   }

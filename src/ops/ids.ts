@@ -1,5 +1,17 @@
 /**
- * KPR-454 D4/D6: the four bounds, and why they differ.
+ * KPR-454 D4/D6: this producer's bounds, and why they differ.
+ *
+ * Deliberately NOT counted here — the count rotted once already. They fall
+ * into three groups whose behaviour ON BREACH differs, and that difference is
+ * the whole reason they are separate constants rather than one number: the
+ * accept-path value bounds REJECT AND COUNT (`OPS_TOKEN_RE`,
+ * `OPS_ID_MAX_LENGTH`, `OPS_EVIDENCE_MAX`, `OPS_DETAIL_STRING_MAX`,
+ * `OPS_CLEARS_MAX_LENGTH`; `OPS_REMEDIATION_MAX` is the registration-time
+ * sibling and THROWS, because its subject is code-resident); the capture-point
+ * bound OMITS (`ADMISSIBLE_ID_RE` via `admissibleIdOrUndefined`); and the log
+ * bound only SHORTENS what is printed and changes no decision at all
+ * (`OPS_LOG_VALUE_MAX` via `clipForLog`). Each constant's own comment says
+ * which group it is in and why.
  *
  * The token bound and the length bound are ACCEPT-PATH validation: a breach
  * is a mis-integrated producer, so it rejects and increments the rejection
@@ -66,7 +78,7 @@ export const OPS_REMEDIATION_MAX = 500;
 
 /**
  * The bound on a `clears` key — the one string the accept path STORES (and
- * derives an INDEXED `clearsFamily` from) that none of the four bounds above
+ * derives an INDEXED `clearsFamily` from) that none of the bounds above
  * reach: `subject`/`detail`/`evidence` are each bounded on their own, and the
  * `clears` legality test reads one component of the key.
  *
@@ -88,18 +100,23 @@ export const ADMISSIBLE_ID_RE = /^[A-Za-z0-9_.:#+@-]{1,200}$/;
 
 /**
  * C13: the bound on any operator- or foreign-producer-authored value this
- * producer writes into a LOG line. A fifth bound rather than a reuse of the
- * four above, because it governs a different surface: the others decide what
+ * producer writes into a LOG line. Its own group rather than a reuse of the
+ * bounds above, because it governs a different surface: the others decide what
  * is STORED (and reject or omit on breach), this one only shortens what is
  * PRINTED and never changes a decision.
  *
- * It exists because the two places that name such a value are reached
+ * It exists because two of the THREE places that name such a value are reached
  * PRECISELY when it failed its own bound — the accept path's `bad-token` /
- * `bad-subject-kind` rejections, and the registry loader's unusable-row skip —
- * so logging them raw is the one place this producer's log lines are
- * unbounded. 64 is long enough to identify a legitimate token (the token bound
- * is 40) and short enough that a megabyte of foreign input costs one log line
- * of it.
+ * `bad-subject-kind` rejections (publisher.ts), and the registry loader's
+ * unusable-row skip and per-row anomaly tally (store.ts) — so logging them raw
+ * is the one place this producer's log lines are unbounded. The third is
+ * `auditLoadedEnableGate` (publisher.ts), where the value came from a LOADED
+ * `ops_reasons` row rather than from a breach: nothing validates a row's
+ * `producer`/`reasonId` against the token bound on the load path (D5 loads
+ * whatever the collection holds), so the clip is the same defence there for the
+ * same reason. 64 is long enough to identify a legitimate token (the token
+ * bound is 40) and short enough that a megabyte of foreign input costs one log
+ * line of it.
  */
 export const OPS_LOG_VALUE_MAX = 64;
 

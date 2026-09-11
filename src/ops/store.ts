@@ -14,6 +14,16 @@ import type { z } from "zod";
 
 const log = createLogger("ops-store");
 
+/**
+ * The per-row cap on `auditReasonRow` warn lines in `loadReasons`. The
+ * `anomalies` COUNTER is uncapped — it is the operator's signal and must stay
+ * truthful — but `detailKeys` is operator- and foreign-producer-authored and
+ * unbounded in length, so one pathological row must not be able to write a
+ * warn line per element into the boot log. 5 is enough to characterise what a
+ * row got wrong; the tally line names the rest.
+ */
+const REASON_ROW_ANOMALY_LOG_MAX = 5;
+
 export interface LoadedReason {
   row: OpsReason;
   detailSchema: z.ZodType<Record<string, unknown>>;
@@ -88,8 +98,17 @@ export class OpsStore {
     // correct-but-larger index for a possible full scan, against an index-size
     // problem nothing has reported on a collection that already carries a TTL
     // and four other indexes over the same rows.
-    await create("ops_events.clearing-epoch", () =>
-      this.events.createIndex({ clearsFamily: 1, publishedAt: -1, _id: -1 }),
+    //
+    // The remedy is named for the SAME reason the TTL index below names one:
+    // `createIndex` on an existing key pattern with DIFFERENT options raises
+    // IndexOptionsConflict, so any database that already ran an earlier commit
+    // of this branch (the `sparse` version) fails this index on every boot —
+    // contained and counted, but leaving D8's clearing-side read unindexed.
+    // Never deployed, so this is a dev/test-database condition only.
+    await create(
+      "ops_events.clearing-epoch",
+      () => this.events.createIndex({ clearsFamily: 1, publishedAt: -1, _id: -1 }),
+      'option change: drop the ops_events clearsFamily index once (db.ops_events.dropIndex("clearsFamily_1_publishedAt_-1__id_-1")) and restart',
     );
     // D2: NOT unique — the log appends every publish.
     await create("ops_events.dedupe", () => this.events.createIndex({ dedupeKey: 1, publishedAt: -1 }));
@@ -181,15 +200,48 @@ export class OpsStore {
    * on both lanes unrecorded for the whole boot, behind a log line
    * indistinguishable from a Mongo outage. One malformed operator row must
    * cost that row, never the producer.
+   *
+   * ⚠ AND THE CATCH IS NOT SUFFICIENT ON ITS OWN — the `Array.isArray` test at
+   * the top of the try is doing work, not restating it. A string is iterable,
+   * so the one malformed shape that does NOT throw is the most plausible typo
+   * (`detailKeys: "tool"`), and it would otherwise load the row with a garbage
+   * schema behind one warn per character. Both halves of that — the shape and
+   * the per-row log volume — are bounded below; see the comments inline.
    */
   async loadReasons(): Promise<{ map: Map<string, LoadedReason>; anomalies: number }> {
     const map = new Map<string, LoadedReason>();
     let anomalies = 0;
     for (const row of await this.reasons.find({}).toArray()) {
       try {
-        for (const anomaly of auditReasonRow(row)) {
-          anomalies += 1;
+        // ⚠ EXPLICIT, not TypeError-dependent, and it closes a real gap rather
+        // than restating the catch below. A STRING is iterable, so
+        // `detailKeys: "tool"` — an entirely plausible operator or foreign-
+        // producer typo — does NOT throw out of either call below: `for…of`
+        // walks its CHARACTERS, `spec.key` is `undefined` on each (which
+        // `DETAIL_KEY_NAME_RE` then accepts as the literal "undefined", so only
+        // the unrecognized-type arm fires), and the row loads with a garbage
+        // schema behind one warn PER CHARACTER. Testing the shape states the
+        // containment's intent and routes the string case onto the same
+        // one-warning, one-anomaly, row-skipped path as every other malformed
+        // row.
+        if (!Array.isArray(row.detailKeys)) throw new Error("detailKeys is not an array");
+        // BOUNDED per row. `detailKeys` is operator-controlled and unbounded in
+        // LENGTH as well as in shape, so an oversized array is a boot-time log
+        // flood from a single row — the failure mode the rule above forbids
+        // ("cost that row, never the producer"). The counter still sees every
+        // anomaly; the log sees the first few plus one tally line.
+        const rowAnomalies = auditReasonRow(row);
+        anomalies += rowAnomalies.length;
+        for (const anomaly of rowAnomalies.slice(0, REASON_ROW_ANOMALY_LOG_MAX)) {
           log.warn("ops reason row normalized — the row declares something this engine narrows", { anomaly });
+        }
+        if (rowAnomalies.length > REASON_ROW_ANOMALY_LOG_MAX) {
+          // C13: the row's `_id` and two counts. No anomaly text.
+          log.warn("ops reason row normalized — further anomalies on this row not logged", {
+            id: clipForLog(row._id),
+            logged: REASON_ROW_ANOMALY_LOG_MAX,
+            suppressed: rowAnomalies.length - REASON_ROW_ANOMALY_LOG_MAX,
+          });
         }
         map.set(`${row.producer}:${row.reasonId}`, { row, detailSchema: compileDetailSchema(row.detailKeys) });
       } catch (err) {
