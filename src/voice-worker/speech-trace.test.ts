@@ -505,6 +505,116 @@ describe("speech lifecycle", () => {
   });
 
   it.each(["bridge", "synthesis"] as const)(
+    "promotes a valid overflow %s failure when the first 48 sources conflict",
+    (kind) => {
+      const { rows, trace } = setup();
+      const handle = new FakeSpeechHandle(`speech-${kind}-failure-overflow`);
+      trace.speechCreated(handle.asHandle(), "fallback", 0);
+
+      const attempts = Array.from({ length: 49 }, (_, index) => {
+        if (kind === "bridge") {
+          const attempt = trace.bridgeCreated(bridgeContext("call", `turn-failure-overflow-${index}`));
+          attempt.bind(handle.id);
+          attempt.fail("spawn_failed");
+          return attempt;
+        }
+        const attempt = trace.synthesisCreated(synthesisContext("call", `synth-failure-overflow-${index}`));
+        attempt.bind(handle.id);
+        attempt.fail("tts_provider_failed");
+        return attempt;
+      });
+      for (let index = 0; index < 48; index += 1) attempts[index]!.bind(`conflict-${index}`);
+      for (const attempt of attempts) attempt.finish("failed", "unknown");
+      handle.settle();
+
+      expect(
+        rows.filter(
+          (row) => row.event === `${kind}_terminal` && row.speechId === handle.id && row.outcome === "failed",
+        ),
+      ).toHaveLength(1);
+      expect(rows.find((row) => row.event === "speech_terminal")).toMatchObject({
+        outcome: "failed",
+        errorClass: kind === "bridge" ? "spawn_failed" : "tts_provider_failed",
+      });
+      const report = reduceVoiceDiagnostics(`${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "call");
+      expect(report.byOutcome.speech).toMatchObject({ failed: 1, incomplete: 0 });
+      expect(report.byOutcome[kind]).toMatchObject({ failed: 49 });
+      expect(report.details.speech[0]).toMatchObject({ outcome: "failed" });
+    },
+  );
+
+  it.each(["bridge", "synthesis"] as const)(
+    "preserves an evicted %s failure source for an unsettled speech",
+    (kind) => {
+      const { rows, trace } = setup();
+      const handle = new FakeSpeechHandle(`speech-${kind}-failure-eviction`);
+      trace.speechCreated(handle.asHandle(), "fallback", 0);
+
+      if (kind === "bridge") {
+        const failed = trace.bridgeCreated(bridgeContext("call", "turn-failure-eviction"));
+        failed.bind(handle.id);
+        failed.fail("spawn_failed");
+        failed.finish("failed", "unknown");
+        for (let index = 0; index < 256; index += 1) {
+          const retained = trace.bridgeCreated(bridgeContext("call", `turn-retained-${index}`));
+          retained.bind(handle.id);
+          retained.finish("completed", "unknown");
+        }
+      } else {
+        const failed = trace.synthesisCreated(synthesisContext("call", "synth-failure-eviction"));
+        failed.bind(handle.id);
+        failed.fail("tts_provider_failed");
+        failed.finish("failed", "unknown");
+        for (let index = 0; index < 256; index += 1) {
+          const retained = trace.synthesisCreated(synthesisContext("call", `synth-retained-${index}`));
+          retained.bind(handle.id);
+          retained.finish("completed", "unknown");
+        }
+      }
+      handle.settle();
+
+      expect(rows.find((row) => row.event === "speech_terminal")).toMatchObject({
+        outcome: "failed",
+        errorClass: kind === "bridge" ? "spawn_failed" : "tts_provider_failed",
+      });
+      const report = reduceVoiceDiagnostics(`${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "call");
+      expect(report.byOutcome.speech).toMatchObject({ failed: 1, incomplete: 0 });
+      expect(report.details.speech[0]).toMatchObject({ outcome: "failed" });
+    },
+  );
+
+  it("preserves an evicted overflow synthesis failure after all reversible sources conflict", () => {
+    const { rows, trace } = setup();
+    const handle = new FakeSpeechHandle("speech-evicted-failure-overflow");
+    trace.speechCreated(handle.asHandle(), "fallback", 0);
+    const failed = Array.from({ length: 49 }, (_, index) => {
+      const attempt = trace.synthesisCreated(synthesisContext("call", `synth-evicted-overflow-${index}`));
+      attempt.bind(handle.id);
+      attempt.fail("tts_provider_failed");
+      return attempt;
+    });
+
+    failed[48]!.finish("failed", "unknown");
+    for (let index = 0; index < 48; index += 1) failed[index]!.finish("failed", "unknown");
+    for (let index = 0; index < 208; index += 1) {
+      const clean = trace.synthesisCreated(synthesisContext("call", `synth-clean-${index}`));
+      clean.bind(handle.id);
+      clean.finish("completed", "unknown");
+    }
+    for (let index = 0; index < 48; index += 1) failed[index]!.bind(`conflict-${index}`);
+    handle.settle();
+
+    expect(rows.filter((row) => row.event === "diagnostic_gap" && row.reason === "binding_conflict")).toHaveLength(48);
+    expect(rows.find((row) => row.event === "speech_terminal")).toMatchObject({
+      outcome: "failed",
+      errorClass: "tts_provider_failed",
+    });
+    const report = reduceVoiceDiagnostics(`${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "call");
+    expect(report.byOutcome.speech).toMatchObject({ failed: 1, incomplete: 0 });
+    expect(report.details.speech[0]).toMatchObject({ outcome: "failed" });
+  });
+
+  it.each(["bridge", "synthesis"] as const)(
     "keeps a terminal %s late error supplemental while an unsettled speech completes",
     (kind) => {
       const { rows, trace } = setup();
