@@ -1,11 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { SlackGateway } from "./slack-gateway.js";
+import { SlackGateway, __resetIdentityFallbackLatchForTests } from "./slack-gateway.js";
+
+const warnSpy = vi.fn();
+const errorSpy = vi.fn();
 
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
     info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
+    warn: (...args: unknown[]) => warnSpy(...args),
+    error: (...args: unknown[]) => errorSpy(...args),
     debug: vi.fn(),
   }),
 }));
@@ -477,5 +480,148 @@ describe("SlackGateway — explicit notification receipts", () => {
 
     expect(ack).toHaveBeenCalledTimes(1);
     expect(onMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("SlackGateway — per-agent identity + error sink (KPR-492 D1/D2/D3)", () => {
+  let gateway: SlackGateway;
+
+  // The hoisted defaults, re-established around EVERY test in this describe.
+  // `vi.clearAllMocks()` clears call history but NOT implementations, and several
+  // tests below use the non-`Once` `mockRejectedValue` (the split path posts an
+  // unknown number of chunks, so counting `Once`s would be a guess). Without the
+  // afterEach the LAST test's persistent rejection leaks forward to every later
+  // describe in the file — harmless today only because Task 3's describes never
+  // post, which is not a property to rely on.
+  const restoreDefaults = () => {
+    postMessageMock.mockResolvedValue({ ok: true, ts: "1234.5678", channel: "C123" });
+    uploadV2Mock.mockResolvedValue({ ok: true });
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    restoreDefaults();
+    __resetIdentityFallbackLatchForTests();
+    gateway = new SlackGateway("xapp-test", "xoxb-test");
+  });
+
+  afterEach(() => {
+    restoreDefaults();
+  });
+
+  it("forwards an emoji identity as username + icon_emoji", async () => {
+    await gateway.postAndRegister("C123", "hello", undefined, { name: "Grant", icon: ":seedling:" });
+    expect(postMessageMock).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: "C123", username: "Grant", icon_emoji: ":seedling:" }),
+    );
+  });
+
+  it("forwards a URL identity as icon_url", async () => {
+    await gateway.postAndRegister("C123", "hello", undefined, {
+      name: "Grant",
+      icon: "https://example.com/grant.png",
+    });
+    expect(postMessageMock).toHaveBeenCalledWith(
+      expect.objectContaining({ username: "Grant", icon_url: "https://example.com/grant.png" }),
+    );
+  });
+
+  it('sends username only when icon is "" (the five agents with an empty icon — §10 step 1 owns the data)', async () => {
+    await gateway.postAndRegister("C123", "hello", undefined, { name: "Grant", icon: "" });
+    const payload = postMessageMock.mock.calls[0][0];
+    expect(payload.username).toBe("Grant");
+    expect(payload.icon_emoji).toBeUndefined();
+    expect(payload.icon_url).toBeUndefined();
+  });
+
+  it("returns the real Slack error instead of 'postMessage returned no ts'", async () => {
+    postMessageMock.mockRejectedValueOnce(new Error("An API error occurred: not_in_channel"));
+    const result = await gateway.postAndRegister("C123", "hello");
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("not_in_channel");
+    expect(result.error).not.toBe("postMessage returned no ts");
+  });
+
+  it("never cross-attributes errors between concurrent sends (the per-call sink)", async () => {
+    postMessageMock
+      .mockRejectedValueOnce(new Error("An API error occurred: not_in_channel"))
+      .mockRejectedValueOnce(new Error("An API error occurred: is_archived"));
+    const [a, b] = await Promise.all([gateway.postAndRegister("C111", "one"), gateway.postAndRegister("C222", "two")]);
+    const errors = [a.error, b.error].sort();
+    expect(errors[0]).toContain("is_archived");
+    expect(errors[1]).toContain("not_in_channel");
+  });
+
+  it("retries plain exactly once when the identity post throws, and posts the message", async () => {
+    postMessageMock
+      .mockRejectedValueOnce(new Error("An API error occurred: missing_scope"))
+      .mockResolvedValueOnce({ ok: true, ts: "1.1", channel: "C123" });
+    const result = await gateway.postAndRegister("C123", "hello", undefined, { name: "Grant", icon: ":seedling:" });
+    expect(result.ok).toBe(true);
+    expect(postMessageMock).toHaveBeenCalledTimes(2);
+    expect(postMessageMock.mock.calls[1][0].username).toBeUndefined();
+  });
+
+  // ── Step 4's forwarding, pinned per branch ──────────────────────────────
+  // Every assertion above posts a SHORT message, so all of them route through
+  // postMessage's postSingle branch and would stay green with the errorSink
+  // argument dropped from postSplit and/or postAsFile. The THREE below are the
+  // only ones that fail in that state, and they fail in a known pattern (Task 11
+  // rows g/h): dropping `:505` fails the first two (the upload-failure fallback
+  // re-enters postSplit and hits `:505` too); dropping `:557` fails exactly the
+  // second; dropping `:545` fails exactly the third.
+
+  it("carries the real error out of the postSplit branch (>SLACK_MAX_CHARS)", async () => {
+    postMessageMock.mockRejectedValue(new Error("An API error occurred: not_in_channel"));
+    const result = await gateway.postAndRegister("C123", "x".repeat(5000));
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("not_in_channel");
+    expect(result.error).not.toBe("postMessage returned no ts");
+  });
+
+  it("carries the real error out of the postAsFile upload-failure fallback (`:557`)", async () => {
+    // The third forwarding. Summary post succeeds, uploadV2 FAILS, so postAsFile
+    // falls back into postSplit (`:557`) and every chunk then fails. With `:557`
+    // alone dropped, postSplit receives errorSink: undefined, `:505` forwards
+    // nothing, and the result regresses to "postMessage returned no ts" while
+    // the postSplit-branch test above and the postAsFile-branch test below both
+    // still pass. This is the only case that pins `:557` (Task 11 row h).
+    postMessageMock.mockResolvedValueOnce({ ok: true, ts: "1.0", channel: "C123" });
+    postMessageMock.mockRejectedValue(new Error("An API error occurred: not_in_channel"));
+    uploadV2Mock.mockRejectedValueOnce(new Error("upload failed"));
+    const result = await gateway.postAndRegister("C123", "x".repeat(9000));
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("not_in_channel");
+    expect(result.error).not.toBe("postMessage returned no ts");
+  });
+
+  it("carries the real error out of the postAsFile branch (>SPLIT_MAX_CHARS)", async () => {
+    // The summary post fails; the upload SUCCEEDS, so postAsFile returns the
+    // summary's undefined ts and postAndRegister reads the sink. This pins the
+    // `:545` forwarding specifically — the upload-failure fallback at `:557`
+    // would otherwise mask it by re-entering postSplit.
+    postMessageMock.mockRejectedValue(new Error("An API error occurred: is_archived"));
+    // uploadV2 keeps the beforeEach default ({ ok: true }) — deliberately.
+    const result = await gateway.postAndRegister("C123", "x".repeat(9000));
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("is_archived");
+    expect(result.error).not.toBe("postMessage returned no ts");
+  });
+
+  // ── D3: the once-per-process latch (INSIDE this describe — needs its beforeEach) ──
+  it("emits the chat:write.customize error exactly once per process across two failures", async () => {
+    postMessageMock
+      .mockRejectedValueOnce(new Error("missing_scope"))
+      .mockResolvedValueOnce({ ok: true, ts: "1.1", channel: "C1" })
+      .mockRejectedValueOnce(new Error("missing_scope"))
+      .mockResolvedValueOnce({ ok: true, ts: "2.2", channel: "C1" });
+    await gateway.postAndRegister("C1", "a", undefined, { name: "Grant", icon: ":seedling:" });
+    await gateway.postAndRegister("C1", "b", undefined, { name: "Grant", icon: ":seedling:" });
+    const customizeErrors = errorSpy.mock.calls.filter((c) => String(c[0]).includes("chat:write.customize"));
+    expect(customizeErrors).toHaveLength(1);
+    const identityWarns = warnSpy.mock.calls.filter(
+      (c) => c[0] === "Failed to post with identity, falling back to plain post",
+    );
+    expect(identityWarns).toHaveLength(2);
   });
 });

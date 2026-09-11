@@ -16,6 +16,38 @@ import {
 
 const log = createLogger("slack-gateway");
 
+/**
+ * KPR-492 D2: a per-call sink that carries the real Slack error out of
+ * `postSingle`'s catch. Deliberately NOT the `lastReadError` instance-field
+ * precedent (`:54`): reads are one-at-a-time per tool call, but posts fan out
+ * (meeting mode, conference rounds, cron bursts), and an error string
+ * attributed to the wrong agent's tool result is worse than a generic one.
+ * `postAndRegister` allocates a fresh sink per call.
+ *
+ * Multi-write on one sink is safe and intentional. A single `postAndRegister`
+ * can drive `postSingle` more than once against the same sink: `postSplit`
+ * posts every chunk (`:505`), and `postAsFile`'s upload catch falls back to
+ * `postSplit` AFTER the summary post already ran (`:554-558`). Last-write-wins
+ * is correct because `postAndRegister` reads the sink ONLY when `ts === undefined`
+ * — i.e. only when nothing landed at all — so the string the agent sees always
+ * describes a genuinely-failed send. No ordering discipline, no per-chunk array.
+ */
+export interface PostErrorSink {
+  error?: string;
+}
+
+/**
+ * KPR-492 D3: one `log.error` per process the first time an identity-mode post
+ * falls back to a plain post. Warn-once is the house idiom (`clampLaneAEffort`,
+ * the orphan-prefix warns). Module-level, so tests reset it explicitly.
+ */
+let identityFallbackReported = false;
+
+/** Test-only: reset the D3 once-per-process latch so ordering across describes cannot decide the assertion. */
+export function __resetIdentityFallbackLatchForTests(): void {
+  identityFallbackReported = false;
+}
+
 type MessageHandler = (msg: IncomingMessage) => void;
 
 export interface ThreadStartedEvent {
@@ -380,16 +412,17 @@ export class SlackGateway {
     text: string,
     threadTs?: string,
     identity?: { name: string; icon?: string },
+    errorSink?: PostErrorSink,
   ): Promise<string | undefined> {
     if (text.length <= SlackGateway.SLACK_MAX_CHARS) {
-      return this.postSingle(channel, text, threadTs, identity);
+      return this.postSingle(channel, text, threadTs, identity, errorSink);
     }
 
     if (text.length <= SlackGateway.SPLIT_MAX_CHARS) {
-      return this.postSplit(channel, text, threadTs, identity);
+      return this.postSplit(channel, text, threadTs, identity, errorSink);
     }
 
-    return this.postAsFile(channel, text, threadTs, identity);
+    return this.postAsFile(channel, text, threadTs, identity, errorSink);
   }
 
   private async postSingle(
@@ -397,6 +430,7 @@ export class SlackGateway {
     text: string,
     threadTs?: string,
     identity?: { name: string; icon?: string },
+    errorSink?: PostErrorSink,
   ): Promise<string | undefined> {
     // Try with agent identity first, fall back to plain bot post
     if (identity) {
@@ -423,7 +457,24 @@ export class SlackGateway {
         }
         return result.ts;
       } catch (err) {
-        log.warn("Failed to post with identity, falling back to plain post", { error: String(err) });
+        // KPR-492 D2: record it even though the plain retry follows — the sink is
+        // read only when nothing landed, so this surfaces only if the retry also
+        // yields no ts without throwing its own error.
+        if (errorSink) errorSink.error = String(err);
+        // KPR-492 D3: the fallback stays (⚠A3 — a generically-labelled post beats
+        // no post, and the floor is "not a human"), but it stops being quiet.
+        log.warn("Failed to post with identity, falling back to plain post", {
+          channel,
+          username: identity.name,
+          error: String(err),
+        });
+        if (!identityFallbackReported) {
+          identityFallbackReported = true;
+          log.error(
+            "Slack identity-mode post failed — agent posts are rendering as the plain Hive bot. Grant chat:write.customize to the Slack app and reinstall; the boot scope preflight reports it.",
+            { channel, username: identity.name, error: String(err) },
+          );
+        }
       }
     }
 
@@ -439,6 +490,7 @@ export class SlackGateway {
       }
       return result.ts;
     } catch (err) {
+      if (errorSink) errorSink.error = String(err);
       log.error("Failed to post message", { channel, error: String(err) });
       return undefined;
     }
@@ -495,6 +547,7 @@ export class SlackGateway {
     text: string,
     threadTs?: string,
     identity?: { name: string; icon?: string },
+    errorSink?: PostErrorSink,
   ): Promise<string | undefined> {
     const chunks = this.splitText(text);
     log.info("Splitting oversized message", { channel, totalLength: text.length, chunks: chunks.length });
@@ -502,7 +555,7 @@ export class SlackGateway {
     let firstTs: string | undefined;
     for (let i = 0; i < chunks.length; i++) {
       const chunk = i === 0 ? chunks[i] : `_(cont.)_ ${chunks[i]}`;
-      const ts = await this.postSingle(channel, chunk, threadTs, identity);
+      const ts = await this.postSingle(channel, chunk, threadTs, identity, errorSink);
       if (i === 0) firstTs = ts;
     }
     return firstTs;
@@ -513,6 +566,7 @@ export class SlackGateway {
     text: string,
     threadTs?: string,
     identity?: { name: string; icon?: string },
+    errorSink?: PostErrorSink,
   ): Promise<string | undefined> {
     // Build summary: first SUMMARY_LENGTH chars, trimmed to last complete sentence or line break
     const summaryRaw = text.slice(0, SlackGateway.SUMMARY_LENGTH);
@@ -542,7 +596,7 @@ export class SlackGateway {
     const filename = `${agentName.toLowerCase()}-${timestamp}.md`;
 
     // Post summary message first for context
-    const summaryTs = await this.postSingle(channel, summary, threadTs, identity);
+    const summaryTs = await this.postSingle(channel, summary, threadTs, identity, errorSink);
 
     // Upload full text as .md file
     try {
@@ -554,7 +608,7 @@ export class SlackGateway {
     } catch (err) {
       log.warn("File upload failed, falling back to split", { channel, error: String(err) });
       // Fallback: split the remaining text (summary already posted)
-      return this.postSplit(channel, text, threadTs, identity);
+      return this.postSplit(channel, text, threadTs, identity, errorSink);
     }
   }
 
@@ -631,18 +685,27 @@ export class SlackGateway {
    * where the cache write happens. Returns the first chunk's ts (sufficient for the caller —
    * every chunk's ts is registered independently).
    *
-   * Caller should resolve `channel` to a Slack channel ID first (via `resolveChannelId`) — this
-   * method does not re-resolve, and does not return a canonical channel ID.
+   * Caller should resolve `channel` to a Slack conversation ID first (via
+   * `resolveConversation`) — this method does not re-resolve, and does not return
+   * a canonical channel ID.
+   *
+   * KPR-492 D1: `identity` is the same `{ name, icon }` Path A passes
+   * (`slack-adapter.ts:196-197`). It used to be dropped here, so every Path B post
+   * rendered as a generic "Hive" bot even on the bot transport.
+   * KPR-492 D2: a fresh `PostErrorSink` per call carries the real Slack error out,
+   * replacing the useless `"postMessage returned no ts"` whenever one is available.
    */
   async postAndRegister(
     channel: string,
     text: string,
     threadTs?: string,
+    identity?: { name: string; icon?: string },
   ): Promise<{ ok: boolean; ts?: string; error?: string }> {
+    const sink: PostErrorSink = {};
     try {
-      const ts = await this.postMessage(channel, text, threadTs);
+      const ts = await this.postMessage(channel, text, threadTs, identity, sink);
       if (ts) return { ok: true, ts };
-      return { ok: false, error: "postMessage returned no ts" };
+      return { ok: false, error: sink.error ?? "postMessage returned no ts" };
     } catch (err) {
       return { ok: false, error: (err as Error).message };
     }
