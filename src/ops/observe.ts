@@ -85,13 +85,22 @@ export function observeToolFailure(obs: ToolFailureObservation): void {
       waiting: waitingFor(obs.workItemId),
       subject: { kind: "tool", id: obs.tool },
       detail,
-      // D6: this producer's ENTIRE `kind` vocabulary is "workItem". `[]` when
+      // D6: this producer's ENTIRE `kind` vocabulary is "work-item". `[]` when
       // the id is absent or inadmissible — the detached worker/scribe case and
       // the untrusted-id case deliberately land in the same shape. threadId is
       // NOT mirrored here: it is a filterable attribute of the condition and
       // belongs in detail, whereas evidence points at the record a responder
       // would open next.
-      evidence: workItemId !== undefined ? [{ kind: "workItem", id: workItemId }] : [],
+      //
+      // ⚠ Corrected from the design doc's literal "workItem" (capital I),
+      // which fails this producer's own evidence[].kind bound, OPS_TOKEN_RE
+      // (^[a-z][a-z0-9-]{0,39}$) — a self-contradiction within
+      // kpr-454-design.md that would reject every tool-failed event carrying
+      // a work item. See the append-only correction note in that doc (D6
+      // section, "evidence: this producer's kind vocabulary"). The vocabulary
+      // is this producer's own private key space, so the spelling carries no
+      // external contract.
+      evidence: workItemId !== undefined ? [{ kind: "work-item", id: workItemId }] : [],
     });
   } catch (err) {
     // Never reaches the turn. Not published (D10 invariant (a)).

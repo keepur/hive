@@ -164,8 +164,8 @@ describe("OpsPublisher boot and registry", () => {
 describe("OpsPublisher accept path and epoch", () => {
   it("stores one document at generation 0 and opens one condition", async () => {
     await publisher.init();
-    // No workItemId here on purpose — see the `it.fails` case below, which
-    // holds the one open contradiction in this contract.
+    // No workItemId here on purpose — the admissible-id case (evidence
+    // carrying a work-item reference) is asserted separately below.
     driveFailure("Bash", { agentId: "mokie", threadId: "T1", durationMs: 12 });
     await publisher.__drainForTests();
 
@@ -196,32 +196,25 @@ describe("OpsPublisher accept path and epoch", () => {
     expect(entry.dedupeKey).toBe(`${familyFor("Bash")}:0`);
   });
 
-  // ⚠ OPEN CONTRADICTION IN THE CONTRACT — do NOT "fix" this by editing the
-  // test. D6 (kpr-454-design.md:237) fixes this producer's ENTIRE evidence
-  // `kind` vocabulary as the literal `workItem`; D6's bounds clause
-  // (kpr-454-design.md:240, restated by AC3 at :425) requires
-  // `evidence[].kind` to match `OPS_TOKEN_RE` — `^[a-z][a-z0-9-]{0,39}$`,
-  // committed in chunk 2's `ids.ts`. `"workItem"` does not match it (the
-  // capital I), so accept-path step 2 rejects EVERY tool failure that carries
-  // an admissible work-item id — the producer's headline case, since KPR-453
-  // sets `WorkItemContext.workItemId` on every manager-owned turn — and
-  // increments `rejected`, which D9 reserves for a mis-integrated producer.
-  // Chunk 5's AC1 and AC3 both assert the stored
-  // `evidence: [{ kind: "workItem", id }]` that this makes unreachable.
-  //
-  // The resolution is a cross-chunk canon call (rename the token, or exempt
-  // `evidence[].kind` from the lowercase bound) touching chunk 2's committed
-  // `ids.ts`, this producer's `observe.ts`, and chunk 5's AC1/AC3 — so it is
-  // deliberately NOT made here: chunk 3 ships the plan's code verbatim.
-  // `it.fails` keeps the suite honest today and turns it RED the moment the
-  // ruling lands, at which point this marker is removed — never the assertion.
-  it.fails("stores a work-item evidence reference on a failure carrying an admissible id", async () => {
+  // ⚠ Resolved contradiction, recorded for anyone diffing this file's history.
+  // D6 (kpr-454-design.md:237) originally fixed this producer's ENTIRE
+  // evidence `kind` vocabulary as the literal `workItem`, which does not
+  // satisfy the same section's own `OPS_TOKEN_RE` bound two lines later
+  // (`^[a-z][a-z0-9-]{0,39}$`, capital I) — a self-contradiction that would
+  // have rejected EVERY tool failure carrying an admissible work-item id, the
+  // producer's headline case. Corrected to `work-item` (same referent, no
+  // semantic change — the vocabulary is this producer's own private key
+  // space) via an append-only note in kpr-454-design.md, fixed directly in
+  // `observe.ts` rather than demoted to spec (no product/architecture/scope
+  // decision changes). Chunk 5's AC1/AC3 fences were corrected to match
+  // before that chunk was dispatched.
+  it("stores a work-item evidence reference on a failure carrying an admissible id", async () => {
     await publisher.init();
     driveFailure("Bash", { workItemId: "wi-1" });
     await publisher.__drainForTests();
 
     expect(events()).toHaveLength(1);
-    expect(events()[0]!.evidence).toEqual([{ kind: "workItem", id: "wi-1" }]);
+    expect(events()[0]!.evidence).toEqual([{ kind: "work-item", id: "wi-1" }]);
     expect(events()[0]!.detail.workItemId).toBe("wi-1");
     expect(publisher.getSnapshot().rejected).toBe(0);
   });
