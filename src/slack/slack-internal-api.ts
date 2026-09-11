@@ -49,9 +49,43 @@ export class SlackInternalApi {
       });
     });
 
-    await new Promise<void>((resolve) => {
-      this.server!.listen(this.port, "127.0.0.1", () => resolve());
+    // KPR-492 (pre-PR review round 2): `listen` needs an 'error' listener. Without
+    // one, an EADDRINUSE emits on an EventEmitter with no handler and throws out of
+    // a libuv callback as an uncaughtException — index.ts installs only an
+    // `unhandledRejection` handler (`index.ts:1052`), so the process dies and
+    // launchd KeepAlive restarts it: a silent crash loop. This awaits above the
+    // spawn-capable boundary, so the promise must also always settle, exactly once.
+    // Policy follows D10's precedent one call earlier in this same hoisted block
+    // (`slack-scope-preflight.ts`): log loudly and continue — "a single optional
+    // Slack feature should not crash hive startup". Continuing costs agents' Slack
+    // MCP tool calls, which then fail at call time with a connection error: loud at
+    // the point of use, and strictly better than a boot loop that takes every
+    // non-Slack surface down with it.
+    const bound = await new Promise<boolean>((resolve) => {
+      const server = this.server!;
+      const onBindError = (err: NodeJS.ErrnoException) => {
+        // Drop the handle: nothing ever bound, so stop() must not close it.
+        this.server = null;
+        log.error("Slack internal API failed to bind — agents' Slack MCP tools will fail with a connection error", {
+          port: this.port,
+          error: String(err),
+          likelyCause: `port ${this.port} is already in use`,
+        });
+        resolve(false);
+      };
+      server.once("error", onBindError);
+      server.listen(this.port, "127.0.0.1", () => {
+        server.removeListener("error", onBindError);
+        // Leave a handler installed for the bound server's lifetime — a
+        // listener-less 'error' would throw for the same reason as above, and this
+        // process installs no uncaughtException handler.
+        server.on("error", (err) =>
+          log.error("Slack internal API server error", { port: this.port, error: String(err) }),
+        );
+        resolve(true);
+      });
     });
+    if (!bound) return;
 
     log.info("Slack internal API started", { port: this.port });
   }

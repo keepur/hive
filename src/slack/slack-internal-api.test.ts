@@ -2,14 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { SlackInternalApi } from "./slack-internal-api.js";
 import type { WorkItem } from "../types/work-item.js";
 
-vi.mock("../logging/logger.js", () => ({
-  createLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }),
+// Hoisted shared spies (the `memory-lifecycle.test.ts` idiom) so log emission is
+// capturable — the bind-failure test below asserts on `log.error`.
+const { mockLog } = vi.hoisted(() => ({
+  mockLog: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
+vi.mock("../logging/logger.js", () => ({ createLogger: () => mockLog }));
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -615,6 +613,53 @@ describe("SlackInternalApi — /internal/slack/users resolution (KPR-492 D4)", (
       expect(res.body).toMatchObject({ ok: false, error: "failed to look up user" });
     } finally {
       await ctx.stop();
+    }
+  });
+});
+
+describe("SlackInternalApi — bind failure (pre-PR review round 2)", () => {
+  it("resolves and logs loudly when the port is already in use, instead of hanging or crashing", async () => {
+    // Pre-fix, `listen` had no 'error' listener: EADDRINUSE emitted on a
+    // handler-less EventEmitter, so the promise never settled (this test times
+    // out) and the throw escaped as an uncaughtException that index.ts does not
+    // handle — a launchd crash loop. D10's precedent one call earlier in the
+    // same hoisted block is the policy: log and continue, never crash boot.
+    const first = await startApi(makeGateway(), makeAgentManager());
+    // Clear AFTER the successful bind: the spies are shared, and `first` logged
+    // its own success line for this very port.
+    mockLog.error.mockClear();
+    mockLog.info.mockClear();
+
+    const second = new SlackInternalApi({
+      port: first.port,
+      authToken: "test-token-abc",
+      gateway: makeGateway() as never,
+      agentManager: makeAgentManager() as never,
+      registry: makeRegistry() as never,
+    });
+
+    try {
+      await expect(second.start()).resolves.toBeUndefined();
+
+      expect(mockLog.error).toHaveBeenCalledWith(
+        expect.stringContaining("failed to bind"),
+        expect.objectContaining({
+          port: first.port,
+          error: expect.stringContaining("EADDRINUSE"),
+          likelyCause: expect.stringContaining("already in use"),
+        }),
+      );
+      // No success line on the failed path.
+      expect(mockLog.info).not.toHaveBeenCalledWith("Slack internal API started", { port: first.port });
+
+      // stop() after a failed bind is safe and must not close the listener that
+      // actually owns the port.
+      await expect(second.stop()).resolves.toBeUndefined();
+      const res = await post(first.port, "/internal/slack/channels", {}, first.token);
+      expect(res.status).toBe(200);
+    } finally {
+      await second.stop();
+      await first.stop();
     }
   });
 });

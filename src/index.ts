@@ -468,7 +468,11 @@ async function main(): Promise<void> {
   // tool call reaches it over loopback during a turn, so it must be listening
   // before anything below the boundary can dispatch one. Pre-KPR-492 it started
   // ~190 lines below the marker, masked only because the local server was opt-in
-  // and unset on both live instances; D6's default inversion makes it universal.
+  // and explicitly disabled on both live instances (dodi `hive.yaml:45`, keepur
+  // `hive.yaml:17` both pin `localMcpServer: false` — which is why shipping this
+  // is a fleet no-op); D6's inversion makes it the default for every instance
+  // that does not pin `false`. The hoist is right either way: the dependency is
+  // spawn-read, so correct placement cannot hinge on a config flag.
   // Guarded by src/boot-order.test.ts, which carries `await slackInternalApi.start()`
   // as an anchor in ALL THREE of its literal lists.
   // The gateway constructor only instantiates clients — Socket Mode connects in
