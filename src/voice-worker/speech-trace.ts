@@ -41,6 +41,7 @@ export interface BridgeAttempt {
   response(status: number): void;
   text(length: number, monoMs: number): void;
   fail(errorClass: VoiceErrorClass): void;
+  refineFailure(errorClass: VoiceErrorClass): void;
   finish(outcome: AttemptOutcome, cause: CancellationCause): void;
   bind(speechId: string): void;
 }
@@ -771,6 +772,8 @@ export class SpeechTrace implements SpeechTracePort {
       response: (status: number) => this.#safe(() => owner && this.#bridgeResponse(owner, status)),
       text: (length: number, monoMs: number) => this.#safe(() => owner && this.#bridgeText(owner, length, monoMs)),
       fail: (errorClass: VoiceErrorClass) => this.#safe(() => owner && this.#bridgeFail(owner, errorClass)),
+      refineFailure: (errorClass: VoiceErrorClass) =>
+        this.#safe(() => owner && this.#refineBridgeFailure(owner, errorClass)),
       finish: (outcome: AttemptOutcome, cause: CancellationCause) =>
         this.#safe(() => owner && this.#finishBridge(owner, outcome, cause)),
       bind: (speechId: string) => this.#safe(() => this.#bindBridge(turnId, speechId, "sdk_metrics_context")),
@@ -859,6 +862,13 @@ export class SpeechTrace implements SpeechTracePort {
         speechId: this.#boundId(owner.binding),
       });
     }
+  }
+
+  #refineBridgeFailure(owner: BridgeOwner, errorClass: VoiceErrorClass): void {
+    if (owner.terminalEmitted || owner.errorClass === null || owner.errorClass === errorClass) return;
+    owner.errorClass = errorClass;
+    const speech = this.#speechForBinding(owner.binding);
+    if (speech) this.#applySpeechFailure(speech, this.#bridgeFailureSource(owner.turnId), errorClass);
   }
 
   #finishBridge(owner: BridgeOwner, outcome: AttemptOutcome, cause: CancellationCause): void {

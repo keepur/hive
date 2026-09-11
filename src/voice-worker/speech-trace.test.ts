@@ -431,6 +431,27 @@ describe("speech lifecycle", () => {
     },
   );
 
+  it("refines a pending bridge failure without losing its bound speech failure source", () => {
+    const { rows, trace } = setup();
+    const handle = new FakeSpeechHandle("speech-refined-http-failure");
+    trace.speechCreated(handle.asHandle(), "sdk_response", 1);
+    const bridge = trace.bridgeCreated(bridgeContext("call", "turn-refined-http-failure"));
+    bridge.bind(handle.id);
+    bridge.fail("engine_auth");
+    bridge.refineFailure("budget_saturated");
+    bridge.finish("failed", "unknown");
+    handle.settle();
+
+    expect(rows.find((row) => row.event === "bridge_terminal")).toMatchObject({
+      outcome: "failed",
+      errorClass: "budget_saturated",
+    });
+    expect(rows.find((row) => row.event === "speech_terminal")).toMatchObject({
+      outcome: "failed",
+      errorClass: "budget_saturated",
+    });
+  });
+
   it("keeps a known speech failure ahead of active-registry overflow cleanup", () => {
     const { rows, trace } = setup();
     const oldest = new FakeSpeechHandle("speech-overflow-failed");

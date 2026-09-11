@@ -352,7 +352,7 @@ export function parseVoiceDiagnosticEvent(value: unknown): VoiceDiagnosticEvent 
     !nonempty(value.clockId) ||
     !finiteNonnegative(value.monoMs) ||
     !nonempty(value.callId) ||
-    !nullableString(value.workerBootId) ||
+    !(value.workerBootId === null || (nonempty(value.workerBootId) && UUID.test(value.workerBootId))) ||
     !nullableString(value.speechId) ||
     !nullableString(value.turnId) ||
     !nullableString(value.synthesisId) ||

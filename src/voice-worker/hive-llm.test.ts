@@ -1,7 +1,7 @@
 import { initializeLogger, llm } from "@livekit/agents";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { formatSSEDone, formatSSETextChunk } from "../channels/voice/openai-translator.js";
 import { VOICE_OUTAGE_SPOKEN_NOTICE } from "../outage/outage-notices.js";
 import {
@@ -61,7 +61,7 @@ function traceHarness(callId = "call-test") {
   return { rows, trace: new SpeechTrace({ callId, workerBootId: VOICE_PROCESS_ID, writer }) };
 }
 
-function makeHive(bridgeUrl: string, trace = traceHarness().trace): HiveLLM {
+function makeHive(bridgeUrl: string, trace = traceHarness().trace, callSignal?: AbortSignal): HiveLLM {
   return new HiveLLM({
     bridgeUrl,
     bridgeToken: "test-bridge-token",
@@ -70,6 +70,7 @@ function makeHive(bridgeUrl: string, trace = traceHarness().trace): HiveLLM {
     goal: "help the caller",
     context: "pilot",
     trace,
+    callSignal,
   });
 }
 
@@ -275,6 +276,57 @@ describe("HiveLLM (KPR-322)", () => {
         status: 503,
         outcome: "failed",
         errorClass: "budget_saturated",
+      }),
+    ]);
+  });
+
+  it("keeps a flushed non-2xx failure authoritative when call cleanup aborts its pending body", async () => {
+    const headers = gate();
+    const closed = gate();
+    const stub = await listen((req, res) => {
+      req.resume();
+      res.once("close", () => closed.resolve());
+      res.writeHead(503, { "Content-Type": "text/plain" });
+      res.flushHeaders();
+      headers.resolve();
+      // Hold the body open: cleanup must not replace the observed status failure.
+    });
+    openServers.push(stub.server);
+
+    const callAbort = new AbortController();
+    const { trace, rows } = traceHarness();
+    const hive = makeHive(stub.url, trace, callAbort.signal);
+    const ownFailure = vi.spyOn(hive, "ownFailure");
+    const emittedFailures: Error[] = [];
+    hive.on("error", (event) => emittedFailures.push(event.error));
+    const consuming = consumeTurn(hive, userCtx("hello"));
+
+    await headers.promise;
+    await until(() => bridgeRows(rows).some((row) => row.event === "bridge_response"), "bridge response status");
+    expect(ownFailure).toHaveBeenCalledTimes(1);
+    const originalFailure = ownFailure.mock.calls[0]![0];
+
+    callAbort.abort();
+    trace.close("call_closed");
+    await closed.promise;
+    const result = await consuming;
+
+    expect(result.bridge).toBe(originalFailure);
+    expect(result.eventError).toBe(originalFailure);
+    expect(result.thrown).toBeUndefined();
+    expect(emittedFailures).toEqual([originalFailure]);
+    expect(originalFailure).toMatchObject({
+      turnId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      failureClass: "engine_auth",
+      bytesReceived: false,
+    });
+    expect(terminalRows(rows)).toEqual([
+      expect.objectContaining({
+        turnId: originalFailure.turnId,
+        status: 503,
+        outcome: "failed",
+        cause: "call_closed",
+        errorClass: "engine_auth",
       }),
     ]);
   });

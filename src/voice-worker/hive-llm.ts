@@ -27,17 +27,63 @@ import { SSEParser } from "./sse.js";
 import { bridgeTraceContext, type BridgeTraceContext } from "./trace-context.js";
 
 const log = createLogger("hive-llm");
+const MAX_FAILURE_BODY_BYTES = 800;
+const MAX_FAILURE_SNIPPET_CHARS = 200;
+
+async function readFailureSnippet(res: Response): Promise<string> {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let byteCount = 0;
+  let snippet = "";
+  try {
+    while (byteCount < MAX_FAILURE_BODY_BYTES && snippet.length < MAX_FAILURE_SNIPPET_CHARS) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = MAX_FAILURE_BODY_BYTES - byteCount;
+      const bounded = value.subarray(0, remaining);
+      byteCount += bounded.byteLength;
+      snippet += decoder.decode(bounded, { stream: byteCount < MAX_FAILURE_BODY_BYTES });
+    }
+    snippet += decoder.decode();
+  } catch {
+    // Headers/status already own the failure; body diagnostics are optional.
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // The observed HTTP failure remains authoritative.
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      // A failed release is cleanup-only.
+    }
+  }
+  return snippet.slice(0, MAX_FAILURE_SNIPPET_CHARS);
+}
+
+const bridgeErrorFailureClasses = new WeakMap<BridgeError, BridgeFailureClass>();
 
 export class BridgeError extends Error {
   constructor(
-    public readonly failureClass: BridgeFailureClass,
+    failureClass: BridgeFailureClass,
     public readonly turnId: string,
     /** True when at least one content chunk was already yielded (mid-stream). */
     public readonly bytesReceived: boolean,
   ) {
     super("Hive voice bridge request failed");
     this.name = "BridgeError";
+    bridgeErrorFailureClasses.set(this, failureClass);
   }
+
+  get failureClass(): BridgeFailureClass {
+    return bridgeErrorFailureClasses.get(this)!;
+  }
+}
+
+function refineFailureClass(failure: BridgeError, failureClass: BridgeFailureClass): void {
+  bridgeErrorFailureClasses.set(failure, failureClass);
 }
 
 export interface HiveLLMOptions {
@@ -196,6 +242,7 @@ export class HiveLLMStream extends llm.LLMStream {
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let yielded = false;
     let responseStatus: number | undefined;
+    let observedFailure: BridgeError | null = null;
     let outcome: "completed" | "cancelled" | "failed" = "completed";
     let cause: "framework_cancelled" | "call_closed" | "unknown" = "unknown";
     this.attempt.started();
@@ -234,12 +281,23 @@ export class HiveLLMStream extends llm.LLMStream {
       responseStatus = res.status;
       this.attempt.response(res.status);
       if (!res.ok || !res.body) {
-        const snippet = (await res.text().catch(() => "")).slice(0, 200);
-        throw new BridgeError(
-          res.ok ? "engine_unreachable" : classifyHttpFailure(res.status, snippet),
+        observedFailure = new BridgeError(
+          res.ok ? "engine_unreachable" : classifyHttpFailure(res.status, ""),
           this.traceContext.turnId,
           false,
         );
+        // Status headers are already a direct application failure. Own that
+        // exact error before reading the optional body so a later teardown
+        // abort cannot erase it while classification is pending.
+        this.attempt.fail(observedFailure.failureClass);
+        this.parent.ownFailure(observedFailure);
+        if (!res.ok) {
+          const snippet = await readFailureSnippet(res);
+          const refinedClass = classifyHttpFailure(res.status, snippet);
+          refineFailureClass(observedFailure, refinedClass);
+          this.attempt.refineFailure(refinedClass);
+        }
+        throw observedFailure;
       }
       // Engine accepted the marked user message. Leave the flag cleared on a
       // later barge-in abort — do not restore. BridgeError (503/500) above
@@ -272,7 +330,10 @@ export class HiveLLMStream extends llm.LLMStream {
       // Degenerate zero-content turn (§5.1): stream ends empty — no-reply,
       // the session synthesizes nothing.
     } catch (err) {
-      if (controller.signal.aborted || this.abortController.signal.aborted || this.parent.callSignal.aborted) {
+      if (
+        observedFailure === null &&
+        (controller.signal.aborted || this.abortController.signal.aborted || this.parent.callSignal.aborted)
+      ) {
         outcome = "cancelled";
         cause = this.parent.callSignal.aborted ? "call_closed" : "framework_cancelled";
         log.info("Bridge request aborted", {
@@ -283,18 +344,19 @@ export class HiveLLMStream extends llm.LLMStream {
         return; // cancelled turn — not an error
       }
       const failure =
-        err instanceof BridgeError
+        observedFailure ??
+        (err instanceof BridgeError
           ? err
-          : new BridgeError(yielded ? "midstream_error" : "engine_unreachable", this.traceContext.turnId, yielded);
+          : new BridgeError(yielded ? "midstream_error" : "engine_unreachable", this.traceContext.turnId, yielded));
       outcome = "failed";
-      this.attempt.fail(failure.failureClass);
+      if (observedFailure === null) this.attempt.fail(failure.failureClass);
       log.warn("Bridge request failed", {
         callId: this.opts.callId,
         turnId: this.traceContext.turnId,
         failureClass: failure.failureClass,
         status: responseStatus,
       });
-      this.parent.ownFailure(failure);
+      if (observedFailure === null) this.parent.ownFailure(failure);
       throw failure;
     } finally {
       this.abortController.signal.removeEventListener("abort", onFetchAbort);

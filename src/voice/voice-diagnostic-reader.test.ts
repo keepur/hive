@@ -725,6 +725,37 @@ describe("voice diagnostic input validation", () => {
     expect(report.byOutcome.speech.incomplete).toBe(1);
   });
 
+  it("counts selected speech rows with an invalid worker boot ID as malformed instead of complete", () => {
+    const invalidWorkerBootId = "not-a-uuid";
+    const started = {
+      ...row(
+        "invalid-boot-start",
+        { event: "speech_started", origin: "sdk_response", acceptedEpoch: 1 },
+        { speechId: "speech-invalid-boot" },
+      ),
+      workerBootId: invalidWorkerBootId,
+    };
+    const terminal = {
+      ...row(
+        "invalid-boot-terminal",
+        { event: "speech_terminal", origin: "sdk_response", acceptedEpoch: 1, outcome: "completed" },
+        { speechId: "speech-invalid-boot" },
+      ),
+      workerBootId: invalidWorkerBootId,
+    };
+
+    expect(parseVoiceDiagnosticEvent(started)).toBeNull();
+    expect(parseVoiceDiagnosticEvent(terminal)).toBeNull();
+    expect(
+      reduceVoiceDiagnostics(`${JSON.stringify(started)}\n${JSON.stringify(terminal)}\n`, "call-test"),
+    ).toMatchObject({
+      complete: false,
+      speechAttempts: 0,
+      malformedRows: 2,
+      incomplete: { total: 0 },
+    });
+  });
+
   it("ignores legacy and other-call rows but rejects a selected unsupported schema", () => {
     const other = {
       ...row("other", { event: "speech_started", origin: "opening", acceptedEpoch: 0 }, { speechId: "other" }),
