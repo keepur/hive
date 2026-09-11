@@ -14,7 +14,7 @@ import { OpsPublisher, familyOf } from "./publisher.js";
 import { __resetOpsPublisherForTests, setOpsPublisher } from "./publisher-singleton.js";
 import { observeToolFailure, observeToolSuccess, type ToolFailureObservation } from "./observe.js";
 import { HIVE_RUNTIME_PRODUCER, REASON_TOOL_FAILED, REASON_TOOL_RECOVERED } from "./reasons.js";
-import { OPS_CLEARS_MAX_LENGTH, OPS_ID_MAX_LENGTH, OPS_MATCHED_IDS_MAX } from "./ids.js";
+import { OPS_CLEARS_MAX_LENGTH, OPS_ID_MAX_LENGTH } from "./ids.js";
 import { OPS_EVENTS_COLLECTION, OPS_REASONS_COLLECTION, OPS_SUBSCRIPTIONS_COLLECTION } from "./types.js";
 
 /**
@@ -681,6 +681,28 @@ describe("an unusable subscription row is COUNTED and NAMED, per reload (C2)", (
     expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(1);
   });
 
+  it("a RESHUFFLE of Mongo natural order does not re-fire the warn — the signature is order-INDEPENDENT", async () => {
+    await publisher.init();
+    // MORE bad rows than the log sample holds. That is the only case where
+    // natural order can change WHICH ids the signature is built from, and it is
+    // the case the latch was sized for.
+    const bad = ["sub-b1", "sub-b2", "sub-b3", "sub-b4", "sub-b5", "sub-b6", "sub-b7"];
+    for (const id of bad) await insert({ _id: id, filter: "producer" });
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(bad.length);
+    expect(warnsMatching(ANOMALY_WARN)).toBe(1);
+
+    // `loadSubscriptions()` is a bare `find({ enabled: true })` with no sort, so
+    // a delete-and-insert anywhere in the collection can hand back the SAME set
+    // in a different order. Nothing about what is broken has changed, so nothing
+    // is logged again — otherwise this is a line per 60 s reload, 1440 a day.
+    fakeDb.collection(OPS_SUBSCRIPTIONS_COLLECTION).rows.length = 0;
+    for (const id of [...bad].reverse()) await insert({ _id: id, filter: "producer" });
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(bad.length);
+    expect(warnsMatching(ANOMALY_WARN)).toBe(1);
+  });
+
   it("a SECOND bad row appearing is reported rather than swallowed behind the first", async () => {
     await publisher.init();
     await insert({ _id: new ObjectId() });
@@ -731,12 +753,17 @@ describe("an unusable subscription row is COUNTED and NAMED, per reload (C2)", (
 });
 
 // ───────────────────────────────────────────────────────────────────────────
-// C3 — `matchedSubscriptionIds` was bounded per ELEMENT and not in COUNT, while
-// `loadSubscriptions()` is unbounded: N matching subscriptions wrote N × ≤200
-// characters into EVERY stored event for the whole retention window.
+// `matchedSubscriptions` ≡ `matchedSubscriptionIds.length` — the contract this
+// file exists to hold able-to-fail. It is asserted in THREE artifacts
+// (kpr-458-design.md:111, kpr-454-design.md:360, kpr-455-design.md:131) and was
+// briefly broken by a stored-list cap that kept the pre-slice count beside a
+// post-slice list. KPR-468's ingest reads the STAMPED list and never
+// re-evaluates a filter, so every id past such a cut gets no ledger row, no
+// delivery and no nudge — with no counter and no log line to find it by.
+// The set size here is deliberately > 20, the cap that was reverted.
 // ───────────────────────────────────────────────────────────────────────────
 
-describe("matchedSubscriptionIds is bounded in COUNT while the count stays TRUE (C3)", () => {
+describe("matchedSubscriptions IS matchedSubscriptionIds.length — no stored-list cap", () => {
   const matchAll = (index: number) => ({
     _id: `sub-${String(index).padStart(3, "0")}`,
     subscriberId: "ops-team",
@@ -753,33 +780,21 @@ describe("matchedSubscriptionIds is bounded in COUNT while the count stays TRUE 
   };
   const ids = (count: number) => Array.from({ length: count }, (_, i) => matchAll(i)._id);
 
-  it("over the cap: the first N ids in registration order, and matchedSubscriptions is the UNCAPPED total", async () => {
+  it("stamps EVERY matched id, and the count is that list's length", async () => {
     await publisher.init();
-    const total = OPS_MATCHED_IDS_MAX + 3;
+    const total = 23;
     await seed(total);
     expect(publisher.getSnapshot().subscriptions).toBe(total);
 
     driveFailure("Bash");
     await publisher.__drainForTests();
     const doc = events()[0]!;
-    // THE COUNT IS THE FACT. It is what `matchedSubscriptions: 0` means on every
-    // row this ticket ships, so capping the list must not touch it.
+    // The identity itself, stated as the contract states it.
+    expect(doc.matchedSubscriptions).toBe(doc.matchedSubscriptionIds.length);
+    // And that the length is the WHOLE matched set, not a prefix of it — the
+    // identity alone would survive a cap that also capped the count.
     expect(doc.matchedSubscriptions).toBe(total);
-    expect(doc.matchedSubscriptionIds).toHaveLength(OPS_MATCHED_IDS_MAX);
-    expect(doc.matchedSubscriptionIds).toEqual(ids(OPS_MATCHED_IDS_MAX));
-    // The truncation needs no counter and no log line because it is self-evident
-    // in the document itself — asserted rather than claimed.
-    expect(doc.matchedSubscriptions).toBeGreaterThan(doc.matchedSubscriptionIds.length);
-  });
-
-  it("exactly AT the cap nothing is dropped — the bound is not off by one", async () => {
-    await publisher.init();
-    await seed(OPS_MATCHED_IDS_MAX);
-    driveFailure("Bash");
-    await publisher.__drainForTests();
-    const doc = events()[0]!;
-    expect(doc.matchedSubscriptions).toBe(OPS_MATCHED_IDS_MAX);
-    expect(doc.matchedSubscriptionIds).toEqual(ids(OPS_MATCHED_IDS_MAX));
+    expect(doc.matchedSubscriptionIds).toEqual(ids(total));
   });
 });
 

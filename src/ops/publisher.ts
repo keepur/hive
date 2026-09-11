@@ -4,14 +4,7 @@ import { OpsStore, type LoadedReason } from "./store.js";
 import { evaluateMatches, isAdmissibleSubscriptionRow } from "./match.js";
 import { assertReasonTableLegal, HIVE_RUNTIME_REASONS } from "./reasons.js";
 import { OPS_SCHEMA_VERSION, type OpsEvent, type OpsPublishInput, type OpsSubscription } from "./types.js";
-import {
-  OPS_CLEARS_MAX_LENGTH,
-  OPS_EVIDENCE_MAX,
-  OPS_ID_MAX_LENGTH,
-  OPS_MATCHED_IDS_MAX,
-  clipForLog,
-  isOpsToken,
-} from "./ids.js";
+import { OPS_CLEARS_MAX_LENGTH, OPS_EVIDENCE_MAX, OPS_ID_MAX_LENGTH, clipForLog, isOpsToken } from "./ids.js";
 
 const log = createLogger("ops-publisher");
 
@@ -78,6 +71,15 @@ const SUBSCRIPTION_RELOAD_MS = 60_000;
  * hazard on the reason loader.
  */
 const SUBSCRIPTION_ROW_ANOMALY_LOG_MAX = 5;
+
+/**
+ * The latch value `auditSubscriptionRows`' own catch parks on. Folded into the
+ * SAME signature as the success path rather than given a second latch field, so
+ * "the audit is throwing" and "these rows are broken" cannot both be latched at
+ * once and a recovery re-arms the other. Cannot collide with a real signature,
+ * which is always `<digits>:<ids>`.
+ */
+const SUBSCRIPTION_AUDIT_FAULT_SIGNATURE = "audit-threw";
 
 // EXPORTED so a test can name the return type of `__openEntryForTests`.
 // (NOT because omitting `export` would fail the build: TS4053 covers a name
@@ -322,7 +324,21 @@ export class OpsPublisher {
     try {
       const inadmissible = rows.filter((row) => !isAdmissibleSubscriptionRow(row));
       this.counters.subscriptionRowAnomalies = inadmissible.length;
-      const named = inadmissible.slice(0, SUBSCRIPTION_ROW_ANOMALY_LOG_MAX).map((row) => clipForLog(row._id));
+      // SORTED BEFORE the slice, not after — and the order matters. The
+      // signature IS the latch, and `loadSubscriptions()` is a bare
+      // `find({ enabled: true })` with no sort, so rows arrive in Mongo natural
+      // order. Sorting only the sample would leave the sample's MEMBERSHIP
+      // order-dependent: with more than SUBSCRIPTION_ROW_ANOMALY_LOG_MAX broken
+      // rows, a delete-and-insert anywhere in the collection reshuffles natural
+      // order, swaps which ids land in the first five, and re-fires the warn
+      // with nothing having actually changed — a line per 60 s reload is 1440 a
+      // day, the exact flood this latch exists to prevent, in the very case it
+      // was sized for. Sorting the whole list first makes both the signature and
+      // the printed sample a function of WHICH rows are broken and nothing else.
+      const named = inadmissible
+        .map((row) => clipForLog(row._id))
+        .sort()
+        .slice(0, SUBSCRIPTION_ROW_ANOMALY_LOG_MAX);
       const signature = `${inadmissible.length}:${named.join(",")}`;
       if (signature === this.subscriptionAnomalySignature) return;
       this.subscriptionAnomalySignature = signature;
@@ -333,6 +349,15 @@ export class OpsPublisher {
         { count: inadmissible.length, ids: named },
       );
     } catch (err) {
+      // LATCHED, on the same signature field — and this catch is unlike
+      // `auditLoadedEnableGate`'s, which runs once per `init()` and so cannot
+      // flood. This one runs every 60 s, so an unlatched warn here would be the
+      // 1440-lines-a-day flood on the very path added to stop flooding.
+      // Effectively unreachable today (`isAdmissibleSubscriptionRow` is total
+      // except on a null element, which the driver does not return), which is
+      // why it is latched rather than counted.
+      if (this.subscriptionAnomalySignature === SUBSCRIPTION_AUDIT_FAULT_SIGNATURE) return;
+      this.subscriptionAnomalySignature = SUBSCRIPTION_AUDIT_FAULT_SIGNATURE;
       log.warn("Ops subscription row audit failed — skipped", { error: String(err) });
     }
   }
@@ -737,13 +762,30 @@ export class OpsPublisher {
       detail: detail.data as OpsEvent["detail"],
       // ALWAYS present, [] when empty — never omitted.
       evidence: input.evidence.map((ref) => ({ kind: ref.kind, id: ref.id })),
-      // The COUNT is the fact and is always exact; the ID LIST is a bounded
-      // convenience (`OPS_MATCHED_IDS_MAX`, ids.ts) — `loadSubscriptions()` is
-      // unbounded, so an uncapped list wrote one ≤200-character id per matching
-      // subscription into every stored event for the whole retention window.
-      // `slice` also satisfies step 7's rebuild rule on this field.
+      // ⚠ `matchedSubscriptions` IS `matchedSubscriptionIds.length` — a
+      // three-artifact contract, not an implementation detail, and NOT to be
+      // re-derived as cappable by a later reader worried about document size.
+      // KPR-458 D2 (kpr-458-design.md:111) fixes the identity and calls the list
+      // "the only join between the synchronous half and the swept half", bounded
+      // by "the registered subscription set, which is operator-registered data
+      // and does not grow with traffic"; D9 step 8 of this ticket's own design
+      // (kpr-454-design.md:360) says the insert carries the list "and its length
+      // as `matchedSubscriptions`"; KPR-455 (kpr-455-design.md:131) asserts the
+      // identity independently and cites the second. A cap breaks all three AND
+      // strands subscribers silently: KPR-468's ingest reads THIS list and never
+      // re-evaluates a filter, so a truncated id gets no ledger row, no delivery
+      // and no nudge, with no counter and no log line. `loadSubscriptions()` has
+      // no sort either, so which ids survived would be Mongo natural order.
+      // A bound on the LOADED SET is the shape that would not break this
+      // identity; it belongs at load time with a counter and a warn, and it is
+      // not this field's business.
+      //
+      // Written by reference deliberately: `evaluateMatches` returns a freshly
+      // built local array that nothing else retains, so step 7's rebuild rule
+      // — which exists for CALLER-SUPPLIED objects carrying extra properties
+      // past the allow-list — has no subject here.
       matchedSubscriptions: matchedSubscriptionIds.length,
-      matchedSubscriptionIds: matchedSubscriptionIds.slice(0, OPS_MATCHED_IDS_MAX),
+      matchedSubscriptionIds,
       ...(input.clears !== undefined ? { clears: input.clears, clearsFamily } : {}),
     };
 

@@ -45,6 +45,21 @@ export interface ToolFailureObservation {
  * site sits inside the one method whose header promise is "structurally
  * cannot throw", and the Claude-lane sites sit in hook callbacks the SDK
  * awaits mid-turn.
+ *
+ * ⚠ `obs.tool` IS NOT RE-CHECKED HERE, and that is a POSTURE, not an omission —
+ * recorded so a third capture point does not inherit the gap by silence. This
+ * pair of functions is the one narrow waist both lanes pass through, so a guard
+ * here would look like the natural home for it; it is not. The empty/absent
+ * name is SDK-DRIFT DETECTION and belongs where the drift is observable: the two
+ * Claude-lane hook sites read `tool_name` off an SDK payload and guard it there
+ * (agent-runner.ts — a typeof-plus-length test whose failure warns under a
+ * per-event latch and names WHICH hook drifted), while Lane B passes the
+ * bridge's own closed-over inventory name (tool-bridge.ts), which cannot be
+ * empty without the inventory itself being malformed. Adding a test here would
+ * be a THIRD predicate for the same fact with no drift-naming ability, which is
+ * exactly the evaluator drift this module's one-copy discipline forbids (cf.
+ * `isAdmissibleSubscriptionRow`). A NEW capture point owes its own guard at its
+ * own payload boundary, in the shape the Claude-lane hooks use.
  */
 export function observeToolFailure(obs: ToolFailureObservation): void {
   try {
@@ -108,7 +123,14 @@ export function observeToolFailure(obs: ToolFailureObservation): void {
   }
 }
 
-/** The recovery half. Two arguments and no others — the same closed pair on both lanes. */
+/**
+ * The recovery half. Two arguments and no others — the same closed pair on both
+ * lanes.
+ *
+ * ⚠ Same posture on `obs.tool` as `observeToolFailure` above, for the same
+ * reason and with the same obligation on any new capture point: the name is
+ * guarded at the CAPTURE POINT, never here.
+ */
 export function observeToolSuccess(obs: { tool: string; lane: CaptureLane }): void {
   try {
     const publisher = opsPublisher();
