@@ -696,12 +696,22 @@ async function main(): Promise<void> {
     // and it does NOT replace §10's membership gate; it makes the gate's subject
     // visible early. NOT gated on localMcpServer: this is about Path A.
     {
-      const ID_SHAPE = /^[CDG][A-Z0-9]+$/;
+      // Channel shapes only. A D…-shaped homeBase is a DM — `resolveNotificationChannel`
+      // accepts one and posts to it verbatim — but `conversations.list` above asks for
+      // `public_channel,private_channel`, which NEVER returns an IM, so a DM is neither
+      // "missing from" nor "not visible": it is not a channel the bot can be absent from.
+      // Checking it would report every such agent on EVERY boot — the same permanent
+      // false positive the id-keying above was added to prevent for C… (pre-PR review
+      // round 1). Skipped explicitly, so the fall-through to the name branch (where a
+      // raw `D0…` would miss `channelIdByName` just as loudly) cannot reintroduce it.
+      const ID_SHAPE = /^[CG][A-Z0-9]+$/;
+      const DM_SHAPE = /^D[A-Z0-9]+$/;
       const notMember: string[] = [];
       const notVisible: string[] = [];
       const check = (raw: string) => {
         const dep = raw.trim();
         if (!dep) return;
+        if (DM_SHAPE.test(dep)) return;
         if (ID_SHAPE.test(dep)) {
           // An id-shaped homeBase: membership by id. Absent from the page ⇒ the
           // bot cannot see it (private + unjoined, or not a channel at all).

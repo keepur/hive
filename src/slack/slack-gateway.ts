@@ -1069,9 +1069,21 @@ export class SlackGateway {
    */
   private async buildUserHandleMap(force = false): Promise<void> {
     if (this.userHandleMapBuilt && !force) return;
-    this.userIdByName.clear();
-    this.userIdsByDisplayName.clear();
-    this.userHandleById.clear();
+    // Page into LOCAL maps and publish them in one synchronous step at the end
+    // (pre-PR review round 1). Clearing the shared maps UP FRONT left them
+    // observably empty across every `await` of the page-through, and there is no
+    // single-flight guard: a concurrent `resolveUserId` for a handle the map
+    // already holds would see `userHandleMapBuilt === true`, skip the build,
+    // miss the emptied map, and burn its own one allowed rebuild — and with a
+    // third concurrent miss straddling that rebuild it could answer the false
+    // "no active Slack user matches" `resolveUserId` must never give. Posts fan
+    // out concurrently by design (meeting mode, conference rounds, cron bursts
+    // — see `PostErrorSink`), so this is not hypothetical. The FAILURE path
+    // publishes too, deliberately: the partial pages replace the old map exactly
+    // as the clear-first version left them, so only the timing changes.
+    const userIdByName = new Map<string, string>();
+    const userIdsByDisplayName = new Map<string, Set<string>>();
+    const userHandleById = new Map<string, string>();
     this.lastUserListError = undefined;
     try {
       let cursor: string | undefined;
@@ -1080,15 +1092,15 @@ export class SlackGateway {
         for (const m of res.members ?? []) {
           if (!m.id || m.deleted || m.is_bot) continue;
           if (m.name) {
-            this.userIdByName.set(m.name.toLowerCase(), m.id);
-            this.userHandleById.set(m.id, `@${m.name}`);
+            userIdByName.set(m.name.toLowerCase(), m.id);
+            userHandleById.set(m.id, `@${m.name}`);
           }
           for (const alt of [m.profile?.display_name, m.profile?.real_name, m.real_name]) {
             if (!alt) continue;
             const k = alt.toLowerCase();
-            const set = this.userIdsByDisplayName.get(k) ?? new Set<string>();
+            const set = userIdsByDisplayName.get(k) ?? new Set<string>();
             set.add(m.id);
-            this.userIdsByDisplayName.set(k, set);
+            userIdsByDisplayName.set(k, set);
           }
         }
         cursor = res.response_metadata?.next_cursor || undefined;
@@ -1098,6 +1110,9 @@ export class SlackGateway {
       this.lastUserListError = String(err);
       log.warn("users.list page-through failed", { error: String(err) });
     }
+    this.userIdByName = userIdByName;
+    this.userIdsByDisplayName = userIdsByDisplayName;
+    this.userHandleById = userHandleById;
     this.userHandleMapBuilt = true;
   }
 

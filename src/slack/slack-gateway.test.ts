@@ -915,6 +915,45 @@ describe("SlackGateway — resolveUserId (KPR-492 D4)", () => {
     expect(usersListMock).toHaveBeenCalledTimes(2);
   });
 
+  it("a KNOWN handle still resolves while an unknown-handle rebuild is in flight — the rebuild pages into local maps", async () => {
+    // Pre-PR review round 1. `buildUserHandleMap` used to `.clear()` the three
+    // shared maps BEFORE awaiting `users.list`, with no single-flight guard, so
+    // the maps were observably empty for the whole page-through. A concurrent
+    // lookup of a handle the map already held saw `userHandleMapBuilt === true`,
+    // skipped the build, missed the emptied map, and burned its own one allowed
+    // rebuild — one straddling miss further and it answers the false "no active
+    // Slack user matches" `resolveUserId`'s contract forbids. Posts fan out
+    // concurrently by design (meeting mode, conference rounds, cron bursts).
+    const roster = { members: [{ id: "UALICE", name: "alice" }], response_metadata: { next_cursor: "" } };
+    usersListMock.mockResolvedValue(roster);
+    await expect(gateway.resolveUserId("alice")).resolves.toEqual({ ok: true, id: "UALICE" });
+    expect(usersListMock).toHaveBeenCalledTimes(1);
+
+    // Hold the miss-policy rebuild open mid-page-through.
+    let reached!: () => void;
+    let release!: () => void;
+    const rebuildReached = new Promise<void>((resolve) => (reached = resolve));
+    const rebuildGate = new Promise<void>((resolve) => (release = resolve));
+    usersListMock.mockImplementationOnce(async () => {
+      reached();
+      await rebuildGate;
+      return roster;
+    });
+
+    const ghost = gateway.resolveUserId("ghost");
+    await rebuildReached;
+    // `resolveUserId` runs synchronously through `matchHandle` on the built-map
+    // path, so this consults the maps WHILE the rebuild above is parked.
+    const alice = gateway.resolveUserId("alice");
+    release();
+
+    await expect(alice).resolves.toEqual({ ok: true, id: "UALICE" });
+    await expect(ghost).resolves.toMatchObject({ ok: false });
+    // 1 build + ghost's ONE forced rebuild. A third page-through means the
+    // concurrent lookup saw an emptied map and spent its own rebuild on it.
+    expect(usersListMock).toHaveBeenCalledTimes(2);
+  });
+
   it("miss policy: a second miss errors and does NOT page a third time", async () => {
     usersListMock.mockResolvedValue({ members: [], response_metadata: { next_cursor: "" } });
     const result = await gateway.resolveUserId("nobody");
