@@ -489,8 +489,11 @@ async function main(): Promise<void> {
       agentManager,
       registry,
     });
+    // KPR-492 (pre-PR Frontier round): no success line here. start() returns
+    // normally on bind failure by design, so an unconditional info line printed
+    // "started" straight after the module's own bind error. SlackInternalApi
+    // logs its own success (slack-internal-api.ts), suppressed on failure.
     await slackInternalApi.start();
-    log.info("Slack internal API started", { port: config.slackInternal.port });
   } else if (config.slack.mcpToken) {
     // KPR-492 D6: `false` stays reachable as the config-level rollback lever, but
     // it never again silently outlives its reason.

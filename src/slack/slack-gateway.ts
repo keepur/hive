@@ -66,8 +66,9 @@ function resolutionFailureCode(raw: string): string {
 
 /**
  * KPR-492 D3: one `log.error` per process the first time an identity-mode post
- * falls back to a plain post. Warn-once is the house idiom (`clampLaneAEffort`,
- * the orphan-prefix warns). Module-level, so tests reset it explicitly.
+ * falls back to a plain post THAT THEN LANDS — the state its text asserts.
+ * Warn-once is the house idiom (`clampLaneAEffort`, the orphan-prefix warns).
+ * Module-level, so tests reset it explicitly.
  */
 let identityFallbackReported = false;
 
@@ -485,6 +486,18 @@ export class SlackGateway {
     errorSink?: PostErrorSink,
   ): Promise<string | undefined> {
     // Try with agent identity first, fall back to plain bot post
+    // KPR-492 D3 (pre-PR Frontier round): set when the identity post throws, and
+    // read only after the plain retry LANDS. The once-per-process error asserts
+    // "the message went out, rendering as the plain Hive bot", which is true only
+    // in that state. A not_in_channel / channel_not_found / is_archived / 5xx
+    // identity failure posts nothing at all and is not a chat:write.customize
+    // degradation: emitting there would hand the operator a confident wrong
+    // diagnosis in exactly the rollout scenario (not_in_channel is this ticket's
+    // own named risk) AND exhaust the latch before a genuine scope degradation
+    // could use it. Resolves the spec's internal inconsistency toward edge 4's
+    // intent, not D3's looser "the first time". The warn below is unnarrowed and
+    // still fires on every identity failure.
+    let identityFailure: { username: string; error: string } | undefined;
     if (identity) {
       try {
         const iconOpts: Record<string, string> = {};
@@ -520,13 +533,7 @@ export class SlackGateway {
           username: identity.name,
           error: String(err),
         });
-        if (!identityFallbackReported) {
-          identityFallbackReported = true;
-          log.error(
-            "Slack identity-mode post failed — agent posts are rendering as the plain Hive bot. Grant chat:write.customize to the Slack app and reinstall; the boot scope preflight reports it.",
-            { channel, username: identity.name, error: String(err) },
-          );
-        }
+        identityFailure = { username: identity.name, error: String(err) };
       }
     }
 
@@ -539,6 +546,13 @@ export class SlackGateway {
       });
       if (result.ok && result.ts && result.channel) {
         this.outboundTsCache.register(result.channel, result.ts);
+      }
+      if (identityFailure && result.ts && !identityFallbackReported) {
+        identityFallbackReported = true;
+        log.error(
+          "Slack identity-mode post failed — agent posts are rendering as the plain Hive bot. Grant chat:write.customize to the Slack app and reinstall; the boot scope preflight reports it.",
+          { channel, username: identityFailure.username, error: identityFailure.error },
+        );
       }
       return result.ts;
     } catch (err) {

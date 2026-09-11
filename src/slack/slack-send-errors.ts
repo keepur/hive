@@ -38,8 +38,12 @@ const DM_ID = /^D[A-Z0-9]+$/;
  * the DM advice — is fully expressible against this signature, and a parameter
  * the function cannot see cannot be mis-keyed on. Code-enforce, don't
  * prose-enforce: the wrong branch is unrepresentable rather than tested-for.
- * (The dead parameter lint-passed only because `no-unused-vars` defaults to
- * `after-used`, `eslint.config.js:12` — a warning that never fired.)
+ * (The dead parameter lint-passed because `no-unused-vars` is configured at
+ * severity `"warn"`, not `"error"` (`eslint.config.js:12`), and the repo sits at
+ * ~1538 warnings / 0 errors — one more is invisible in a green gate. NOT because
+ * of the rule's `after-used` default, as rounds 2-4 recorded: a TRAILING unused
+ * parameter IS flagged under `after-used`; only a middle-position one is exempt.
+ * Verified by scratch eslint run — the warning fired the whole time, unread.)
  */
 export function describeSendFailure(target: string, raw: string): string {
   const advice = adviceFor(target, raw);

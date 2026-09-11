@@ -619,6 +619,38 @@ describe("SlackGateway — per-agent identity + error sink (KPR-492 D1/D2/D3)", 
   });
 
   // ── D3: the once-per-process latch (INSIDE this describe — needs its beforeEach) ──
+  it("stays silent on an identity failure that landed nothing, and leaves the latch unspent", async () => {
+    // The rollout shape, reachable on both live instances at deploy: the bot is
+    // not in the channel, so the identity post AND the plain retry both fail and
+    // NOTHING rendered — as the agent or as the plain bot. chat:write.customize
+    // is not the cause. Pre-fix, the identity catch emitted its confident wrong
+    // diagnosis here and burned the once-per-process latch doing it, so the
+    // genuine degradation below could never report itself. Discriminating on
+    // both counts: the pre-fix code fails the first assertion and the last.
+    postMessageMock.mockRejectedValue(new Error("An API error occurred: not_in_channel"));
+    const landedNothing = await gateway.postAndRegister("C123", "a", undefined, {
+      name: "Grant",
+      icon: ":seedling:",
+    });
+    expect(landedNothing.ok).toBe(false);
+    expect(errorSpy.mock.calls.filter((c) => String(c[0]).includes("chat:write.customize"))).toHaveLength(0);
+    // Deliberately unnarrowed: the warn still fires on EVERY identity failure.
+    expect(
+      warnSpy.mock.calls.filter((c) => c[0] === "Failed to post with identity, falling back to plain post"),
+    ).toHaveLength(1);
+
+    // The latch is still available for the state the message actually describes:
+    // the identity post fails and the plain retry LANDS — the message went out,
+    // rendering as the plain Hive bot.
+    postMessageMock.mockReset();
+    postMessageMock
+      .mockRejectedValueOnce(new Error("An API error occurred: missing_scope"))
+      .mockResolvedValueOnce({ ok: true, ts: "9.9", channel: "C123" });
+    await gateway.postAndRegister("C123", "b", undefined, { name: "Grant", icon: ":seedling:" });
+    expect(errorSpy.mock.calls.filter((c) => String(c[0]).includes("chat:write.customize"))).toHaveLength(1);
+  });
+
+  // The genuine shape both times: identity post throws, plain retry lands.
   it("emits the chat:write.customize error exactly once per process across two failures", async () => {
     postMessageMock
       .mockRejectedValueOnce(new Error("missing_scope"))
