@@ -24,6 +24,23 @@ const log = createLogger("ops-publisher");
  * so ~600 KB at full cap — immaterial to the choice either way. Breach evicts
  * oldest-first and costs one delayed epoch boundary — the restart residual's
  * exact shape and bound.
+ *
+ * ⚠ "BOUNDED BY THE INVENTORY" IS STRUCTURAL ON LANE B ONLY, and the honest
+ * version matters because it is what makes the sentence above a reason rather
+ * than an assumption. Lane B's key comes from the bridge's own closed-over tool
+ * name (tool-bridge.ts), which is inventory by construction. The Claude lane's
+ * comes from `failure.tool_name` — i.e. FROM THE SDK. The probe
+ * (scripts/probe-posttooluse-failure.ts) establishes that a DENIED call does not
+ * fire the hook, but it does not cover a MODEL-INVENTED tool name, and nobody
+ * has measured whether the CLI fires PostToolUseFailure for one. If it does, the
+ * family key space becomes model-influenced: this cap moves from "unreachable"
+ * to "reachable", and an invented name over `OPS_ID_MAX_LENGTH` increments
+ * `rejected` — D9's mis-integrated-PRODUCER signal — from model output.
+ *
+ * The COST is bounded either way, which is why this is recorded rather than
+ * defended against: eviction is oldest-first and costs one delayed boundary, and
+ * a rejection stores nothing. Named as the seventh class on the probe script's
+ * standing re-check list.
  */
 const OPEN_CONDITION_MAP_CAP = 2000;
 /**
@@ -328,6 +345,23 @@ export class OpsPublisher {
    * drain and NEVER stored on the event (D2's key set is closed and openSeq
    * is not in it). The entry is removed later, by the drainer, if and when
    * that publish is accepted.
+   *
+   * ⚠ THE FOURTH RACE, and the only one where the recovery is LOST rather than
+   * delayed — named here beside the three `runJob` enumerates (a sibling
+   * recovery already closed the interval ⇒ `recoveryCoalesced`; the family
+   * re-opened under a new openSeq ⇒ `recoverySuperseded`; and the declined
+   * remove-at-enqueue). The map entry is created by the DRAINER, after the
+   * opening failure's own job has been accepted — so a success observed BEFORE
+   * that job drains finds no entry here and enqueues nothing at all. Nothing
+   * is queued, so nothing later reconsiders it.
+   *
+   * Reachable only inside a parallel-tool batch where ONE tool both fails and
+   * succeeds inside a single drain window. It self-heals at that tool's next
+   * success; absent one, the condition stays open and the following failure
+   * does not advance its epoch — the same shape and the same bound as D2's
+   * named restart residual (one delayed boundary, never a lost failure
+   * record). Not counted: the enqueue side is a map read and adding a counter
+   * here would count the overwhelmingly common "no open condition" case too.
    */
   enqueueRecoveryIfOpen(family: string, build: (clears: string) => OpsPublishInput): void {
     const entry = this.open.get(family);

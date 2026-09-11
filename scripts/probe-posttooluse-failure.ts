@@ -16,23 +16,61 @@
  *
  * ── RESULT, 2026-09-11, @anthropic-ai/claude-agent-sdk@0.3.258, claude-haiku-4-5
  *
- *   1 throwing in-process MCP tool ............ FIRED (is_interrupt=false)
- *   2 MCP isError result ...................... FIRED (is_interrupt=false)
- *   3 stdio server whose command exits ........ did NOT fire — the server never
- *     connects (CONNECTION_CLOSED), its tools never enter the inventory, so no
- *     tool call is ever made. A connect-time fault, not an unobserved call.
- *   4 builtin throw (Read ENOENT, Bash rc=7) .. FIRED x2
- *   5 KPR-438-style interrupt ................. INCONCLUSIVE — not reproduced
- *     (the same caveat repro-bg-subagent-mcp.ts carries). NOT "does not fire".
- *   6 PreToolUse DENY ......................... did NOT fire. PermissionDenied
- *     did not fire either; the denial reason reached the model verbatim and the
- *     turn continued. ⇒ AC12 holds as written: an archetype denial mints no
- *     `tool-failed` row, and NO id-keyed suppression is needed.
+ * Two columns: PTUF = PostToolUseFailure, PTU = PostToolUse. The PTU column is
+ * the RECOVERY half's load-bearing assumption (see the standing re-check below);
+ * the run below observed it — the per-class dump at the foot of this file prints
+ * every fired event in sequence, PostToolUse included — but the run's summary
+ * line tallied only PTUF, so the PTU answers were not PRESERVED and are recorded
+ * as `unrecorded` rather than reconstructed. The summary line now tallies both,
+ * so the next run records them without a re-run being needed for that alone.
  *
- * ⚠ Class 6 is the standing re-check. AC12's Claude-lane clause rests on that
- * "did not fire", it is CLI-version-dependent, and it cannot be unit-tested —
- * the fleet floats ^0.3.258 and resolves HIGHER than this lockfile, so re-run
- * this probe on an SDK bump before assuming the answer still holds.
+ *   1 throwing in-process MCP tool ............ PTUF FIRED (is_interrupt=false)
+ *                                              PTU  unrecorded
+ *   2 MCP isError result ...................... PTUF FIRED (is_interrupt=false)
+ *                                              PTU  unrecorded
+ *   3 stdio server whose command exits ........ PTUF did NOT fire — the server
+ *     never connects (CONNECTION_CLOSED), its tools never enter the inventory, so
+ *     no tool call is ever made. A connect-time fault, not an unobserved call.
+ *                                              PTU  n/a (no call was made)
+ *   4 builtin throw (Read ENOENT, Bash rc=7) .. PTUF FIRED x2
+ *                                              PTU  unrecorded
+ *   5 KPR-438-style interrupt ................. PTUF INCONCLUSIVE — not
+ *     reproduced (the same caveat repro-bg-subagent-mcp.ts carries). NOT "does
+ *     not fire".                               PTU  unrecorded
+ *   6 PreToolUse DENY ......................... PTUF did NOT fire.
+ *     PermissionDenied did not fire either; the denial reason reached the model
+ *     verbatim and the turn continued. ⇒ AC12 holds as written: an archetype
+ *     denial mints no `tool-failed` row, and NO id-keyed suppression is needed.
+ *                                              PTU  did NOT fire (the `order:`
+ *     field this class already prints enumerates every seq >= 0 event, and it
+ *     was empty — so this one PTU answer IS recorded, by that field).
+ *
+ * ── THE STANDING RE-CHECK LIST. Each item is CLI-version-dependent, cannot be
+ *    unit-tested, and the fleet floats ^0.3.258 and resolves HIGHER than this
+ *    lockfile — so re-run this probe on an SDK bump rather than assuming.
+ *
+ * ⚠ Class 6's "did not fire". AC12's Claude-lane clause rests on it.
+ *
+ * ⚠ The PTU column, on classes 1/2/4 — the RECOVERY half's single most
+ *   load-bearing SDK assumption, and until now documented without being
+ *   recorded. The recovery half rests on PostToolUse firing per SUCCESSFUL call
+ *   and NEVER after a failed one. If it also fired after PostToolUseFailure,
+ *   every failure would be followed by a closure, so the NEXT failure of that
+ *   tool would advance `generation` — a fresh epoch per failure (the C18 flood),
+ *   plus a fresh ledger row and a first delivery once KPR-468 exists. A
+ *   `PostToolUse` line for the same `tool_use_id` as a `PostToolUseFailure` line
+ *   is the signature to look for.
+ *
+ * ⚠ Class 7 (NOT PROBED, added from review — do not read the absence as a
+ *   negative): a MODEL-INVENTED tool name. Class 6 establishes that a DENIED
+ *   call does not fire the hook; nothing here covers a name the model made up
+ *   that resolves to no tool at all. If that fires PostToolUseFailure, the
+ *   Claude lane's family key space becomes model-influenced rather than bounded
+ *   by the installed inventory — which is what `OPEN_CONDITION_MAP_CAP`'s
+ *   rationale rests on (publisher.ts) — and an invented name over 200 characters
+ *   increments `rejected`, D9's mis-integrated-PRODUCER signal, from model
+ *   output. Bounded either way (eviction costs one delayed boundary; a rejection
+ *   stores nothing), which is why it is recorded rather than defended against.
  *
  * Usage: npx tsx scripts/probe-posttooluse-failure.ts [class-number ...]
  */
@@ -269,11 +307,23 @@ async function main(): Promise<void> {
       console.log(`  [${f.seq}] ${f.event} tool=${f.tool} id=${f.toolUseId}${f.extra ? ` ${f.extra}` : ""}`);
     }
     const ptuf = fired.filter((f) => f.event === "PostToolUseFailure");
+    const ptu = fired.filter((f) => f.event === "PostToolUse");
     const pd = fired.filter((f) => f.event === "PermissionDenied");
+    const tally = (label: string, rows: Fired[]) =>
+      `${label}: ${rows.length > 0 ? `FIRED x${rows.length}` : "did not fire"}`;
+    // PostToolUse is tallied HERE, not only dumped above: the per-class dump
+    // prints it, but the dump is transcript and the summary is what gets pasted
+    // into this file's RESULT block — which is how the 2026-09-11 run observed
+    // the PTU answers and preserved none of them. It is also the recovery half's
+    // load-bearing assumption, so `tool_use_id` overlap with a
+    // PostToolUseFailure on the same class is the thing to read (see the
+    // standing re-check list at the head of this file).
+    const overlap = ptu.filter((s) => ptuf.some((f) => f.toolUseId === s.toolUseId)).map((s) => s.toolUseId);
     console.log(
-      `  => PostToolUseFailure: ${ptuf.length > 0 ? `FIRED x${ptuf.length}` : "did not fire"}` +
+      `  => ${tally("PostToolUseFailure", ptuf)} | ${tally("PostToolUse", ptu)}` +
+        (overlap.length > 0 ? ` | ⚠ SAME tool_use_id on BOTH: ${overlap.join(",")}` : "") +
         (c.denyAll
-          ? ` | PermissionDenied: ${pd.length > 0 ? `FIRED x${pd.length}` : "did not fire"}` +
+          ? ` | ${tally("PermissionDenied", pd)}` +
             ` | order: ${fired
               .filter((f) => f.seq >= 0)
               .map((f) => f.event)

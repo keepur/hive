@@ -27,6 +27,28 @@ import { ObjectId, type Db } from "mongodb";
  * (`failAll`/`failNext` with a supplied error), which is what the store's
  * containment actually reacts to, and emulating a conflict would make a
  * second `init()` throw for a reason no production path has.
+ *
+ * TWO FURTHER DIVERGENCES, both safe and both previously undocumented — the
+ * kind a case author only discovers by reading the implementation:
+ *
+ *  3. `operation()` pushes onto `operations` BEFORE fault injection, so a
+ *     FAULTED call is counted. That is what the read-counting surface means:
+ *     `operations` is "calls attempted", not "calls that returned". A case
+ *     combining `failAll`/`failNext` with an `operations`-length assertion
+ *     must therefore expect the faulted attempts in its count — not a bug,
+ *     but not the reading the name invites either. (It is also why
+ *     `armThrowOnEveryAccess` is the opposite: that throw precedes the push,
+ *     so the two absence surfaces — "no operation ran" and "nothing was
+ *     recorded" — agree.)
+ *  4. `insertOne` does NOT write `_id` back onto the CALLER's document the way
+ *     the Node driver does: it mints the id onto its own stored copy and
+ *     returns it as `insertedId`, leaving the caller's object untouched. This
+ *     double is therefore STRICTER than production — the safe direction. Code
+ *     that reads `doc._id` after its own `insertOne` works against real Mongo
+ *     and fails here, so a case cannot come to depend on a mutation the
+ *     publisher does not need (it reads `insertedId` nowhere and returns the
+ *     `_id`-less `doc`, which is exactly why `isMoreRecent`'s `String(a._id)`
+ *     is only ever applied to documents read BACK out of the collection).
  */
 
 type Row = Record<string, any>;

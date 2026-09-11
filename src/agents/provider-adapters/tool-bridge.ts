@@ -361,6 +361,18 @@ export class ToolBridge {
           this.record(name, Date.now() - t0);
           // KPR-454 D3, the recovery half. Two arguments and no others — the
           // same closed pair the Claude lane's success hook passes.
+          //
+          // ⚠ NO ABORT CHECK HERE, deliberately (spec-faithful, unchanged), and
+          // the DIRECTION of the resulting cross-lane skew is worth stating
+          // rather than leaving to be re-derived. This success site has no
+          // `signal.aborted` guard while the failure site below does, and the
+          // Claude lane's PostToolUse hook checks `wasAborted` — so on Lane B an
+          // aborted turn can still CLOSE a condition (an early boundary, which
+          // means the next failure of that tool advances an epoch), where on the
+          // Claude lane it cannot (a delayed boundary). Both are bounded at ONE
+          // boundary, with opposite signs; the consequence for a reader is that
+          // a cross-lane tool-health view sees Lane B epochs advancing slightly
+          // more eagerly than Claude-lane ones for the same tool.
           observeToolSuccess({ tool: name, lane: "laneB" });
           return result;
         } catch (err) {
