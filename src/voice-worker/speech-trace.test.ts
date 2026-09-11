@@ -505,6 +505,86 @@ describe("speech lifecycle", () => {
   });
 
   it.each(["bridge", "synthesis"] as const)(
+    "keeps a terminal %s late error supplemental while an unsettled speech completes",
+    (kind) => {
+      const { rows, trace } = setup();
+      const handle = new FakeSpeechHandle(`speech-late-${kind}-error`);
+      trace.speechCreated(handle.asHandle(), "fallback", 0);
+
+      const synthesis = trace.synthesisCreated(synthesisContext("call", `synth-late-${kind}-coverage`));
+      synthesis.bind(handle.id);
+      synthesis.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+      synthesis.finish("completed", "unknown");
+
+      if (kind === "bridge") {
+        const bridge = trace.bridgeCreated(bridgeContext("call", "turn-late-error"));
+        bridge.bind(handle.id);
+        bridge.finish("completed", "unknown");
+        bridge.fail("spawn_failed");
+      } else {
+        synthesis.fail("tts_provider_failed");
+      }
+      handle.settle();
+
+      expect(rows.find((row) => row.event === `${kind}_terminal`)).toMatchObject({
+        outcome: "completed",
+        errorClass: null,
+      });
+      expect(rows.find((row) => row.event === "speech_terminal")).toMatchObject({
+        outcome: "completed",
+        errorClass: null,
+      });
+      expect(rows.filter((row) => row.event === "diagnostic_gap" && row.reason === "late_error_observed")).toHaveLength(
+        1,
+      );
+    },
+  );
+
+  it.each(["bridge", "synthesis"] as const)("keeps a preterminal %s error causal", (kind) => {
+    const { rows, trace } = setup();
+    const handle = new FakeSpeechHandle(`speech-preterminal-${kind}-error`);
+    trace.speechCreated(handle.asHandle(), "fallback", 0);
+
+    const synthesis = trace.synthesisCreated(synthesisContext("call", `synth-preterminal-${kind}`));
+    synthesis.bind(handle.id);
+    synthesis.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+    if (kind === "bridge") {
+      synthesis.finish("completed", "unknown");
+      const bridge = trace.bridgeCreated(bridgeContext("call", "turn-preterminal-error"));
+      bridge.bind(handle.id);
+      bridge.fail("spawn_failed");
+      bridge.finish("completed", "unknown");
+    } else {
+      synthesis.fail("tts_provider_failed");
+      synthesis.finish("completed", "unknown");
+    }
+    handle.settle();
+
+    expect(rows.find((row) => row.event === `${kind}_terminal`)).toMatchObject({ outcome: "failed" });
+    expect(rows.find((row) => row.event === "speech_terminal")).toMatchObject({
+      outcome: "failed",
+      errorClass: kind === "bridge" ? "spawn_failed" : "tts_provider_failed",
+    });
+  });
+
+  it("preserves a direct speech-handle failure after a terminal synthesis late error", () => {
+    const { rows, trace } = setup();
+    const handle = new FakeSpeechHandle("speech-direct-after-late-error");
+    trace.speechCreated(handle.asHandle(), "fallback", 0);
+    const synthesis = trace.synthesisCreated(synthesisContext("call", "synth-direct-after-late-error"));
+    synthesis.bind(handle.id);
+    synthesis.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+    synthesis.finish("completed", "unknown");
+    synthesis.fail("tts_provider_failed");
+    handle.settle(new Error("direct handle failure"));
+
+    expect(rows.find((row) => row.event === "speech_terminal")).toMatchObject({
+      outcome: "failed",
+      errorClass: "speech_handle_failed",
+    });
+  });
+
+  it.each(["bridge", "synthesis"] as const)(
     "keeps a settled speech outcome immutable when a failed %s owner later conflicts",
     (kind) => {
       const { rows, trace } = setup();
@@ -530,11 +610,12 @@ describe("speech lifecycle", () => {
 
       expect(rows.filter((row) => row.event === "speech_terminal")).toHaveLength(1);
       expect(rows.find((row) => row.event === "speech_terminal")).toMatchObject({ outcome: "failed" });
-      expect(rows.some((row) => row.event === "sdk_metric" && row.source === "late_observation")).toBe(true);
+      expect(rows.some((row) => row.event === "sdk_metric" && row.source === "late_observation")).toBe(false);
+      expect(rows.some((row) => row.event === "diagnostic_gap" && row.reason === "late_error_observed")).toBe(true);
       expect(rows.some((row) => row.event === "diagnostic_gap" && row.reason === "binding_conflict")).toBe(true);
       const report = reduceVoiceDiagnostics(`${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "call");
       expect(report.byOutcome.speech).toMatchObject({ failed: 1 });
-      expect(report.details.speech[0]?.lateSupplements).toHaveLength(1);
+      expect(report.details.speech[0]?.lateSupplements).toHaveLength(0);
     },
   );
 
@@ -875,6 +956,44 @@ describe("bounded attempt registries and metrics", () => {
     expect(trace.snapshot()).toMatchObject({ synthesizedAudioObserved: 2, generatedAudioObserved: 1 });
     second.bind("speech-conflict-b");
     expect(trace.snapshot()).toMatchObject({ synthesizedAudioObserved: 2, generatedAudioObserved: 0 });
+  });
+
+  it("restores one audio aggregate after terminal conflict invalidation and a valid late rebind", () => {
+    const { rows, trace } = setup();
+    const handle = new FakeSpeechHandle("speech-terminal-audio-rebind");
+    trace.speechCreated(handle.asHandle(), "fallback", 0);
+    const original = trace.synthesisCreated(synthesisContext("call", "synth-terminal-audio-original"));
+    original.bind(handle.id);
+    original.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+    original.finish("completed", "unknown");
+    handle.settle();
+    expect(trace.snapshot().generatedAudioObserved).toBe(1);
+
+    original.bind("speech-conflict");
+    expect(trace.snapshot().generatedAudioObserved).toBe(0);
+
+    const rebound = trace.synthesisCreated(synthesisContext("call", "synth-terminal-audio-rebound"));
+    rebound.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+    rebound.finish("completed", "unknown");
+    rebound.bind(handle.id);
+    rebound.bind(handle.id);
+    const duplicate = trace.synthesisCreated(synthesisContext("call", "synth-terminal-audio-duplicate"));
+    duplicate.frame({ sampleRate: 24_000, samplesPerChannel: 240 });
+    duplicate.finish("completed", "unknown");
+    duplicate.bind(handle.id);
+    expect(trace.snapshot().generatedAudioObserved).toBe(1);
+
+    for (let index = 0; index < 257; index += 1) {
+      trace
+        .synthesisCreated(synthesisContext("call", `synth-terminal-audio-empty-${index}`))
+        .finish("completed", "unknown");
+    }
+    expect(trace.snapshot()).toMatchObject({ generatedAudioObserved: 1, registry: { recentSynthesis: 256 } });
+    trace.close("call_closed");
+
+    const report = reduceVoiceDiagnostics(`${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "call");
+    expect(trace.snapshot()).toMatchObject({ generatedAudioObserved: 1, registry: { recentSynthesis: 0 } });
+    expect(report.generatedAudioObserved).toBe(1);
   });
 
   it("finalizes generated-audio accounting when its retained synthesis owner is evicted and on close", () => {

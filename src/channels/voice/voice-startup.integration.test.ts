@@ -525,6 +525,12 @@ describe("VoiceAdapter real manager ownership", () => {
     expect(replacement).toContain("[DONE]");
     expect(runnerControl.send).toHaveBeenCalledTimes(2);
     expect(rows("cold-shared", "engine_terminal")).toHaveLength(2);
+    expect(rows("cold-shared", "engine_attempt_terminal")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ outcome: "cancelled", errorClass: null }),
+        expect.objectContaining({ outcome: "completed", errorClass: null }),
+      ]),
+    );
     const turnIds = rows("cold-shared", "engine_received").map((row) => row.turnId);
     expect(new Set(turnIds).size).toBe(2);
   });
@@ -662,6 +668,12 @@ describe("VoiceAdapter real manager ownership", () => {
     expect(done).toContain("[DONE]");
     expect(pushed).toHaveLength(2);
     expect(runnerControl.openStream).toHaveBeenCalledTimes(1);
+    expect(rows("warm-shared", "engine_attempt_terminal")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ outcome: "cancelled", errorClass: null }),
+        expect.objectContaining({ outcome: "completed", errorClass: null }),
+      ]),
+    );
   });
 
   it.each(["eof", "rejection"] as const)(
@@ -883,7 +895,7 @@ describe("VoiceAdapter real manager ownership", () => {
       expect(managerResults[0]!.voiceLifetimeSignal?.reason).not.toBeInstanceOf(AgentStoppedError);
       expect(runnerControl.openStream).toHaveBeenCalledTimes(1);
       expect(rows(callId, "engine_attempt_terminal")).toEqual([
-        expect.objectContaining({ engineAttemptSeq: 1, outcome: "cancelled", stopped: false }),
+        expect.objectContaining({ engineAttemptSeq: 1, outcome: "cancelled", errorClass: null, stopped: false }),
       ]);
       expect(rows(callId, "engine_terminal")).toEqual([
         expect.objectContaining({ engineAttemptSeq: 1, outcome: "cancelled", clientGone: true }),
@@ -1247,7 +1259,7 @@ describe("VoiceAdapter real manager ownership", () => {
     });
     expect(runnerControl.openStream).toHaveBeenCalledTimes(1);
     expect(rows(callId, "engine_attempt_terminal")).toEqual([
-      expect.objectContaining({ engineAttemptSeq: 1, outcome: "cancelled", stopped: false }),
+      expect.objectContaining({ engineAttemptSeq: 1, outcome: "cancelled", errorClass: null, stopped: false }),
     ]);
     expect(rows(callId, "engine_terminal")).toEqual([
       expect.objectContaining({ engineAttemptSeq: 1, outcome: "cancelled" }),

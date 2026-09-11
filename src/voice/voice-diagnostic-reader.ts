@@ -857,7 +857,15 @@ function isSpeechEvidence(row: VoiceDiagnosticEvent): boolean {
 }
 
 function isBridgeEvidence(row: VoiceDiagnosticEvent): boolean {
-  return row.event.startsWith("bridge_");
+  return (
+    row.event.startsWith("bridge_") ||
+    (row.event === "sdk_metric" &&
+      row.metric === "llm" &&
+      row.source === "sdk_metrics_context" &&
+      row.turnId !== null &&
+      row.workerBootId !== null &&
+      UUID.test(row.workerBootId))
+  );
 }
 
 function isSynthesisEvidence(row: VoiceDiagnosticEvent): boolean {

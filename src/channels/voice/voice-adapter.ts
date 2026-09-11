@@ -625,11 +625,13 @@ export class VoiceAdapter {
           const errorClass: VoiceErrorClass | null = writeFailed
             ? "sse_write_failed"
             : attemptFailure
-              ? attemptFailure.circuitOpen
-                ? "llm_provider_failed"
-                : isAuthError(attemptFailure.reason)
-                  ? "engine_auth"
-                  : "spawn_failed"
+              ? attemptFailure.cancelled
+                ? null
+                : attemptFailure.circuitOpen
+                  ? "llm_provider_failed"
+                  : isAuthError(attemptFailure.reason)
+                    ? "engine_auth"
+                    : "spawn_failed"
               : null;
           emitEngine(
             {

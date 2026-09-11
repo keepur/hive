@@ -163,6 +163,7 @@ interface SpeechOwner {
   readonly associatedFailures: Map<string, VoiceErrorClass>;
   cancellationCause: CancellationCause | null;
   generatedAudio: boolean;
+  audioAggregateCounted: boolean;
   generatedDurationMs: number;
   readonly audioBySynthesis: Map<string, number>;
   knownPlayout: boolean;
@@ -338,6 +339,7 @@ export class SpeechTrace implements SpeechTracePort {
         associatedFailures: new Map(),
         cancellationCause: null,
         generatedAudio: false,
+        audioAggregateCounted: false,
         generatedDurationMs: 0,
         audioBySynthesis: new Map(),
         knownPlayout: false,
@@ -845,14 +847,16 @@ export class SpeechTrace implements SpeechTracePort {
   }
 
   #bridgeFail(owner: BridgeOwner, errorClass: VoiceErrorClass): void {
-    if (!owner.terminalEmitted) owner.errorClass ??= errorClass;
-    else
+    if (!owner.terminalEmitted) {
+      owner.errorClass ??= errorClass;
+      const speech = this.#speechForBinding(owner.binding);
+      if (speech) this.#applySpeechFailure(speech, this.#bridgeFailureSource(owner.turnId), errorClass);
+    } else {
       this.#gap("late_error_observed", {
         turnId: owner.turnId,
         speechId: this.#boundId(owner.binding),
       });
-    const speech = this.#speechForBinding(owner.binding);
-    if (speech) this.#applySpeechFailure(speech, this.#bridgeFailureSource(owner.turnId), errorClass);
+    }
   }
 
   #finishBridge(owner: BridgeOwner, outcome: AttemptOutcome, cause: CancellationCause): void {
@@ -936,14 +940,16 @@ export class SpeechTrace implements SpeechTracePort {
   }
 
   #synthesisFail(owner: SynthesisOwner, errorClass: "tts_provider_failed" | "tts_node_failed"): void {
-    if (!owner.terminalEmitted) owner.errorClass ??= errorClass;
-    else
+    if (!owner.terminalEmitted) {
+      owner.errorClass ??= errorClass;
+      const speech = this.#speechForBinding(owner.binding);
+      if (speech) this.#applySpeechFailure(speech, this.#synthesisFailureSource(owner.synthesisId), errorClass);
+    } else {
       this.#gap("late_error_observed", {
         synthesisId: owner.synthesisId,
         speechId: this.#boundId(owner.binding),
       });
-    const speech = this.#speechForBinding(owner.binding);
-    if (speech) this.#applySpeechFailure(speech, this.#synthesisFailureSource(owner.synthesisId), errorClass);
+    }
   }
 
   #finishSynthesis(owner: SynthesisOwner, outcome: AttemptOutcome, cause: CancellationCause): void {
@@ -1447,12 +1453,13 @@ export class SpeechTrace implements SpeechTracePort {
       return;
     }
     const speech = this.#speechById(owner.binding);
-    if (speech?.generatedAudio) {
+    if (speech?.audioAggregateCounted) {
       owner.audioContribution = { speechId: owner.binding, finalized: true };
       return;
     }
     owner.audioContribution = { speechId: owner.binding, finalized: false };
     this.#generatedAudioObserved += 1;
+    if (speech) speech.audioAggregateCounted = true;
   }
 
   #detachAudioContribution(owner: SynthesisOwner): void {
@@ -1462,7 +1469,11 @@ export class SpeechTrace implements SpeechTracePort {
     const retained = [...this.#activeSynthesis.values(), ...this.#recentSynthesis.values()].some(
       (candidate) => candidate !== owner && candidate.audioContribution === contribution,
     );
-    if (!contribution.finalized && !retained) this.#generatedAudioObserved -= 1;
+    if (!contribution.finalized && !retained) {
+      this.#generatedAudioObserved -= 1;
+      const speech = this.#speechById(contribution.speechId);
+      if (speech) speech.audioAggregateCounted = false;
+    }
   }
 
   #validBridgeContext(context: BridgeTraceContext): boolean {

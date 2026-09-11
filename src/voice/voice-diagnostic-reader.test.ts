@@ -499,6 +499,120 @@ describe("voice diagnostic entity lifecycles", () => {
     },
   );
 
+  it("materializes missing bridge lifecycle from an associated LLM metric across row order and duplicates", () => {
+    const speechId = "speech-llm-metric-only-bridge";
+    const turnId = "turn-llm-metric-only-bridge";
+    const synthesisId = "synth-llm-metric-only-bridge";
+    const llm = row(
+      "llm-metric",
+      {
+        event: "sdk_metric",
+        source: "sdk_metrics_context",
+        metric: "llm",
+        ttftMs: { value: 5, reason: null },
+      },
+      { speechId, turnId },
+    );
+    const lifecycle = [
+      row("speech-start", { event: "speech_started", origin: "sdk_response", acceptedEpoch: 1 }, { speechId }),
+      row(
+        "eou",
+        { event: "sdk_metric", source: "sdk_wall", metric: "eou", eouMs: { value: 20, reason: null } },
+        { speechId },
+      ),
+      row("synth-start", { event: "synthesis_started" }, { synthesisId }),
+      row("synth-bind", { event: "synthesis_bound", source: "sdk_metrics_context" }, { synthesisId, speechId }),
+      row(
+        "tts-metric",
+        { event: "sdk_metric", source: "sdk_metrics_context", metric: "tts", ttfbMs: { value: 8, reason: null } },
+        { synthesisId, speechId },
+      ),
+      row(
+        "synth-frame",
+        {
+          event: "synthesis_first_frame",
+          frameCount: 1,
+          sampleCount: 240,
+          sampleRate: 24_000,
+          generatedDurationMs: { value: 10, reason: null },
+        },
+        { synthesisId },
+      ),
+      row("synth-terminal", { event: "synthesis_terminal", frameCount: 1, outcome: "completed" }, { synthesisId }),
+      row(
+        "speech-terminal",
+        {
+          event: "speech_terminal",
+          origin: "sdk_response",
+          acceptedEpoch: 1,
+          outcome: "completed",
+          generatedAudio: true,
+        },
+        { speechId },
+      ),
+    ];
+
+    for (const events of [
+      [llm, ...lifecycle, llm],
+      [...lifecycle.toReversed(), llm, llm],
+    ]) {
+      const report = reduceVoiceDiagnostics(jsonl(events), "call-test");
+      expect(report).toMatchObject({
+        complete: false,
+        speechAttempts: 1,
+        bridgeAttempts: 1,
+        synthesisAttempts: 1,
+        byOutcome: { bridge: { incomplete: 1 } },
+        incomplete: { total: 1, byReason: { missing_start: 1 }, byEntity: { bridge: 1 } },
+      });
+      expect(report.details.bridge).toEqual([
+        expect.objectContaining({
+          turnId,
+          firstObservation: expect.objectContaining({ eventId: "llm-metric", event: "sdk_metric" }),
+          started: false,
+          terminalEventId: null,
+          outcome: "incomplete",
+          incompleteReason: "missing_start",
+        }),
+      ]);
+      expect(report.distributions.estimatedEouToFirstGeneratedAudioMs).toMatchObject({
+        eligibleAttempts: 0,
+        excludedByReason: { missing_bridge_first_text: 1 },
+      });
+    }
+  });
+
+  it("does not materialize bridge attempts from action, gap, wrong-source, or invalid-worker rows", () => {
+    const action = row(
+      "action-only",
+      { event: "opening_decision", decision: "defer", reason: "caller_speaking" },
+      { speechId: "speech-action", turnId: "turn-action" },
+    );
+    const gap = row(
+      "gap-only",
+      { event: "diagnostic_gap", reason: "action_ownership_unproved", count: 1 },
+      { speechId: "speech-gap", turnId: "turn-gap" },
+    );
+    const wrongSource = row(
+      "wrong-source",
+      { event: "sdk_metric", source: "sdk_wall", metric: "llm" },
+      { speechId: "speech-wrong-source", turnId: "turn-wrong-source" },
+    );
+    const invalidWorker = {
+      ...row(
+        "invalid-worker",
+        { event: "sdk_metric", source: "sdk_metrics_context", metric: "llm" },
+        { speechId: "speech-invalid-worker", turnId: "turn-invalid-worker" },
+      ),
+      workerBootId: "not-a-worker-boot-id",
+    } as VoiceDiagnosticEvent;
+
+    const report = reduceVoiceDiagnostics(jsonl([action, gap, wrongSource, invalidWorker]), "call-test");
+    expect(report.bridgeAttempts).toBe(0);
+    expect(report.speechAttempts).toBe(1);
+    expect(report.details.speech[0]?.speechId).toBe("speech-wrong-source");
+  });
+
   it("keeps a bound speech with a retained start and missing terminal incomplete across row order and duplicates", () => {
     const speechId = "speech-bound-missing-terminal";
     const binding = row(
