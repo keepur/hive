@@ -625,12 +625,6 @@ async function doSlack(env: Record<string, string>, pkgRoot: string) {
   console.log('Bot Token: Go to "OAuth & Permissions" → "Bot User OAuth Token"');
   env.SLACK_BOT_TOKEN = await ask("Bot Token (xoxb-...)", env.SLACK_BOT_TOKEN || "");
 
-  console.log("");
-  const wantMcp = await confirm("Do you have a Slack MCP user token (xoxp-...)? (for Slack search)", false);
-  if (wantMcp) {
-    env.SLACK_MCP_TOKEN = await ask("Slack MCP Token (xoxp-...)", env.SLACK_MCP_TOKEN || "");
-  }
-
   // Validate — use fetch() instead of curl to avoid leaking token to process listings
   if (env.SLACK_APP_TOKEN && env.SLACK_BOT_TOKEN) {
     try {
@@ -660,11 +654,6 @@ async function doSlack(env: Record<string, string>, pkgRoot: string) {
     }
     if (env.SLACK_BOT_TOKEN) {
       execFileSync("honeypot", ["set", "SLACK_BOT_TOKEN", env.SLACK_BOT_TOKEN], {
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    }
-    if (env.SLACK_MCP_TOKEN) {
-      execFileSync("honeypot", ["set", "SLACK_MCP_TOKEN", env.SLACK_MCP_TOKEN], {
         stdio: ["pipe", "pipe", "pipe"],
       });
     }
