@@ -9,6 +9,7 @@ import {
   type OpsSubscription,
 } from "./types.js";
 import { auditReasonRow, compileDetailSchema } from "./reasons.js";
+import { clipForLog } from "./ids.js";
 import type { z } from "zod";
 
 const log = createLogger("ops-store");
@@ -74,8 +75,21 @@ export class OpsStore {
       }),
     );
     // D8's clearing-side epoch read, in the same order the resolver compares.
+    //
+    // ⚠ NO `sparse: true`. It was here and it was a NO-OP: a compound sparse
+    // index omits a document only when it is missing EVERY indexed field, and
+    // `publishedAt`/`_id` are present on every row, so all rows were indexed
+    // regardless. Removing it changes nothing and stops the option claiming
+    // something the index does not do. `partialFilterExpression:
+    // { clearsFamily: { $exists: true } }` WOULD express the apparent intent
+    // and was declined: it makes the clearing-side read depend on the planner
+    // proving the query predicate a subset of the filter, and a planner that
+    // declines degrades D8's per-failure read to a collection scan — trading a
+    // correct-but-larger index for a possible full scan, against an index-size
+    // problem nothing has reported on a collection that already carries a TTL
+    // and four other indexes over the same rows.
     await create("ops_events.clearing-epoch", () =>
-      this.events.createIndex({ clearsFamily: 1, publishedAt: -1, _id: -1 }, { sparse: true }),
+      this.events.createIndex({ clearsFamily: 1, publishedAt: -1, _id: -1 }),
     );
     // D2: NOT unique — the log appends every publish.
     await create("ops_events.dedupe", () => this.events.createIndex({ dedupeKey: 1, publishedAt: -1 }));
@@ -154,16 +168,44 @@ export class OpsStore {
    * way; without this loop the operator's only signal is the generic rejection
    * counter, which D9 reserves for a mis-integrated PRODUCER. Warn and count,
    * never refuse: refusing would let one operator row disable publishing.
+   *
+   * ⚠ THE PER-ROW try/catch IS THAT RULE, not belt-and-braces. `OpsReason` is a
+   * compile-time claim about a runtime document and nothing validates the
+   * shape a row arrives in: `ops_reasons` is operator- and foreign-producer-
+   * writable BY DESIGN (D4 — "adding a reason is a row"; AC16 inserts foreign
+   * rows directly), and both calls below iterate `row.detailKeys` with
+   * `for…of`, so a row whose `detailKeys` is missing, null or a non-array
+   * object throws `TypeError: … is not iterable`. Uncontained that throw
+   * leaves `loadReasons`, leaves `init()`, is caught by index.ts as an init
+   * failure and leaves the publisher UNSET — every tool failure and recovery
+   * on both lanes unrecorded for the whole boot, behind a log line
+   * indistinguishable from a Mongo outage. One malformed operator row must
+   * cost that row, never the producer.
    */
   async loadReasons(): Promise<{ map: Map<string, LoadedReason>; anomalies: number }> {
     const map = new Map<string, LoadedReason>();
     let anomalies = 0;
     for (const row of await this.reasons.find({}).toArray()) {
-      for (const anomaly of auditReasonRow(row)) {
+      try {
+        for (const anomaly of auditReasonRow(row)) {
+          anomalies += 1;
+          log.warn("ops reason row normalized — the row declares something this engine narrows", { anomaly });
+        }
+        map.set(`${row.producer}:${row.reasonId}`, { row, detailSchema: compileDetailSchema(row.detailKeys) });
+      } catch (err) {
+        // Counted on the SAME counter as the normalizations above: both mean
+        // "a data-sourced row this engine could not take at face value", which
+        // is the one thing an operator reading the snapshot acts on, and
+        // neither is a `rejected` (D9's mis-integrated-producer signal).
+        //
+        // C13: the row's `_id` and nothing else — never the row body, whose
+        // every field is operator-authored text of unbounded shape.
         anomalies += 1;
-        log.warn("ops reason row normalized — the row declares something this engine narrows", { anomaly });
+        log.warn("ops reason row unusable — skipped, the rest of the registry still loads", {
+          id: clipForLog(row._id),
+          error: String(err),
+        });
       }
-      map.set(`${row.producer}:${row.reasonId}`, { row, detailSchema: compileDetailSchema(row.detailKeys) });
     }
     return { map, anomalies };
   }

@@ -64,11 +64,58 @@ export const OPS_DETAIL_STRING_MAX = 200;
 /** D4: a remediation template is "a bounded parameterised string" — the bound. */
 export const OPS_REMEDIATION_MAX = 500;
 
+/**
+ * The bound on a `clears` key — the one string the accept path STORES (and
+ * derives an INDEXED `clearsFamily` from) that none of the four bounds above
+ * reach: `subject`/`detail`/`evidence` are each bounded on their own, and the
+ * `clears` legality test reads one component of the key.
+ *
+ * ⚠ DELIBERATELY LOOSE, and the arithmetic matters. D2's dedupeKey is
+ * `<producer>:<subject.kind>:<subject.id>:<reasonId>:<generation>`, so its
+ * maximum legal length under the bounds above is three tokens (40 each, per
+ * `OPS_TOKEN_RE`) + one id (200) + four separators + the generation's decimal
+ * digits — **324 plus the generation**. A tighter number (e.g.
+ * `OPS_ID_MAX_LENGTH + 64` = 264) would REJECT a legitimate key from a
+ * foreign producer whose own producer/subject.kind tokens are long, which is
+ * the exact opposite of what this guards: the job is to stop an UNBOUNDED
+ * string being stored and indexed, not to re-derive the key grammar at the
+ * accept path. 512 leaves the generation ~188 digits no counter will reach.
+ */
+export const OPS_CLEARS_MAX_LENGTH = 512;
+
 /** D6: the capture-point admissibility bound for externally-authored ids. */
 export const ADMISSIBLE_ID_RE = /^[A-Za-z0-9_.:#+@-]{1,200}$/;
 
+/**
+ * C13: the bound on any operator- or foreign-producer-authored value this
+ * producer writes into a LOG line. A fifth bound rather than a reuse of the
+ * four above, because it governs a different surface: the others decide what
+ * is STORED (and reject or omit on breach), this one only shortens what is
+ * PRINTED and never changes a decision.
+ *
+ * It exists because the two places that name such a value are reached
+ * PRECISELY when it failed its own bound — the accept path's `bad-token` /
+ * `bad-subject-kind` rejections, and the registry loader's unusable-row skip —
+ * so logging them raw is the one place this producer's log lines are
+ * unbounded. 64 is long enough to identify a legitimate token (the token bound
+ * is 40) and short enough that a megabyte of foreign input costs one log line
+ * of it.
+ */
+export const OPS_LOG_VALUE_MAX = 64;
+
 export function isOpsToken(value: string): boolean {
   return OPS_TOKEN_RE.test(value);
+}
+
+/**
+ * C13. Takes `unknown` DELIBERATELY: every caller sits on the fail-closed
+ * accept/load path, where the value is typed `string` but arrives from a
+ * document this engine did not author, so a non-string must shorten to a
+ * marker rather than throw out of a log statement.
+ */
+export function clipForLog(value: unknown): string {
+  const text = typeof value === "string" ? value : String(value);
+  return text.length > OPS_LOG_VALUE_MAX ? `${text.slice(0, OPS_LOG_VALUE_MAX)}…` : text;
 }
 
 /**

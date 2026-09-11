@@ -13,6 +13,7 @@ import { OpsPublisher, familyOf } from "./publisher.js";
 import { __resetOpsPublisherForTests, setOpsPublisher } from "./publisher-singleton.js";
 import { observeToolFailure, observeToolSuccess, type ToolFailureObservation } from "./observe.js";
 import { HIVE_RUNTIME_PRODUCER, REASON_TOOL_FAILED, REASON_TOOL_RECOVERED } from "./reasons.js";
+import { OPS_CLEARS_MAX_LENGTH, OPS_ID_MAX_LENGTH } from "./ids.js";
 import { OPS_EVENTS_COLLECTION, OPS_REASONS_COLLECTION } from "./types.js";
 
 /**
@@ -158,6 +159,98 @@ describe("OpsPublisher boot and registry", () => {
     expect(events()).toHaveLength(1);
     expect(events()[0]!.producer).toBe("acme");
     expect(publisher.getSnapshot().rejected).toBe(0);
+  });
+
+  it("skips a MALFORMED operator row and still loads the rest — one bad row never disables the producer", async () => {
+    // `detailKeys` ABSENT. `ops_reasons` is operator- and foreign-producer-
+    // writable by design and `OpsReason` is only a compile-time claim about a
+    // runtime document, so this row is reachable; both `auditReasonRow` and
+    // `compileDetailSchema` iterate `row.detailKeys` with `for…of` and throw
+    // `TypeError: … is not iterable` on it. Inserted BEFORE init(), so it is
+    // the FIRST row the loader sees — without per-row containment the throw
+    // leaves loadReasons, leaves init(), and index.ts leaves the publisher
+    // unset: every tool failure and recovery on both lanes unrecorded for the
+    // whole boot.
+    await fakeDb.collection(OPS_REASONS_COLLECTION).insertOne({
+      _id: "acme:shapeless",
+      producer: "acme",
+      reasonId: "shapeless",
+      class: "informational",
+      retry: "transient",
+      remediationTemplate: "fix the row",
+      enabled: true,
+    });
+
+    await expect(publisher.init()).resolves.toBeUndefined();
+
+    // Counted on the same counter as a normalization — a data-sourced row this
+    // engine could not take at face value — and NOT as a rejection.
+    expect(publisher.getSnapshot().reasonRowAnomalies).toBe(1);
+    expect(publisher.getSnapshot().rejected).toBe(0);
+    expect(warnsMatching("ops reason row unusable")).toBe(1);
+
+    // C13: the row's _id and nothing else. Nothing from the row body reaches
+    // the log line.
+    const call = mockLog.warn.mock.calls.find((c) => String(c[0]).includes("ops reason row unusable"))!;
+    expect(call[1]).toMatchObject({ id: "acme:shapeless" });
+    expect(JSON.stringify(call[1])).not.toContain("fix the row");
+
+    // The skipped row is absent from the map, so publishing under it fails
+    // closed at accept step 1 rather than throwing…
+    publisher.enqueueFailure({
+      producer: "acme",
+      reasonId: "shapeless",
+      waiting: "nobody",
+      subject: { kind: "widget", id: "w-1" },
+      detail: {},
+      evidence: [],
+    });
+    await publisher.__drainForTests();
+    expect(events()).toHaveLength(0);
+    expect(publisher.getSnapshot().rejected).toBe(1);
+
+    // …and THE POINT: the engine's own rows loaded past it and still publish.
+    driveFailure("Bash");
+    await publisher.__drainForTests();
+    expect(events()).toHaveLength(1);
+    expect(events()[0]!.producer).toBe(HIVE_RUNTIME_PRODUCER);
+  });
+
+  it("log.errors once when the LOADED registry leaves an enabled class:resource reason unclearable", async () => {
+    await publisher.init();
+    // The healthy registry says nothing — the gate only speaks when breached.
+    expect(mockLog.error).not.toHaveBeenCalled();
+
+    // The foot-gun `assertReasonTableLegal` structurally cannot see: it is a
+    // precondition over the CODE-RESIDENT table, where both rows are enabled.
+    // Disabling the CLEARING row alone leaves `tool-failed` enabled and
+    // unclearable — every recovery is refused at accept step 1 forever, so the
+    // operator sees a climbing `rejected` (D9's mis-integrated-producer
+    // signal) plus permanent silence, with nothing telling the two apart.
+    reasons().find((r) => r._id === RECOVERED_ID)!.enabled = false;
+    await publisher.init();
+
+    expect(mockLog.error).toHaveBeenCalledTimes(1);
+    expect(mockLog.error.mock.calls[0]![1]).toMatchObject({ reasons: [FAILED_ID], count: 1 });
+    // A diagnostic, not a gate: the publisher is still wired and still
+    // publishes the condition.
+    driveFailure("Bash");
+    await publisher.__drainForTests();
+    expect(events()).toHaveLength(1);
+    // …and the recovery it can never clear is refused, which is the state the
+    // log line exists to name.
+    driveSuccess("Bash");
+    await publisher.__drainForTests();
+    expect(events().filter((d) => d.reasonId === REASON_TOOL_RECOVERED)).toHaveLength(0);
+    expect(publisher.getSnapshot().rejected).toBe(1);
+  });
+
+  it("stays silent when BOTH rows are disabled — the condition is not enabled, so nothing is unclearable", async () => {
+    await publisher.init();
+    reasons().find((r) => r._id === RECOVERED_ID)!.enabled = false;
+    reasons().find((r) => r._id === FAILED_ID)!.enabled = false;
+    await publisher.init();
+    expect(mockLog.error).not.toHaveBeenCalled();
   });
 });
 
@@ -456,6 +549,109 @@ describe("OpsPublisher recovery and the openSeq identity", () => {
     expect(publisher.__openEntryForTests(family)).toBeUndefined();
   });
 
+  // `clears`/`clearsFamily` are the only strings this accept path STORES that
+  // step 2 does not bound: step 2 covers subject/detail/evidence, and step 4's
+  // legality test reads one component. Unreachable from this producer's own
+  // capture points — `observe.ts` always passes a key this publisher minted —
+  // but the accept path is the fail-closed gate AC16 drives with foreign rows.
+  it("rejects an over-long `clears` rather than storing it verbatim", async () => {
+    await publisher.init();
+    // Legal in every OTHER respect: right producer, right cleared reasonId, a
+    // declared clearer. Only the length is wrong — so before this bound
+    // existed the whole string (and its derived, INDEXED clearsFamily) was
+    // stored.
+    const clears = `${HIVE_RUNTIME_PRODUCER}:tool:${"a".repeat(600)}:${REASON_TOOL_FAILED}:0`;
+    expect(clears.length).toBeGreaterThan(OPS_CLEARS_MAX_LENGTH);
+    publisher.enqueueFailure({
+      producer: HIVE_RUNTIME_PRODUCER,
+      reasonId: REASON_TOOL_RECOVERED,
+      waiting: "nobody",
+      subject: { kind: "tool", id: "Bash" },
+      detail: { tool: "Bash", lane: "claude" },
+      evidence: [],
+      clears,
+    });
+    await publisher.__drainForTests();
+
+    expect(events()).toHaveLength(0);
+    expect(publisher.getSnapshot().rejected).toBe(1);
+    expect(publisher.getSnapshot().published).toBe(0);
+  });
+
+  it("accepts a MAXIMAL legal key — the length bound must not refuse a long foreign one", async () => {
+    // ⚠ THE COMPLEMENT THAT PINS THE CONSTANT. A dedupeKey's maximum legal
+    // length under this producer's own bounds is three 40-char tokens + a
+    // 200-char subject.id + four separators + the generation — over 324 — so a
+    // bound derived from `OPS_ID_MAX_LENGTH` alone would reject this key, which
+    // an out-of-engine producer (D4/AC16) can legitimately mint. Built from the
+    // bounds rather than from a literal, so it tracks them.
+    const token = `f${"o".repeat(39)}`; // 40 chars, satisfies OPS_TOKEN_RE
+    await fakeDb.collection(OPS_REASONS_COLLECTION).insertOne({
+      _id: `${token}:${token}`,
+      producer: token,
+      reasonId: token,
+      class: "informational",
+      retry: "transient",
+      remediationTemplate: "none",
+      detailKeys: [],
+      clearsReasonIds: [token],
+      enabled: true,
+    });
+    await publisher.init();
+
+    const clears = `${token}:${token}:${"i".repeat(OPS_ID_MAX_LENGTH)}:${token}:0`;
+    expect(clears.length).toBeGreaterThan(OPS_ID_MAX_LENGTH + 64); // the bound that would have been wrong
+    expect(clears.length).toBeLessThanOrEqual(OPS_CLEARS_MAX_LENGTH);
+    publisher.enqueueFailure({
+      producer: token,
+      reasonId: token,
+      waiting: "nobody",
+      subject: { kind: token, id: "x" },
+      detail: {},
+      evidence: [],
+      clears,
+    });
+    await publisher.__drainForTests();
+
+    expect(publisher.getSnapshot().rejected).toBe(0);
+    expect(events()).toHaveLength(1);
+    expect(events()[0]!.clears).toBe(clears);
+  });
+
+  it("rejects a `clears` naming ANOTHER producer's family", async () => {
+    await publisher.init();
+    // `tool-failed` IS in this row's clearsReasonIds, so the membership test
+    // passes and only ownership refuses it: without this check one producer's
+    // clearing reason could close — and advance the generation of — a family
+    // belonging to a producer it has no standing over.
+    publisher.enqueueFailure({
+      producer: HIVE_RUNTIME_PRODUCER,
+      reasonId: REASON_TOOL_RECOVERED,
+      waiting: "nobody",
+      subject: { kind: "tool", id: "Bash" },
+      detail: { tool: "Bash", lane: "claude" },
+      evidence: [],
+      clears: `florist:tool:bloom:${REASON_TOOL_FAILED}:0`,
+    });
+    await publisher.__drainForTests();
+
+    expect(events()).toHaveLength(0);
+    expect(publisher.getSnapshot().rejected).toBe(1);
+    // Nothing was written, so no foreign clearsFamily entered the index.
+    expect(events().some((d) => d.clearsFamily !== undefined)).toBe(false);
+  });
+
+  it("still accepts a well-formed same-producer `clears` — the two bounds refuse nothing legitimate", async () => {
+    await publisher.init();
+    driveFailure("Bash");
+    await publisher.__drainForTests();
+    driveSuccess("Bash");
+    await publisher.__drainForTests();
+
+    expect(events().filter((d) => d.reasonId === REASON_TOOL_RECOVERED)).toHaveLength(1);
+    expect(publisher.getSnapshot().rejected).toBe(0);
+  });
+
   it("performs NO database access for a success with no open condition", async () => {
     await publisher.init();
     // The armed-to-throw mode, AFTER init(): a publisher over a `Db` whose
@@ -523,9 +719,14 @@ describe("OpsPublisher queue, map and shutdown", () => {
     expect(snapshot.drainDropped).toBe(0);
     expect(events()).toHaveLength(1);
 
-    // The stopping latch: a later enqueue is a silent no-op.
+    // The stopping latch: a later enqueue is refused — and COUNTED. The latch
+    // is set before a drain that can run for up to SHUTDOWN_DRAIN_MS while
+    // turns are still producing observations, so an uncounted refusal here is
+    // a shutdown loss `drainDropped`'s deadline arm cannot see.
     driveFailure("Grep");
     expect(publisher.getSnapshot().queueDepth).toBe(0);
+    expect(publisher.getSnapshot().drainDropped).toBe(1);
+    expect(events()).toHaveLength(1); // still nothing published for it
   });
 
   it("stop() drops and counts a queue it cannot drain inside the bound", async () => {

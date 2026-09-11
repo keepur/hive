@@ -40,12 +40,14 @@ describe("one reserved-prefix predicate (KPR-454 AC4, C6)", () => {
       absolute: false,
     }).filter((f) => !f.endsWith(".test.ts"));
 
+    const hits: string[] = [];
     const offenders: string[] = [];
     for (const file of files) {
       const source = readFileSync(`${root}${file}`, "utf8");
       for (const literal of RESERVED) {
         const pattern = new RegExp(`\\.\\s*startsWith\\s*\\(\\s*["'\`]${literal}`);
         if (!pattern.test(source)) continue;
+        hits.push(`${file}: startsWith("${literal}")`);
         const allowed = ALLOWLIST.some((a) => a.file === file && (a.literal === "*" || a.literal === literal));
         if (!allowed) offenders.push(`${file}: startsWith("${literal}")`);
       }
@@ -56,6 +58,29 @@ describe("one reserved-prefix predicate (KPR-454 AC4, C6)", () => {
       "a second reserved-prefix predicate exists — route it through sourceOfId (src/outage/outage-notices.ts) " +
         "or, if the literal is a coincidence, add a reviewed entry to ALLOWLIST with its reason",
     ).toEqual([]);
+
+    // ⚠ THE ABLE-TO-FAIL HALF. The assertion above is `toEqual([])`, so it is
+    // green both when the repository is clean AND when this scan has stopped
+    // reaching anything — a glob that matches nothing, or a regex that matches
+    // nothing, guards nothing while reporting a pass. Both halves of the reach
+    // are therefore pinned against reality:
+    //
+    //  · the glob reaches the tree (269 non-test files at this commit; the
+    //    floor is deliberately far below that, so ordinary growth and pruning
+    //    never touch it and only a broken pattern does), and
+    //  · the regex matches a REAL occurrence — the one `sse.ts` hit the
+    //    allowlist exists to excuse. Asserted as the EXACT pre-allowlist hit
+    //    set rather than as a `toContain`, which additionally pins that the
+    //    allowlist is excusing exactly one thing: a new hit shows up here as
+    //    well as in `offenders`, and one silenced by an allowlist entry added
+    //    without a matching source change shows up here alone.
+    //
+    // The second `it` below pins the same literal by substring; this pins it
+    // through THIS test's own regex, which is the thing that can rot.
+    expect(files.length, "the source glob stopped reaching the tree").toBeGreaterThan(100);
+    expect(hits, "the reserved-prefix regex no longer matches its one known real occurrence").toEqual([
+      'src/agents/provider-adapters/sse.ts: startsWith("event:")',
+    ]);
   });
 
   it("every allowlist entry still corresponds to a real occurrence (no stale entries)", () => {

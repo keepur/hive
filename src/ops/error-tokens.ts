@@ -78,6 +78,28 @@ const TEXT_RULES: ReadonlyArray<readonly [RegExp, ToolErrorToken]> = [
 ];
 
 /**
+ * The bound on the TEXT the rules above are run over, applied HERE — at the
+ * one classifier boundary both lanes share — rather than at either call site,
+ * so neither lane can acquire an uncapped path.
+ *
+ * `message` is unbounded at both capture points: the Claude lane's
+ * `PostToolUseFailure.error` is whatever the tool wrote, and Lane B's
+ * `errorText(err)` can carry a whole tool payload as the message (that is how
+ * `discover()`'s MCP-`isError`→throw conversion arrives). `observeToolFailure`
+ * is synchronous on the turn thread, so without this the eight tests below are
+ * O(8·n) of turn latency on a path C15 promises does not move a turn's latency
+ * profile. Not a ReDoS bound — every pattern here is anchor-free and linear.
+ *
+ * 4096 rather than something tighter because it costs nothing to be generous:
+ * every signature in the table is a short phrase that a real error puts near
+ * the front, the message is read and DISCARDED either way (nothing derived
+ * from it is stored — C13), and a signature buried past 4 KB simply classifies
+ * as `unclassified`, which is this classifier's honest answer for "I could not
+ * tell" rather than a wrong one.
+ */
+const CLASSIFIER_TEXT_MAX = 4096;
+
+/**
  * TOTAL: every input returns exactly one member of TOOL_ERROR_TOKENS. The
  * message is read here and DISCARDED — no substring of it is ever returned,
  * which is what a test asserts against a credential-shaped and a path-shaped
@@ -94,9 +116,12 @@ export function classifyToolError(message: string, signals: ToolErrorSignals = {
   if (signals.mcpErrorCode === -32602) return "invalid-input";
   if (signals.mcpErrorCode === -32601) return "not-found";
 
-  // 2. A small fixed set of text tests, then honest ignorance.
+  // 2. A small fixed set of text tests, over a BOUNDED prefix, then honest
+  //    ignorance. The typed signals above are read first and short-circuit, so
+  //    a capped text never costs a fact.
+  const text = message.length > CLASSIFIER_TEXT_MAX ? message.slice(0, CLASSIFIER_TEXT_MAX) : message;
   for (const [pattern, token] of TEXT_RULES) {
-    if (pattern.test(message)) return token;
+    if (pattern.test(text)) return token;
   }
   return "unclassified";
 }

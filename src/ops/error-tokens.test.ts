@@ -50,6 +50,29 @@ describe("classifyToolError (KPR-454 D6)", () => {
     expect(classifyToolError("weird vendor failure #7719")).toBe("unclassified");
   });
 
+  it("runs the text rules over a BOUNDED prefix — both lanes hand it an unbounded message", () => {
+    // `observeToolFailure` is synchronous on the turn thread and the message is
+    // unbounded at both capture points (Lane B's `errorText(err)` can carry a
+    // whole tool payload), so the eight rules must not be O(8·n) of turn
+    // latency. Asserted by BEHAVIOUR, not by timing: a signature inside the
+    // 4096-char window classifies, the same signature past it does not.
+    const filler = "x".repeat(4000);
+    expect(classifyToolError(`${filler} ECONNREFUSED 127.0.0.1:27017`)).toBe("transport-unavailable");
+    expect(classifyToolError(`${"x".repeat(5000)} ECONNREFUSED 127.0.0.1:27017`)).toBe("unclassified");
+
+    // Exactly at the boundary: the cap is a slice of the first 4096 chars, so
+    // a signature ending on char 4096 still classifies.
+    const head = "y".repeat(4096 - " ETIMEDOUT".length);
+    expect(classifyToolError(`${head} ETIMEDOUT`)).toBe("timeout");
+  });
+
+  it("a typed signal still wins over a message longer than the text cap", () => {
+    // The signals are read BEFORE the slice, so capping the text can never
+    // cost a fact the caller supplied.
+    expect(classifyToolError("z".repeat(100_000), { isInterrupt: true })).toBe("interrupted");
+    expect(classifyToolError("z".repeat(100_000), { mcpErrorCode: -32001 })).toBe("timeout");
+  });
+
   it("returns a member of the closed nine-value set, so no input byte can ride out (C13)", () => {
     for (const input of [
       "auth failed for sk-ant-api03-DEADBEEF at /Users/mokie/.env",

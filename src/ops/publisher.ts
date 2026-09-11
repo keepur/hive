@@ -4,7 +4,7 @@ import { OpsStore, type LoadedReason } from "./store.js";
 import { evaluateMatches } from "./match.js";
 import { assertReasonTableLegal, HIVE_RUNTIME_REASONS } from "./reasons.js";
 import { OPS_SCHEMA_VERSION, type OpsEvent, type OpsPublishInput, type OpsSubscription } from "./types.js";
-import { OPS_EVIDENCE_MAX, OPS_ID_MAX_LENGTH, isOpsToken } from "./ids.js";
+import { OPS_CLEARS_MAX_LENGTH, OPS_EVIDENCE_MAX, OPS_ID_MAX_LENGTH, clipForLog, isOpsToken } from "./ids.js";
 
 const log = createLogger("ops-publisher");
 
@@ -167,12 +167,62 @@ export class OpsPublisher {
     // process open (the outage-replay-processor.ts:44 precedent).
     this.reloadTimer = setInterval(() => void this.reloadSubscriptions(), SUBSCRIPTION_RELOAD_MS);
     this.reloadTimer.unref();
+    this.auditLoadedEnableGate();
     log.info("Ops publisher initialized", {
       reasons: this.reasons.size,
       subscriptions: this.subscriptions.length,
       indexFailures: this.counters.indexFailures,
       reasonRowAnomalies: this.counters.reasonRowAnomalies,
     });
+  }
+
+  /**
+   * D4's enable gate, RE-RUN over the LOADED map — the half
+   * `assertReasonTableLegal` structurally cannot reach.
+   *
+   * That function is a pure precondition over the CODE-RESIDENT table, so it
+   * sees both rows enabled and passes. At runtime `enabled: false` is a
+   * per-row kill switch (D5), and disabling only the CLEARING row leaves a
+   * legal-looking registry in an unclearable state: every success on an open
+   * family enqueues a recovery that accept-path step 1 refuses, forever. The
+   * operator then sees a climbing `rejected` — the counter D9 reserves for a
+   * mis-integrated producer — plus D2's permanent silence, with nothing in the
+   * log telling the two apart. This line is that missing signal.
+   *
+   * ONE `log.error`, never a throw: this is a runtime DATA condition an
+   * operator created with a documented lever, not the development-time defect
+   * the constructor gate refuses, and D10's rule is that init()'s data faults
+   * leave the engine running. Total by construction (`Array.isArray`) and
+   * contained anyway — a diagnostic added to init() must never become the
+   * thing that leaves the publisher unset.
+   */
+  private auditLoadedEnableGate(): void {
+    try {
+      const rows = [...this.reasons.values()].map((loaded) => loaded.row);
+      const unclearable = rows
+        .filter(
+          (row) =>
+            row.enabled &&
+            row.class === "resource" &&
+            !rows.some(
+              (other) =>
+                other.enabled &&
+                other.producer === row.producer &&
+                Array.isArray(other.clearsReasonIds) &&
+                other.clearsReasonIds.includes(row.reasonId),
+            ),
+        )
+        .map((row) => clipForLog(`${row.producer}:${row.reasonId}`));
+      if (unclearable.length === 0) return;
+      log.error(
+        "Ops registry: an enabled class:resource reason has no ENABLED clearing reason. Every recovery for it will be " +
+          "rejected at accept step 1 and the condition can never close. Re-enable the clearing row in ops_reasons and " +
+          "restart, or disable the condition row too.",
+        { reasons: unclearable.slice(0, 20), count: unclearable.length },
+      );
+    } catch (err) {
+      log.warn("Ops enable-gate audit failed — skipped", { error: String(err) });
+    }
   }
 
   /** D9. A fault leaves the PREVIOUS set in place and counts — never empties it, because an empty set silently makes every event a zero-match. */
@@ -290,7 +340,24 @@ export class OpsPublisher {
   }
 
   private enqueue(job: Job): void {
-    if (this.stopping) return;
+    if (this.stopping) {
+      // D10: observations arriving after `stopping` is set are refused. That
+      // window is NOT instantaneous — `stop()` sets the latch and then drains
+      // for up to SHUTDOWN_DRAIN_MS while turns are still running — so this
+      // arm can swallow real failures, and swallowing them with no counter is
+      // the one shutdown loss `drainDropped` did not see.
+      //
+      // COUNTED ON `drainDropped` rather than on a counter of its own: from
+      // the only point of view that acts on it, both are "shutdown lost N ops
+      // observations"; the two cannot overlap in time (this arm is live only
+      // once the latch is set, the deadline arm runs once, after); and a
+      // second field would split one shutdown-loss number across two entries
+      // in `getSnapshot()` that no reader distinguishes. No log line: a
+      // shutdown storm here would be the same flood the overflow latch exists
+      // to prevent, and `stop()` already logs the drop it can see.
+      this.counters.drainDropped += 1;
+      return;
+    }
     if (this.queue.length >= PUBLISH_QUEUE_DEPTH) {
       // D9: drop the OLDEST. A full queue means a storm, and the newest
       // failures are the ones a responder needs.
@@ -461,6 +528,29 @@ export class OpsPublisher {
     //    is why this step precedes step 5.
     let clearsFamily: string | undefined;
     if (input.clears !== undefined) {
+      // `clears` is stored verbatim, and `clearsFamily` is derived from it and
+      // INDEXED — yet step 2 bounds only subject/detail/evidence, and the
+      // membership test below reads just one component. Its own two bounds
+      // therefore live here.
+      //
+      // LENGTH: `OPS_CLEARS_MAX_LENGTH`, which is derived from the key's own
+      // grammar and deliberately loose (see ids.ts — a tight bound would
+      // reject a legitimate FOREIGN key, the opposite of the point). Rejected,
+      // never truncated: a truncated key names a different family.
+      if (input.clears.length > OPS_CLEARS_MAX_LENGTH) return this.reject("clears-bounds", input);
+      // OWNERSHIP: a clearing fact may only clear a family of its OWN
+      // producer. Without this, one producer's clearing reason could publish a
+      // clearing fact — and a `clearsFamily` index entry the epoch resolver
+      // reads — against another producer's family, closing a condition it has
+      // no standing to close and advancing that producer's generations. The
+      // leading component of a dedupeKey IS the producer (and a producer is
+      // token-bounded, so colon-free), which is why this reads a component
+      // rather than a prefix.
+      if (input.clears.split(":", 1)[0] !== input.producer) return this.reject("clears-producer", input);
+      // Unreachable from this producer's own capture points — `observe.ts`
+      // always passes a dedupeKey THIS publisher minted for THIS producer —
+      // but the accept path is the fail-closed gate AC16 deliberately drives
+      // with a foreign producer's rows.
       const declared = loaded.row.clearsReasonIds ?? [];
       const clearedReason = reasonIdOfDedupeKey(input.clears);
       if (declared.length === 0 || clearedReason === undefined || !declared.includes(clearedReason)) {
@@ -543,12 +633,20 @@ export class OpsPublisher {
 
   private reject(reason: string, input: OpsPublishInput): undefined {
     this.counters.rejected += 1;
-    // Reason and identifiers only — never the detail values that failed.
+    // Reason and identifiers only — never the detail values that failed, and
+    // never `subject.id`.
+    //
+    // CLIPPED (C13): two of these arms are reached PRECISELY BECAUSE the value
+    // printed here failed its own bound — `bad-token` names producer/reasonId,
+    // `bad-subject-kind` names subject.kind — so logging them raw would make
+    // this the one unbounded log line in the producer. Defensive at this
+    // diff's own capture points, where all three are module constants, and not
+    // defensive at all on the fail-closed path AC16 drives with foreign input.
     log.warn("Ops publish rejected", {
       reason,
-      producer: input.producer,
-      reasonId: input.reasonId,
-      subjectKind: input.subject.kind,
+      producer: clipForLog(input.producer),
+      reasonId: clipForLog(input.reasonId),
+      subjectKind: clipForLog(input.subject?.kind),
     });
     return undefined;
   }
