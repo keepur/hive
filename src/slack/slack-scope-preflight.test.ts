@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { preflightBotScopes, REQUIRED_BOT_SCOPES } from "./slack-scope-preflight.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
+import { preflightBotScopes, PREFLIGHT_TIMEOUT_MS, REQUIRED_BOT_SCOPES } from "./slack-scope-preflight.js";
 
 const warnSpy = vi.fn();
 const infoSpy = vi.fn();
@@ -54,7 +57,7 @@ describe("preflightBotScopes", () => {
     await preflightBotScopes("xoxb-token");
     expect(warnSpy).toHaveBeenCalledWith(
       "Slack bot token missing recommended scopes — some features may degrade silently",
-      expect.objectContaining({ missing: ["chat:write"] }),
+      expect.objectContaining({ missing: ["chat:write", "im:write", "users:read.email"] }),
     );
   });
 
@@ -117,5 +120,107 @@ describe("preflightBotScopes", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(makeResponse({ ok: true }, spacedScopes)));
     await expect(preflightBotScopes("xoxb-token")).resolves.toBeUndefined();
     expect(warnSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("REQUIRED_BOT_SCOPES (KPR-492 D4)", () => {
+  it("carries im:write and users:read.email", () => {
+    expect(REQUIRED_BOT_SCOPES).toContain("im:write");
+    expect(REQUIRED_BOT_SCOPES).toContain("users:read.email");
+  });
+
+  it("still does NOT carry im:history — the manifest grants it, the engine does not depend on it (§3, §5.3)", () => {
+    expect(REQUIRED_BOT_SCOPES).not.toContain("im:history");
+  });
+});
+
+describe("setup/slack-manifest.yaml ⊇ REQUIRED_BOT_SCOPES (KPR-492 D11 drift guard)", () => {
+  it("every scope the engine declares is granted by the manifest every fresh install pastes", () => {
+    // The real file, not a fixture — resolved relative to THIS test, never cwd.
+    // Fails at 46d3d9d (users:read.email absent); passes after the D11 edit.
+    // Negative-verify (i) in Task 11 reverts that one line and expects this red.
+    const manifestPath = fileURLToPath(new URL("../../setup/slack-manifest.yaml", import.meta.url));
+    const manifest = parseYaml(readFileSync(manifestPath, "utf8")) as {
+      oauth_config?: { scopes?: { bot?: string[] } };
+    };
+    const granted = manifest.oauth_config?.scopes?.bot ?? [];
+    expect(granted.length).toBeGreaterThan(0); // a parse that yields nothing must not pass vacuously
+    for (const scope of REQUIRED_BOT_SCOPES) {
+      expect(granted, `manifest bot: block is missing ${scope}`).toContain(scope);
+    }
+  });
+});
+
+describe("preflightBotScopes — transport guard (KPR-492 D10)", () => {
+  it("warns and resolves when fetch REJECTS (the crash-loop guard)", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("getaddrinfo ENOTFOUND slack.com")));
+    await expect(preflightBotScopes("xoxb-token")).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Slack auth.test unreachable — skipping scope preflight",
+      expect.objectContaining({ error: expect.stringContaining("ENOTFOUND") }),
+    );
+  });
+
+  it("warns and resolves when the body is not JSON (the second bare await)", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("<html>gateway error</html>", { status: 502 })));
+    await expect(preflightBotScopes("xoxb-token")).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Slack auth.test unreachable — skipping scope preflight",
+      expect.objectContaining({ error: expect.any(String) }),
+    );
+  });
+
+  it("bounds a fetch that never settles: the TimeoutError lands in the same catch (the hang guard)", async () => {
+    // Driven through D10's `timeoutMs` seam with a REAL 20 ms bound — not fake
+    // timers: AbortSignal.timeout() schedules on Node's internal timer machinery
+    // and makes zero calls to globalThis.setTimeout, so vi.useFakeTimers() can
+    // never advance it (round-5 spec reviewer, Node 26.7.0). And not a spy on
+    // AbortSignal.timeout either — the seam is the version-independent form.
+    //
+    // The mock settles ONLY on abort. That is the discriminator: with the signal
+    // removed from the implementation (negative-verify (d)), nothing ever aborts,
+    // the promise never settles, and this test fails by vitest's 10 s testTimeout.
+    // A mock that resolved on its own would pass against the unguarded code.
+    let seenSignal: AbortSignal | null | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: RequestInit) => {
+        seenSignal = init?.signal;
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init?.signal?.reason));
+        });
+      }),
+    );
+
+    await expect(preflightBotScopes("xoxb-token", REQUIRED_BOT_SCOPES, 20)).resolves.toBeUndefined();
+    // Present — a mock that never inspects the signal proves nothing.
+    expect(seenSignal).toBeInstanceOf(AbortSignal);
+    // Fired, and fired for the right reason.
+    expect(seenSignal?.aborted).toBe(true);
+    expect((seenSignal?.reason as DOMException).name).toBe("TimeoutError");
+    // …and landed in the SAME catch as the rejecting-fetch case above.
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Slack auth.test unreachable — skipping scope preflight",
+      expect.objectContaining({ error: expect.stringContaining("TimeoutError") }),
+    );
+  });
+
+  it("the one-argument production call still passes a signal, bounded by PREFLIGHT_TIMEOUT_MS = 10 s", async () => {
+    // The seam test above exercises the three-argument form. This pins that the
+    // default path index.ts actually uses is bounded too (an implementation that
+    // attached the signal only when timeoutMs was passed would pass the test
+    // above and hang boot), and that the production constant is the spec's 10 s.
+    expect(PREFLIGHT_TIMEOUT_MS).toBe(10_000);
+    let seenSignal: AbortSignal | null | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: RequestInit) => {
+        seenSignal = init?.signal;
+        return Promise.resolve(makeResponse({ ok: true }, REQUIRED_BOT_SCOPES.join(",")));
+      }),
+    );
+    await expect(preflightBotScopes("xoxb-token")).resolves.toBeUndefined();
+    expect(seenSignal).toBeInstanceOf(AbortSignal);
+    expect(seenSignal?.aborted).toBe(false);
   });
 });
