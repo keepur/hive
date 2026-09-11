@@ -1,5 +1,21 @@
 # KPR-454 plan — chunk 3: the publisher
 
+> ## ⚠ POST-REVIEW AMENDMENTS — the shipped source is authoritative
+>
+> **Read this before re-running any fence below.** The code fences in this chunk generate the **pre-review** version of `src/ops/`. Two pre-PR review rounds landed after Task 4 was first executed — **`81d7c05`** (round 1: containment, bounds and able-to-fail guards) and **`b438558`** (round 2: the six CONSIDER items) — and this chunk's fences were deliberately **not** re-edited hunk by hunk, because six separate fences would have had to be kept in step with each other and with the source. Per the correction discipline at `kpr-454-design.md:242` ("chunks get re-dispatched and re-executed"), the amendment is recorded here instead, once, at the top:
+>
+> **Where a fence below differs from the shipped file under `src/ops/`, the shipped file wins. Re-executing this chunk verbatim would revert both review rounds.** Specifically, the fences predate:
+>
+> - the `clears` **key bound** (`OPS_CLEARS_MAX_LENGTH`) and its accept-path check — the one stored-and-indexed string none of the other bounds reached;
+> - `clipForLog` and the `OPS_LOG_VALUE_MAX` log bound at its three call sites — the accept path's token rejections, the registry loader's unusable-row skip and per-row anomaly tally, and `auditLoadedEnableGate`;
+> - the `stopping` **counter arm** in `enqueue()` — post-latch observations are counted on `drainDropped` rather than swallowed silently (see the note on `kpr-454-plan.md`'s constants table);
+> - `auditLoadedEnableGate()` itself — the loaded-registry diagnostic `assertReasonTableLegal` structurally cannot see;
+> - the classifier's `CLASSIFIER_TEXT_MAX` cap **and its totality helper** (`classifierText` in `error-tokens.ts`) — the cap must not reintroduce a throw edge on a path whose containment would drop the whole failure record;
+> - `loadReasons`'s **per-row containment**: the `try`/`catch`, the explicit `Array.isArray(row.detailKeys)` test (a string is iterable and would otherwise load a garbage schema behind one warn per character), and the per-row anomaly **log cap** with its tally line. The `loadReasons` fence at **`:213`** shows the uncontained loop and must not be copied;
+> - the `ops_events.clearing-epoch` index dropping `{ sparse: true }` (a no-op on a compound index) and gaining an operator **remedy** string. The fence at **`:133`** still carries `{ sparse: true }`.
+>
+> Everything else in this chunk — the design rulings, the ordering constraints, the harness requirements, the step sequence and the Testing Contract mapping — still stands as written and is still the right thing to read first.
+
 Implements design **D8**, **D9**, **D10**. One task, one commit. This is the ticket's centre of gravity: the accept path, the epoch resolver, the open-condition map with its `openSeq` identity, the bounded queue and its serial drainer, the counters, and the module-global singleton.
 
 Read D8 in full before writing `drain()`. Three things in it are decided against a named alternative and must not be re-derived at the keyboard: **removal happens at accept, not at enqueue**; the drainer's pre-publish test is `entry?.openSeq === job.openSeq` and **membership is not sufficient**; and a superseded recovery is **dropped, not re-targeted**.
