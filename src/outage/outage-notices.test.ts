@@ -2,6 +2,9 @@ import { describe, it, expect } from "vitest";
 import {
   OutageEpisodeTracker,
   policyFor,
+  policyForId,
+  sourceOfId,
+  waitingFor,
   adapterKeyFor,
   threadKeyFor,
   outageNoticeFor,
@@ -44,6 +47,85 @@ describe("policyFor (§5-3a source policy table)", () => {
     expect(policyFor(item({ source: { kind: "imessage", id: "+1555", label: "x" } }))).toBe("notify");
     expect(policyFor(item({ source: { kind: "app", id: "dev-1", label: "x" } }))).toBe("notify");
     expect(policyFor(item({ source: { kind: "team", id: "dm:agent-a", label: "x" } }))).toBe("notify");
+  });
+
+  // KPR-454 AC4: the pre-refactor value of every reserved prefix, stated once
+  // as a table. This case is written BEFORE the D7 extraction and must pass
+  // unchanged after it — that equality is the entire behaviour-preserving
+  // claim. Negative-verify: break one row of SOURCE_PREFIXES and this fails.
+  it("pins every reserved-prefix classification (pre/post-refactor identity)", () => {
+    const cases: Array<[string, "skip" | "silent" | "notify"]> = [
+      ["sched:agent-a:daily digest:1725465600000", "skip"],
+      ["callback:65a1b2c3d4e5f60718293a4b", "silent"],
+      ["event:65a1b2c3d4e5f60718293a4b:agent-a", "silent"],
+      ["team-65a1b2c3d4e5f60718293a4b", "silent"],
+      ["worker:65a1b2c3d4e5f60718293a4b", "silent"],
+      ["1725465600.123456", "notify"],
+      ["imsg-4471", "notify"],
+      ["scheduled:not-a-reserved-prefix", "notify"],
+    ];
+    for (const [id, expected] of cases) {
+      expect(policyFor(item({ id })), `policyFor(${id})`).toBe(expected);
+    }
+  });
+});
+
+describe("sourceOfId / waitingFor (KPR-454 D7, AC4)", () => {
+  it("classifies all six buckets", () => {
+    expect(sourceOfId("sched:a:b:1")).toBe("cron");
+    expect(sourceOfId("callback:65a1")).toBe("callback");
+    expect(sourceOfId("event:65a1:agent-a")).toBe("event");
+    expect(sourceOfId("team-65a1")).toBe("agent");
+    expect(sourceOfId("worker:65a1")).toBe("worker");
+    expect(sourceOfId("1725465600.123456")).toBe("human");
+  });
+
+  it("maps every bucket to a waiting value — team- is `agent`, not `human-now`", () => {
+    expect(waitingFor("team-65a1")).toBe("agent"); // the stale-comment trap, pinned
+    expect(waitingFor("sched:a:b:1")).toBe("nobody");
+    expect(waitingFor("callback:65a1")).toBe("nobody");
+    expect(waitingFor("event:65a1:agent-a")).toBe("nobody");
+    expect(waitingFor("worker:65a1")).toBe("nobody");
+    expect(waitingFor("1725465600.123456")).toBe("human-now");
+  });
+
+  it("an absent id is `nobody` — the detached worker/scribe case, fail-closed and true", () => {
+    expect(waitingFor(undefined)).toBe("nobody");
+  });
+
+  it("policyForId and waitingFor project from the same bucket", () => {
+    // Not a tautology: it fails if EITHER projection ever acquires a private
+    // prefix test instead of reading sourceOfId. Both are asserted against
+    // LITERAL maps declared here, never against the production Records.
+    const POLICY = {
+      cron: "skip",
+      callback: "silent",
+      event: "silent",
+      agent: "silent",
+      worker: "silent",
+      human: "notify",
+    } as const;
+    const WAITING = {
+      cron: "nobody",
+      callback: "nobody",
+      event: "nobody",
+      agent: "agent",
+      worker: "nobody",
+      human: "human-now",
+    } as const;
+    for (const id of ["sched:x", "callback:x", "event:x", "team-x", "worker:x", "plain-id"]) {
+      const bucket = sourceOfId(id);
+      expect(policyForId(id), `policyForId(${id})`).toBe(POLICY[bucket]);
+      expect(waitingFor(id), `waitingFor(${id})`).toBe(WAITING[bucket]);
+    }
+  });
+
+  it("KPR-402 continuation legs inherit their origin's bucket", () => {
+    // dispatcher.ts:1038 mints `<baseId>#dl<n>`; the suffix is on the TAIL,
+    // so prefix detection is unaffected.
+    expect(waitingFor("team-x#dl1")).toBe("agent");
+    expect(waitingFor("sched:x#dl1")).toBe("nobody");
+    expect(waitingFor("1725465600.123456#dl2")).toBe("human-now");
   });
 });
 
