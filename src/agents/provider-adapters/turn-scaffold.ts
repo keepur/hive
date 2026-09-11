@@ -190,6 +190,7 @@ export abstract class LaneBTurnScaffold implements AgentProviderAdapter {
       workItemContext: request.workItemContext,
       signal: abortController.signal,
       agentId: this.scaffoldInit.name,
+      agentSlug: this.scaffoldInit.assembly.agentId, // KPR-454 D6 — the slug, not the display label
       sessionCwd: this.scaffoldInit.assembly.sessionCwd,
       skillIndex: this.scaffoldInit.assembly.skillIndex,
       delegateRunner: this.scaffoldInit.assembly.delegateTurnRunner, // KPR-354

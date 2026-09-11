@@ -123,6 +123,20 @@ export interface ProviderTurnAssembly {
    * memory-in-instructions as before.
    */
   memoryInTurnInput?: boolean;
+  /**
+   * KPR-454 D6: the agent's `agent_definitions` SLUG — the stable identity
+   * D5 requires. Needed because ToolBridgeOptions.agentId is documented
+   * "logging/telemetry label only" and is fed `config.name`, the DISPLAY
+   * name, which D5 says is never an identity.
+   *
+   * Optional because this type is frozen provider ABI
+   * (LANE_B_PROVIDER_ABI_VERSION = 1): this is exactly the
+   * `datetimeInTurnInput?` (KPR-432) / `memoryInTurnInput?` (KPR-434)
+   * additive-optional precedent and needs no version bump. Absent ⇒ the
+   * `agentId` detail key is OMITTED on a published tool failure, never
+   * substituted with the display name and never guessed.
+   */
+  agentId?: string;
   /** Bridgeable subset for the route provider — already partitioned. */
   toolInventory: HiveToolInventoryEntry[];
   /**
@@ -243,6 +257,7 @@ export async function assembleProviderTurn(input: {
     const sessionCwd = input.runner.resolveTurnCwd(input.workItemContext);
     return {
       instructions,
+      agentId: input.config.id, // KPR-454 D6 — the definitions slug
       datetimeInTurnInput: true,
       toolInventory: bridgeable,
       omittedTools: omitted,
@@ -327,6 +342,10 @@ export function buildNestedDelegateAssembly(input: NestedDelegateAssemblyInput):
   return {
     assembly: {
       instructions,
+      // KPR-454 D6: the PARENT's slug — matching the Claude lane's treatment
+      // of subagent-originated failures in D2 (the publishing agent is the
+      // parent, and a delegate's `agent_id` is never stored).
+      agentId: input.config.id,
       datetimeInTurnInput: false, // KPR-432: Claude parity — delegate prompts carry no datetime
       memoryInTurnInput: false, // KPR-434: Claude parity — delegate turns carry no memory (memory: {} below)
       toolInventory,

@@ -24,6 +24,7 @@ import type { GuardrailDecision, GuardrailGate } from "./types.js";
 import type { HiveToolInventoryEntry } from "./tool-transport.js";
 import type { ProviderSkillIndexEntry, DelegateTurnRunner } from "./turn-assembly.js";
 import { BuiltinExecutor, EXECUTOR_BACKED_BUILTIN_NAMES } from "./builtin-executor.js"; // executor-backed builtin dispatch
+import { observeToolFailure, observeToolSuccess } from "../../ops/observe.js";
 
 const log = createLogger("tool-bridge");
 
@@ -54,6 +55,16 @@ export interface ToolBridgeOptions {
   signal: AbortSignal;
   /** Logging/telemetry label only (adapter passes its display name). */
   agentId: string;
+  /**
+   * KPR-454 D6: the agent_definitions SLUG, distinct from the display label
+   * above. The second field needs a second name because `agentId` is already
+   * taken here by the display label; `agentSlug` says which of the two
+   * identities the bridge is holding at the one site that holds both.
+   * Optional — absent ⇒ the published `agentId` detail key is omitted.
+   * `agentId` keeps its documented meaning and all its existing log call
+   * sites; nothing renames it.
+   */
+  agentSlug?: string;
   /** Resolved per-spawn session cwd (spec §D5-cwd) — builtin executor working dir. */
   sessionCwd: string;
   /** load_skill source (spec §D6) — populated by KPR-349's skill index. */
@@ -348,9 +359,53 @@ export class ToolBridge {
         try {
           const result = await underlying(input);
           this.record(name, Date.now() - t0);
+          // KPR-454 D3, the recovery half. Two arguments and no others — the
+          // same closed pair the Claude lane's success hook passes.
+          observeToolSuccess({ tool: name, lane: "laneB" });
           return result;
         } catch (err) {
           this.record(name, Date.now() - t0);
+          // KPR-454 D3, the failure half. THE single Lane B capture point:
+          // every Lane B failure passes through this one catch — an MCP
+          // isError converted to a throw in discover() (which throws
+          // PRECISELY so this catch handles it), a builtin throw, a transport
+          // rejection, a delegate Task fault. Nothing is added at discover().
+          //
+          // Own-abort suppresses: an abort DURING execution surfaces as a
+          // rejection and would otherwise be indistinguishable from a fault.
+          // Reading the signal here is Lane B's exact analogue of the Claude
+          // lane's `wasAborted`, and the two lanes must suppress the same
+          // class or the tool-health view is lane-skewed.
+          if (!this.opts.signal.aborted) {
+            observeToolFailure({
+              // `name` is the CANONICAL name the wrapper closed over —
+              // mcp__<server>__<tool> or a builtin — BEFORE
+              // applyNameAndCapEdges sanitizes/truncates/de-collides for
+              // provider constraints. That method builds a new object and
+              // never rewrites this closure, so Claude/Lane A/Lane B rows for
+              // one tool share a subject.id (AC11).
+              tool: name,
+              error: errorText(err),
+              lane: "laneB",
+              agentId: this.opts.agentSlug,
+              workItemId: this.opts.workItemContext?.workItemId,
+              threadId: this.opts.workItemContext?.threadId,
+              durationMs: Date.now() - t0,
+              // D6's "the bridge's own TOOL_CALL_TIMEOUT_MS path", supplied as
+              // the typed signal it actually arrives as. That constant is
+              // handed to the MCP SDK as RequestOptions.timeout, and the SDK
+              // rejects with a JSON-RPC McpError whose numeric `.code` is
+              // -32001 — which classifyToolError maps to `timeout` ahead of
+              // any text test. Read defensively: `err` is `unknown` and most
+              // throws here carry no `code` at all.
+              signals: {
+                mcpErrorCode:
+                  typeof (err as { code?: unknown })?.code === "number"
+                    ? ((err as { code: number }).code)
+                    : undefined,
+              },
+            });
+          }
           // Mirrors the KPR-122 in-process structured-error invariant.
           return `Tool execution failed (${name}): ${errorText(err)}`;
         }

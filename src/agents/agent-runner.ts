@@ -1,5 +1,7 @@
 import type { DeliveryCapability } from "../obligations/types.js";
 import { query, type Query, type SDKMessage, type SDKResultMessage, type McpServerConfig, type McpSdkServerConfigWithInstance, type SdkPluginConfig, type AgentDefinition, type HookEvent, type HookCallbackMatcher, type HookInput, type Options as SdkQueryOptions, type EffortLevel } from "@anthropic-ai/claude-agent-sdk";
+import type { PostToolUseFailureHookInput, PostToolUseHookInput } from "@anthropic-ai/claude-agent-sdk";
+import { observeToolFailure, observeToolSuccess } from "../ops/observe.js";
 import { resolve } from "node:path";
 import { existsSync, mkdirSync, symlinkSync, lstatSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -1969,6 +1971,69 @@ export class AgentRunner {
         }];
       }
     }
+
+    // ── KPR-454 D2: runtime tool-failure observation ────────────────────
+    // Registered OUTSIDE the archetype try/catch above, deliberately: a
+    // broken archetype must not disarm failure observation, and a broken
+    // observer must not disarm the fail-closed deny-all PreToolUse matcher.
+    // The two are adjacent in this function and collapsing them into one try
+    // couples a diagnostics feed to a security gate in both directions
+    // (AC13, structurally pinned by a test).
+    //
+    // Both matchers are unmatched (all tools), both are async, and both
+    // RETURN AN EMPTY OBJECT. The SDK's PostToolUse/PostToolUseFailure
+    // hookSpecificOutput offers `additionalContext` and (on PostToolUse) a
+    // classifier-context field; neither is used, and a test pins the empty
+    // return — a hook that altered tool output would breach C15's "cannot
+    // alter a turn's outcome" on the one path where altering is trivially
+    // available.
+    hooks.PostToolUseFailure = [{
+      hooks: [async (input: HookInput) => {
+        // Rule 1: OWN-ABORT SUPPRESSES. A turn killed by its wall-clock
+        // deadline (KPR-402) or by an operator abort produces tool errors
+        // that are consequences of the kill, not faults of the tool.
+        // `is_interrupt` alone does NOT suppress: an interrupt the runtime
+        // did not cause is a real fault, and it is the KPR-438
+        // background-subagent signature this producer should be the standing
+        // detector for.
+        if (this.wasAborted) return {};
+        const failure = input as PostToolUseFailureHookInput;
+        // Rule 2: identity is read AT FIRE TIME, never captured at build
+        // time — this.workItemContextRef.current is KPR-453's live reference
+        // and this.agentConfig.id is the stable slug (never the display
+        // name). buildHooks is rebuilt per send() and AgentRunner is
+        // per-spawn, so capture-at-build would be equivalent TODAY; reading
+        // .current is required anyway, because KPR-453 canon fixes the
+        // pattern rather than the coincidence.
+        const ctx = this.workItemContextRef.current;
+        observeToolFailure({
+          tool: failure.tool_name,
+          error: failure.error,
+          lane: "claude",
+          agentId: this.agentConfig.id,
+          workItemId: ctx?.workItemId,
+          threadId: ctx?.threadId,
+          durationMs: failure.duration_ms,
+          signals: { isInterrupt: failure.is_interrupt },
+        });
+        return {};
+      }],
+    }];
+    // The SUCCESS hook — the shipped CLI's own hook table describes
+    // PostToolUse as "Run after successful tool", so this is the RECOVERY
+    // signal D2 makes an obligation, never a failure signal. NO FIELD of the
+    // SDK's success payload beyond the tool's name is read: the outcome is
+    // carried by WHICH hook event fired, and is never inferred from what the
+    // tool returned or from what the turn spent (C12/AC15). Chunk 5's hunk
+    // scan runs over this insertion, so keep the result field's own name out
+    // of this comment too.
+    hooks.PostToolUse = [{
+      hooks: [async (input: HookInput) => {
+        if (this.wasAborted) return {};
+        observeToolSuccess({ tool: (input as PostToolUseHookInput).tool_name, lane: "claude" });
+        return {};
+      }],
+    }];
 
     return hooks;
   }
