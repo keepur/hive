@@ -848,6 +848,13 @@ describe("AC6 (C13) — nothing but tokens reaches a stored field", () => {
 // ───────────────────────────────────────────────────────────────────────────
 
 describe("AC7 (C14) — the ops path publishes nothing about itself", () => {
+  /**
+   * The overflow arm's log lines, by prefix — the same `mockLog` filter the
+   * fault and rejection cases use. `beforeEach`'s `vi.clearAllMocks()` makes
+   * every count below a per-case absolute.
+   */
+  const overflowWarnings = () => mockLog.warn.mock.calls.filter((c) => String(c[0]).includes("Ops publish queue full"));
+
   it("a publish FAULT produces a log line and a counter and no document", async () => {
     fakeDb.failAll(OPS_EVENTS_COLLECTION, "insertOne", new Error("mongo down"));
     driveFailure("Bash");
@@ -867,7 +874,7 @@ describe("AC7 (C14) — the ops path publishes nothing about itself", () => {
     expect(await countEvents()).toBe(0);
   });
 
-  it("an OVERFLOW produces a counter, and mints no document about the overflow itself", async () => {
+  it("an OVERFLOW produces a log line and a counter, and mints no document about the overflow itself", async () => {
     // ⚠ DELIBERATE DIVERGENCE from the plan's fence, disclosed in the
     // implementation report. The fence asks for `countDocuments({}) === 0` on
     // all three, which is unreachable here BY CONSTRUCTION: an overflow needs
@@ -876,11 +883,11 @@ describe("AC7 (C14) — the ops path publishes nothing about itself", () => {
     // count — 1001, never 1002 — plus the reason-id sweep below. An extra
     // self-report row would move the count and fail this case just as loudly.
     //
-    // Also disclosed: unlike the two paths above, the overflow arm in
-    // `enqueue()` counts WITHOUT logging, so no log-line assertion is made
-    // here. That is publisher.ts's behaviour today, not this file's choice.
+    // ONE drop here, so the log line's once-per-episode shape is invisible in
+    // this case; the sibling case below is the one that pins it.
     for (let i = 1; i <= 1002; i += 1) driveFailure(`tool-${i}`);
     expect(publisher.getSnapshot().queueOverflow).toBe(1);
+    expect(overflowWarnings()).toHaveLength(1);
     await publisher.__drainForTests();
 
     expect(rows()).toHaveLength(1001);
@@ -890,6 +897,36 @@ describe("AC7 (C14) — the ops path publishes nothing about itself", () => {
       expect(doc.subject.kind).toBe("tool");
     }
     expect(publisher.getSnapshot().published).toBe(1001);
+  });
+
+  it("a STORM of drops still produces ONE log line, and a later storm produces a second", async () => {
+    // The overflow line is warn-once-per-EPISODE, not per dropped job: a queue
+    // only overflows under a storm, so a per-drop line would itself be the
+    // operational flood this producer exists to replace. 2000 drives leaves
+    // one job in flight, 1000 queued and 999 dropped — 999 chances to flood.
+    for (let i = 1; i <= 2000; i += 1) driveFailure(`tool-${i}`);
+    expect(publisher.getSnapshot().queueOverflow).toBe(999);
+    expect(overflowWarnings()).toHaveLength(1);
+
+    // C13, asserted on the WHOLE call rather than the message alone, so a
+    // payload that later grew a `tool`/`dedupeKey`/`error` field fails here
+    // even though the prefix filter above would still match it. Counts and a
+    // code-resident bound only; nothing names the job that was dropped.
+    const [message, payload] = overflowWarnings()[0] as [unknown, Record<string, unknown>];
+    expect(String(message)).not.toMatch(/tool-\d/);
+    expect(Object.keys(payload).sort()).toEqual(["depth", "totalDropped"]);
+    expect(JSON.stringify(payload)).not.toMatch(/tool-\d/);
+
+    // Re-arm on a full drain: a second storm is reported rather than swallowed
+    // for the life of the process. Without the latch the first storm alone is
+    // 999 lines; with a warn-ONCE latch that never re-arms this stays at 1.
+    await publisher.__drainForTests();
+    for (let i = 1; i <= 2000; i += 1) driveFailure(`tool-${i}`);
+    expect(publisher.getSnapshot().queueOverflow).toBe(1998);
+    expect(overflowWarnings()).toHaveLength(2);
+    // Drained before the case ends: an in-flight drainer outliving the case
+    // would log into the NEXT case's freshly cleared `mockLog`.
+    await publisher.__drainForTests();
   });
 
   it("no code path in this diff spawns a turn", () => {

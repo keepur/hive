@@ -95,6 +95,19 @@ export class OpsPublisher {
   private readonly queue: Job[] = [];
   private draining = false;
   private stopping = false;
+  /**
+   * D9 + AC7's "a log line and a counter". ARMED on the transition INTO the
+   * overflowing state, re-armed only once the drainer has emptied the queue.
+   *
+   * Overflow is a storm-only event by construction — the queue is
+   * PUBLISH_QUEUE_DEPTH deep, so anything that reaches the cap is dropping on
+   * every arrival until it drains — and a line per dropped job would be
+   * exactly the operational flood this producer exists to replace. The
+   * `noKeyWarned` latch in `meeting-classifier.ts` is the idiom; the one
+   * difference is that this latch RE-ARMS, so a second storm an hour later is
+   * reported rather than silently swallowed for the life of the process.
+   */
+  private overflowWarned = false;
   private reloadTimer?: ReturnType<typeof setInterval>;
   private nextOpenSeq = 1;
   private readonly counters: OpsPublisherCounters = {
@@ -281,8 +294,24 @@ export class OpsPublisher {
     if (this.queue.length >= PUBLISH_QUEUE_DEPTH) {
       // D9: drop the OLDEST. A full queue means a storm, and the newest
       // failures are the ones a responder needs.
+      //
+      // The COUNTER moves on every dropped job — unchanged, and the only
+      // per-drop work here. The LOG LINE is once per overflow EPISODE
+      // (`overflowWarned`), because the per-drop shape of this same line would
+      // be a thousand-line burst in the one situation the engine is already
+      // struggling. C13: counts and a code-resident bound only. Nothing names
+      // the dropped job — its tool, key, reason and subject are all
+      // operator-adjacent text of unbounded shape, and none of it is needed to
+      // act on "the ops queue overflowed".
       this.queue.shift();
       this.counters.queueOverflow += 1;
+      if (!this.overflowWarned) {
+        this.overflowWarned = true;
+        log.warn("Ops publish queue full — dropping the oldest job on each arrival until it drains", {
+          depth: PUBLISH_QUEUE_DEPTH,
+          totalDropped: this.counters.queueOverflow,
+        });
+      }
     }
     this.queue.push(job);
     void this.drain();
@@ -306,6 +335,23 @@ export class OpsPublisher {
           log.warn("Ops publish job failed", { kind: job.kind, error: String(err) });
         }
       }
+      // THE RE-ARM POINT, and deliberately the only one. Reaching here means
+      // the `while` condition is false — the queue is empty as a matter of
+      // control flow rather than of a sampled read — so the drainer has
+      // absorbed every job the storm produced and the next overflow is a NEW
+      // episode. A low-water mark (say, half depth) would re-arm mid-storm and
+      // emit a line per oscillation across it, which is the flood again; a
+      // timer would need its own constant and would fire while the storm was
+      // still storming. Full drain needs neither: per D9's own sizing, 1000
+      // jobs is seconds of Mongo work, so two lines can never be closer
+      // together than the time it takes to clear a full queue.
+      //
+      // The two writers of this latch cannot race: `enqueue` sets it only at
+      // depth PUBLISH_QUEUE_DEPTH and this clears it only at depth 0, and both
+      // run on the one event loop. Skipping this line (only reachable if
+      // something outside the inner try/catch throws — nothing here can) leaves
+      // the latch set, i.e. errs toward silence rather than toward a flood.
+      this.overflowWarned = false;
     } finally {
       this.draining = false;
     }
