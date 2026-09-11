@@ -713,8 +713,11 @@ async function main(): Promise<void> {
       // raw `D0…` would miss `channelIdByName` just as loudly) cannot reintroduce it.
       const ID_SHAPE = /^[CG][A-Z0-9]+$/;
       const DM_SHAPE = /^D[A-Z0-9]+$/;
-      const notMember: string[] = [];
-      const notVisible: string[] = [];
+      // Sets, not arrays: two agents can share a homeBase, and `auditChannel` can
+      // equal one — a plain array repeats that channel in the warn payload, which
+      // reads as two broken agents (child-PR integration round 1).
+      const notMember = new Set<string>();
+      const notVisible = new Set<string>();
       const check = (raw: string) => {
         const dep = raw.trim();
         if (!dep) return;
@@ -722,23 +725,23 @@ async function main(): Promise<void> {
         if (ID_SHAPE.test(dep)) {
           // An id-shaped homeBase: membership by id. Absent from the page ⇒ the
           // bot cannot see it (private + unjoined, or not a channel at all).
-          if (!isMemberById.has(dep)) notVisible.push(dep);
-          else if (isMemberById.get(dep) !== true) notMember.push(dep);
+          if (!isMemberById.has(dep)) notVisible.add(dep);
+          else if (isMemberById.get(dep) !== true) notMember.add(dep);
           return;
         }
         const name = dep.replace(/^#/, "");
-        if (!channelIdByName.has(name)) notVisible.push(name);
-        else if (isMemberByName.get(name) !== true) notMember.push(name);
+        if (!channelIdByName.has(name)) notVisible.add(name);
+        else if (isMemberByName.get(name) !== true) notMember.add(name);
       };
       // registry.getAll() returns the ACTIVE map only — disabled definitions are
       // dropped from it at load (agent-registry.ts:350-357), so no `disabled`
       // filter is needed here; one would be dead code.
       for (const agent of registry.getAll()) if (agent.homeBase) check(agent.homeBase);
       check(config.slack.auditChannel);
-      if (notMember.length > 0 || notVisible.length > 0) {
+      if (notMember.size > 0 || notVisible.size > 0) {
         log.warn("Slack bot is missing from channels the engine depends on — posts there will fail (KPR-492)", {
-          notMember,
-          notVisible,
+          notMember: [...notMember],
+          notVisible: [...notVisible],
           note: "Invite the hive bot to each channel. A private channel the bot has not joined is indistinguishable from a channel that does not exist — a full audit needs the workspace admin.",
         });
       }
