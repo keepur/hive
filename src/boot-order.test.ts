@@ -53,6 +53,10 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     // scribeEnabled's own nesting lives (meeting-scribe.ts, not config.ts),
     // so this anchor is what closes the gap at the one live feed.
     offsetOf("dispatcher.setMeetingAckEnabled(config.meetingWorkers.ackEnabled)");
+    // KPR-454: the ops publisher is a spawn-read surface (the first turn
+    // after boot can fail a tool), so both anchors are order-pinned below.
+    offsetOf("await opsPublisher.init()");
+    offsetOf("setOpsPublisher(");
     offsetOf("await bgTaskManager.start()");
     offsetOf("await bgTaskManager.scanOrphans()");
     offsetOf("await codeTaskManager.start()");
@@ -67,6 +71,8 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("await workerPool.ensureIndexes()"),
       offsetOf("dispatcher.setMeetingScribe("),
       offsetOf("dispatcher.setMeetingAckEnabled("),
+      offsetOf("await opsPublisher.init()"),
+      offsetOf("setOpsPublisher("),
     ];
     const surfaceOffsets = [
       offsetOf("await bgTaskManager.start()"),
@@ -93,6 +99,8 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("await workerPool.ensureIndexes()"),
       offsetOf("dispatcher.setMeetingScribe("),
       offsetOf("dispatcher.setMeetingAckEnabled("),
+      offsetOf("await opsPublisher.init()"),
+      offsetOf("setOpsPublisher("),
     );
     // Known non-spawn-capable `.start(`/`.scanOrphans(` calls that legitimately
     // precede the wiring. Adding to this list is a deliberate, reviewed
@@ -128,6 +136,16 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offenders,
       "an unallowlisted spawn-capable start/scanOrphans precedes the wiring — classify it (allowlist if inert, move the wiring if not)",
     ).toEqual([]);
+  });
+
+  it("(d) index.ts never calls opsPublisher.start( — (c)'s allowlist needs no entry (KPR-454 AC13)", () => {
+    // The drainer is demand-driven and the subscription-reload timer is armed
+    // inside init(), so there is no start() to call and (c)'s allowlist needs
+    // no publisher entry. A later refactor introducing `opsPublisher.start(`
+    // in index.ts must either place it AFTER the wiring anchors or add it to
+    // that allowlist under the reviewed-classification discipline the list's
+    // own comment demands. Scope: this scans index.ts, not src/ops/.
+    expect(codeOnly).not.toContain("opsPublisher.start(");
   });
 });
 
