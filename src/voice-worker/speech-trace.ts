@@ -921,7 +921,7 @@ export class SpeechTrace implements SpeechTracePort {
     else if (owner.sampleRate !== sampleRate) owner.mixedSampleRates = true;
     const speech = this.#speechForBinding(owner.binding);
     this.#attachAudioContribution(owner);
-    if (speech && !speech.terminalEmitted) {
+    if (speech && !speech.terminalEmitted && speech.synthesisIds.has(owner.synthesisId)) {
       speech.audioBySynthesis.set(owner.synthesisId, owner.generatedDurationMs);
       this.#refreshSpeechAudio(speech);
     }
@@ -1038,13 +1038,13 @@ export class SpeechTrace implements SpeechTracePort {
       return;
     }
     owner.binding = speechId;
-    this.#associateSynthesis(speechId, synthesisId);
+    const associationRetained = this.#associateSynthesis(speechId, synthesisId);
     this.#emit({ synthesisId, speechId }, { event: "synthesis_bound", source });
     const speech = this.#speechById(speechId);
     this.#attachAudioContribution(owner);
     if (speech && owner.errorClass)
       this.#applySpeechFailure(speech, this.#synthesisFailureSource(synthesisId), owner.errorClass);
-    if (speech && !speech.terminalEmitted && owner.frameCount > 0) {
+    if (speech && !speech.terminalEmitted && owner.frameCount > 0 && associationRetained) {
       speech.audioBySynthesis.set(owner.synthesisId, owner.generatedDurationMs);
       this.#refreshSpeechAudio(speech);
     } else if (speech?.terminalEmitted && (owner.errorClass || owner.frameCount > 0)) {
@@ -1291,23 +1291,24 @@ export class SpeechTrace implements SpeechTracePort {
     speech.bridgeIds.add(turnId);
   }
 
-  #associateSynthesis(speechId: string, synthesisId: string): void {
+  #associateSynthesis(speechId: string, synthesisId: string): boolean {
     const speech = this.#speechById(speechId);
     if (!speech) {
       this.#gap("correlation_missing", { speechId, synthesisId });
-      return;
+      return false;
     }
-    if (speech.synthesisIds.has(synthesisId)) return;
+    if (speech.synthesisIds.has(synthesisId)) return true;
     if (speech.synthesisIds.size >= SPEECH_SYNTHESIS_LIMIT) {
       if (!speech.terminalEmitted) speech.synthesisAssociationOverflow = true;
       this.#gap("association_overflow", { speechId, synthesisId });
-      return;
+      return false;
     }
     if (speech.terminalEmitted) {
       this.#lateSpeechEvidence(speech, null);
-      return;
+      return false;
     }
     speech.synthesisIds.add(synthesisId);
+    return true;
   }
 
   #speechById(speechId: string): SpeechOwner | undefined {

@@ -802,6 +802,43 @@ describe("bounded attempt registries and metrics", () => {
     );
   });
 
+  it("caps audio bookkeeping across both binding orders and synthesis eviction", () => {
+    const { rows, trace } = setup();
+    const handle = new FakeSpeechHandle("speech-audio-associations");
+    trace.speechCreated(handle.asHandle(), "fallback", 0);
+
+    for (let index = 0; index < 600; index += 1) {
+      const synthesis = trace.synthesisCreated(synthesisContext("call", `audio-synthesis-${index}`));
+      if (index % 2 === 0) synthesis.bind(handle.id);
+      synthesis.frame({ sampleRate: 24_000, samplesPerChannel: 480 });
+      if (index % 2 !== 0) synthesis.bind(handle.id);
+      synthesis.finish("completed", "unknown");
+    }
+    handle.settle();
+
+    expect(trace.snapshot()).toMatchObject({
+      synthesisAttempts: 600,
+      synthesisOutcomes: { completed: 600 },
+      synthesizedAudioObserved: 600,
+      generatedAudioObserved: 1,
+      registry: { recentSynthesis: 256 },
+    });
+    expect(rows.filter((row) => row.event === "synthesis_terminal")).toHaveLength(600);
+    expect(rows.filter((row) => row.event === "diagnostic_gap" && row.reason === "association_overflow")).toHaveLength(
+      568,
+    );
+    expect(rows.filter((row) => row.event === "diagnostic_gap" && row.reason === "recent_cache_evicted")).toHaveLength(
+      344,
+    );
+    expect(rows.filter((row) => row.event === "speech_terminal")).toEqual([
+      expect.objectContaining({
+        speechId: handle.id,
+        outcome: "incomplete",
+        generatedDurationMs: { value: 640, reason: null },
+      }),
+    ]);
+  });
+
   it("joins reversed overlapping metrics only through their immutable ALS contexts", () => {
     const { rows, trace } = setup();
     trace.bridgeCreated(bridgeContext("call", "turn-a"));
