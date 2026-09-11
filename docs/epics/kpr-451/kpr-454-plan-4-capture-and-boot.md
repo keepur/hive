@@ -291,7 +291,7 @@ Do **not**, under either branch, suppress by inferring "this looks like a policy
 
 Record, in the implementation report, a table of class → fired/did-not-fire, plus the **resolved** SDK version — `npm ls @anthropic-ai/claude-agent-sdk` (prints `@anthropic-ai/claude-agent-sdk@0.3.258` against this tree today). ⚠ The obvious `node -p "require('@anthropic-ai/claude-agent-sdk/package.json').version"` **does not work here** and must not be used: the package's `exports` map declares no `./package.json` subpath, so it dies with `ERR_PACKAGE_PATH_NOT_EXPORTED`. If a machine-readable string is wanted instead of `npm ls`'s tree, read the file directly, bypassing `exports`: `node -p "JSON.parse(require('fs').readFileSync('node_modules/@anthropic-ai/claude-agent-sdk/package.json','utf8')).version"`. Both forms were run in this worktree; both print `0.3.258`.
 
-**The rule on a class that does not fire (C12/AC15): it is left UNCAPTURED on the Claude lane in this ticket.** It is not papered over by inferring failure from a `PostToolUse` `tool_response`, from `costUsd`, from a duration or from an elapsed-time threshold. If a class does not fire, add one line to the `CLAUDE.md` bullet in Task 6 Step 4 naming it, so the next reader knows the coverage boundary rather than assuming totality.
+**The rule on a class that does not fire (C12/AC15): it is left UNCAPTURED on the Claude lane in this ticket.** It is not papered over by inferring failure from a `PostToolUse` `tool_response`, from `costUsd`, from a duration or from an elapsed-time threshold. If a class does not fire, add one line to the `CLAUDE.md` bullet in Task 6 Step 5 naming it, so the next reader knows the coverage boundary rather than assuming totality.
 
 - [ ] **Step 7:** Verify and commit.
 
