@@ -438,8 +438,9 @@ describe("speech lifecycle", () => {
     const bridge = trace.bridgeCreated(bridgeContext("call", "turn-refined-http-failure"));
     bridge.bind(handle.id);
     bridge.fail("engine_auth");
-    bridge.refineFailure("budget_saturated");
+    expect(bridge.refineFailure("budget_saturated")).toBe(true);
     bridge.finish("failed", "unknown");
+    expect(bridge.refineFailure("engine_auth")).toBe(false);
     handle.settle();
 
     expect(rows.find((row) => row.event === "bridge_terminal")).toMatchObject({

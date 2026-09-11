@@ -41,7 +41,8 @@ export interface BridgeAttempt {
   response(status: number): void;
   text(length: number, monoMs: number): void;
   fail(errorClass: VoiceErrorClass): void;
-  refineFailure(errorClass: VoiceErrorClass): void;
+  /** Returns true only when the authoritative pre-terminal class changed. */
+  refineFailure(errorClass: VoiceErrorClass): boolean;
   finish(outcome: AttemptOutcome, cause: CancellationCause): void;
   bind(speechId: string): void;
 }
@@ -772,8 +773,13 @@ export class SpeechTrace implements SpeechTracePort {
       response: (status: number) => this.#safe(() => owner && this.#bridgeResponse(owner, status)),
       text: (length: number, monoMs: number) => this.#safe(() => owner && this.#bridgeText(owner, length, monoMs)),
       fail: (errorClass: VoiceErrorClass) => this.#safe(() => owner && this.#bridgeFail(owner, errorClass)),
-      refineFailure: (errorClass: VoiceErrorClass) =>
-        this.#safe(() => owner && this.#refineBridgeFailure(owner, errorClass)),
+      refineFailure: (errorClass: VoiceErrorClass) => {
+        let accepted = false;
+        this.#safe(() => {
+          if (owner) accepted = this.#refineBridgeFailure(owner, errorClass);
+        });
+        return accepted;
+      },
       finish: (outcome: AttemptOutcome, cause: CancellationCause) =>
         this.#safe(() => owner && this.#finishBridge(owner, outcome, cause)),
       bind: (speechId: string) => this.#safe(() => this.#bindBridge(turnId, speechId, "sdk_metrics_context")),
@@ -864,11 +870,12 @@ export class SpeechTrace implements SpeechTracePort {
     }
   }
 
-  #refineBridgeFailure(owner: BridgeOwner, errorClass: VoiceErrorClass): void {
-    if (owner.terminalEmitted || owner.errorClass === null || owner.errorClass === errorClass) return;
+  #refineBridgeFailure(owner: BridgeOwner, errorClass: VoiceErrorClass): boolean {
+    if (owner.terminalEmitted || owner.errorClass === null || owner.errorClass === errorClass) return false;
     owner.errorClass = errorClass;
     const speech = this.#speechForBinding(owner.binding);
     if (speech) this.#applySpeechFailure(speech, this.#bridgeFailureSource(owner.turnId), errorClass);
+    return true;
   }
 
   #finishBridge(owner: BridgeOwner, outcome: AttemptOutcome, cause: CancellationCause): void {

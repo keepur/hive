@@ -301,8 +301,11 @@ export class HiveLLMStream extends llm.LLMStream {
           await readFailureSnippet(res, (snippet) => {
             const refinedClass = classifyHttpFailure(res.status, snippet);
             if (refinedClass === failure.failureClass) return;
-            refineFailureClass(failure, refinedClass);
-            this.attempt.refineFailure(refinedClass);
+            // The recorder owns the one-shot terminal class. A bounded-registry
+            // eviction can terminalize this attempt while the optional body is
+            // still arriving, so mutate the exact owned error only when the
+            // recorder accepts the same refinement.
+            if (this.attempt.refineFailure(refinedClass)) refineFailureClass(failure, refinedClass);
           });
         }
         throw observedFailure;
@@ -330,8 +333,20 @@ export class HiveLLMStream extends llm.LLMStream {
             this.attempt.text(ev.text.length, performance.now());
             // Yield immediately — NEVER buffer (§5.4).
             this.queue.put({ id: requestId, delta: { role: "assistant", content: ev.text } });
+          } else if (ev.finishReason === "error") {
+            // The engine can discover a provider failure after it has already
+            // streamed text. Preserve that explicit application-owned failure
+            // synchronously; SDK settlement alone does not carry it reliably.
+            observedFailure = new BridgeError(
+              yielded ? "midstream_error" : "engine_unreachable",
+              this.traceContext.turnId,
+              yielded,
+            );
+            this.attempt.fail(observedFailure.failureClass);
+            this.parent.ownFailure(observedFailure);
+            throw observedFailure;
           } else {
-            // done frame: [DONE] follows; loop ends when the body closes.
+            // Successful done frame: [DONE] follows; loop ends when the body closes.
           }
         }
       }

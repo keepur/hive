@@ -368,6 +368,7 @@ export function parseVoiceDiagnosticEvent(value: unknown): VoiceDiagnosticEvent 
     return null;
   }
   if (value.component === "voice-worker" && value.engineAttemptSeq !== null) return null;
+  if (ENGINE_EVENTS.has(event) && !nonempty(value.turnId)) return null;
   if (
     (event === "engine_attempt_started" || event === "engine_first_text" || event === "engine_attempt_terminal") &&
     !positiveInteger(value.engineAttemptSeq)

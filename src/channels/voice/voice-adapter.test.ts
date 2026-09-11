@@ -629,6 +629,41 @@ describe("VoiceAdapter — spawnTurnViaAgentManager", () => {
     expect(res.writableEnded).toBe(true);
   });
 
+  it("marks a provider failure after partial streamed text with one explicit SSE error terminal", async () => {
+    const am = makeAgentManager();
+    const adapter = makeVoiceAdapter(am);
+    const res = new MockServerResponse();
+    am.spawnTurn.mockImplementationOnce(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
+      am.calls.push({ ctx, onStream });
+      ctx.onVoiceAdmission?.("fresh");
+      onStream?.("partial reply");
+      return {
+        finalMessage: "partial reply",
+        newSessionId: "",
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          contextWindow: 1,
+          costUsd: 0,
+          durationMs: 1,
+        },
+        errors: ["Could not resolve authentication method"],
+      } satisfies TurnResult;
+    });
+
+    await callHandle(adapter, makeRequest({ stream: true }), res);
+
+    const written = res.written.join("");
+    expect(written).toContain('"content":"partial reply"');
+    expect(written.match(/"finish_reason":"error"/g)).toHaveLength(1);
+    expect(written).toContain("[DONE]");
+    expect(engineTraceRows("engine_terminal")).toEqual([
+      expect.objectContaining({ outcome: "failed", errorClass: "engine_auth", textLength: 13 }),
+    ]);
+  });
+
   it("treats write(false) as accepted backpressure and completes the request trace", async () => {
     const am = makeAgentManager();
     const adapter = makeVoiceAdapter(am);

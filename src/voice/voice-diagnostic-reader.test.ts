@@ -756,6 +756,28 @@ describe("voice diagnostic input validation", () => {
     });
   });
 
+  it("rejects engine request and attempt lifecycle rows without turn identity", () => {
+    const missingRequestIdentity = row("missing-request-turn", {
+      event: "engine_received",
+      correlation: "legacy",
+    });
+    const missingAttemptIdentity = row(
+      "missing-attempt-turn",
+      { event: "engine_attempt_started", continuity: "fresh" },
+      { engineAttemptSeq: 1 },
+    );
+
+    expect(parseVoiceDiagnosticEvent(missingRequestIdentity)).toBeNull();
+    expect(parseVoiceDiagnosticEvent(missingAttemptIdentity)).toBeNull();
+    expect(reduceVoiceDiagnostics(jsonl([missingRequestIdentity, missingAttemptIdentity]), "call-test")).toMatchObject({
+      complete: false,
+      engineRequests: 0,
+      engineAttempts: 0,
+      malformedRows: 2,
+      incomplete: { total: 0 },
+    });
+  });
+
   it("ignores legacy and other-call rows but rejects a selected unsupported schema", () => {
     const other = {
       ...row("other", { event: "speech_started", origin: "opening", acceptedEpoch: 0 }, { speechId: "other" }),

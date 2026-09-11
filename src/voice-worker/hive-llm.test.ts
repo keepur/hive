@@ -238,6 +238,33 @@ describe("HiveLLM (KPR-322)", () => {
     expect(chunks.map((c) => c.delta?.content)).toEqual([VOICE_OUTAGE_SPOKEN_NOTICE]);
   });
 
+  it("owns an explicit SSE error marker after partial text and fails the bridge exactly once", async () => {
+    const stub = await listen((_req, res) => {
+      _req.resume();
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end(formatSSETextChunk(STREAM_ID, "partial reply", MODEL) + formatSSEDone(STREAM_ID, MODEL, "error"));
+    });
+    openServers.push(stub.server);
+
+    const { trace, rows } = traceHarness();
+    const hive = makeHive(stub.url, trace);
+    const ownFailure = vi.spyOn(hive, "ownFailure");
+    const result = await consumeTurn(hive, userCtx("hello"));
+
+    expect(result.chunks.map((chunk) => chunk.delta?.content)).toEqual(["partial reply"]);
+    expectBridge(result.bridge, "midstream_error", true);
+    expect(ownFailure).toHaveBeenCalledTimes(1);
+    expect(ownFailure).toHaveBeenCalledWith(result.bridge);
+    expect(terminalRows(rows)).toEqual([
+      expect.objectContaining({
+        turnId: result.bridge?.turnId,
+        textLength: 13,
+        outcome: "failed",
+        errorClass: "midstream_error",
+      }),
+    ]);
+  });
+
   it("records a maximum gap only after the second nonempty content chunk", async () => {
     const firstWritten = gate();
     const releaseSecond = gate();
@@ -409,6 +436,85 @@ describe("HiveLLM (KPR-322)", () => {
         errorClass: "budget_saturated",
       }),
     ]);
+  });
+
+  it("keeps a held 503 error, bridge terminal, and bound speech aligned after active-registry eviction", async () => {
+    const headers = gate();
+    const releaseBody = gate();
+    const bodyWritten = gate();
+    const closed = gate();
+    const stub = await listen((req, res) => {
+      req.resume();
+      res.once("close", () => closed.resolve());
+      res.writeHead(503, { "Content-Type": "text/plain" });
+      res.flushHeaders();
+      headers.resolve();
+      void releaseBody.promise.then(() => {
+        res.write("Voice temporarily unavailable", () => bodyWritten.resolve());
+        // Keep the body open until call teardown.
+      });
+    });
+    openServers.push(stub.server);
+
+    const callAbort = new AbortController();
+    const { trace, rows } = traceHarness();
+    const originalBridgeCreated = trace.bridgeCreated.bind(trace);
+    const refinementObserved = gate<boolean>();
+    vi.spyOn(trace, "bridgeCreated").mockImplementation((context) => {
+      const attempt = originalBridgeCreated(context);
+      return {
+        ...attempt,
+        refineFailure: (errorClass) => {
+          const accepted = attempt.refineFailure(errorClass);
+          refinementObserved.resolve(accepted);
+          return accepted;
+        },
+      };
+    });
+    const speech = unsettledSpeechHandle("speech-evicted-held-503");
+    trace.speechCreated(speech, "sdk_response", 1);
+    const hive = makeHive(stub.url, trace, callAbort.signal);
+    const ownFailure = vi.spyOn(hive, "ownFailure");
+    const emittedFailures: Error[] = [];
+    hive.on("error", (event) => emittedFailures.push(event.error));
+    const stream = hive.chat({ chatCtx: userCtx("hello") });
+    trace.bindBridge(stream.traceContext.turnId, speech.id);
+    const consuming = drainStream(stream);
+
+    await headers.promise;
+    await until(() => ownFailure.mock.calls.length === 1, "owned status failure");
+    const originalFailure = ownFailure.mock.calls[0]![0];
+    for (let index = 0; index < 256; index += 1) {
+      trace.bridgeCreated({
+        workerBootId: VOICE_PROCESS_ID,
+        callId: "call-test",
+        turnId: `registry-pressure-${index}`,
+      });
+    }
+    expect(terminalRows(rows).filter((row) => row.turnId === originalFailure.turnId)).toEqual([
+      expect.objectContaining({
+        speechId: speech.id,
+        status: 503,
+        outcome: "failed",
+        errorClass: "engine_auth",
+      }),
+    ]);
+
+    releaseBody.resolve();
+    await bodyWritten.promise;
+    expect(await refinementObserved.promise).toBe(false);
+    expect(originalFailure.failureClass).toBe("engine_auth");
+
+    callAbort.abort();
+    trace.close("call_closed");
+    await closed.promise;
+    expect(await consuming).toEqual([]);
+    expect(emittedFailures).toEqual([originalFailure]);
+    expect(originalFailure.failureClass).toBe("engine_auth");
+    expect(rows.filter((row) => row.event === "speech_terminal" && row.speechId === speech.id)).toEqual([
+      expect.objectContaining({ outcome: "failed", errorClass: "engine_auth" }),
+    ]);
+    expect(terminalRows(rows).filter((row) => row.turnId === originalFailure.turnId)).toHaveLength(1);
   });
 
   it("maps 401 to bridge_auth", async () => {
