@@ -463,6 +463,40 @@ async function main(): Promise<void> {
     scribeMaxConcurrent: config.meetingWorkers.scribeMaxConcurrent,
   });
 
+  // ── Slack gateway + internal API (KPR-492 D7) ─────────────────────────
+  // The internal API is a SPAWN-READ dependency: an agent's slack_send_message
+  // tool call reaches it over loopback during a turn, so it must be listening
+  // before anything below the boundary can dispatch one. Pre-KPR-492 it started
+  // ~190 lines below the marker, masked only because the local server was opt-in
+  // and unset on both live instances; D6's default inversion makes it universal.
+  // Guarded by src/boot-order.test.ts, which carries `await slackInternalApi.start()`
+  // as an anchor in ALL THREE of its literal lists.
+  // The gateway constructor only instantiates clients — Socket Mode connects in
+  // slackAdapter.start(), which stays at its original site below, as does the
+  // audit-channel block that pages conversations.list.
+  const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
+  let slackInternalApi: SlackInternalApi | null = null;
+  if (config.slack.localMcpServer) {
+    await preflightBotScopes(config.slack.botToken);
+    slackInternalApi = new SlackInternalApi({
+      port: config.slackInternal.port,
+      authToken: config.slackInternal.authToken,
+      gateway: slack,
+      agentManager,
+      registry,
+    });
+    await slackInternalApi.start();
+    log.info("Slack internal API started", { port: config.slackInternal.port });
+  } else if (config.slack.mcpToken) {
+    // KPR-492 D6: `false` stays reachable as the config-level rollback lever, but
+    // it never again silently outlives its reason.
+    log.warn(
+      "Slack MCP is on the hosted user-token transport — agent posts will be attributed to the token's human owner (KPR-492). Set slack.localMcpServer: true to post as the bot with per-agent identity.",
+    );
+  } else {
+    log.warn("slack.localMcpServer is false and SLACK_MCP_TOKEN is empty — agents have no Slack MCP tools.");
+  }
+
   // ── Spawn-capable boundary (KPR-394, restated by KPR-414) ──────────────
   // Everything BELOW this line can dispatch a turn: bgTaskManager's
   // orphan-completion callbacks, meetingMonitor, every channel adapter,
@@ -601,7 +635,6 @@ async function main(): Promise<void> {
   // Start Slack adapter
   // Exclude SMS channels — those are handled directly by the SmsAdapter
   const smsChannels = config.sms.lines.map((l) => l.slackChannel).filter(Boolean);
-  const slack = new SlackGateway(config.slack.appToken, config.slack.botToken);
   const slackAdapter = new SlackAdapter(slack, registry, smsChannels, "slack", config.defaultAgent);
   dispatcher.registerAdapter(slackAdapter);
   dispatcher.setSlackAdapter(slackAdapter);
@@ -620,6 +653,14 @@ async function main(): Promise<void> {
   // homeBase channel. The global slack.auditChannel (if set) is the fallback
   // for agents whose homeBase can't be resolved.
   const channelIdByName = new Map<string, string>();
+  // KPR-492 D8: the page already carries is_member — capturing it costs nothing.
+  // Keyed BOTH ways: notificationChannelMatches / resolveNotificationChannel
+  // (slack-gateway.ts:651-665) accept a C…-shaped homeBase, so an operator can
+  // legitimately configure `homeBase: "C0AK579G9DL"`, and a name-only lookup
+  // would report that agent "not visible" on every boot — a permanent false
+  // positive on the one line whose value is being read once.
+  const isMemberByName = new Map<string, boolean>();
+  const isMemberById = new Map<string, boolean>();
   try {
     let cursor: string | undefined = undefined;
     do {
@@ -629,7 +670,11 @@ async function main(): Promise<void> {
         cursor,
       });
       for (const c of page.channels ?? []) {
-        if (c.name && c.id) channelIdByName.set(c.name, c.id);
+        if (c.name && c.id) {
+          channelIdByName.set(c.name, c.id);
+          isMemberByName.set(c.name, c.is_member === true);
+          isMemberById.set(c.id, c.is_member === true);
+        }
       }
       cursor = page.response_metadata?.next_cursor || undefined;
     } while (cursor);
@@ -641,23 +686,48 @@ async function main(): Promise<void> {
       fallback: fallbackName || null,
       fallbackResolved: Boolean(fallbackAuditId),
     });
+    // KPR-492 D8: a targeted, honest boot warning — SCOPED TO THE CHANNELS THE
+    // ENGINE DEPENDS ON (every enabled agent's homeBase plus slack.auditChannel),
+    // not to every public channel the bot is absent from. In a real workspace the
+    // bot is legitimately outside most channels, so an unfiltered list would be a
+    // permanent, meaningless 20-name boot warning that trains operators to ignore
+    // the line. The narrow version has a true-positive rate near 1: a homeBase the
+    // bot cannot post to is a broken agent. Informational only — never fails boot,
+    // and it does NOT replace §10's membership gate; it makes the gate's subject
+    // visible early. NOT gated on localMcpServer: this is about Path A.
+    {
+      const ID_SHAPE = /^[CDG][A-Z0-9]+$/;
+      const notMember: string[] = [];
+      const notVisible: string[] = [];
+      const check = (raw: string) => {
+        const dep = raw.trim();
+        if (!dep) return;
+        if (ID_SHAPE.test(dep)) {
+          // An id-shaped homeBase: membership by id. Absent from the page ⇒ the
+          // bot cannot see it (private + unjoined, or not a channel at all).
+          if (!isMemberById.has(dep)) notVisible.push(dep);
+          else if (isMemberById.get(dep) !== true) notMember.push(dep);
+          return;
+        }
+        const name = dep.replace(/^#/, "");
+        if (!channelIdByName.has(name)) notVisible.push(name);
+        else if (isMemberByName.get(name) !== true) notMember.push(name);
+      };
+      // registry.getAll() returns the ACTIVE map only — disabled definitions are
+      // dropped from it at load (agent-registry.ts:350-357), so no `disabled`
+      // filter is needed here; one would be dead code.
+      for (const agent of registry.getAll()) if (agent.homeBase) check(agent.homeBase);
+      check(config.slack.auditChannel);
+      if (notMember.length > 0 || notVisible.length > 0) {
+        log.warn("Slack bot is missing from channels the engine depends on — posts there will fail (KPR-492)", {
+          notMember,
+          notVisible,
+          note: "Invite the hive bot to each channel. A private channel the bot has not joined is indistinguishable from a channel that does not exist — a full audit needs the workspace admin.",
+        });
+      }
+    }
   } catch (err) {
     log.warn("Failed to configure audit channel", { error: String(err) });
-  }
-
-  // Slack internal API — local HTTP server for agent-side Slack MCP tools
-  let slackInternalApi: SlackInternalApi | null = null;
-  if (config.slack.localMcpServer) {
-    await preflightBotScopes(config.slack.botToken);
-    slackInternalApi = new SlackInternalApi({
-      port: config.slackInternal.port,
-      authToken: config.slackInternal.authToken,
-      gateway: slack,
-      agentManager,
-      registry,
-    });
-    await slackInternalApi.start();
-    log.info("Slack internal API started", { port: config.slackInternal.port });
   }
 
   // SMS adapter — direct path, bypasses Slack. Per-turn-spawn routing is

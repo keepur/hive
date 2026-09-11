@@ -17,6 +17,12 @@ import { fileURLToPath } from "node:url";
 // occurring before the wiring, named or not. The one residual (c) does not
 // close: a spawn-capable surface that starts itself through some spelling
 // other than `.start(`/`.scanOrphans(` — accepted, not exhaustive.
+//
+// KPR-492: the slackInternalApi start anchor is a WIRING anchor, not an
+// allowlist entry. The internal API dispatches no turns of its own, but an
+// agent's Slack MCP tool call reaches it over loopback mid-turn — it is a
+// spawn-READ dependency, so it must be listening before anything below the
+// boundary can dispatch. It therefore appears in all three lists below.
 describe("boot order — spawn-capable boundary (KPR-414)", () => {
   const source = readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf8");
   // Strip `//` line comments before scanning — the boundary marker comment
@@ -53,6 +59,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     // scribeEnabled's own nesting lives (meeting-scribe.ts, not config.ts),
     // so this anchor is what closes the gap at the one live feed.
     offsetOf("dispatcher.setMeetingAckEnabled(config.meetingWorkers.ackEnabled)");
+    offsetOf("await slackInternalApi.start()");
     offsetOf("await bgTaskManager.start()");
     offsetOf("await bgTaskManager.scanOrphans()");
     offsetOf("await slackAdapter.start(");
@@ -67,6 +74,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("await workerPool.ensureIndexes()"),
       offsetOf("dispatcher.setMeetingScribe("),
       offsetOf("dispatcher.setMeetingAckEnabled("),
+      offsetOf("await slackInternalApi.start()"),
     ];
     const surfaceOffsets = [
       offsetOf("await bgTaskManager.start()"),
@@ -93,6 +101,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("await workerPool.ensureIndexes()"),
       offsetOf("dispatcher.setMeetingScribe("),
       offsetOf("dispatcher.setMeetingAckEnabled("),
+      offsetOf("await slackInternalApi.start()"),
     );
     // Known non-spawn-capable `.start(`/`.scanOrphans(` calls that legitimately
     // precede the wiring. Adding to this list is a deliberate, reviewed
