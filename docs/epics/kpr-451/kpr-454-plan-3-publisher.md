@@ -916,13 +916,13 @@ export function observeToolFailure(obs: ToolFailureObservation): void {
       waiting: waitingFor(obs.workItemId),
       subject: { kind: "tool", id: obs.tool },
       detail,
-      // D6: this producer's ENTIRE `kind` vocabulary is "workItem". `[]` when
+      // D6: this producer's ENTIRE `kind` vocabulary is "work-item". `[]` when
       // the id is absent or inadmissible — the detached worker/scribe case and
       // the untrusted-id case deliberately land in the same shape. threadId is
       // NOT mirrored here: it is a filterable attribute of the condition and
       // belongs in detail, whereas evidence points at the record a responder
       // would open next.
-      evidence: workItemId !== undefined ? [{ kind: "workItem", id: workItemId }] : [],
+      evidence: workItemId !== undefined ? [{ kind: "work-item", id: workItemId }] : [],
     });
   } catch (err) {
     // Never reaches the turn. Not published (D10 invariant (a)).

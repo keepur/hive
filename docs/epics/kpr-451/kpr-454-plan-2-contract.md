@@ -49,7 +49,7 @@ export interface OpsSubject {
   id: string;
 }
 
-/** D2: references only — no text, no URLs. This producer's whole `kind` vocabulary is "workItem". */
+/** D2: references only — no text, no URLs. This producer's whole `kind` vocabulary is "work-item". */
 export interface OpsEvidence {
   kind: string;
   id: string;

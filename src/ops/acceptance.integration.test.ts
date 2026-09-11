@@ -54,10 +54,10 @@ import {
  * doc's original `workItem` fails this producer's own `evidence[].kind` bound,
  * `OPS_TOKEN_RE` (`^[a-z][a-z0-9-]{0,39}$`, capital I) — a self-contradiction
  * that would reject every tool failure carrying a work item. Corrected in
- * `observe.ts` (commit ef6c7b1) and in `kpr-454-design.md`. The chunk-5 plan
- * file still carries the pre-correction spelling at its AC1 and AC3 fences
- * (`kpr-454-plan-5-acceptance.md:163` and `:338`); the source is authoritative
- * and this file follows it. Disclosed in the implementation report.
+ * `observe.ts` (commit ef6c7b1) and, by an append-only note, in
+ * `kpr-454-design.md`; the plan chunks were corrected directly. The source is
+ * authoritative and this file follows it. Disclosed in the implementation
+ * report.
  */
 
 // ───────────────────────────────────────────────────────────────────────────
