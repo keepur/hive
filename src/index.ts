@@ -654,6 +654,7 @@ async function main(): Promise<void> {
       authToken: config.slackInternal.authToken,
       gateway: slack,
       agentManager,
+      registry,
     });
     await slackInternalApi.start();
     log.info("Slack internal API started", { port: config.slackInternal.port });
