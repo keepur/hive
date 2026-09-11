@@ -1,10 +1,17 @@
 import type { Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import { OpsStore, type LoadedReason } from "./store.js";
-import { evaluateMatches } from "./match.js";
+import { evaluateMatches, isAdmissibleSubscriptionRow } from "./match.js";
 import { assertReasonTableLegal, HIVE_RUNTIME_REASONS } from "./reasons.js";
 import { OPS_SCHEMA_VERSION, type OpsEvent, type OpsPublishInput, type OpsSubscription } from "./types.js";
-import { OPS_CLEARS_MAX_LENGTH, OPS_EVIDENCE_MAX, OPS_ID_MAX_LENGTH, clipForLog, isOpsToken } from "./ids.js";
+import {
+  OPS_CLEARS_MAX_LENGTH,
+  OPS_EVIDENCE_MAX,
+  OPS_ID_MAX_LENGTH,
+  OPS_MATCHED_IDS_MAX,
+  clipForLog,
+  isOpsToken,
+} from "./ids.js";
 
 const log = createLogger("ops-publisher");
 
@@ -61,6 +68,17 @@ const SHUTDOWN_DRAIN_MS = 2000;
 /** D9: stated AND delegated by the spec; adopted as written. */
 const SUBSCRIPTION_RELOAD_MS = 60_000;
 
+/**
+ * The per-reload cap on how many inadmissible subscription `_id`s one warn line
+ * NAMES. The COUNTER is uncapped — it is the operator's signal and must stay
+ * truthful — but `ops_subscriptions` is operator-writable and unbounded in row
+ * count, so a collection of a thousand malformed rows must not write a thousand
+ * clipped ids into one line. 5 is enough to find the rows; the count names the
+ * rest. Mirrors `REASON_ROW_ANOMALY_LOG_MAX` (store.ts), which bounds the same
+ * hazard on the reason loader.
+ */
+const SUBSCRIPTION_ROW_ANOMALY_LOG_MAX = 5;
+
 // EXPORTED so a test can name the return type of `__openEntryForTests`.
 // (NOT because omitting `export` would fail the build: TS4053 covers a name
 // imported from another module that cannot be named, not a same-file local
@@ -100,6 +118,19 @@ export interface OpsPublisherCounters {
   indexFailures: number;
   /** Data-sourced registry rows this engine normalized (reasons.ts auditReasonRow). */
   reasonRowAnomalies: number;
+  /**
+   * Subscription rows the LAST RELOAD loaded and the matcher will skip on every
+   * event (match.ts `isAdmissibleSubscriptionRow`). The counterpart to
+   * `reasonRowAnomalies` — without it a row inserted with no explicit string
+   * `_id` showed as `subscriptions: 1` here and `matchedSubscriptionIds: []` on
+   * every event, forever, with nothing saying why.
+   *
+   * ⚠ SET per reload, never accumulated, unlike every other counter in this
+   * interface. It describes the CURRENT loaded set, so a standing bad row must
+   * read 1 rather than climbing by one every 60 s — a monotonic version would
+   * make "how many rows are broken right now" unanswerable.
+   */
+  subscriptionRowAnomalies: number;
   subscriptionReloadFaults: number;
   drainDropped: number;
 }
@@ -125,6 +156,16 @@ export class OpsPublisher {
    * reported rather than silently swallowed for the life of the process.
    */
   private overflowWarned = false;
+  /**
+   * The `overflowWarned` idiom applied to the subscription-row audit: the WARN
+   * fires on a CHANGE of what is broken, not once per reload. The condition is a
+   * property of the collection, so it holds across every 60 s reload — a line per
+   * reload is 1440 a day for one bad row, the same flood in slow motion. A
+   * signature rather than a boolean so that a SECOND bad row appearing, or a
+   * different row replacing it, is reported rather than swallowed behind the
+   * first. The COUNTER is unlatched and refreshed every reload regardless.
+   */
+  private subscriptionAnomalySignature = "";
   private reloadTimer?: ReturnType<typeof setInterval>;
   private nextOpenSeq = 1;
   private readonly counters: OpsPublisherCounters = {
@@ -138,6 +179,7 @@ export class OpsPublisher {
     epochResolveFaults: 0,
     indexFailures: 0,
     reasonRowAnomalies: 0,
+    subscriptionRowAnomalies: 0,
     subscriptionReloadFaults: 0,
     drainDropped: 0,
   };
@@ -190,6 +232,7 @@ export class OpsPublisher {
       subscriptions: this.subscriptions.length,
       indexFailures: this.counters.indexFailures,
       reasonRowAnomalies: this.counters.reasonRowAnomalies,
+      subscriptionRowAnomalies: this.counters.subscriptionRowAnomalies,
     });
   }
 
@@ -250,6 +293,47 @@ export class OpsPublisher {
     } catch (err) {
       this.counters.subscriptionReloadFaults += 1;
       log.warn("Ops subscription reload failed — keeping the previous set", { error: String(err) });
+      // The audit describes what THIS reload loaded. On a fault the previous set
+      // is kept and was already audited, so re-auditing it would only re-set the
+      // counter to the value it already holds.
+      return;
+    }
+    this.auditSubscriptionRows(this.subscriptions);
+  }
+
+  /**
+   * The subscription half of the `loadReasons` idiom, and the reason
+   * `isAdmissibleSubscriptionRow` is exported rather than inlined in the
+   * matcher. Skipping an unusable row is right (a row that cannot be evaluated
+   * cannot have been satisfied) and logging it per EVENT is the flood the whole
+   * producer exists to replace — so the signal lives HERE, on the reload path,
+   * where it costs one predicate call per row per 60 s and nothing at all on the
+   * hot path.
+   *
+   * C13: a count and clipped `_id`s. Nothing else — a row's every other field is
+   * operator-authored text of unbounded shape, and on the arm that fires because
+   * the `_id` ITSELF breached its bound, the clip is the only thing keeping this
+   * line bounded.
+   *
+   * Contained for the same reason `auditLoadedEnableGate` is: a diagnostic added
+   * to the reload path must never become the thing that empties the loaded set.
+   */
+  private auditSubscriptionRows(rows: readonly OpsSubscription[]): void {
+    try {
+      const inadmissible = rows.filter((row) => !isAdmissibleSubscriptionRow(row));
+      this.counters.subscriptionRowAnomalies = inadmissible.length;
+      const named = inadmissible.slice(0, SUBSCRIPTION_ROW_ANOMALY_LOG_MAX).map((row) => clipForLog(row._id));
+      const signature = `${inadmissible.length}:${named.join(",")}`;
+      if (signature === this.subscriptionAnomalySignature) return;
+      this.subscriptionAnomalySignature = signature;
+      if (inadmissible.length === 0) return;
+      log.warn(
+        "Ops subscription rows unusable — skipped from every match, the rest of the set still matches. A row needs a " +
+          "plain-object `filter` and an explicit string `_id` (an auto-minted ObjectId is not one).",
+        { count: inadmissible.length, ids: named },
+      );
+    } catch (err) {
+      log.warn("Ops subscription row audit failed — skipped", { error: String(err) });
     }
   }
 
@@ -653,8 +737,13 @@ export class OpsPublisher {
       detail: detail.data as OpsEvent["detail"],
       // ALWAYS present, [] when empty — never omitted.
       evidence: input.evidence.map((ref) => ({ kind: ref.kind, id: ref.id })),
+      // The COUNT is the fact and is always exact; the ID LIST is a bounded
+      // convenience (`OPS_MATCHED_IDS_MAX`, ids.ts) — `loadSubscriptions()` is
+      // unbounded, so an uncapped list wrote one ≤200-character id per matching
+      // subscription into every stored event for the whole retention window.
+      // `slice` also satisfies step 7's rebuild rule on this field.
       matchedSubscriptions: matchedSubscriptionIds.length,
-      matchedSubscriptionIds,
+      matchedSubscriptionIds: matchedSubscriptionIds.slice(0, OPS_MATCHED_IDS_MAX),
       ...(input.clears !== undefined ? { clears: input.clears, clearsFamily } : {}),
     };
 

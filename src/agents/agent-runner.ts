@@ -351,31 +351,40 @@ function warnIfToolSearchForceDisabled(): void {
 }
 
 /**
- * KPR-454: the SDK tool-hook payload did not carry a string `tool_name`, so the
- * ops capture point skipped this observation. WARNED ONCE PER PROCESS, and the
- * latch is the point rather than tidiness: the condition is a property of the
- * resolved CLI, so it holds for EVERY tool call of every turn for the life of
- * the process, and a line per call is the same flood the observation's own
- * guard exists to prevent (OpsPublisher's `overflowWarned`,
+ * KPR-454: the SDK tool-hook payload did not carry a usable `tool_name`, so the
+ * ops capture point skipped this observation. WARNED ONCE PER PROCESS PER EVENT,
+ * and the latch is the point rather than tidiness: the condition is a property
+ * of the resolved CLI, so it holds for EVERY tool call of every turn for the
+ * life of the process, and a line per call is the same flood the observation's
+ * own guard exists to prevent (OpsPublisher's `overflowWarned`,
  * `warnedToolSearchForceDisabled` above — the standing idiom). One line still
  * has to exist: without it the whole producer goes silent fleet-wide on an SDK
  * bump with nothing in the log saying so.
+ *
+ * ⚠ PER EVENT, not one latch for both, and the asymmetry of the two failure
+ * modes is why. A single shared latch means that if `PostToolUse` drifts AFTER
+ * `PostToolUseFailure` has already warned, the success half's drift is never
+ * reported at all — and that is the SILENT half: failures keep publishing while
+ * the recovery half goes quietly dead, so every condition this producer opens
+ * stays open forever with nothing in the log naming the cause. The failure half
+ * at least stops producing rows an operator was reading.
  *
  * Returns `{}` so the two hook callbacks can `return warnDrifted...(...)` in one
  * statement and keep C15's "both matchers return an empty object" visibly
  * true on this arm too.
  */
-let warnedDriftedToolHookPayload = false;
+type DriftedToolHookEvent = "PostToolUseFailure" | "PostToolUse";
+const warnedDriftedToolHookPayload = new Set<DriftedToolHookEvent>();
 export function __resetToolHookPayloadWarnForTests(): void {
-  warnedDriftedToolHookPayload = false;
+  warnedDriftedToolHookPayload.clear();
 }
-function warnDriftedToolHookPayload(event: "PostToolUseFailure" | "PostToolUse"): Record<string, never> {
-  if (!warnedDriftedToolHookPayload) {
-    warnedDriftedToolHookPayload = true;
+function warnDriftedToolHookPayload(event: DriftedToolHookEvent): Record<string, never> {
+  if (!warnedDriftedToolHookPayload.has(event)) {
+    warnedDriftedToolHookPayload.add(event);
     log.warn(
-      "SDK tool hook payload carried no string tool_name — ops tool-failure observation skipped for this and every " +
-        "further such payload this process (KPR-454). The SDK floats ^0.3.258; a renamed or absent field is the drift " +
-        "signature.",
+      "SDK tool hook payload carried no usable tool_name (absent, non-string, or empty) — ops tool-failure observation " +
+        "skipped for this and every further such payload from this event this process (KPR-454). The SDK floats " +
+        "^0.3.258; a renamed, absent or emptied field is the drift signature.",
       { event },
     );
   }
@@ -2052,7 +2061,18 @@ export class AgentRunner {
         // `classifierText`, precisely so drift there costs the token and not the
         // failure record. `duration_ms`/`is_interrupt` read off any object yield
         // `undefined`, which both destinations already accept as absent.
-        if (typeof failure?.tool_name !== "string") return warnDriftedToolHookPayload("PostToolUseFailure");
+        //
+        // ⚠ THE EMPTY STRING IS DRIFT, and the length clause is not padding on
+        // the type test: `""` is a string, so it passed the type test and reached
+        // accept step 2, where `subject.id` failed its own lower bound — spending
+        // `rejected`, D9's mis-integrated-PRODUCER signal, on SDK drift AND
+        // warning once per tool call with no latch. That is exactly the pair of
+        // harms this guard exists to prevent, reached by a drift shape one
+        // character away from the guarded one (measured: 5 pairs ⇒
+        // `rejected: 5`, five `Ops publish rejected` lines).
+        if (typeof failure?.tool_name !== "string" || failure.tool_name.length === 0) {
+          return warnDriftedToolHookPayload("PostToolUseFailure");
+        }
         // Rule 2: identity is read AT FIRE TIME, never captured at build
         // time — this.workItemContextRef.current is KPR-453's live reference
         // and this.agentConfig.id is the stable slug (never the display
@@ -2085,13 +2105,16 @@ export class AgentRunner {
     hooks.PostToolUse = [{
       hooks: [async (input: HookInput) => {
         if (this.wasAborted) return {};
-        // The same SDK-shape guard, same reason — see the failure hook above.
-        // A non-object `input` would throw out of this callback into the SDK;
-        // an absent `tool_name` would compose a `familyOf` key naming the
-        // literal "undefined", which no open condition can ever match, so the
-        // recovery half would go quietly dead.
+        // The same SDK-shape guard, same reason, same empty-string clause — see
+        // the failure hook above. A non-object `input` would throw out of this
+        // callback into the SDK; an absent, non-string or EMPTY `tool_name` would
+        // compose a `familyOf` key naming the literal "undefined" (or one with an
+        // empty id), which no open condition can ever match, so the recovery half
+        // would go quietly dead.
         const success = input as PostToolUseHookInput;
-        if (typeof success?.tool_name !== "string") return warnDriftedToolHookPayload("PostToolUse");
+        if (typeof success?.tool_name !== "string" || success.tool_name.length === 0) {
+          return warnDriftedToolHookPayload("PostToolUse");
+        }
         observeToolSuccess({ tool: success.tool_name, lane: "claude" });
         return {};
       }],

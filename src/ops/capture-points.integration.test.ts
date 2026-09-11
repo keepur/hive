@@ -367,8 +367,14 @@ describe("D3 — recovery", () => {
 // ───────────────────────────────────────────────────────────────────────────
 
 describe("the hook payload's own fields are read behind a shape guard", () => {
+  const DRIFT_WARN = "carried no usable tool_name";
   const warnsMatching = (fragment: string) =>
     mockLog.warn.mock.calls.filter((call) => String(call[0]).includes(fragment)).length;
+  /** The `event` each drift line named, in order — the per-event latch's surface. */
+  const driftEvents = () =>
+    mockLog.warn.mock.calls
+      .filter((call) => String(call[0]).includes(DRIFT_WARN))
+      .map((call) => (call[1] as { event: string }).event);
 
   beforeEach(() => {
     // The drift warn is latched per PROCESS (the condition is a property of the
@@ -403,27 +409,62 @@ describe("the hook payload's own fields are read behind a shape guard", () => {
     expect(fixture.publisher.getSnapshot().publishFaults).toBe(0);
     expect(warnsMatching("Ops publish job failed")).toBe(0);
     // The drift is still REPORTED — once for the process, not once per call.
-    expect(warnsMatching("carried no string tool_name")).toBe(1);
+    expect(warnsMatching(DRIFT_WARN)).toBe(1);
   });
 
-  it("a non-string tool_name is drift too — the guard is a type test, not a presence test", async () => {
+  it("a non-string OR EMPTY tool_name is drift too — a type test, not a presence test", async () => {
     const harness = buildClaudeLaneHarness();
     for (let i = 0; i < 3; i += 1) {
       await expect(harness.fireFailure({ ...FAILURE_INPUT, tool_name: { name: "Bash" } })).resolves.toEqual({});
       // The success half is benign either way: an object `tool_name` composes a
       // family key naming "[object Object]", which no open condition matches.
       await expect(harness.fireSuccess({ ...SUCCESS_INPUT, tool_name: 42 })).resolves.toEqual({});
+      // ⚠ `""` IS A STRING, so it passed a bare type test and reached accept
+      // step 2, where `subject.id` failed its own LOWER bound — `rejected` spent
+      // on SDK drift plus an `Ops publish rejected` line PER TOOL CALL, with no
+      // latch. One character away from the guarded shape, and both harms the
+      // guard exists to prevent (measured: 5 pairs ⇒ `rejected: 5`).
+      await expect(harness.fireFailure({ ...FAILURE_INPUT, tool_name: "" })).resolves.toEqual({});
+      await expect(harness.fireSuccess({ ...SUCCESS_INPUT, tool_name: "" })).resolves.toEqual({});
     }
     await fixture.drain();
     expect(fixture.events()).toHaveLength(0);
     expect(fixture.publisher.getSnapshot().publishFaults).toBe(0);
-    // THE able-to-fail assertion for this shape. Unguarded, an object
+    // THE able-to-fail assertion for these shapes. Unguarded, an object
     // `tool_name` survives the subject-id bounds (`.length` is `undefined`, so
     // neither comparison fires) and is caught one step later by the detail
-    // schema — so it spends `rejected`, D9's mis-integrated-PRODUCER signal, on
-    // SDK drift, and warns once per tool call while doing it.
+    // schema, and `""` fails the bounds outright — so both spend `rejected`,
+    // D9's mis-integrated-PRODUCER signal, on SDK drift, and warn once per tool
+    // call while doing it.
     expect(fixture.publisher.getSnapshot().rejected).toBe(0);
     expect(warnsMatching("Ops publish rejected")).toBe(0);
+  });
+
+  it("the drift latch is PER EVENT — the success half's drift is reported after the failure half's", async () => {
+    const harness = buildClaudeLaneHarness();
+    await expect(harness.fireFailure({ ...FAILURE_INPUT, tool_name: undefined })).resolves.toEqual({});
+    expect(warnsMatching(DRIFT_WARN)).toBe(1);
+
+    // ⚠ THE CASE ONE SHARED LATCH LOSES, and it loses the SILENT half. With a
+    // single boolean, `PostToolUse` drifting AFTER `PostToolUseFailure` has
+    // warned is never reported at all — and that is the half whose failure mode
+    // is quiet: failures keep publishing while the recovery half goes dead, so
+    // every condition this producer opens stays open forever with nothing in the
+    // log naming the cause.
+    await expect(harness.fireSuccess({ ...SUCCESS_INPUT, tool_name: undefined })).resolves.toEqual({});
+    expect(warnsMatching(DRIFT_WARN)).toBe(2);
+    expect(driftEvents()).toEqual(["PostToolUseFailure", "PostToolUse"]);
+
+    // …and still latched WITHIN each event: the condition is a property of the
+    // resolved CLI, so a line per call is the flood the latch exists to prevent.
+    for (let i = 0; i < 3; i += 1) {
+      await expect(harness.fireFailure({ ...FAILURE_INPUT, tool_name: undefined })).resolves.toEqual({});
+      await expect(harness.fireSuccess({ ...SUCCESS_INPUT, tool_name: undefined })).resolves.toEqual({});
+    }
+    expect(warnsMatching(DRIFT_WARN)).toBe(2);
+    await fixture.drain();
+    expect(fixture.events()).toHaveLength(0);
+    expect(fixture.publisher.getSnapshot().rejected).toBe(0);
   });
 
   it("a well-formed payload is unaffected, and `error` needs no guard of its own", async () => {
@@ -436,7 +477,7 @@ describe("the hook payload's own fields are read behind a shape guard", () => {
     expect(failures()).toHaveLength(1);
     expect(failures()[0]!.detail.errorSig).toBe("unclassified");
     expect(failures()[0]!.subject.id).toBe(FAILURE_INPUT.tool_name);
-    expect(warnsMatching("carried no string tool_name")).toBe(0);
+    expect(warnsMatching(DRIFT_WARN)).toBe(0);
   });
 
   it("the recovery half still closes a condition when the payload is well-formed", async () => {

@@ -13,6 +13,12 @@
  * (`OPS_LOG_VALUE_MAX` via `clipForLog`). Each constant's own comment says
  * which group it is in and why.
  *
+ * ⚠ AND A FOURTH, added after the count above rotted once: the stored-list bound
+ * `OPS_MATCHED_IDS_MAX` TRUNCATES what a document holds while a sibling field
+ * keeps the true count. It is neither a rejection (the event is real and
+ * publishes), nor an omission (the field is always present), nor a log bound (it
+ * changes the DOCUMENT, not a printed line).
+ *
  * The token bound and the length bound are ACCEPT-PATH validation: a breach
  * is a mis-integrated producer, so it rejects and increments the rejection
  * counter (C5), never truncates.
@@ -57,6 +63,35 @@ export const OPS_ID_MAX_LENGTH = 200;
 
 /** D2: at most 4 references per event. This producer never emits more than one. */
 export const OPS_EVIDENCE_MAX = 4;
+
+/**
+ * The cap on how many matched subscription ids a stored event CARRIES — a
+ * sibling of `OPS_EVIDENCE_MAX` by role, not by group: that one REJECTS on
+ * breach, this one TRUNCATES THE LIST AND KEEPS THE COUNT.
+ *
+ * `evidence` is bounded per event and per element; `matchedSubscriptionIds` was
+ * bounded per ELEMENT (`OPS_ID_MAX_LENGTH`, via the row-admissibility gate in
+ * match.ts) and not in COUNT, and `loadSubscriptions()` is unbounded — so N
+ * enabled matching subscriptions wrote N × ≤200 characters into EVERY stored
+ * event for the whole retention window. 100 subscriptions is ~20 KB per tool
+ * failure; a pathological collection reaches the 16 MB BSON document limit and
+ * turns every publish into a `publishFault` plus a warn, which is the flood
+ * again. The count is the FACT (`matchedSubscriptions`, always exact); the id
+ * list is the CONVENIENCE, so capping the convenience costs nothing the
+ * document's own meaning depends on.
+ *
+ * 20 × `OPS_ID_MAX_LENGTH` is a ~4 KB ceiling on the field. The 20 echoes
+ * `auditLoadedEnableGate`'s log slice (publisher.ts) by ADJACENCY, not
+ * derivation, and covers every realistic subscription set whole — so in normal
+ * operation this never fires at all.
+ *
+ * NO counter and NO log line, deliberately, and the asymmetry with the
+ * subscription-row skip is the reason: a truncation is SELF-EVIDENT in the
+ * stored document (`matchedSubscriptions > matchedSubscriptionIds.length`, both
+ * in the same row, queryable), whereas a skipped row leaves nothing behind and
+ * therefore needs `subscriptionRowAnomalies`.
+ */
+export const OPS_MATCHED_IDS_MAX = 20;
 
 /**
  * D6/C13: the hard ceiling on any string value admitted into `detail`, and

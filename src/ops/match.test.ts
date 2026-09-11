@@ -101,17 +101,33 @@ describe("the D5 filter grammar (KPR-454 AC5, C7)", () => {
 // ───────────────────────────────────────────────────────────────────────────
 
 describe("a malformed subscription row is skipped, never fatal (the container guard)", () => {
-  // Each of these four was independently broken before the guard: the first
-  // two THREW out of the "pure" evaluator (`filter.producer` on
-  // undefined/null), and the last two matched EVERYTHING — every
-  // `filter.<key>` read on a string or an array is `undefined`, so `term()`
-  // answered true six times and the row was fail-OPEN, inverting the posture
-  // `term()`'s own comment claims.
+  // Each of these was independently broken before the guard: the first two
+  // THREW out of the "pure" evaluator (`filter.producer` on undefined/null),
+  // and every other shape here matched EVERYTHING — every `filter.<key>` read
+  // on a string, an array or a BSON scalar is `undefined`, so `term()` answered
+  // true six times and the row was fail-OPEN, inverting the posture `term()`'s
+  // own comment claims.
+  //
+  // ⚠ THE BSON SHAPES ARE WHY THE GUARD IS A PROTOTYPE TEST, not padding on a
+  // settled case. The first version was truthy ∧ typeof-object ∧ not-array,
+  // which fixed the string and the array and left every OTHER non-plain object
+  // fail-OPEN — and those are precisely the shapes the Mongo driver
+  // deserializes a scalar BSON field into, so a hand-written row carrying
+  // `filter: ISODate(…)`, or a `filter: ObjectId("…")` pasted from a sibling
+  // field, was an UNDECLARED match-all subscription whose `_id` landed in
+  // `matchedSubscriptionIds` on every stored event. Store-only here; real
+  // spurious delivery on KPR-468, which inherits this evaluator.
   const MALFORMED: ReadonlyArray<readonly [string, unknown]> = [
     ["filter missing", undefined],
     ["filter null", null],
     ["filter a string (was fail-OPEN: matched every event)", "producer"],
     ["filter an array (was fail-OPEN)", [{ producer: ["hive-runtime"] }]],
+    ["filter a BSON date (fail-OPEN past the typeof-object guard)", new Date()],
+    ["filter an ObjectId (fail-OPEN past the typeof-object guard)", new ObjectId()],
+    ["filter BSON binary (fail-OPEN past the typeof-object guard)", Buffer.from("producer")],
+    ["filter a RegExp (fail-OPEN past the typeof-object guard)", /hive-runtime/],
+    ["filter a number", 7],
+    ["filter a boolean", true],
   ];
 
   it.each(MALFORMED)("%s: the row matches nothing and evaluateMatches still answers", (_label, filter) => {
@@ -132,6 +148,19 @@ describe("a malformed subscription row is skipped, never fatal (the container gu
     expect(
       evaluateMatches(EVENT, [{ ...sub("weird", {}), filter: { $or: [] } } as unknown as OpsSubscription]),
     ).toEqual(["weird"]);
+  });
+
+  // The over-tightening this guard must NOT be: `Object.create(null)` is a
+  // plain-ish object with no prototype at all, and some BSON deserialization
+  // options produce them, so the `proto === null` arm is deliberate rather than
+  // incidental. A guard written as `=== Object.prototype` alone would skip a
+  // legitimate row.
+  it("a null-prototype object still matches — the proto === null arm is deliberate", () => {
+    const bare = Object.create(null) as Record<string, unknown>;
+    bare.producer = ["hive-runtime"];
+    expect(evaluateMatches(EVENT, [{ ...sub("bare", {}), filter: bare } as unknown as OpsSubscription])).toEqual([
+      "bare",
+    ]);
   });
 });
 

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ObjectId } from "mongodb";
 
 // `store.ts`, `publisher.ts` and `observe.ts` each call `createLogger` at
 // module load; the mock must hand back the SAME object every call so the
@@ -13,7 +14,7 @@ import { OpsPublisher, familyOf } from "./publisher.js";
 import { __resetOpsPublisherForTests, setOpsPublisher } from "./publisher-singleton.js";
 import { observeToolFailure, observeToolSuccess, type ToolFailureObservation } from "./observe.js";
 import { HIVE_RUNTIME_PRODUCER, REASON_TOOL_FAILED, REASON_TOOL_RECOVERED } from "./reasons.js";
-import { OPS_CLEARS_MAX_LENGTH, OPS_ID_MAX_LENGTH } from "./ids.js";
+import { OPS_CLEARS_MAX_LENGTH, OPS_ID_MAX_LENGTH, OPS_MATCHED_IDS_MAX } from "./ids.js";
 import { OPS_EVENTS_COLLECTION, OPS_REASONS_COLLECTION, OPS_SUBSCRIPTIONS_COLLECTION } from "./types.js";
 
 /**
@@ -619,6 +620,167 @@ describe("OpsPublisher survives a malformed subscription row", () => {
       expect(warnsMatching("Ops publish job failed")).toBe(0);
     },
   );
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// C2 — the skip is right; the SILENCE was not. `loadReasons` warns per row and
+// counts every unusable one; the subscription path skipped rows for two reasons
+// and did neither, so an operator who inserted a row without an explicit string
+// `_id` saw `subscriptions: 1` in the snapshot and `matchedSubscriptionIds: []`
+// on every event, forever, with nothing saying why.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("an unusable subscription row is COUNTED and NAMED, per reload (C2)", () => {
+  const ANOMALY_WARN = "Ops subscription rows unusable";
+  const row = (over: Record<string, unknown>) => ({
+    _id: "sub-ok",
+    subscriberId: "ops-team",
+    subscriberKind: "human",
+    enabled: true,
+    filter: {},
+    transport: { adapterId: "slack", target: "C1" },
+    ...over,
+  });
+  const anomalyPayload = () =>
+    mockLog.warn.mock.calls.find((call) => String(call[0]).includes(ANOMALY_WARN))?.[1] as
+      { count: number; ids: string[] } | undefined;
+  const insert = async (over: Record<string, unknown>) =>
+    fakeDb.collection(OPS_SUBSCRIPTIONS_COLLECTION).insertOne(row(over) as never);
+
+  it("an auto-minted ObjectId _id: counted, and one warn names its clipped _id — a count and ids, nothing else (C13)", async () => {
+    await publisher.init();
+    const oid = new ObjectId();
+    await insert({ _id: oid });
+    await publisher.reloadSubscriptions();
+
+    const snapshot = publisher.getSnapshot();
+    expect(snapshot.subscriptions).toBe(1); // the row really loaded
+    expect(snapshot.subscriptionRowAnomalies).toBe(1);
+    expect(warnsMatching(ANOMALY_WARN)).toBe(1);
+    // The redaction assertion, as a key-set equality rather than as prose: the
+    // line carries a COUNT and CLIPPED `_id`s and no other field of the row.
+    expect(anomalyPayload()).toEqual({ count: 1, ids: [oid.toHexString()] });
+  });
+
+  it("a malformed `filter` is counted on the SAME counter — the two skip reasons share one signal", async () => {
+    await publisher.init();
+    await insert({ _id: "sub-bad-filter", filter: new Date() });
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(1);
+    expect(anomalyPayload()).toEqual({ count: 1, ids: ["sub-bad-filter"] });
+  });
+
+  it("a STANDING bad row warns once across reloads, not once per 60 s reload", async () => {
+    await publisher.init();
+    await insert({ _id: new ObjectId() });
+    for (let i = 0; i < 5; i += 1) await publisher.reloadSubscriptions();
+    // The `overflowWarned` idiom: the warn is on a CHANGE of what is broken. A
+    // line per reload is 1440 a day for one row — the same flood in slow motion.
+    expect(warnsMatching(ANOMALY_WARN)).toBe(1);
+    // …and the COUNTER is unlatched and truthful on every one of them.
+    expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(1);
+  });
+
+  it("a SECOND bad row appearing is reported rather than swallowed behind the first", async () => {
+    await publisher.init();
+    await insert({ _id: new ObjectId() });
+    await publisher.reloadSubscriptions();
+    expect(warnsMatching(ANOMALY_WARN)).toBe(1);
+
+    await insert({ _id: "sub-second", filter: "producer" });
+    await publisher.reloadSubscriptions();
+    expect(warnsMatching(ANOMALY_WARN)).toBe(2);
+    expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(2);
+    expect(anomalyPayload()!.count).toBe(1); // `find` returns the FIRST match — the latest line is asserted below
+    const latest = mockLog.warn.mock.calls.filter((call) => String(call[0]).includes(ANOMALY_WARN)).at(-1)!;
+    expect(latest[1]).toMatchObject({ count: 2 });
+  });
+
+  it("the counter describes the CURRENT set, never a running total — fixing the row returns it to 0", async () => {
+    await publisher.init();
+    await insert({ _id: new ObjectId() });
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(1);
+
+    // Repair the collection (no deleteOne on the double; the fixture's own
+    // reads are direct too) and reload.
+    fakeDb.collection(OPS_SUBSCRIPTIONS_COLLECTION).rows.length = 0;
+    await insert({ _id: "sub-fixed" });
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(0);
+    expect(publisher.getSnapshot().subscriptions).toBe(1);
+
+    driveFailure("Bash");
+    await publisher.__drainForTests();
+    expect(events()[0]!.matchedSubscriptionIds).toEqual(["sub-fixed"]);
+  });
+
+  it("a reload FAULT leaves the counter alone — it describes the set that loaded, not the one that did not", async () => {
+    await publisher.init();
+    await insert({ _id: new ObjectId() });
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(1);
+
+    fakeDb.failNext(OPS_SUBSCRIPTIONS_COLLECTION, "find");
+    await publisher.reloadSubscriptions();
+    const snapshot = publisher.getSnapshot();
+    expect(snapshot.subscriptionReloadFaults).toBe(1);
+    expect(snapshot.subscriptionRowAnomalies).toBe(1); // the kept set's value, unchanged
+    expect(snapshot.subscriptions).toBe(1); // the previous set really was kept
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// C3 — `matchedSubscriptionIds` was bounded per ELEMENT and not in COUNT, while
+// `loadSubscriptions()` is unbounded: N matching subscriptions wrote N × ≤200
+// characters into EVERY stored event for the whole retention window.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("matchedSubscriptionIds is bounded in COUNT while the count stays TRUE (C3)", () => {
+  const matchAll = (index: number) => ({
+    _id: `sub-${String(index).padStart(3, "0")}`,
+    subscriberId: "ops-team",
+    subscriberKind: "human",
+    enabled: true,
+    filter: {},
+    transport: { adapterId: "slack", target: "C1" },
+  });
+  const seed = async (count: number) => {
+    for (let i = 0; i < count; i += 1) {
+      await fakeDb.collection(OPS_SUBSCRIPTIONS_COLLECTION).insertOne(matchAll(i) as never);
+    }
+    await publisher.reloadSubscriptions();
+  };
+  const ids = (count: number) => Array.from({ length: count }, (_, i) => matchAll(i)._id);
+
+  it("over the cap: the first N ids in registration order, and matchedSubscriptions is the UNCAPPED total", async () => {
+    await publisher.init();
+    const total = OPS_MATCHED_IDS_MAX + 3;
+    await seed(total);
+    expect(publisher.getSnapshot().subscriptions).toBe(total);
+
+    driveFailure("Bash");
+    await publisher.__drainForTests();
+    const doc = events()[0]!;
+    // THE COUNT IS THE FACT. It is what `matchedSubscriptions: 0` means on every
+    // row this ticket ships, so capping the list must not touch it.
+    expect(doc.matchedSubscriptions).toBe(total);
+    expect(doc.matchedSubscriptionIds).toHaveLength(OPS_MATCHED_IDS_MAX);
+    expect(doc.matchedSubscriptionIds).toEqual(ids(OPS_MATCHED_IDS_MAX));
+    // The truncation needs no counter and no log line because it is self-evident
+    // in the document itself — asserted rather than claimed.
+    expect(doc.matchedSubscriptions).toBeGreaterThan(doc.matchedSubscriptionIds.length);
+  });
+
+  it("exactly AT the cap nothing is dropped — the bound is not off by one", async () => {
+    await publisher.init();
+    await seed(OPS_MATCHED_IDS_MAX);
+    driveFailure("Bash");
+    await publisher.__drainForTests();
+    const doc = events()[0]!;
+    expect(doc.matchedSubscriptions).toBe(OPS_MATCHED_IDS_MAX);
+    expect(doc.matchedSubscriptionIds).toEqual(ids(OPS_MATCHED_IDS_MAX));
+  });
 });
 
 describe("OpsPublisher recovery and the openSeq identity", () => {
