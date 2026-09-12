@@ -1339,6 +1339,12 @@ describe("audit routing (KPR-452)", () => {
   // radius of the missing pin is bounded by the 60 s floor — at most one
   // spurious `conversations.list` per minute — which is why it is one row and
   // not a redesign. `ops-audit` IS in `CHANNELS()`, so a hit must cost nothing.
+  //
+  // Correcting this comment's own first draft (r3 CONSIDER 1): the other rows
+  // did NOT stay green because they miss the map. AC1/AC3/AC4/AC5/AC7/AC8 all
+  // `wire("ops-audit")` and therefore HIT it. They stayed green because none of
+  // them asserts on `listChannels` at all — the gap was a missing call-count
+  // assertion on hit-path rows, not a missing hit-path fixture.
   it("AC10: a name already in the map resolves with no Slack call at all", async () => {
     wire("ops-audit");
     await dispatcher.dispatch(internalItem("team-1"));
@@ -1371,6 +1377,49 @@ describe("audit routing (KPR-452)", () => {
     nowMs += 30_000;
     await dispatcher.dispatch(internalItem("team-2"));
     expect(listChannels).toHaveBeenCalledTimes(1);
+
+    // ⚠ PAST THE WINDOW, THE RETRY MUST ACTUALLY HAPPEN (r3 SHOULD-FIX 1).
+    // This leg is not symmetry for its own sake — it is what pins the
+    // `finally { this.auditRefreshInFlight = undefined; }` on the REJECTION
+    // path. Clearing the in-flight promise on success only (M-f) left all 377
+    // `src/channels` cases green, and the consequence is worse than a missing
+    // stamp: `refreshAuditChannelIds` returns at `if (existing) return existing`
+    // BEFORE the 60 s check, so one transient 429 latches a resolved promise for
+    // the life of the process and a channel created after boot never resolves
+    // again — silently defeating the very "usable without a restart" property
+    // D4 gives the lazy refresh as its reason to exist.
+    //
+    // It also repairs THIS row: without this leg the row above discriminates the
+    // M8 stamp mutation only in isolation, and a compound regression (stamp
+    // moved to success-only AND the `finally` dropped) passes green, because the
+    // latch suppresses the very second call the stamp mutation would have caused.
+    nowMs += 31_000;
+    await dispatcher.dispatch(internalItem("team-3"));
+    expect(listChannels).toHaveBeenCalledTimes(2);
+  });
+
+  // ⚠ THE LEADING `await Promise.resolve()` INSIDE THE IIFE (r3 CONSIDER 2).
+  // Its docblock argues it is unreachable through `mockRejectedValue` "which is
+  // exactly why it must be closed here rather than left to a test" — true of the
+  // rejection path, but a SYNCHRONOUS throw from the client reaches it, and that
+  // is testable. Without that await, a sync throw runs the IIFE's catch and
+  // `finally` BEFORE `this.auditRefreshInFlight = inFlight` executes, so the
+  // field is left holding an already-settled promise that nothing will ever
+  // clear — the same permanent latch as the rejection path above, reached by a
+  // different route. A client whose `conversations.list` throws on a bad token
+  // or a malformed option is exactly this shape.
+  it("AC10: a SYNCHRONOUSLY throwing conversations.list does not latch the in-flight guard", async () => {
+    listChannels.mockImplementation(() => {
+      throw new Error("sync boom");
+    });
+    wire("late-audit");
+    await dispatcher.dispatch(internalItem("team-1"));
+    expect(listChannels).toHaveBeenCalledTimes(1);
+
+    // Past the window: if the guard latched, this second attempt never happens.
+    nowMs += 61_000;
+    await dispatcher.dispatch(internalItem("team-2"));
+    expect(listChannels).toHaveBeenCalledTimes(2);
   });
 
   it("AC10: a concurrent fan-out of audit posts issues exactly one refresh", async () => {
