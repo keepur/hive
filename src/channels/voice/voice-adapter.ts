@@ -32,6 +32,7 @@ import {
   voiceDiagnosticEvent,
   type AttemptOutcome,
   type EnginePayload,
+  type Measure,
   type VoiceErrorClass,
 } from "../../voice/voice-trace.js";
 
@@ -318,6 +319,26 @@ export class VoiceAdapter {
           payload,
         ),
       );
+    };
+    // KPR-465 §3.2: stage measures with honest reasons. Any attempt whose
+    // outcome is not "completed" forces not_observed for BOTH new stages —
+    // spec §3.2 bullet 2 says "a failed, cancelled or disconnected attempt",
+    // and this adapter encodes a barge-in/disconnect as `cancelled` (an
+    // aborted TurnResult → "cancelled"; "interrupted" is never emitted here),
+    // so guarding only "failed" would let a cancelled turn 1 that still
+    // returned a result carry real-but-misleading stage values. The request
+    // terminal's `incomplete` falls under the same guard. The three
+    // pre-existing stages stay outcome-blind exactly as today — not
+    // harmonized in this chunk.
+    const bootToInitMeasure = (r: TurnResult | undefined, outcome: AttemptOutcome): Measure => {
+      if (!r || outcome !== "completed") return measure(undefined, "not_observed");
+      if (r.warmPath && (r.warmTurnSeq ?? 0) >= 2) return measure(undefined, "not_applicable");
+      return measure(r.stageTimings?.bootToInitMs, "not_observed"); // cold, or warm turn 1 (a survivor without the boot stage lands here → not_observed)
+    };
+    const queueWaitMeasure = (r: TurnResult | undefined, outcome: AttemptOutcome): Measure => {
+      if (!r || outcome !== "completed") return measure(undefined, "not_observed");
+      if (!r.warmPath) return measure(undefined, "not_applicable");
+      return measure(r.stageTimings?.queueWaitMs, "not_observed");
     };
     const latchWriteFailure = (): void => {
       if (writeFailed) return;
@@ -650,6 +671,8 @@ export class VoiceAdapter {
               lockWaitMs: measure(attemptResult?.stageTimings?.lockWaitMs, "not_observed"),
               spawnPrepMs: measure(attemptResult?.stageTimings?.spawnPrepMs, "not_observed"),
               initToFirstTokenMs: measure(attemptResult?.stageTimings?.initToFirstTokenMs, "not_observed"),
+              bootToInitMs: bootToInitMeasure(attemptResult, attemptOutcome),
+              queueWaitMs: queueWaitMeasure(attemptResult, attemptOutcome),
               firstTextMs: measure(firstTokenMs, "not_reached"),
               stopped: stoppedError !== undefined || attemptFailure?.stopped === true,
             },
@@ -941,6 +964,8 @@ export class VoiceAdapter {
           sessionLookupMs: measure(sessionLookupMs, "not_reached"),
           firstTextMs: measure(firstTokenMs, "not_reached"),
           responseCompleteMs: measure(responseCompleteMs, "not_observed"),
+          bootToInitMs: bootToInitMeasure(finalResult, requestOutcome),
+          queueWaitMs: queueWaitMeasure(finalResult, requestOutcome),
           clientGone,
           correlation: parsedTrace.correlation,
           continuityAttempted,

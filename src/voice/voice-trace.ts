@@ -264,6 +264,10 @@ export type EnginePayload = {
   lockWaitMs?: Measure;
   spawnPrepMs?: Measure;
   initToFirstTokenMs?: Measure;
+  /** KPR-465 §3.2: cold every attempt; warm opener only; warm turns ≥ 2 not_applicable; any outcome other than `completed` (failed, cancelled, incomplete) not_observed. */
+  bootToInitMs?: Measure;
+  /** KPR-465 §3.2: warm turns only (entry → consume start; opener → open call); cold not_applicable; any outcome other than `completed` (failed, cancelled, incomplete) not_observed. */
+  queueWaitMs?: Measure;
   responseCompleteMs?: Measure;
   clientGone?: boolean;
   correlation?: ParsedTrace["correlation"];

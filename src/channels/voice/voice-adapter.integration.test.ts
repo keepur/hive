@@ -496,6 +496,78 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     expect(engineRows("engine_terminal")).toHaveLength(1);
   });
 
+  it("KPR-465: cold attempt terminal carries bootToInitMs equal to the log row's and queueWaitMs not_applicable", async () => {
+    const spawn = async (_ctx: TurnContext, onStream?: (c: string) => void): Promise<TurnResult> => {
+      onStream?.("hi");
+      return {
+        ...echoTurnResult("hi"),
+        stageTimings: { lockWaitMs: 1, spawnPrepMs: 2, bootToInitMs: 741, initToFirstTokenMs: 1263 },
+      };
+    };
+    const setup = makeAdapter({ spawn, bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p } = await startAdapter(setup);
+    const res = await postChatCompletion(p, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: workerShapedBody("cold-465"),
+    });
+    expect(res.status).toBe(200);
+    const terminal = engineRows("engine_attempt_terminal").find((r) => r.callId === "cold-465")!;
+    expect(terminal.outcome).toBe("completed");
+    expect(terminal.bootToInitMs).toEqual({ value: 741, reason: null });
+    expect(terminal.queueWaitMs).toEqual({ value: null, reason: "not_applicable" });
+    const requestTerminal = engineRows("engine_terminal").find((r) => r.callId === "cold-465")!;
+    expect(requestTerminal.bootToInitMs).toEqual({ value: 741, reason: null });
+    expect(requestTerminal.queueWaitMs).toEqual({ value: null, reason: "not_applicable" });
+    const logRow = mockLog.info.mock.calls.find((c) => c[0] === "Voice turn complete")![1] as Record<string, unknown>;
+    expect(logRow.bootToInitMs).toBe(741);
+    expect(logRow).not.toHaveProperty("queueWaitMs");
+  });
+
+  it("KPR-465: a failed attempt reports not_observed for both new stages", async () => {
+    const spawn = async (): Promise<TurnResult> => ({
+      ...echoTurnResult(""),
+      errors: ["boom"],
+      stageTimings: { lockWaitMs: 0, spawnPrepMs: 0, bootToInitMs: 500 },
+    });
+    const setup = makeAdapter({ spawn, bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p } = await startAdapter(setup);
+    await postChatCompletion(p, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: workerShapedBody("failed-465"),
+    });
+    const terminal = engineRows("engine_attempt_terminal").find((r) => r.callId === "failed-465")!;
+    expect(terminal.outcome).toBe("failed");
+    expect(terminal.bootToInitMs).toEqual({ value: null, reason: "not_observed" });
+    expect(terminal.queueWaitMs).toEqual({ value: null, reason: "not_observed" });
+  });
+
+  // The adapter encodes barge-in/disconnect as `cancelled` (aborted result →
+  // "cancelled"), never "interrupted"; spec §3.2 bullet 2 wants not_observed
+  // for it too — a cancelled warm turn 1 must not contribute a boot sample.
+  it("KPR-465: a cancelled (aborted-result) attempt reports not_observed for both new stages even when the stages were measured", async () => {
+    const spawn = async (_ctx: TurnContext, onStream?: (c: string) => void): Promise<TurnResult> => {
+      onStream?.("partial");
+      return {
+        ...echoTurnResult("partial", true),
+        warmPath: true,
+        warmTurnSeq: 1,
+        stageTimings: { lockWaitMs: 0, spawnPrepMs: 0, queueWaitMs: 12, bootToInitMs: 500, initToFirstTokenMs: 40 },
+      };
+    };
+    const setup = makeAdapter({ spawn, bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p } = await startAdapter(setup);
+    await postChatCompletion(p, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: workerShapedBody("cancelled-465"),
+    });
+    const terminal = engineRows("engine_attempt_terminal").find((r) => r.callId === "cancelled-465")!;
+    expect(terminal.outcome).toBe("cancelled");
+    expect(terminal.bootToInitMs).toEqual({ value: null, reason: "not_observed" });
+    expect(terminal.queueWaitMs).toEqual({ value: null, reason: "not_observed" });
+    // Pre-existing stages stay outcome-blind (unchanged behavior, pinned so a "harmonizing" edit is caught).
+    expect(terminal.initToFirstTokenMs).toEqual({ value: 40, reason: null });
+  });
+
   it("second turn (resume from session-store) — latest-user-message prompt", async () => {
     const setup = makeAdapter({
       storedSessionId: "stored-from-first-turn",
