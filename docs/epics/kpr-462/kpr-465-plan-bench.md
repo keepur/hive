@@ -851,7 +851,7 @@ This task runs only inside a chunk E quiet window (Task E3). Nothing here is exe
 
 Per arm: A0/A1 → no `effort` key; A2 → `effort: "medium"` (then `"low"` only under the spec §4 A2 rule) via `agent_update`. `contacts` is deliberately absent (`contacts_create`/`contacts_update` write dodi's live collection). Nothing from `WORKER_SERVER_DENYLIST` (`src/workers/meeting-worker-pool.ts:54`) and no vendor write surface is on the list.
 
-- [ ] **Step 2: Quiescence pre-check.** Confirm via the freshest `spawn_coordinator_stats` heartbeat (or `hive doctor`'s Spawn coordinator section) that `activeSpawns == 0` for every agent and no other live call is in progress. This quiet-window pre-check is required before proceeding. See spec §6.2 for the full quiescence requirement.
+- [ ] **Step 2: Quiescence pre-check.** Run the same quiescence check as chunk E's Task E3 Step 2 (mongosh query against `spawn_coordinator_stats`/`meeting_worker_claims`) immediately before creating the clone. Proceed only if every row shows `activeSpawns: 0` and `warmVoiceSessions: 0`, and `running claims: 0`, and no live call is up — see spec §6.2 and chunk E Task E3 Step 2 for the exact command and accepted residuals.
 
 - [ ] **Step 2b: Containment, stated honestly (spec §4.2).** The clone runs on an ordinary `AgentRunner`; the four auto-injected servers (`team`, `schedule`, `team-roster`, `skill-author`) cannot be stripped (only worker-mode runners set `suppressAutoInjectedServers`). Containment rests on the fixed script (no line asks for a message, a schedule, or a skill) and the delete window. After `agent_create`: `kill -USR1 <engine-pid>`; readback `agent_get mokie-bench` and record `coreServers`, `channels`, `effort`, `disabled`.
 
