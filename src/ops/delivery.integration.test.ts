@@ -173,6 +173,16 @@ describe("resolveCadence — D5's data-sourced cadence, with no merge and no fal
     expect(warnLines("ops cadence profile below the registered minimum")).toHaveLength(2);
   });
 
+  it("an operator-written profile NAME reaches that warn CLIPPED, never raw (C13)", () => {
+    const long = `fast-${"p".repeat(10_000)}`;
+    const policy = policyWith({ profiles: { [long]: 1_000 }, minNudgeIntervalMs: 60_000 });
+    expect(resolveCadence(row, sub("s1", { cadenceProfile: long }), policy)).toBe(60_000);
+
+    const lines = warnLines("ops cadence profile below the registered minimum");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]![1].profile).toBe(`${long.slice(0, OPS_LOG_VALUE_MAX)}…`);
+  });
+
   it("a below-floor TABLE entry clamps up WITHOUT a warning", () => {
     const policy: OpsPolicy = {
       _id: OPS_POLICY_ID,
@@ -634,6 +644,147 @@ describe("the DB identity write guard (KPR-294) — nothing is posted that canno
     guard.disengage();
     await h.notifier.reloadSubscriptions();
     expect(h.snapshot().subscriptions).toBe(2);
+  });
+
+  it("a guard engaging between the pre-post re-read and the post declines the post — nothing posted, nothing withheld", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE for attemptRow's step-4b check, and the only one:
+    // the loop-head and step-0 checks both ran while the guard was still clear,
+    // so without 4b this row is POSTED and then withheld at step 6 — a
+    // duplicate on disengagement where there should be none. The after-hook
+    // lands the engagement after the re-read has returned the row, i.e.
+    // exactly between the last read the decision rests on and the post.
+    const guard = guarded();
+    const h = await harness({ subscriptions: [sub("s1")], policy: policyWith(), writeGuard: guard });
+    const e = await h.seedEvent();
+    const reRead = h.db.pause(
+      OPS_NOTIFICATIONS_COLLECTION,
+      "findOne",
+      (ctx) => (ctx.filter as { _id?: unknown } | undefined)?._id !== undefined,
+      true,
+    );
+    const tick = h.tick();
+    await reRead.reached;
+    guard.engage("mismatch");
+    reRead.release();
+    await tick;
+
+    expect(h.transport.views).toHaveLength(0);
+    expect(h.snapshot().deliveryRecordLost).toBe(0);
+    expect(warnLines("ops delivery record withheld")).toHaveLength(0);
+    expect(guard.refusedWriteCount).toBe(0);
+    expect(h.snapshot().identityUnverifiedSkips).toBe(1);
+    expect((await h.row("s1", e.dedupeKey)).attemptCount).toBe(0);
+
+    // Declined, not spent: the row is posted exactly once, on the first
+    // verified tick.
+    guard.disengage();
+    await h.tick();
+    expect(h.transport.views).toHaveLength(1);
+    expect((await h.row("s1", e.dedupeKey)).attemptCount).toBe(1);
+  });
+
+  it("a guard engaged when start() runs does not ingest against the empty map — the first verified tick loads subscriptions first", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE. The guard skips start()'s first subscription
+    // load WITHOUT throwing, so start() armed the sweep holding the initial
+    // EMPTY map; the first tick after the guard cleared matched the stamped
+    // event against nothing, created no row, and advanced the cursor past it —
+    // the event lost for good, with no counter moved. The 60 s reload timer
+    // cannot be relied on: that tick lands up to 30 s after the guard clears.
+    const guard = guarded();
+    const h = await harness({ subscriptions: [sub("s1")], policy: policyWith(), writeGuard: guard, firstLoad: false });
+    guard.engage("cant_verify");
+    await h.notifier.start();
+    try {
+      await h.tick(); // joins (or follows) start()'s own fired tick — skipped whole
+      expect(h.snapshot().started).toBe(true);
+      expect(h.snapshot().subscriptionsLoaded).toBe(false);
+      const e = await h.seedEvent();
+
+      guard.disengage();
+      await h.tick();
+
+      expect((await h.row("s1", e.dedupeKey)).attemptCount).toBe(1);
+      expect(h.snapshot().subscriptionsLoaded).toBe(true);
+      expect(h.snapshot().rowsCreated).toBe(1);
+      expect(h.snapshot().eventsApplied).toBe(1);
+    } finally {
+      await h.notifier.stop(); // start() armed two real intervals
+    }
+  });
+
+  it("a load that FAULTS on that first verified tick moves nothing — no cursor, no stall, degraded — and the next tick recovers", async () => {
+    const guard = guarded();
+    const h = await harness({ subscriptions: [sub("s1")], policy: policyWith(), writeGuard: guard, firstLoad: false });
+    guard.engage("cant_verify");
+    await h.notifier.start();
+    try {
+      await h.tick();
+      const e = await h.seedEvent();
+      // A due first delivery that a delivery phase run against the empty map
+      // would stall on `subscription` for a whole re-check interval.
+      const { insertedId } = await h.store.notifications.insertOne(ledgerRow({ attemptCount: 0, nextNudgeAt: t(-1) }));
+      const cursorBefore = await h.store.readCursor();
+
+      guard.disengage();
+      failOn(h.db, OPS_SUBSCRIPTIONS_COLLECTION, "find", () => true);
+      await h.tick();
+
+      expect(await h.store.readCursor()).toEqual(cursorBefore);
+      expect(await h.ledgerCount()).toBe(1);
+      expect(
+        Object.prototype.hasOwnProperty.call(await h.store.notifications.findOne({ _id: insertedId }), "stalledReason"),
+      ).toBe(false);
+      expect(h.transport.views).toHaveLength(0);
+      expect(h.snapshot().subscriptionReloadFaults).toBe(1);
+      expect(h.snapshot().subscriptionsLoaded).toBe(false);
+      expect((await h.heartbeat()).state).toBe("degraded");
+
+      await h.tick();
+      expect((await h.row("s1", e.dedupeKey)).attemptCount).toBe(1);
+      expect(h.transport.views.map((v) => v.handle)).toContain(String(insertedId));
+    } finally {
+      await h.notifier.stop();
+    }
+  });
+
+  it("a SIGUSR1 reload that completed BEFORE the adapter was registered does not stand in for start()'s skipped load", async () => {
+    // index.ts calls a pre-start reload harmless because start()'s own first
+    // load re-validates every target. A guard-skipped load re-validates
+    // nothing, so without start() discarding the earlier load, the first
+    // verified tick swept on a map whose targets no adapter ever judged.
+    const guard = guarded();
+    const REJECTED = "s-prestart-rejected"; // unique: the unload warn memo is process-global
+    const rejecting = new FakeTransport(
+      "fake",
+      () => BASE,
+      (target) => target !== "C-REJECTED",
+    );
+    const h = await harness({
+      subscriptions: [sub("s1"), sub(REJECTED, { transport: { adapterId: "fake", target: "C-REJECTED" } })],
+      policy: policyWith(),
+      writeGuard: guard,
+      firstLoad: false,
+      transport: null,
+    });
+    await h.notifier.reloadSubscriptions(); // the early SIGUSR1: no adapter yet, both load unjudged
+    expect(h.snapshot().subscriptions).toBe(2);
+    h.notifier.registerTransport(rejecting);
+    guard.engage("cant_verify");
+    await h.notifier.start();
+    try {
+      await h.tick();
+      const e = await h.seedEvent();
+
+      guard.disengage();
+      await h.tick();
+
+      expect(h.snapshot().subscriptions).toBe(1);
+      expect((await h.row("s1", e.dedupeKey)).attemptCount).toBe(1);
+      await expect(h.row(REJECTED, e.dedupeKey)).rejects.toThrow(/no ledger row/);
+      expect(rejecting.views).toHaveLength(1);
+    } finally {
+      await h.notifier.stop();
+    }
   });
 
   it("index.ts wires the notifier to the guard in the same shape it wires KPR-456's runtime", () => {

@@ -70,6 +70,18 @@ export class OpsNotifier {
   private readonly locks = new Map<string, Promise<void>>();
 
   private subscriptions = new Map<string, OpsSubscription>();
+  /**
+   * TRUE ONCE A LOAD HAS ACTUALLY REPLACED THE MAP — never on a load the write
+   * guard skipped, never on a faulted one. The initial empty map above is not
+   * a subscription set, it is the absence of one, and ingest cannot tell the
+   * two apart: it matches every stamped id against the map, creates no row for
+   * an id it does not find, and advances the cursor past the event anyway — a
+   * permanent loss nothing counts. run() therefore refuses to ingest (or
+   * deliver) until this flips, and retries the load at the head of every tick
+   * that finds it false. See start() for the one path that reaches a tick with
+   * it false.
+   */
+  private subscriptionsLoaded = false;
   private reasons = new Map<string, LoadedReason>();
   /**
    * D5's three-valued policy state, and the third value is load-bearing.
@@ -135,7 +147,7 @@ export class OpsNotifier {
       () => this.stopping,
     );
     this.deliveryPhase = new DeliveryPhase(this.store.notifications, this.counters, retention);
-    this.intake = new OpsIntake(this.store.notifications, retention, this.clock);
+    this.intake = new OpsIntake(this.store.notifications, this.counters, retention, this.clock);
   }
 
   /**
@@ -204,9 +216,26 @@ export class OpsNotifier {
    * validateTarget AFTER every registerTransport — arms the 60 s reload timer,
    * and begins the sweep. Contained: a first-load fault leaves the notifier
    * unstarted with intake live, never throwing into boot.
+   *
+   * ⚠ A WRITE GUARD ENGAGED HERE IS NOT A FIRST-LOAD FAULT, and start()
+   * proceeds. reloadSubscriptions skips its read without throwing, so the
+   * notifier starts with `subscriptionsLoaded === false` and an empty map. That
+   * is safe only because run() will not ingest against a map no load has
+   * produced: its first tick after the guard clears loads first, and only then
+   * ingests. The engagement is transient by design (the identity monitor
+   * disengages on its own), so treating it as the unstarted posture — which
+   * nothing retries before a restart — would turn a boot-window reconnect into
+   * a process-lifetime outage. KPR-456's sweeper takes the same position: its
+   * start() arms its timer whether or not the guard let the first sweep run.
    */
   async start(): Promise<void> {
     if (this.started || this.stopping || !this.initialized || !this.startable) return;
+    // Only a load from HERE ON counts. A SIGUSR1 reload that completed before
+    // this call ran with no adapter registered, so every target in its map is
+    // unjudged (D6); index.ts calls that harmless BECAUSE this first load
+    // re-validates — which a guard-skipped load does not do. Cleared, run()
+    // re-loads on its first verified tick instead of sweeping on that map.
+    this.subscriptionsLoaded = false;
     try {
       await this.reloadSubscriptions(true);
     } catch (err) {
@@ -260,6 +289,11 @@ export class OpsNotifier {
     // interval. Treated like a reload fault — the previous set stays in
     // place — minus the counter and the warn, which the tick's own
     // identityUnverifiedSkips and edge-triggered warn already carry.
+    //
+    // ⚠ It does NOT throw, even under `rethrow` — and "the previous set" is
+    // the EMPTY initial map when no load has ever run. That is why this return
+    // leaves `subscriptionsLoaded` false and why run() gates on it: the skip
+    // is harmless only because nothing ingests until a real load lands.
     if (!this.canWrite()) return;
     try {
       const rows = await this.opsStore.loadSubscriptions();
@@ -335,6 +369,7 @@ export class OpsNotifier {
         next.set(sub._id, sub);
       }
       this.subscriptions = next;
+      this.subscriptionsLoaded = true;
     } catch (err) {
       this.counters.subscriptionReloadFaults += 1;
       log.warn("ops subscription reload failed — retaining the previous set", { error: String(err) });
@@ -407,6 +442,29 @@ export class OpsNotifier {
     if (this.identityPaused) {
       this.identityPaused = false;
       log.info("ops sweep resumed — DB identity verified");
+    }
+    // ⚠ NO PHASE RUNS AGAINST A MAP NO LOAD HAS PRODUCED (`subscriptionsLoaded`).
+    // Reachable when start() ran with the write guard engaged: the load was
+    // skipped, the timers were armed, and this is the first tick since the
+    // guard cleared — which can beat the 60 s reload timer by up to 30 s. The
+    // load is retried HERE rather than left to that timer, so the first
+    // verified tick is also the first tick that does any work. If it still
+    // did not land, the WHOLE tick is skipped, delivery and expiry included:
+    // ingest would advance the cursor past events it matched against nothing,
+    // and delivery would stall every due row on `subscription` for a full
+    // re-check interval.
+    if (!this.subscriptionsLoaded) {
+      await this.reloadSubscriptions();
+      if (!this.subscriptionsLoaded) {
+        // The guard re-engaged during the load, or the load faulted — counted
+        // and warned inside reloadSubscriptions. Nothing has moved either way.
+        if (!this.canWrite()) {
+          this.skipForIdentity();
+          return;
+        }
+        await this.writeDegradedHeartbeat(now);
+        return;
+      }
     }
     try {
       await this.runPhases(now);
@@ -625,6 +683,7 @@ export class OpsNotifier {
       startable: this.startable,
       started: this.started,
       stopping: this.stopping,
+      subscriptionsLoaded: this.subscriptionsLoaded,
       subscriptions: this.subscriptions.size,
       adapters: [...this.transports.keys()],
       lastSuccessfulSweep: this.lastSuccessfulSweep,
@@ -636,15 +695,22 @@ export class OpsNotifier {
   /**
    * D6/D7/D10: the seam KPR-455's inbound edge calls. NEVER THROWS.
    *
-   * `{ state: "unavailable" }` means exactly six things and no others: the
-   * singleton is unset (pre-wiring, or a bare test construction — handled in
-   * notifier-singleton.ts), init() did not complete, stop() has begun, the DB
-   * identity guard is engaged (KPR-456's `discover` answers the same way: a
-   * read out of an unverified database could REFUSE a real act as
-   * `unknown-handle`, which an edge must not retry), the work failed with a
-   * storage fault, or it did not finish inside INTAKE_DEADLINE_MS. The last
-   * two are each logged with their own line, so they are distinguishable in
-   * the log even though the edge sees one answer.
+   * `{ state: "unavailable" }` means exactly seven things and no others. FOUR
+   * are STANDING states of the process, answered before any read and not
+   * logged per call (a line per call would repeat one fact for as long as it
+   * holds): (1) the singleton is unset (pre-wiring, or a bare test
+   * construction — handled in notifier-singleton.ts), (2) init() did not
+   * complete, (3) stop() has begun, (4) the DB identity guard is engaged
+   * (KPR-456's `discover` answers the same way: a read out of an unverified
+   * database could REFUSE a real act as `unknown-handle`, which an edge must
+   * not retry). THREE are outcomes of the WORK, and each is logged with its
+   * own line, so they are distinguishable in the log even though the edge sees
+   * one answer: (5) the work failed with a storage fault ("ops intake work
+   * failed"), (6) it did not finish inside INTAKE_DEADLINE_MS ("ops intake
+   * deadline elapsed"), (7) its CAS was lost twice (intake.ts, "ops intake
+   * lost its CAS twice"). A new `unavailable` added anywhere on this path
+   * belongs in this list and gets its own line.
+   *
    * It is deliberately NOT gated on start(): intake depends on nothing start()
    * provides, and gating it there would widen its dead window across the whole
    * Slack connect for no gain.
@@ -685,7 +751,9 @@ export class OpsNotifier {
     if (!(input.at instanceof Date) || Number.isNaN(input.at.getTime())) {
       // Counted at the seam; intake.ts substitutes `now`. See its step-3
       // comment: the cost is a per-retry lastAckKey, so this is a real signal
-      // about a mis-serializing edge, not noise.
+      // about a mis-serializing edge, not noise. The counter's OTHER shape — a
+      // valid Date earlier than the row's first event — needs the row, so it
+      // is counted in intake.ts instead.
       this.counters.intakeInvalidAt += 1;
       // `act` is logged only when it is one of D7's three: this runs BEFORE
       // intake.ts validates it, and a caller-supplied value must not reach a

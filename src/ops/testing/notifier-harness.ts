@@ -172,6 +172,15 @@ export interface HarnessOptions {
    * true only for lifecycle cases that are ABOUT start().
    */
   start?: boolean;
+  /**
+   * Default TRUE. `false` ⇒ the harness runs NEITHER start() NOR its first
+   * subscription load, and `start` is ignored: the case gets a notifier that
+   * has never loaded a subscription set and calls start() itself — the only
+   * way to engage a write guard BEFORE that load (init() writes indexes, so
+   * the guard cannot be engaged earlier). A case that calls start() owns the
+   * `stop()` teardown above.
+   */
+  firstLoad?: boolean;
 }
 
 export interface NotifierHarness {
@@ -234,8 +243,11 @@ export async function harness(options: HarnessOptions = {}): Promise<NotifierHar
     await store.writeCursor({ publishedAt: options.cursorAt ?? t(-1), eventId: null });
   }
 
-  if (options.start) await notifier.start();
-  else await notifier.reloadSubscriptions(true);
+  // `firstLoad: false` ⇒ neither: the case drives start() itself.
+  if (options.firstLoad !== false) {
+    if (options.start) await notifier.start();
+    else await notifier.reloadSubscriptions(true);
+  }
 
   let keys = 0;
   const seedEvent = async (over: Partial<OpsEvent> = {}): Promise<OpsEvent> => {

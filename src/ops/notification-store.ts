@@ -99,14 +99,20 @@ export class OpsNotificationStore {
     // 3. Delivery ARM 1 — the guaranteed first delivery. Equality on
     //    attemptCount: 0 means an already-attempted row is not in this index's
     //    scanned prefix AT ALL, which is what makes arm 1 structurally immune
-    //    to a stall backlog rather than merely ordered ahead of one.
+    //    to the CADENCE-stall backlog rather than merely ordered ahead of it.
+    //    ⚠ Only that one: a row stalled on `subscription` or `transport` was
+    //    never attempted, so it keeps attemptCount 0 and IS in this prefix.
+    //    Arms 1 and 2 are read in two passes (DeliveryPhase.run) so those rows
+    //    cannot take a servable row's page or budget; the index alone does not.
     await create("ops_notifications.arm1", () =>
       this.notifications.createIndex({ state: 1, attemptCount: 1, nextNudgeAt: 1 }),
     );
     // 4. Delivery ARM 2 — the two non-cadence re-delivery triggers. The
     //    equality bound on forceDeliver: true confines the scan; the
     //    cadence-stall backlog carries no forceDeliver at all (step 5 consumes
-    //    it), so it is not in this bucket. The absent `state` key is NOT an
+    //    it), so it is not in this bucket — with arm 1's caveat: a forced row
+    //    stalled on `subscription` or `transport` keeps its flag and IS, which
+    //    the two-pass read handles. The absent `state` key is NOT an
     //    omission: no NON-WORKING row carries a nextNudgeAt (D5's scoping of
     //    the never-unset rule), so this index's range holds only
     //    pending/delivered rows by type bracketing rather than by a filter.

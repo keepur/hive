@@ -620,6 +620,77 @@ describe("the anchor", () => {
       rowState: "seen",
     });
   });
+
+  describe("an `at` EARLIER than the row's first event — the past-side bound", () => {
+    // A Slack `action_ts` in SECONDS read as MILLISECONDS: January 1970.
+    const SECONDS_AS_MS = new Date(1_757_700_000);
+
+    it("buys no collapsed snooze: the ceiling is measured from the server clock, and the substitution is counted", async () => {
+      // ⚠ THE ABLE-TO-FAIL CASE. Anchored on this `at`, the ceiling was
+      // `1970 + 7 d`, so an hour's pause was applied — and echoed — as a
+      // snoozedUntil in 1970, expired on the very next tick.
+      const h = await harness();
+      h.advance(10 * MINUTE);
+      const now = h.now();
+      const { id, handle } = await seedRow(h);
+      const input = ack(handle, { act: "snoozed", at: SECONDS_AS_MS, snoozedUntil: new Date(now.getTime() + HOUR) });
+
+      await expect(h.notifier.accept(input)).resolves.toEqual({
+        state: "applied",
+        rowState: "snoozed",
+        snoozedUntil: new Date(now.getTime() + HOUR),
+      });
+      const row = await rowById(h, id);
+      expect(row.snoozedUntil).toEqual(new Date(now.getTime() + HOUR));
+      expect(row.stateAt).toEqual(now);
+      expect(row.principalAt).toEqual(now);
+      expect(row.lastAckAt).toEqual(now);
+      expect(h.snapshot().intakeInvalidAt).toBe(1);
+      expect(warnLines("earlier than the notification it acknowledges").map((call) => call[1])).toEqual([
+        { act: "snoozed" },
+      ]);
+
+      // Unlike a non-Date `at`, the RAW value still keys the act, so the
+      // duplicated callback dedupes — and is counted again, being a second
+      // call carrying the same unusable instant.
+      expect(row.lastAckKey).toBe(`U1:snoozed:${SECONDS_AS_MS.toISOString()}`);
+      await expect(h.notifier.accept(input)).resolves.toEqual({ state: "noop", reason: "already-applied" });
+      expect(h.snapshot().intakeInvalidAt).toBe(2);
+    });
+
+    it("buys no collapsed retention horizon: expiresAt is measured from the server clock", async () => {
+      // Anchored on this `at`, expiresAt was 1970 + 30 d — decades past, so the
+      // TTL monitor deleted a just-dismissed row within a minute.
+      const h = await harness();
+      h.advance(10 * MINUTE);
+      const { id, handle } = await seedRow(h);
+
+      await expect(h.notifier.accept(ack(handle, { act: "dismissed", at: SECONDS_AS_MS }))).resolves.toEqual({
+        state: "applied",
+        rowState: "dismissed",
+      });
+      expect((await rowById(h, id)).expiresAt).toEqual(new Date(h.now().getTime() + RETENTION_MS));
+    });
+
+    it("an honest PAST `at` — after the row's first event — is still used as given, and counts nothing", async () => {
+      // D7: a vendor act genuinely precedes its callback. The bound is the
+      // row's BIRTH, so it must not swallow that.
+      const h = await harness();
+      const { id, handle } = await seedRow(h, { firstSeenAt: BASE });
+      const actAt = new Date(BASE.getTime() + MINUTE);
+      h.advance(10 * MINUTE);
+
+      await expect(h.notifier.accept(ack(handle, { act: "seen", at: actAt }))).resolves.toEqual({
+        state: "applied",
+        rowState: "seen",
+      });
+      const row = await rowById(h, id);
+      expect(row.stateAt).toEqual(actAt);
+      expect(row.expiresAt).toEqual(new Date(actAt.getTime() + RETENTION_MS));
+      expect(h.snapshot().intakeInvalidAt).toBe(0);
+      expect(warnLines("earlier than the notification it acknowledges")).toHaveLength(0);
+    });
+  });
 });
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -870,6 +941,11 @@ describe("the CAS", () => {
     await expect(call).resolves.toEqual({ state: "unavailable" });
     expect(casWrites(h, mark)).toHaveLength(2); // one retry, and only one
     expect(h.snapshot().intakeUnavailable).toBe(1);
+    // The seventh `unavailable`, and it is LOGGED — as itself, not as either
+    // of the other two work-shaped causes.
+    expect(warnLines("ops intake lost its CAS twice")).toHaveLength(1);
+    expect(warnLines("ops intake work failed")).toHaveLength(0);
+    expect(warnLines("ops intake deadline elapsed")).toHaveLength(0);
     const after = await rowById(h, id);
     expect(hasKey(after, "lastAckKey")).toBe(false);
     expect(hasKey(after, "lastAckAt")).toBe(false);

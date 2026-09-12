@@ -13,6 +13,7 @@
  * free-text reason for a dismissal.
  */
 import { ObjectId, type Collection } from "mongodb";
+import { createLogger } from "../logging/logger.js";
 import {
   HARD_SNOOZE_CEILING_MS,
   OPS_SYSTEM_PRINCIPAL,
@@ -22,10 +23,13 @@ import {
   type OpsIntakeResult,
   type OpsNotification,
   type OpsNotificationState,
+  type OpsNotifierCounters,
   type OpsPolicy,
 } from "./notification-types.js";
 import { WRITE } from "./notification-store.js";
 import { OPS_ID_MAX_LENGTH } from "./ids.js";
+
+const log = createLogger("ops-intake");
 
 /** D7's table: the four states an attributed act may transition FROM. */
 const LEGAL_FROM: readonly OpsNotificationState[] = ["pending", "delivered", "seen", "snoozed"];
@@ -64,16 +68,23 @@ export function parseHandle(handle: unknown): ObjectId | undefined {
   return id.toHexString() === handle.toLowerCase() ? id : undefined;
 }
 
+/** Per-call facts an attempt observed, so a retried attempt does not double-count them. */
+interface AttemptNotes {
+  atPredatesRow: boolean;
+}
+
 export class OpsIntake {
   constructor(
     private readonly notifications: Collection<OpsNotification>,
+    private readonly counters: OpsNotifierCounters,
     private readonly retentionDays: number,
     private readonly clock: () => Date,
   ) {}
 
   /**
    * One indexed read plus one CAS. A lost CAS — a sweep tick moved the row
-   * between read and write — retries ONCE and then returns unavailable.
+   * between read and write — retries ONCE and then returns unavailable, with
+   * a warn of its own.
    *
    * `policy` is THE COPY THE LAST TICK RETAINED, never a fresh read (D5). That
    * is what keeps this inside the "one indexed read plus one CAS" bound, and
@@ -83,17 +94,47 @@ export class OpsIntake {
    * resolve to the hard ceiling, which is the correct answer for both.
    */
   async accept(input: OpsAcknowledgement, rowId: ObjectId, policy: OpsPolicy | null): Promise<OpsIntakeResult> {
+    const notes: AttemptNotes = { atPredatesRow: false };
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const outcome = await this.attempt(input, rowId, policy);
-      if (outcome !== LOST) return outcome;
+      const outcome = await this.attempt(input, rowId, policy, notes);
+      if (outcome !== LOST) {
+        this.countNotes(notes, input);
+        return outcome;
+      }
     }
+    this.countNotes(notes, input);
+    // ⚠ The seventh `unavailable` (OpsNotifier.accept enumerates all seven),
+    // and until this line the only one of the three WORK-shaped causes that
+    // left no trace. Two lost CASes in one call mean the row's state or ack
+    // marks moved between read and write twice running. This call holds the
+    // per-row latch, so in-process only ingest's clearing arm can do that, and
+    // a retry that reads the clear is refused `row-cleared` rather than lost —
+    // a stream of these points at a writer outside this process (a second
+    // engine, a hand edit). `act` is safe to print: a CAS is only reached
+    // after step 2b validated it.
+    log.warn("ops intake lost its CAS twice — answered unavailable; a retry of the same act is safe", {
+      act: input.act,
+    });
     return { state: "unavailable" };
+  }
+
+  /** Once per accept() call, never once per attempt. */
+  private countNotes(notes: AttemptNotes, input: OpsAcknowledgement): void {
+    if (!notes.atPredatesRow) return;
+    this.counters.intakeInvalidAt += 1;
+    log.warn(
+      "ops intake received an `at` earlier than the notification it acknowledges — anchoring on the server clock",
+      {
+        act: input.act,
+      },
+    );
   }
 
   private async attempt(
     input: OpsAcknowledgement,
     rowId: ObjectId,
     policy: OpsPolicy | null,
+    notes: AttemptNotes,
   ): Promise<OpsIntakeResult | typeof LOST> {
     // ── 1. Resolve the handle to exactly one row. ──
     const row = await this.notifications.findOne({ _id: rowId });
@@ -151,9 +192,41 @@ export class OpsIntake {
     // must not lose a human's acknowledgement), but the operator gets a
     // counter and a warn instead of silence. Recorded in the plan index's
     // Assumptions as a named edge this child owes forward to KPR-455.
-    const at = input.at instanceof Date && !Number.isNaN(input.at.getTime()) ? input.at : now;
+    const usableAt = input.at instanceof Date && !Number.isNaN(input.at.getTime());
+    const at = usableAt ? input.at : now;
+    // ⚠ THE PAST-SIDE BOUND, which `min(at, now)` alone does not have. D7 uses
+    // a past `at` as given because a vendor act honestly precedes its callback
+    // — but an `at` EARLIER THAN THE ROW'S OWN FIRST EVENT cannot be the
+    // instant of an act on this row, and used as given it collapses every
+    // horizon derived from anchorAt: a Slack `action_ts` read as milliseconds
+    // instead of seconds lands in January 1970, so `expiresAt` (D9) is decades
+    // past and the TTL deletes the row within a minute, and the snooze ceiling
+    // is `anchorAt + 7 d` — also 1970 — so the pause expires on the next tick.
+    // Such an `at` is treated exactly like an unusable one: the ANCHOR takes
+    // the server clock and the substitution is counted (`intakeInvalidAt`,
+    // once per call — countNotes) and warned. `lastAckKey` still keeps the RAW
+    // value, so unlike the non-Date shape a retried duplicate DOES dedupe.
+    //
+    // `firstSeenAt`, not the `_id`'s embedded timestamp: it is a named,
+    // immutable, engine-written field (the first event's publishedAt, which
+    // KPR-454's publisher stamps from the engine's clock), where an ObjectId's
+    // timestamp is second-granular and read nowhere else in this component.
+    // The bound invents no number. An honest act follows its row's first event
+    // by at least the ingest that created the row — plus, for a vendor act, a
+    // post and a human — which ordinary clock skew does not reach; and a false
+    // trip costs only a horizon measured from a few seconds later.
+    //
+    // ⚠ RESIDUAL, named in the plan index's Assumptions and owed to KPR-455 /
+    // the spec lane: this bounds the anchor at the row's BIRTH, not at "now
+    // minus some staleness window". A dishonest `at` that falls INSIDE the
+    // row's lifetime still shortens its horizons by up to the row's age; and a
+    // substituted anchor is its ARRIVAL instant, so a delayed duplicate of an
+    // older predating act is applied rather than superseded (step 3's guard
+    // orders by anchor). Choosing a window is a number D7 does not name.
+    const atPredatesRow = usableAt && row.firstSeenAt instanceof Date && at.getTime() < row.firstSeenAt.getTime();
+    if (atPredatesRow) notes.atPredatesRow = true;
     // The one derived value that governs every clock-bearing write.
-    const anchorAt = new Date(Math.min(at.getTime(), now.getTime()));
+    const anchorAt = atPredatesRow ? now : new Date(Math.min(at.getTime(), now.getTime()));
 
     // ── 3. Idempotence replay check, BEFORE legality — plus the monotonicity
     //       guard on the same step. ──

@@ -4,6 +4,7 @@
  */
 import type { Collection } from "mongodb";
 import { createLogger } from "../logging/logger.js";
+import { clipForLog } from "./ids.js";
 import type { LoadedReason } from "./store.js";
 import type { OpsSubscription } from "./types.js";
 import type { DeliveryOutcome, NotificationView, OpsTransport } from "./transport.js";
@@ -79,7 +80,10 @@ export function resolveCadence(
       if (!floorWarned.has(key)) {
         floorWarned.add(key);
         log.warn("ops cadence profile below the registered minimum — clamped up", {
-          profile: sub.cadenceProfile,
+          // Operator-written and unbounded, so clipped exactly as the same
+          // row's `_id` is on the subscription-load warns (notifier.ts, C13).
+          // The memo key above keeps the FULL name: it decides, it is not printed.
+          profile: clipForLog(sub.cadenceProfile),
           requestedMs: raw,
           clampedToMs: floor,
         });

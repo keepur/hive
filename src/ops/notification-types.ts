@@ -282,7 +282,13 @@ export interface OpsNotifierCounters {
   intakeNoop: number;
   intakeRefused: number;
   intakeUnavailable: number;
-  /** D7: an `at` that was not a usable Date and was substituted with `now`. */
+  /**
+   * D7: an `at` that cannot be the act's instant, substituted with `now`. Two
+   * shapes, once per accept() call: not a usable Date (counted at the seam;
+   * `now` replaces it in lastAckKey too), or a valid Date EARLIER THAN THE
+   * ROW'S `firstSeenAt` (counted in intake.ts, which has the row; `now`
+   * replaces only the anchor, and lastAckKey keeps the raw value).
+   */
   intakeInvalidAt: number;
   cursorReinitialized: number;
   ingestFaults: number;
