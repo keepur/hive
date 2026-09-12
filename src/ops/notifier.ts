@@ -14,6 +14,7 @@ import type { OpsSubscription } from "./types.js";
 import type { OpsTransport } from "./transport.js";
 import {
   GAUGE_COUNT_LIMIT,
+  INTAKE_DEADLINE_MS,
   OPS_NUDGE_STATES,
   SUBSCRIPTION_RELOAD_MS,
   SWEEP_INTERVAL_MS,
@@ -28,6 +29,7 @@ import {
 import { OpsNotificationStore } from "./notification-store.js";
 import { IngestPhase } from "./ingest.js";
 import { DeliveryPhase, type DeliveryResult } from "./delivery.js";
+import { OpsIntake, parseHandle } from "./intake.js";
 
 const log = createLogger("ops-notifier");
 
@@ -38,6 +40,7 @@ export class OpsNotifier {
   private readonly store: OpsNotificationStore;
   private readonly ingestPhase: IngestPhase;
   private readonly deliveryPhase: DeliveryPhase;
+  private readonly intake: OpsIntake;
   private readonly counters: OpsNotifierCounters = freshCounters();
   private readonly transports = new Map<string, OpsTransport>();
   private readonly locks = new Map<string, Promise<void>>();
@@ -89,6 +92,7 @@ export class OpsNotifier {
       () => this.stopping,
     );
     this.deliveryPhase = new DeliveryPhase(this.store.notifications, this.counters, retention);
+    this.intake = new OpsIntake(this.store.notifications, retention, this.clock);
   }
 
   /**
@@ -493,8 +497,92 @@ export class OpsNotifier {
     };
   }
 
-  /** Chunk 4 replaces this stub with the real intake. */
-  accept(_input: OpsAcknowledgement): Promise<OpsIntakeResult> {
-    return Promise.resolve({ state: "unavailable" });
+  /**
+   * D6/D7/D10: the seam KPR-455's inbound edge calls. NEVER THROWS.
+   *
+   * `{ state: "unavailable" }` means exactly four things and no others: the
+   * singleton is unset (pre-wiring, or a bare test construction — handled in
+   * notifier-singleton.ts), init() did not complete, stop() has begun, or the
+   * work did not finish inside INTAKE_DEADLINE_MS.
+   * It is deliberately NOT gated on start(): intake depends on nothing start()
+   * provides, and gating it there would widen its dead window across the whole
+   * Slack connect for no gain.
+   *
+   * ⚠ THE ONE SENTENCE KPR-455's EDGE NEEDS: `unavailable` means UNKNOWN, NOT
+   * "did not apply", and it is SAFE TO RETRY. The deadline below abandons the
+   * work rather than cancelling it, so a write can land after the caller has
+   * already been told `unavailable` — and a retry of the SAME
+   * (actorId, act, at) is the correct response, because `lastAckKey` makes it
+   * return `{ state: "noop", reason: "already-applied" }` if it did land and
+   * apply it if it did not. An edge that treats `unavailable` as a failure and
+   * surfaces an error to the human is reading it wrong.
+   *
+   * ⚠ AND ONE DETERMINISTIC INTERACTION, named because it is a property of
+   * this seam rather than a race: `withDeadline` wraps `withRowLock`, so the
+   * 5 s INTAKE_DEADLINE_MS covers LATCH ACQUISITION as well as the work. The
+   * delivery phase holds that same per-row latch across
+   * ATTEMPT_SPACING_MS + the adapter's own SLACK_POST_TIMEOUT_MS (up to 11 s),
+   * so an acknowledgement landing on a row whose delivery is slow returns
+   * `unavailable` EVERY TIME, not occasionally — and the act it names will
+   * then apply on the retry the sentence above already asks for. The
+   * alternative — taking the deadline INSIDE the lock — would make the
+   * deadline unbounded from the caller's side, which is worse for a Slack
+   * interaction callback that must answer its vendor in 3 s.
+   */
+  async accept(input: OpsAcknowledgement): Promise<OpsIntakeResult> {
+    if (!this.initialized || this.stopping) return this.tallyIntake({ state: "unavailable" });
+    if (!(input.at instanceof Date) || Number.isNaN(input.at.getTime())) {
+      // Counted at the seam; intake.ts substitutes `now`. See its step-3
+      // comment: the cost is a per-retry lastAckKey, so this is a real signal
+      // about a mis-serializing edge, not noise.
+      this.counters.intakeInvalidAt += 1;
+      log.warn("ops intake received an unusable `at` — substituting the server clock", { act: input.act });
+    }
+    // Step 1 of D7's order is split across two files ON PURPOSE: the parsed id
+    // is the per-row latch's key, so it must be resolved before the lock is
+    // taken. Intake re-uses the parsed value rather than re-parsing.
+    const rowId = parseHandle(input.handle);
+    if (!rowId) return this.tallyIntake({ state: "refused", reason: "unknown-handle" });
+    try {
+      const result = await this.withDeadline(
+        this.withRowLock(String(rowId), () => this.intake.accept(input, rowId, this.policy ?? null)),
+      );
+      return this.tallyIntake(result);
+    } catch (err) {
+      log.warn("ops intake unavailable", { error: String(err) });
+      return this.tallyIntake({ state: "unavailable" });
+    }
+  }
+
+  /**
+   * The losing side of this race keeps running to completion — deliberately.
+   * It is one bounded CAS whose write is idempotent under the same
+   * preconditions, so abandoning the result is safe; cancelling it is not
+   * expressible against the driver and inventing an AbortController path here
+   * would add a second way for a half-applied write to exist.
+   */
+  private withDeadline<T extends OpsIntakeResult>(work: Promise<T>): Promise<T | OpsIntakeResult> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve({ state: "unavailable" }), INTAKE_DEADLINE_MS);
+      timer.unref?.();
+      void work.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        () => {
+          clearTimeout(timer);
+          resolve({ state: "unavailable" });
+        },
+      );
+    });
+  }
+
+  private tallyIntake(result: OpsIntakeResult): OpsIntakeResult {
+    if (result.state === "applied") this.counters.intakeApplied += 1;
+    else if (result.state === "noop") this.counters.intakeNoop += 1;
+    else if (result.state === "refused") this.counters.intakeRefused += 1;
+    else this.counters.intakeUnavailable += 1;
+    return result;
   }
 }
