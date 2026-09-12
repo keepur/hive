@@ -2576,11 +2576,23 @@ Meeting rules:
    * multi-page sweep would put Slack pagination latency inside a turn's
    * completion. ONE page, cursor NOT followed.
    *
-   * ⚠ THIS METHOD IS DELIBERATELY NOT `async`. Everything up to storing
-   * `auditRefreshInFlight` runs synchronously, so an N-agent fan-out firing N
-   * audit posts concurrently produces ONE refresh, not N. Making it `async`
-   * would introduce an await point before the flag is stored and break the
-   * single-flight guarantee (AC10).
+   * ⚠ THE INVARIANT IS "NO `await` MAY PRECEDE
+   * `this.auditRefreshInFlight = inFlight`" — everything from the
+   * `if (existing)` read down to that assignment runs in one synchronous
+   * run-to-completion step, so an N-agent fan-out firing N audit posts
+   * concurrently produces ONE refresh, not N (AC10).
+   *
+   * THE `async` KEYWORD IS NOT WHAT PROTECTS THAT, and an earlier version of
+   * this note claimed it was. Declaring a function `async` introduces no await
+   * point of its own: an `async` body still runs synchronously up to its first
+   * `await`, and only the RETURN value becomes a promise. Marking this method
+   * `async` would therefore leave single-flight intact (r1 CONSIDER 5 —
+   * mutation-verified: all 141 cases in dispatcher.test.ts stay green). The
+   * signature stays non-`async` because it already returns the promise callers
+   * need and there is nothing to gain — but do not credit the keyword with a
+   * guarantee that never lived there. What actually closes the race is the
+   * leading `await Promise.resolve()` INSIDE the IIFE; that note, below, is
+   * correct and IS load-bearing.
    *
    * The 60 s stamp is taken BEFORE the call is issued, so a slow or failing
    * refresh cannot be retried at request rate.

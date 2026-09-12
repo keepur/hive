@@ -136,7 +136,25 @@ export interface AuditRoutingControlDeps {
   initialOverride: AuditRoutingDoc | null;
 }
 
-const NOT_READY = "Audit routing is not ready yet — the engine is still starting. Retry in a moment.";
+/**
+ * Both tools' not-ready answer. It deliberately names BOTH causes (r1
+ * CONSIDER 2). `dispatcher.auditRoutingReady()` is a single boolean and it is
+ * false in two very different situations: the ordinary boot window before
+ * `setAuditChannel` runs, and — permanently, for the life of the process —
+ * after the boot channel sweep threw, since `index.ts` wraps that pagination
+ * in a try/catch that warns `Failed to configure audit channel` and skips
+ * `setAuditChannel` entirely. "The engine is still starting. Retry in a
+ * moment." was true of the first and actively misleading about the second,
+ * sending the operator into an unbounded retry loop instead of at the boot
+ * warn that explains it.
+ *
+ * Genuinely DISTINGUISHING the two would need a third state out of the
+ * Dispatcher (wired-but-sweep-failed), which is a dispatcher change this
+ * ticket does not make. The honest fix at this layer is to stop asserting the
+ * cause and name where the answer is.
+ */
+const NOT_READY =
+  'Audit routing is not ready yet. Either the engine is still starting — retry in a moment — or the boot-time Slack channel sweep failed, in which case retrying will never help: check the engine log for "Failed to configure audit channel".';
 
 /**
  * KPR-452 D5. Precedence is runtime override → `config.slack.auditChannel` →

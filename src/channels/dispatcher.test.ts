@@ -1352,6 +1352,18 @@ describe("audit routing (KPR-452)", () => {
     expect(auditCalls()).toHaveLength(3);
   });
 
+  // ⚠ THE DISCRIMINATING ASSERTION HERE IS THE ABSENT WARN, NOT the absent
+  // `listChannels` call (r1 SF3). `bare` never receives the client that owns
+  // `listChannels`, so `expect(listChannels).not.toHaveBeenCalled()` is
+  // unfalsifiable in this fixture — it held even with `!client` deleted from
+  // `refreshAuditChannelIds`'s guard, and it is kept below as documentation
+  // only. What the guard actually protects is the IIFE: without `!client` the
+  // body runs, `client.conversations.list` throws a TypeError on `undefined`,
+  // and the catch logs `Audit channel refresh failed`. Absence of that warn —
+  // paired with PRESENCE of the downstream `No audit channel resolved` warn,
+  // which proves the audit path really did run to the destination step rather
+  // than exiting somewhere harmlessly earlier — is what makes this row fail
+  // when the guard is removed.
   it("AC10: no refresh is attempted when the Slack adapter is unset", async () => {
     const bare = new Dispatcher(
       registry as any,
@@ -1363,9 +1375,104 @@ describe("audit routing (KPR-452)", () => {
     bare.setAuditChannel(slackAdapter as any, CHANNELS());
     bare.setAuditChannelName("late-audit");
     await bare.dispatch(internalItem("team-1"));
-    expect(listChannels).not.toHaveBeenCalled();
+    const warns = mockLogWarn.mock.calls.map((c: any[]) => c[0]);
+    expect(warns).not.toContain("Audit channel refresh failed");
+    expect(warns).toContain("No audit channel resolved");
+    expect(listChannels).not.toHaveBeenCalled(); // documentation — see the note above
     expect(auditCalls()).toHaveLength(0);
     expect(bare.auditRoutingReady()).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // D5 — `audit_channel_set`'s validation sweep (`resolveAuditChannelIdFully`).
+  //
+  // This block is the ONLY place the real method runs. `audit-routing.test.ts`
+  // replaces it with a `vi.fn()` on its structural dispatcher stub, so nothing
+  // there drives the implementation: in r1 the reviewer inserted
+  // `if (name) return undefined;` at the top of the method and the whole suite
+  // stayed green (r1 SF1). Both properties the Testing Contract names are
+  // pinned here — full pagination, and the SEEDING that makes the tool a
+  // working escape rather than a success report.
+  // -------------------------------------------------------------------------
+  describe("resolveAuditChannelIdFully (D5 full sweep)", () => {
+    it("follows next_cursor across pages, seeds every page, and stops once found", async () => {
+      const channels = CHANNELS();
+      wire("page2-audit", channels);
+      listChannels
+        .mockResolvedValueOnce({
+          channels: [{ name: "chatter", id: "C-CHATTER" }],
+          response_metadata: { next_cursor: "cursor-1" },
+        })
+        // A cursor is STILL returned on the page that contains the match. The
+        // sweep must stop anyway — that is the `!found` half of
+        // `while (cursor && !found)`, and the third page below would answer
+        // with the default one-channel mock if it were ever requested.
+        .mockResolvedValueOnce({
+          channels: [{ name: "page2-audit", id: "C-P2" }],
+          response_metadata: { next_cursor: "cursor-2" },
+        });
+
+      await expect(dispatcher.resolveAuditChannelIdFully("page2-audit")).resolves.toBe("C-P2");
+
+      expect(listChannels).toHaveBeenCalledTimes(2);
+      expect(listChannels.mock.calls[0][0]).toEqual({
+        types: "public_channel,private_channel",
+        limit: 1000,
+        cursor: undefined,
+      });
+      // The cursor IS threaded here — deliberately unlike the one-page
+      // dispatch-path refresh, whose AC10 row pins the opposite.
+      expect(listChannels.mock.calls[1][0].cursor).toBe("cursor-1");
+
+      // SEEDING. The match and a page-1 bystander both land in the live map,
+      // so `peekAuditChannelId()` — the map-only read `audit_channel_get` uses
+      // — now resolves with no Slack call of its own.
+      expect(channels.get("page2-audit")).toBe("C-P2");
+      expect(channels.get("chatter")).toBe("C-CHATTER");
+      expect(dispatcher.peekAuditChannelId()).toBe("C-P2");
+    });
+
+    it("returns undefined once the cursor is exhausted without a match", async () => {
+      const channels = CHANNELS();
+      wire("nowhere", channels);
+      listChannels
+        .mockResolvedValueOnce({
+          channels: [{ name: "chatter", id: "C-CHATTER" }],
+          response_metadata: { next_cursor: "cursor-1" },
+        })
+        // No `response_metadata` at all — the `|| undefined` normalization of a
+        // missing/empty cursor is what terminates the loop.
+        .mockResolvedValueOnce({ channels: [{ name: "other", id: "C-OTHER" }] });
+
+      await expect(dispatcher.resolveAuditChannelIdFully("nowhere")).resolves.toBeUndefined();
+      expect(listChannels).toHaveBeenCalledTimes(2);
+      expect(channels.get("other")).toBe("C-OTHER"); // seeding still happened
+      expect(dispatcher.peekAuditChannelId()).toBeUndefined();
+    });
+
+    it("returns undefined without a Slack call when the Slack adapter is unset", async () => {
+      const bare = new Dispatcher(
+        registry as any,
+        agentManager as any,
+        makeMockHealthReporter() as any,
+        "executive-assistant",
+      );
+      bare.setAuditChannel(slackAdapter as any, CHANNELS());
+      bare.setAuditChannelName("ops-audit");
+      // Not merely "no call": with the `!client` half of the guard gone this
+      // REJECTS on `undefined.conversations`, so `resolves` is the assertion
+      // that carries the weight.
+      await expect(bare.resolveAuditChannelIdFully("ops-audit")).resolves.toBeUndefined();
+      expect(listChannels).not.toHaveBeenCalled();
+    });
+
+    it("returns undefined without a Slack call when the channel map is unset", async () => {
+      // `dispatcher` has the Slack adapter from beforeEach but no
+      // `setAuditChannel` — the boot window between the two wiring calls.
+      dispatcher.setAuditChannelName("ops-audit");
+      await expect(dispatcher.resolveAuditChannelIdFully("ops-audit")).resolves.toBeUndefined();
+      expect(listChannels).not.toHaveBeenCalled();
+    });
   });
 
   // AC13 — the audit path cannot fail an already-delivered turn.
@@ -1450,6 +1557,60 @@ describe("audit routing (KPR-452)", () => {
       "Work item dispatched",
       expect.objectContaining({ agentId: "production-support" }),
     );
+  });
+
+  // -------------------------------------------------------------------------
+  // D1 POSITION (r1 SF2). `postAuditLog` is called from inside the delivery
+  // `else` arm, and the plan lists that POSITION — not merely the predicate —
+  // on the Regression Surface: the two sibling arms (`isNonResponse`,
+  // `killedReaction`) deliver nothing and must mirror nothing, so hoisting the
+  // call above them would newly mirror suppressed turns.
+  //
+  // Nothing pinned it. The three pre-existing non-response dispatch tests
+  // never call `setAuditChannel`, so `auditAdapter` is undefined in them and
+  // NO copy could be observed however the call were positioned — the reviewer
+  // added a `postAuditLog(...)` call inside the `isNonResponse` arm and the
+  // whole suite stayed green. These two rows wire audit routing FIRST.
+  //
+  // Both use the `internal` fixture the AC1 rows above prove DOES yield a copy
+  // when the turn actually delivers, so the absence below is about the arm
+  // taken, not about the routing decision.
+  // -------------------------------------------------------------------------
+  it("D1 position: a non-response-suppressed turn posts no audit copy", async () => {
+    wire("ops-audit");
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(makeTurn({ finalMessage: "No response needed." }));
+    await dispatcher.dispatch(internalItem("team-suppressed"));
+    expect(mockLogInfo).toHaveBeenCalledWith(
+      "Non-response suppressed",
+      expect.objectContaining({ agentId: "production-support" }),
+    );
+    expect(auditCalls()).toHaveLength(0);
+    // Broader than auditCalls(): the audit adapter was not touched AT ALL, so
+    // a copy carrying some other source label would fail this too.
+    expect(slackAdapter.deliver).not.toHaveBeenCalled();
+  });
+
+  it("D1 position: a killed round-1 reaction replay posts no audit copy", async () => {
+    wire("ops-audit");
+    // conferenceRound 1 + aborted + empty text ⇒ `killedReaction`. No outage
+    // wiring, so `maybeHandlePostTurnOutage` exits at `!outage` and the
+    // KPR-402 deadline arm is bypassed by `!isRound1AbortedReplay`.
+    agentManager.runWorkItemTurn.mockResolvedValueOnce(makeTurn({ finalMessage: "", aborted: true, timedOut: true }));
+    await dispatcher.dispatch(
+      makeWorkItem({
+        id: "team-killed",
+        source: { kind: "internal", id: "team-chan-1", label: "team" },
+        sender: "jasper",
+        text: "peer ping",
+        meta: { targetAgentId: "production-support", conferenceRound: 1 },
+      }),
+    );
+    expect(mockLogInfo).toHaveBeenCalledWith(
+      "Round-1 reaction suppressed on replay (killed)",
+      expect.objectContaining({ agentId: "production-support", aborted: true }),
+    );
+    expect(auditCalls()).toHaveLength(0);
+    expect(slackAdapter.deliver).not.toHaveBeenCalled();
   });
 });
 
