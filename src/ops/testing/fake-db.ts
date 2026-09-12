@@ -21,12 +21,19 @@ import { ObjectId, type Db } from "mongodb";
  *     matching event and the whole epoch mechanism would be tested against the
  *     wrong document.
  *
- * Not emulated, deliberately: unique-index enforcement and MongoDB's
- * IndexOptionsConflict. Neither is a requirement of this double — the
- * index-fault and TTL-conflict cases are driven by a PROGRAMMED rejection
- * (`failAll`/`failNext` with a supplied error), which is what the store's
- * containment actually reacts to, and emulating a conflict would make a
- * second `init()` throw for a reason no production path has.
+ * Not emulated, deliberately: MongoDB's IndexOptionsConflict. It is not a
+ * requirement of this double — the index-fault and TTL-conflict cases are
+ * driven by a PROGRAMMED rejection (`failAll`/`failNext` with a supplied
+ * error), which is what the store's containment actually reacts to, and
+ * emulating a conflict would make a second `init()` throw for a reason no
+ * production path has.
+ *
+ * ⚠ Unique-index enforcement WAS on that list and no longer is (KPR-468). It
+ * became a requirement the moment a consumer used the duplicate-key error as a
+ * signal rather than as a failure: D4's conditional-update-then-insert detects
+ * its own race by catching `code: 11000`. It is enforced against indexes this
+ * double was actually asked to create, so a collection with no unique index
+ * behaves exactly as it did before.
  *
  * TWO FURTHER DIVERGENCES, both safe and both previously undocumented — the
  * kind a case author only discovers by reading the implementation:
@@ -81,6 +88,22 @@ function set(row: Row, path: string, value: unknown): void {
   target[parts.at(-1)!] = copy(value);
 }
 
+/**
+ * KPR-468: the `$unset` counterpart to `set` — an actual `delete`, not
+ * `= undefined`. Several suites assert `Object.keys(doc)` directly, so a real
+ * driver's removed field must DISAPPEAR from the object rather than linger as
+ * an `undefined` value that `Object.keys` still reports.
+ */
+function unset(row: Row, path: string): void {
+  const parts = path.split(".");
+  let target = row;
+  for (const key of parts.slice(0, -1)) {
+    if (target[key] === undefined) return;
+    target = target[key];
+  }
+  delete target[parts.at(-1)!];
+}
+
 function same(a: unknown, b: unknown): boolean {
   if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime();
   if (a instanceof ObjectId || b instanceof ObjectId) return String(a) === String(b);
@@ -100,9 +123,37 @@ function same(a: unknown, b: unknown): boolean {
 }
 
 /**
- * Equality only, per the harness requirements. An operator-shaped term throws
- * rather than silently matching nothing, so a future test reaching for one
- * fails loudly instead of reporting coverage it lacks.
+ * KPR-468: the ONLY operators this double admits — exactly the four the ingest
+ * page-scan filter (`{ _id: { $gt: cursor } }`) needs. Everything else stays
+ * loud, per the original design.
+ */
+const COMPARISON_OPERATORS = ["$lt", "$lte", "$gt", "$gte"] as const;
+type ComparisonOperator = (typeof COMPARISON_OPERATORS)[number];
+
+/** The same `ObjectId → String` coercion `compare()` below already applies for sorting. */
+function coerce(value: any): any {
+  return value instanceof ObjectId ? String(value) : value;
+}
+
+function compareOperand(actual: any, op: ComparisonOperator, expected: any): boolean {
+  const a = coerce(actual);
+  const b = coerce(expected);
+  switch (op) {
+    case "$lt":
+      return a < b;
+    case "$lte":
+      return a <= b;
+    case "$gt":
+      return a > b;
+    case "$gte":
+      return a >= b;
+  }
+}
+
+/**
+ * Equality, plus KPR-468's four comparison operators. Any OTHER operator-shaped
+ * term throws rather than silently matching nothing, so a future test reaching
+ * for one fails loudly instead of reporting coverage it lacks.
  */
 function predicate(actual: any, expected: any): boolean {
   if (
@@ -112,8 +163,14 @@ function predicate(actual: any, expected: any): boolean {
     !(expected instanceof Date) &&
     !(expected instanceof ObjectId)
   ) {
-    const operator = Object.keys(expected).find((key) => key.startsWith("$"));
-    if (operator !== undefined) throw new Error("unsupported_filter_" + operator);
+    const operatorKeys = Object.keys(expected).filter((key) => key.startsWith("$"));
+    if (operatorKeys.length > 0) {
+      const unsupported = operatorKeys.find((key) => !(COMPARISON_OPERATORS as readonly string[]).includes(key));
+      if (unsupported !== undefined) throw new Error("unsupported_filter_" + unsupported);
+      // A real filter may combine bounds (`{ $gt: x, $lte: y }`); `every` is
+      // what makes that one conjunction rather than a special case.
+      return operatorKeys.every((key) => compareOperand(actual, key as ComparisonOperator, expected[key]));
+    }
   }
   return same(actual, expected);
 }
@@ -324,12 +381,39 @@ export class FakeCollection {
   }
 
   async countDocuments(filter: Row = {}, options: Row = {}): Promise<number> {
-    return this.owner.operation(
-      this.name,
-      "countDocuments",
-      { filter, options },
-      () => this.rows.filter((row) => matchesFilter(row, filter)).length,
-    );
+    return this.owner.operation(this.name, "countDocuments", { filter, options }, () => {
+      const matched = this.rows.filter((row) => matchesFilter(row, filter)).length;
+      // KPR-468: the real driver's `limit` option SATURATES the count. Without
+      // this, every "at least N" gauge assertion in the notifier's heartbeat is
+      // untestable — it would pass while asserting nothing.
+      const limit = typeof options.limit === "number" ? options.limit : Number.MAX_SAFE_INTEGER;
+      return Math.min(matched, limit);
+    });
+  }
+
+  /**
+   * KPR-468: unique-index enforcement, which this double declined before this
+   * ticket (see the header's "Not emulated, deliberately"). KPR-468's D4 writes
+   * conditional-update-then-insert and uses the duplicate-key error AS its race
+   * detector, so the error must now exist. Checked against every index recorded
+   * by `createIndex` with `unique: true`; a collection with no such index keeps
+   * the previous behaviour exactly.
+   */
+  private uniqueConflict(row: Row): boolean {
+    return this.indexes
+      .filter((index) => index.unique)
+      .some((index) => {
+        const keys = Object.keys(index.key as Row);
+        return this.rows.some(
+          (existing) => existing !== row && keys.every((key) => same(get(existing, key), get(row, key))),
+        );
+      });
+  }
+
+  private duplicateKeyError(): never {
+    const err: Error & { code?: number } = new Error(`E11000 duplicate key error collection: ${this.name}`);
+    err.code = 11000;
+    throw err;
   }
 
   async insertOne(document: Row, options: Row = {}): Promise<Row> {
@@ -337,6 +421,7 @@ export class FakeCollection {
       // Divergence 1: a REAL ObjectId, so the (publishedAt, _id) tie-break
       // rests on the same per-process monotonic value the driver mints.
       const row = { ...copy(document), _id: document._id ?? new ObjectId() };
+      if (this.uniqueConflict(row)) this.duplicateKeyError();
       this.rows.push(row);
       return { acknowledged: true, insertedId: row._id };
     });
@@ -344,11 +429,27 @@ export class FakeCollection {
 
   async updateOne(filter: Row, update: Row, options: Row = {}): Promise<Row> {
     return this.owner.operation(this.name, "updateOne", { filter, update, options }, () => {
+      // KPR-468: real MongoDB REJECTS an update naming one path in both $set
+      // and $unset ("Updating the path 'X' would create a conflict at 'X'").
+      // Silently resolving it — apply $set, then let $unset win — would make
+      // the notifier's no-interval delivery branch (the shipped-default path,
+      // and the most common write there is) green in test and throwing in
+      // production on the first tick.
+      for (const key of Object.keys(update.$unset ?? {})) {
+        if (Object.prototype.hasOwnProperty.call(update.$set ?? {}, key)) {
+          throw new Error(`Updating the path '${key}' would create a conflict at '${key}'`);
+        }
+      }
       const old = this.rows.find((row) => matchesFilter(row, filter));
       if (!old && !options.upsert) return { acknowledged: true, matchedCount: 0, modifiedCount: 0 };
       const row = old ?? { ...copy(filter), _id: filter._id ?? new ObjectId() };
+      // The upsert-creates-a-row branch is guarded too, not just `insertOne`:
+      // which idiom the ledger's create actually uses is a later task's choice,
+      // and the race-detector property must hold either way.
+      if (!old && this.uniqueConflict(row)) this.duplicateKeyError();
       if (!old && update.$setOnInsert) Object.assign(row, copy(update.$setOnInsert));
       for (const [key, value] of Object.entries(update.$set ?? {})) set(row, key, value);
+      for (const key of Object.keys(update.$unset ?? {})) unset(row, key);
       if (!old) this.rows.push(row);
       return { acknowledged: true, matchedCount: old ? 1 : 0, modifiedCount: old ? 1 : 0, upsertedCount: old ? 0 : 1 };
     });
