@@ -27,6 +27,13 @@ import { WRITE } from "./notification-store.js";
 
 const log = createLogger("ops-delivery");
 
+/**
+ * D5: the two stall reasons that hold a row the attempt gate would ADMIT. The
+ * third, `cadence`, is the gate itself declining, and it cannot hold an
+ * attemptCount-0 or forceDeliver row — see DeliveryPhase.run's two passes.
+ */
+const BLOCKED_STALL_REASONS = ["subscription", "transport"] as const satisfies readonly StalledReason[];
+
 /** D5: warn-once PER PROCESS, memoized on (profileName, intervalMs). */
 const floorWarned = new Set<string>();
 
@@ -95,6 +102,16 @@ export interface DeliveryContext {
   policy: OpsPolicy | null;
   lock: <T>(rowId: string, fn: () => Promise<T>) => Promise<T>;
   stopped: () => boolean;
+  /**
+   * KPR-294's write guard, threaded exactly as KPR-456 threads it
+   * (`() => !writeGuard.engaged`, index.ts). `false` means the database's
+   * identity is unverified: writes are refused and reads may be answering out
+   * of another instance's database. Checked before every write this phase
+   * makes AND immediately before every post — the post is the one step that
+   * cannot be refused after the fact, and a post whose record the guard then
+   * refuses leaves the row due, so the next tick would post it again.
+   */
+  canWrite: () => boolean;
   clock: () => Date;
   sleep: (ms: number) => Promise<void>;
 }
@@ -129,17 +146,31 @@ export class DeliveryPhase {
       .toArray();
     for (const row of rows) {
       if (ctx.stopped()) return ok;
+      // The guard is a phase stop, not a per-row skip: every remaining row
+      // would decline for the same reason, and the notifier counts the tick.
+      if (!ctx.canWrite()) return false;
       try {
         await ctx.lock(String(row._id), async () => {
-          // D7's table verbatim: `delivered` if the row has a recorded
-          // `accepted` outcome, else `pending`.
+          // Re-checked INSIDE the latch, immediately before the write: the
+          // latch can be held across a whole adapter deadline by intake or by
+          // a slow post, and the guard can engage while this row waits for it.
+          if (!ctx.canWrite()) return;
+          // D7's table: `delivered` if the row has a recorded `accepted`
+          // outcome IN THIS OCCURRENCE, else `pending`.
           //
-          // ⚠ The marker is `deliveryReference`, NOT the attempts[] ring. The
-          // ring is capped at ATTEMPTS_RING_CAP, so a row nudged past the cap
-          // since its accepted delivery no longer RECORDS that outcome in the
-          // ring and a ring-derived test would wrongly demote it.
-          // deliveryReference is written only on an accepted outcome and is
-          // never unset, so it is the durable form of the same question.
+          // ⚠ The marker is `deliveryReference`, NOT the attempts[] ring and
+          // NOT `lastOutcome`. The ring is capped at ATTEMPTS_RING_CAP, so a
+          // row nudged past the cap since its accepted delivery no longer
+          // RECORDS that outcome in it; and `lastOutcome` is the LAST
+          // attempt's outcome, so a row accepted and then nudged with a
+          // `rejected` would be demoted, while a reopened row snoozed before
+          // its first new attempt still carries the PREVIOUS occurrence's
+          // `accepted`. deliveryReference is written only on an accepted
+          // outcome and is unset ONLY by the `cleared → pending` reopen
+          // (ingest.ts, Arm A) — the occurrence boundary — so it is exactly
+          // "accepted since this occurrence began". Before the reopen unset
+          // it, a reopen → rejected attempt → snooze → expiry reported
+          // `delivered` for an occurrence no transport ever accepted.
           const next = row.deliveryReference !== undefined ? "delivered" : "pending";
           // ⚠ `snoozedUntil: { $lte: now }` IN THE FILTER, not only in the scan.
           // The scan's copy predates this latch, so a RE-SNOOZE (intake moves
@@ -184,14 +215,42 @@ export class DeliveryPhase {
   }
 
   /**
-   * D5's three ordered arms, served under ONE shared wall-clock budget.
+   * D5's three ordered arms, served under ONE shared wall-clock budget, with
+   * arms 1 and 2 each read in TWO passes.
    *
    * The stall alone bounds the STEADY-STATE cost; it does not by itself
    * guarantee that a re-check tick's arriving cohort cannot crowd out a new
    * row on that tick. That guarantee is the arm split: arms 1 and 2 carry an
-   * equality bound on their index's leading key, so the cadence-stall backlog
+   * equality bound on their index's leading key, so the CADENCE-stall backlog
    * is not in their buckets AT ALL — structural immunity, not an ordering
    * convention a query planner could lose.
+   *
+   * ⚠ That equality bound does NOT exclude the OTHER two stall reasons, and
+   * the two passes are what does. A row stalled on `subscription` or
+   * `transport` has not been attempted, so it keeps `attemptCount: 0` (and a
+   * forced row keeps `forceDeliver`) and sits in arm 1's (or arm 2's) bucket
+   * for as long as it stays blocked — which, for a subscription whose
+   * adapterId names no registered adapter (D6 loads it unvalidated), is
+   * forever, and grows with traffic. Such rows sort OLDEST, so read in one
+   * pass they took the page and the budget ahead of a healthy subscriber's
+   * fresh row, re-arriving every stall re-check, and a large enough blocked
+   * set starved that row indefinitely. So each of arms 1 and 2 is served:
+   *
+   *  (a) first over rows NOT blocked (`stalledReason ∉ {subscription,
+   *      transport}` — a `cadence` stall cannot hold a row here, since the
+   *      first two gate disjuncts pass by construction, and a snooze-expired
+   *      row legitimately arrives still carrying one); then
+   *  (b) over the blocked rows, still ahead of arm 3 — so D5's "an
+   *      attemptCount 0 row stalled on subscription or transport is first
+   *      delivered on a re-check tick once it clears" is not demoted behind
+   *      the cadence backlog.
+   *
+   * The two passes PARTITION each arm exactly, so no row is read twice. What
+   * pass (a)'s exclusion costs is stated plainly: it is a residual filter
+   * over the arm's index, so the DATABASE still walks any due blocked rows in
+   * that prefix. What it buys is that they no longer consume the page, the
+   * per-row latch, a stall write or the phase's wall-clock budget ahead of a
+   * servable row — which is the resource the starvation was over.
    */
   async run(now: Date, ctx: DeliveryContext): Promise<DeliveryResult> {
     // ⚠ The budget clock starts HERE, at the top of the delivery phase, from a
@@ -204,14 +263,22 @@ export class DeliveryPhase {
     // the tick's instant for everything the rows record and for the due-scan.
     const budgetEnd = ctx.clock().getTime() + DELIVERY_BUDGET_MS;
     const working = { $in: [...OPS_NUDGE_STATES] };
+    const notBlocked = { stalledReason: { $nin: [...BLOCKED_STALL_REASONS] } };
+    const blocked = { stalledReason: { $in: [...BLOCKED_STALL_REASONS] } };
+    const arm1 = { state: working, attemptCount: 0, nextNudgeAt: { $lte: now } };
+    // Arm 2 — the two non-cadence re-delivery triggers. No `state` key: no
+    // non-working row carries a nextNudgeAt at all (D5's scoping of the
+    // never-unset rule), so this range holds only pending/delivered rows by
+    // type bracketing rather than by a residual filter.
+    const arm2 = { forceDeliver: true, nextNudgeAt: { $lte: now } };
     const arms = [
-      // Arm 1 — the guaranteed first delivery.
-      { state: working, attemptCount: 0, nextNudgeAt: { $lte: now } },
-      // Arm 2 — the two non-cadence re-delivery triggers. No `state` key: no
-      // non-working row carries a nextNudgeAt at all (D5's scoping of the
-      // never-unset rule), so this range holds only pending/delivered rows by
-      // type bracketing rather than by a residual filter.
-      { forceDeliver: true, nextNudgeAt: { $lte: now } },
+      // Arm 1 — the guaranteed first delivery — then arm 2, each over the rows
+      // no subscription/transport stall is holding.
+      { ...arm1, ...notBlocked },
+      { ...arm2, ...notBlocked },
+      // The same two arms over the rows such a stall IS holding (see above).
+      { ...arm1, ...blocked },
+      { ...arm2, ...blocked },
       // Arm 3 — ordinary cadence nudges. This is the arm a stall cohort lands
       // in, and it is drawn last.
       { state: working, nextNudgeAt: { $lte: now } },
@@ -231,6 +298,8 @@ export class DeliveryPhase {
         .toArray();
       for (const row of rows) {
         if (ctx.stopped()) return { ok, attempted, deferred: true };
+        // A phase stop, like `stopped` — not ok, because work was left due.
+        if (!ctx.canWrite()) return { ok: false, attempted, deferred: true };
         // The budget is wall-clock and is counted over EVERY row the phase
         // touches, attempted or declined — which is precisely why the stall
         // and the arm split exist rather than a bare cap on the scan.
@@ -259,10 +328,10 @@ export class DeliveryPhase {
     if (!deferred) {
       // Rows still due beyond an arm's page bound are backlog too.
       //
-      // A HEURISTIC, deliberately, and named as one: `seen` spans all three
-      // arms, so this conflates "one arm's page was full" with "work remains",
-      // and it can read `true` when the three arms happened to sum to a full
-      // page between them with nothing left behind. It feeds only the
+      // A HEURISTIC, deliberately, and named as one: `seen` spans every arm
+      // pass, so this conflates "one pass's page was full" with "work
+      // remains", and it can read `true` when the passes happened to sum to a
+      // full page between them with nothing left behind. It feeds only the
       // heartbeat's `backlog` vs `ok` label — never a control decision — and
       // both of its failure directions cost an operator one 30 s tick of a
       // slightly pessimistic label. Do not build anything on it that needs the
@@ -282,6 +351,11 @@ export class DeliveryPhase {
     ctx: DeliveryContext,
     waitMs: number,
   ): Promise<"declined" | "attempted" | "attempted-unrecorded"> {
+    // 0. The identity guard, before the first write this method can make (a
+    //    stall). The latch this runs under may have been queued behind a slow
+    //    post or an intake call, so the loop-head check is not enough.
+    if (!ctx.canWrite()) return "declined";
+
     // 1. Resolve the subscription. Unresolved ⇒ stall. This is D11 lever 1 —
     //    ops_subscriptions.enabled: false — taking effect.
     const sub = ctx.subscriptions.get(row.subscriptionId);
@@ -341,6 +415,22 @@ export class DeliveryPhase {
       return "declined";
     }
 
+    // 4b. THE IDENTITY GUARD, immediately before the irreversible side effect —
+    //     KPR-456's `if (!this.canSend()) return … "identity_unverified"`
+    //     (slack-post.ts:55), carried here rather than into the adapter
+    //     because D10 fixes SlackOpsTransport's constructor at two arguments.
+    //
+    // ⚠ Not defensive, and the failure it closes is a LOOP. `db` is
+    // guardDb(rawDb, writeGuard): reads pass through an engaged guard and
+    // writes are refused. Without this check the phase read a due row, posted
+    // it, then had record() refused — leaving attemptCount, forceDeliver and
+    // nextNudgeAt exactly as due as before, so the NEXT tick posted it again,
+    // every tick, for as long as the guard stayed engaged. It is also a
+    // correctness check, not only a rate one: an engaged guard means the
+    // reads that chose this row may be answering out of ANOTHER instance's
+    // database. Declining writes nothing and is not an attempt.
+    if (!ctx.canWrite()) return "declined";
+
     // 5. Build the view FROM THE FRESH READ and deliver, bounded by THE
     //    ADAPTER'S OWN DEADLINE, not by the sweep's patience (D12).
     let outcome: DeliveryOutcome;
@@ -359,8 +449,31 @@ export class DeliveryPhase {
 
     // 6. Record, against the fresh read — its (state, attemptCount) is the CAS
     //    precondition, and its attempts[] ring is the one the append extends.
+    //
+    // The guard can engage DURING the post (an adapter deadline is seconds),
+    // and a guarded write would only be refused. The attempt is then spent and
+    // unrecorded exactly as on the two other shapes below, and counted on the
+    // same counter. What bounds it to ONE post rather than one per tick is
+    // that every later tick is skipped whole while the guard stays engaged
+    // (OpsNotifier.run); on disengagement the row is still due and is posted
+    // once more — a bounded duplicate, the direction D4 errs in.
+    if (!ctx.canWrite()) {
+      this.counters.deliveryRecordLost += 1;
+      log.warn(
+        "ops delivery record withheld — DB identity unverified after an external side effect; the attempt is unrecorded",
+        {
+          adapterId: adapter.adapterId,
+          outcome: outcome.status,
+        },
+      );
+      return "attempted-unrecorded";
+    }
     try {
-      await this.record(fresh, outcome, interval, adapter.adapterId, now);
+      // `false` is a lost CAS — record() has already counted and logged it.
+      // Returned as `attempted-unrecorded` like the thrown shape, so both
+      // mark the phase not-ok and the heartbeat reads `degraded` for either
+      // (notification-types.ts, deliveryRecordLost).
+      if (!(await this.record(fresh, outcome, interval, adapter.adapterId, now))) return "attempted-unrecorded";
     } catch (err) {
       // ⚠ COUNTED ON deliveryRecordLost, NOT sweepFaults. The side effect is
       // spent: the message is posted and, for Slack, its ts registered as an
@@ -442,7 +555,7 @@ export class DeliveryPhase {
     interval: number | undefined,
     adapterId: string,
     now: Date,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const entry: NotificationAttempt = {
       at: now,
       outcome: outcome.status,
@@ -536,7 +649,9 @@ export class DeliveryPhase {
         adapterId,
         outcome: outcome.status,
       });
+      return false;
     }
+    return true;
   }
 
   /** D6. Structured, carrying the RESOLVED target; never a rendered string. */

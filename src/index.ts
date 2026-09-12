@@ -599,7 +599,12 @@ async function main(): Promise<void> {
   //    live, and only the sweep stays off — reasons feed remediation at
   //    delivery and intake consumes none of them.
   //  - every other index fault is contained, counted, and keeps it usable.
-  const opsNotifier = new OpsNotifier(db, config.activity.retentionDays);
+  //
+  // The third argument is KPR-294's write guard in the exact shape and
+  // position ObligationRuntime takes it above. `db` is guarded, so reads pass
+  // an engaged guard and only writes are refused: without this the sweep
+  // posts a due row, has its record refused, and re-posts it every tick.
+  const opsNotifier = new OpsNotifier(db, config.activity.retentionDays, () => !writeGuard.engaged);
   try {
     await opsNotifier.init();
     setOpsNotifier(opsNotifier);

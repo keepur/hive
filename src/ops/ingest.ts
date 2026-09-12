@@ -386,7 +386,15 @@ export class IngestPhase {
             forceDeliver: true,
           },
           $inc: { eventCount: 1 },
-          $unset: { expiresAt: "", stalledAt: "", stalledReason: "" },
+          // ⚠ deliveryReference IS unset here, and this is the ONE write that
+          // unsets it. A reopen starts a new occurrence in `pending`, and
+          // snooze expiry reads deliveryReference as "a transport accepted a
+          // delivery IN THIS OCCURRENCE" (delivery.ts, expire). Retained
+          // across this boundary, a reopen → rejected attempt → snooze →
+          // expiry reported `delivered` for an occurrence nothing accepted.
+          // The previous occurrence's reference is not lost to history: its
+          // accepted attempt is still in attempts[] until the ring rolls.
+          $unset: { expiresAt: "", stalledAt: "", stalledReason: "", deliveryReference: "" },
         },
         WRITE,
       );

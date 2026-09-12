@@ -19,6 +19,7 @@
  * excludes from its producer-source scans — so it may name collections and
  * state literals freely.
  */
+import { guardDb, type WriteGuard } from "../../db/write-guard.js";
 import { OpsNotifier } from "../notifier.js";
 import { OpsNotificationStore, NOTIFIER_STATS_KIND } from "../notification-store.js";
 import { OPS_POLICY_COLLECTION, OPS_POLICY_ID, type OpsNotification, type OpsPolicy } from "../notification-types.js";
@@ -157,6 +158,14 @@ export interface HarnessOptions {
   /** `null` ⇒ register none (the unbound-adapter cases). */
   transport?: FakeTransport | null;
   /**
+   * KPR-294's write guard, wired the way index.ts wires it: the notifier sees
+   * `guardDb(db, guard)` and `() => !guard.engaged`. Absent ⇒ the raw double
+   * and an always-writable guard. Only the NOTIFIER is guarded — the harness's
+   * own `store`, `seedEvent` and `row` keep the raw double, so a case can seed
+   * and inspect while the guard is engaged.
+   */
+  writeGuard?: WriteGuard;
+  /**
    * Default FALSE. Reproduces start()'s first subscription load
    * (reloadSubscriptions(true)) without arming timers or running the
    * immediate sweep, so every tick in a test is one the test asked for. Pass
@@ -208,9 +217,11 @@ export async function harness(options: HarnessOptions = {}): Promise<NotifierHar
 
   const transport = options.transport ?? new FakeTransport("fake", () => clock);
   const store = new OpsNotificationStore(db.db);
+  const guard = options.writeGuard;
   const notifier = new OpsNotifier(
-    db.db,
+    guard ? guardDb(db.db, guard) : db.db,
     options.activityRetentionDays ?? 90,
+    guard ? () => !guard.engaged : () => true,
     () => clock,
     // No real wall-clock delay: ATTEMPT_SPACING_MS must not cost a suite a
     // second per attempt.

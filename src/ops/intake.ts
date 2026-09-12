@@ -25,12 +25,18 @@ import {
   type OpsPolicy,
 } from "./notification-types.js";
 import { WRITE } from "./notification-store.js";
+import { OPS_ID_MAX_LENGTH } from "./ids.js";
 
 /** D7's table: the four states an attributed act may transition FROM. */
 const LEGAL_FROM: readonly OpsNotificationState[] = ["pending", "delivered", "seen", "snoozed"];
 
 /** D7's `OpsAck`: the only three states an attributed act may transition TO. */
 const ACTS: readonly unknown[] = ["seen", "dismissed", "snoozed"] satisfies readonly OpsAck[];
+
+/** Step 2b's membership test, exported so the seam's pre-validation log line can use the same one. */
+export function isOpsAck(value: unknown): value is OpsAck {
+  return ACTS.includes(value);
+}
 
 /** Signals a lost CAS to the one-retry loop. Never escapes this module. */
 const LOST = Symbol("cas-lost");
@@ -101,9 +107,18 @@ export class OpsIntake {
     // the system principal, which D7 rule 5 and C9 forbid ABSOLUTELY. Never
     // attributed to the adapter, to a service account, or to the system
     // principal.
+    //
+    // The LENGTH bound is `OPS_ID_MAX_LENGTH` by ADJACENCY, not derivation —
+    // the same 200 KPR-454 bounds subject/evidence ids and a subscription
+    // row's `_id` with (ids.ts). A real actorId is a Slack user id or an agent
+    // slug, a small fraction of it. Unbounded, a caller-supplied string would
+    // be STORED TWICE on the row (as `principal` and inside `lastAckKey`).
+    // Refused rather than truncated: a truncated id attributes the act to an
+    // identity nobody holds.
     if (
       typeof input.actorId !== "string" ||
       input.actorId.trim().length === 0 ||
+      input.actorId.length > OPS_ID_MAX_LENGTH ||
       input.actorId === OPS_SYSTEM_PRINCIPAL
     ) {
       return { state: "refused", reason: "unattributed" };
@@ -123,7 +138,7 @@ export class OpsIntake {
     // than folded into step 6: a malformed act must never earn a `noop`
     // (`superseded`) or the benign `row-cleared` from steps 3–4, both of which
     // tell the edge its call was fine.
-    if (!ACTS.includes(input.act)) return { state: "refused", reason: "illegal-transition" };
+    if (!isOpsAck(input.act)) return { state: "refused", reason: "illegal-transition" };
 
     const now = this.clock();
     // ⚠ AN UNUSABLE `at` IS SUBSTITUTED WITH `now`, AND THE SUBSTITUTION IS

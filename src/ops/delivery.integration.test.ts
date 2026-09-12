@@ -17,12 +17,18 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mockLog = vi.hoisted(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
 vi.mock("../logging/logger.js", () => ({ createLogger: () => mockLog }));
 
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ObjectId } from "mongodb";
+import { WriteGuard } from "../db/write-guard.js";
 import { DeliveryPhase, __resetCadenceWarningsForTests, resolveCadence } from "./delivery.js";
+import { OPS_LOG_VALUE_MAX } from "./ids.js";
 import { OpsNotifier } from "./notifier.js";
 import { NOTIFIER_STATS_KIND, OpsNotificationStore } from "./notification-store.js";
 import {
   ATTEMPTS_RING_CAP,
+  DELIVERY_ARM_PAGE_SIZE,
   DELIVERY_BUDGET_MS,
   GAUGE_COUNT_LIMIT,
   OPS_NOTIFICATIONS_COLLECTION,
@@ -463,6 +469,183 @@ describe("the stall — a declined row is PUSHED FORWARD, never left untouched",
 // Snooze expiry.
 // ───────────────────────────────────────────────────────────────────────────
 
+describe("the arm passes — a blocked stall set cannot starve a servable row", () => {
+  /** `count` due ledger rows for one subscription, oldest first, all older than `t(0)`. */
+  const seedDue = async (h: NotifierHarness, count: number, over: Partial<OpsNotification>) => {
+    for (let i = 0; i < count; i += 1) {
+      await h.store.notifications.insertOne(
+        ledgerRow({ dedupeKey: `tool:workItem:w${i}:r1:0`, nextNudgeAt: t(-60 + i / 1_000), ...over }),
+      );
+    }
+  };
+
+  it("a healthy subscriber's FIRST delivery is attempted ahead of two full pages of transport-stalled first deliveries", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE. These rows have never been attempted, so they
+    // keep attemptCount 0 and sat in arm 1's bucket forever, sorting OLDEST:
+    // two pages of them filled arm 1's page and then arm 3's, and the fresh
+    // row reached neither on this tick — nor on any later one, since the
+    // blocked set re-arrives every stall re-check.
+    const h = await harness({
+      subscriptions: [sub("healthy"), sub("blocked", { transport: { adapterId: "nowhere", target: "C0000009" } })],
+      policy: policyWith(),
+    });
+    await seedDue(h, 2 * DELIVERY_ARM_PAGE_SIZE, {
+      subscriptionId: "blocked",
+      attemptCount: 0,
+      stalledReason: "transport",
+      stalledAt: t(-65),
+    });
+    const e = await h.seedEvent({ matchedSubscriptionIds: ["healthy"] });
+
+    await h.tick();
+
+    const fresh = await h.row("healthy", e.dedupeKey);
+    expect(h.transport.views.map((v) => v.handle)).toEqual([String(fresh._id)]);
+    expect(fresh.attemptCount).toBe(1);
+    // The blocked rows were still RE-CHECKED rather than skipped: the blocked
+    // pass took one page and arm 3 the next, each row re-stalled and pushed.
+    expect(h.snapshot().transportUnbound).toBe(2 * DELIVERY_ARM_PAGE_SIZE);
+  });
+
+  it("a blocked first delivery that has UNBLOCKED is served ahead of a full page of arm 3's cadence backlog", async () => {
+    // The guard against the naive remedy: excluding blocked rows from arm 1
+    // alone drops them into arm 3, BEHIND the cadence-stall backlog — which,
+    // under the shipped default, is every attempted working row. D5 promises
+    // such a row is first delivered on its re-check tick once it clears.
+    const h = await harness({ subscriptions: [sub("s1")] }); // no ops_policy: every attempted row is cadence-stalled
+    await seedDue(h, DELIVERY_ARM_PAGE_SIZE, { attemptCount: 1, stalledReason: "cadence", stalledAt: t(-65) });
+    // Stalled on a subscription that was disabled and is loaded again now.
+    const { insertedId } = await h.store.notifications.insertOne(
+      ledgerRow({
+        dedupeKey: "tool:workItem:unblocked:r1:0",
+        attemptCount: 0,
+        stalledReason: "subscription",
+        stalledAt: t(-6),
+        nextNudgeAt: t(-1),
+      }),
+    );
+
+    await h.tick();
+
+    expect(h.transport.views.map((v) => v.handle)).toEqual([String(insertedId)]);
+  });
+});
+
+describe("the DB identity write guard (KPR-294) — nothing is posted that cannot be recorded", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const guarded = () => new WriteGuard({ instanceId: "test", dbName: "test" });
+  const notifierOps = (h: NotifierHarness, from: number) =>
+    h.db.operations.slice(from).filter((op) => op.collection !== OPS_EVENTS_COLLECTION);
+
+  it("a guard engaging DURING a post withholds the record, and no later tick re-posts while it stays engaged", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE, and the failure is a loop. `db` is guardDb():
+    // reads pass an engaged guard, writes are refused. Before the guard was
+    // threaded through, a refused record left the row exactly as due as
+    // before, so EVERY tick posted it again for as long as the guard held.
+    const guard = guarded();
+    const h = await harness({ subscriptions: [sub("s1"), sub("s2")], policy: policyWith(), writeGuard: guard });
+    const e = await h.seedEvent();
+    h.transport.onDeliver = () => {
+      guard.engage("mismatch");
+      h.transport.onDeliver = undefined;
+    };
+
+    await h.tick();
+    expect(h.transport.views).toHaveLength(1); // s2's row was never posted
+    expect(h.snapshot().deliveryRecordLost).toBe(1);
+    expect(warnLines("ops delivery record withheld")).toHaveLength(1);
+    // WITHHELD, not attempted-and-refused: no write reached the guard at all.
+    expect(guard.refusedWriteCount).toBe(0);
+
+    const mark = h.db.operations.length;
+    for (let i = 0; i < 5; i += 1) await h.tick();
+    expect(h.transport.views).toHaveLength(1);
+    expect(guard.refusedWriteCount).toBe(0);
+    // The whole tick is skipped — reads included, since an engaged guard may
+    // mean the reads are answering out of another instance's database.
+    expect(notifierOps(h, mark)).toEqual([]);
+    expect(h.snapshot().identityUnverifiedSkips).toBe(6);
+    expect(warnLines("ops sweep paused — DB identity unverified")).toHaveLength(1);
+
+    // Disengaged: the unrecorded row is posted ONCE more (the bounded duplicate
+    // D4 errs toward), s2's row gets its first delivery, and both record.
+    guard.disengage();
+    await h.tick();
+    expect(h.transport.views).toHaveLength(3);
+    expect((await h.row("s1", e.dedupeKey)).attemptCount).toBe(1);
+    expect((await h.row("s2", e.dedupeKey)).attemptCount).toBe(1);
+    expect(mockLog.info.mock.calls.filter((c) => String(c[0]).includes("ops sweep resumed"))).toHaveLength(1);
+    const hb = await h.heartbeat();
+    expect(hb.state).toBe("ok");
+    expect(hb.identityUnverifiedSkips).toBe(6);
+  });
+
+  it("a guard ALREADY engaged at tick start reads, posts and writes nothing, and the due row waits for the first verified tick", async () => {
+    const guard = guarded();
+    const h = await harness({ subscriptions: [sub("s1")], policy: policyWith(), writeGuard: guard });
+    const { insertedId } = await h.store.notifications.insertOne(ledgerRow({ attemptCount: 0, nextNudgeAt: t(-1) }));
+    const before = JSON.stringify(await h.store.notifications.findOne({ _id: insertedId }));
+
+    guard.engage("cant_verify");
+    const mark = h.db.operations.length;
+    await h.tick();
+    await h.tick();
+
+    expect(h.transport.views).toHaveLength(0);
+    expect(notifierOps(h, mark)).toEqual([]);
+    expect(guard.refusedWriteCount).toBe(0);
+    expect(JSON.stringify(await h.store.notifications.findOne({ _id: insertedId }))).toBe(before);
+    expect(h.snapshot().identityUnverifiedSkips).toBe(2);
+
+    guard.disengage();
+    await h.tick();
+    expect(h.transport.views.map((v) => v.handle)).toEqual([String(insertedId)]);
+  });
+
+  it("snooze expiry writes nothing when the guard engages between its scan and its write", async () => {
+    const guard = guarded();
+    const h = await harness({ subscriptions: [sub("s1")], writeGuard: guard });
+    const snoozedRow: Partial<OpsNotification> = ledgerRow({ state: "snoozed", snoozedUntil: t(-5) });
+    delete snoozedRow.nextNudgeAt; // a snoozed row carries none (D5)
+    const { insertedId } = await h.store.notifications.insertOne(snoozedRow as OpsNotification);
+    const gate = h.db.pause(OPS_NOTIFICATIONS_COLLECTION, "find", (ctx) => ctx.filter?.state === "snoozed");
+    const tick = h.tick();
+    await gate.reached;
+    guard.engage("mismatch");
+    gate.release();
+    await tick;
+
+    expect((await h.store.notifications.findOne({ _id: insertedId }))!.state).toBe("snoozed");
+    expect(expiryWrites(h)).toEqual([]);
+    expect(guard.refusedWriteCount).toBe(0);
+    expect(h.snapshot().sweepFaults).toBe(0);
+    expect(h.snapshot().identityUnverifiedSkips).toBe(1);
+  });
+
+  it("a subscription reload while the guard is engaged retains the previous set", async () => {
+    const guard = guarded();
+    const h = await harness({ subscriptions: [sub("s1")], writeGuard: guard });
+    await h.db.collection(OPS_SUBSCRIPTIONS_COLLECTION).insertOne(sub("s2"));
+
+    guard.engage("mismatch");
+    await h.notifier.reloadSubscriptions();
+    expect(h.snapshot().subscriptions).toBe(1);
+
+    guard.disengage();
+    await h.notifier.reloadSubscriptions();
+    expect(h.snapshot().subscriptions).toBe(2);
+  });
+
+  it("index.ts wires the notifier to the guard in the same shape it wires KPR-456's runtime", () => {
+    // The guard is a DEFAULTED constructor argument (KPR-455's intake-only CLI
+    // construction omits it), so the one construction that runs a sweep is
+    // pinned here rather than left to the type checker.
+    const index = readFileSync(join(here, "..", "index.ts"), "utf8");
+    expect(index).toContain("new ObligationRuntime(db, config.activity.retentionDays, () => !writeGuard.engaged)");
+    expect(index).toContain("new OpsNotifier(db, config.activity.retentionDays, () => !writeGuard.engaged)");
+  });
+});
+
 describe("snooze expiry", () => {
   /** Puts the one ledger row into `snoozed` the way intake (chunk 4) will. */
   const snooze = async (h: NotifierHarness, id: ObjectId, until: Date) => {
@@ -522,6 +705,69 @@ describe("snooze expiry", () => {
       principal: OPS_SYSTEM_PRINCIPAL,
     });
     expect(writes[0]!.context.update!.$unset).toEqual({ snoozedUntil: "", expiresAt: "" });
+  });
+
+  it("a REOPENED row whose new attempt was not accepted returns to `pending` — the last occurrence's reference does not count", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE. deliveryReference used to survive the
+    // `cleared → pending` reopen, so this exact sequence — reopen, a rejected
+    // attempt, a snooze from `pending` (legal), expiry — reported `delivered`
+    // for an occurrence no transport ever accepted.
+    const KEY = "tool:workItem:w1:r1:0";
+    const h = await harness({ subscriptions: [sub("s1")] });
+    await h.seedEvent({ dedupeKey: KEY, class: "resource", publishedAt: t(0) });
+    await h.tick();
+    expect((await h.row("s1", KEY)).deliveryReference).toBeDefined();
+
+    await h.seedEvent({
+      dedupeKey: "tool:workItem:w1:recovered:0",
+      clears: KEY,
+      class: "informational",
+      publishedAt: t(1),
+      matchedSubscriptionIds: [],
+    });
+    h.advance(60_000);
+    await h.tick();
+    expect((await h.row("s1", KEY)).state).toBe("cleared");
+
+    // The condition comes back; its forced re-delivery is refused.
+    h.transport.program({ status: "rejected", reason: "refused-rate-limit" });
+    await h.seedEvent({ dedupeKey: KEY, class: "resource", publishedAt: t(3) });
+    h.advance(60_000);
+    await h.tick();
+    const reopened = await h.row("s1", KEY);
+    expect(reopened.state).toBe("pending");
+    expect(reopened.lastOutcome).toBe("rejected");
+    expect(reopened.deliveryReference).toBeUndefined();
+
+    await snooze(h, reopened._id!, new Date(h.now().getTime() + 60_000));
+    h.advance(10 * 60_000);
+    await h.tick();
+
+    const writes = expiryWrites(h);
+    expect(writes.at(-1)!.context.update!.$set).toMatchObject({ state: "pending" });
+    // The expiry tick's own forced re-delivery is refused too (the last
+    // programmed outcome repeats), so the row stays where expiry put it.
+    expect((await h.row("s1", KEY)).state).toBe("pending");
+  });
+
+  it("an accepted delivery followed by a REJECTED nudge still returns to `delivered` — lastOutcome is not the marker", async () => {
+    // The opposite direction, and the reason the marker is not `lastOutcome`:
+    // this occurrence WAS accepted, so demoting it to `pending` would be wrong.
+    const h = await harness({ subscriptions: [sub("s1")], policy: policyWith() });
+    const e = await h.seedEvent();
+    await h.tick();
+    h.transport.program({ status: "rejected", reason: "refused-rate-limit" });
+    h.advance(CADENCE);
+    await h.tick();
+    const row = await h.row("s1", e.dedupeKey);
+    expect(row.state).toBe("delivered");
+    expect(row.lastOutcome).toBe("rejected");
+
+    await snooze(h, row._id!, new Date(h.now().getTime() + 60_000));
+    h.advance(10 * 60_000);
+    await h.tick();
+
+    expect(expiryWrites(h).at(-1)!.context.update!.$set).toMatchObject({ state: "delivered" });
   });
 
   it("runs BEFORE delivery, so an expiring row is re-delivered on the SAME tick", async () => {
@@ -616,6 +862,9 @@ describe("record()'s CAS — the one write that follows an irreversible side eff
 
     expect(h.snapshot().deliveryRecordLost).toBe(1);
     expect(warnLines("ops delivery record lost a CAS")).toHaveLength(1);
+    // The SAME heartbeat treatment as the thrown shape below: a spent,
+    // unrecorded side effect degrades the tick whichever way the record missed.
+    expect((await h.heartbeat()).state).toBe("degraded");
 
     const row = await h.row("s1", KEY);
     expect(row.attempts).toEqual([]);
@@ -944,6 +1193,7 @@ describe("init / start / stop", () => {
       notifier: new OpsNotifier(
         db.db,
         90,
+        () => true,
         () => BASE,
         async () => {},
       ),
@@ -1078,6 +1328,31 @@ describe("validateTarget at subscription-load time", () => {
     const stored = (await h.db.collection(OPS_SUBSCRIPTIONS_COLLECTION).findOne({ _id: "s-rejected-target" }))!;
     expect(stored.enabled).toBe(true);
     expect(stored.transport).toEqual({ adapterId: "fake", target: "C0000001" });
+  });
+
+  it("an operator-written subscription `_id` reaches both unload warns CLIPPED, never raw (C13)", async () => {
+    const rejecting = new FakeTransport(
+      "fake",
+      () => BASE,
+      () => false,
+    );
+    // Unique ids per case: both warn-once memos are process-global.
+    const longRejected = `s-long-rejected-${"x".repeat(10_000)}`;
+    const longMalformed = `s-long-malformed-${"y".repeat(10_000)}`;
+    const h = await harness({
+      subscriptions: [sub(longRejected), sub(longMalformed, { transport: null as never })],
+      transport: rejecting,
+    });
+    expect(h.snapshot().subscriptionUnloaded).toBe(2);
+
+    const logged = [
+      warnLines("ops subscription target rejected by its adapter")[0]![1].subscriptionId,
+      warnLines("ops subscription row has no usable transport binding")[0]![1].subscriptionId,
+    ];
+    expect(logged).toEqual([
+      `${longRejected.slice(0, OPS_LOG_VALUE_MAX)}…`,
+      `${longMalformed.slice(0, OPS_LOG_VALUE_MAX)}…`,
+    ]);
   });
 
   it("a subscription whose adapterId names no registered adapter loads normally, unvalidated", async () => {

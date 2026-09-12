@@ -1872,6 +1872,7 @@ describe("AC14 — boot postures: what a fault at init() or start() leaves live"
       notifier: new OpsNotifier(
         db.db,
         90,
+        () => true,
         () => BASE,
         async () => {},
       ),

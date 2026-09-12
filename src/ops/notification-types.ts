@@ -145,7 +145,13 @@ export interface OpsNotification {
   // D7 delivery.
   attempts: NotificationAttempt[];
   attemptCount: number;
+  /** The LAST attempt's outcome — which, until a reopened row's first new attempt, is the previous occurrence's. */
   lastOutcome?: AttemptOutcome;
+  /**
+   * OCCURRENCE-scoped: set by an accepted outcome, unset only by the
+   * `cleared → pending` reopen. Its presence is "accepted in this occurrence",
+   * which is what snooze expiry's `delivered`-or-`pending` choice reads.
+   */
   deliveryReference?: DeliveryReference;
 
   // D7 nudging.
@@ -243,10 +249,19 @@ export interface OpsNotifierCounters {
   /**
    * D8: the record write that did not land. It counts the one write in this
    * component that happens AFTER an irreversible external side effect (a
-   * posted Slack message, its ts already registered), on BOTH of its failure
-   * shapes — a lost CAS, and a write that threw — so a miss loses the
-   * attempt's whole record, and a row still in a working state is re-attempted
-   * next tick: a duplicate post with no ledger trace.
+   * posted Slack message, its ts already registered), on ALL THREE of its
+   * failure shapes — a lost CAS, a write that threw, and a write withheld
+   * because KPR-294's write guard engaged during the post — so a miss loses
+   * the attempt's whole record, and a row still in a working state can be
+   * re-attempted: a duplicate post with no ledger trace.
+   *
+   * The three shapes are treated IDENTICALLY everywhere, and that is
+   * deliberate: each one marks the delivery phase not-ok, so the tick's
+   * heartbeat reads `degraded` whichever shape fired. A lost CAS is not the
+   * milder of them — no in-process writer can cause one (below), so it means
+   * a writer OUTSIDE this process's latch moved a row mid-post (a second
+   * engine, a hand edit), which an operator needs to see at least as much as
+   * a storage fault.
    *
    * The lost-CAS shape is kept from firing by the per-row latch TOGETHER WITH
    * the delivery phase's pre-post re-read (delivery.ts, attemptRow step 4) —
@@ -254,7 +269,8 @@ export interface OpsNotifierCounters {
    * both, no in-process writer can reach it; it is COUNTED rather than left
    * silent because those two mechanisms are exactly what a future edit
    * changes. The thrown shape is an ordinary storage fault and is reachable
-   * whenever Mongo is.
+   * whenever Mongo is. The withheld shape is bounded to ONE post per
+   * engagement: every tick after it is skipped whole (identityUnverifiedSkips).
    */
   deliveryRecordLost: number;
   subscriptionUnresolved: number;
@@ -274,6 +290,15 @@ export interface OpsNotifierCounters {
   subscriptionReloadFaults: number;
   policyReadFaults: number;
   indexFailures: number;
+  /**
+   * KPR-294/KPR-456: a sweep tick that did nothing — or stopped short at a
+   * phase or row boundary — because the DB identity write guard was engaged.
+   * At most one per tick. While engaged the tick reads nothing, posts nothing
+   * and writes nothing (its heartbeat included, which the guard would refuse
+   * anyway), so this counter reaches the heartbeat on the first tick after
+   * the guard disengages; getSnapshot() carries it live.
+   */
+  identityUnverifiedSkips: number;
 }
 
 export function freshCounters(): OpsNotifierCounters {
@@ -306,6 +331,7 @@ export function freshCounters(): OpsNotifierCounters {
     subscriptionReloadFaults: 0,
     policyReadFaults: 0,
     indexFailures: 0,
+    identityUnverifiedSkips: 0,
   };
 }
 

@@ -23,6 +23,8 @@ const mockLog = vi.hoisted(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn()
 vi.mock("../logging/logger.js", () => ({ createLogger: () => mockLog }));
 
 import { ObjectId } from "mongodb";
+import { WriteGuard } from "../db/write-guard.js";
+import { OPS_ID_MAX_LENGTH } from "./ids.js";
 import { parseHandle } from "./intake.js";
 import { OpsNotifier } from "./notifier.js";
 import { __resetOpsNotifierForTests, acceptOpsAcknowledgement, setOpsNotifier } from "./notifier-singleton.js";
@@ -310,6 +312,27 @@ describe("attribution — the principal and the instant and nothing else", () =>
       reason: "unattributed",
     });
     expect(changedKeys(before, await rowById(h, id))).toEqual([]);
+  });
+
+  it("refuses an actorId longer than OPS_ID_MAX_LENGTH — never truncates it — and admits one at the bound", async () => {
+    const h = await harness();
+    const { id, handle } = await seedRow(h);
+    const before = await rowById(h, id);
+
+    // Unbounded, a caller-supplied string was stored TWICE on the row: as
+    // `principal` and inside `lastAckKey`.
+    await expect(h.notifier.accept(ack(handle, { actorId: "U".repeat(OPS_ID_MAX_LENGTH + 1) }))).resolves.toEqual({
+      state: "refused",
+      reason: "unattributed",
+    });
+    expect(changedKeys(before, await rowById(h, id))).toEqual([]);
+
+    const atBound = "U".repeat(OPS_ID_MAX_LENGTH);
+    await expect(h.notifier.accept(ack(handle, { actorId: atBound }))).resolves.toEqual({
+      state: "applied",
+      rowState: "seen",
+    });
+    expect((await rowById(h, id)).principal).toBe(atBound);
   });
 
   it("refuses the RESERVED system principal and leaves the row byte-identical", async () => {
@@ -705,6 +728,20 @@ describe("an unusable `at`", () => {
     expect(h.snapshot().intakeInvalidAt).toBe(2);
   });
 
+  it("names the act in that warn only once it is one of D7's three — the line runs BEFORE act validation", async () => {
+    const h = await harness();
+    const { handle } = await seedRow(h);
+    const hostile = "<!channel> " + "z".repeat(5_000);
+
+    await expect(h.notifier.accept(ack(handle, { act: hostile as never, at: new Date("nonsense") }))).resolves.toEqual({
+      state: "refused",
+      reason: "illegal-transition",
+    });
+    await h.notifier.accept(ack(handle, { act: "dismissed", at: new Date("nonsense") }));
+
+    expect(warnLines("unusable `at`").map((call) => call[1])).toEqual([{ act: "invalid" }, { act: "dismissed" }]);
+  });
+
   it("⚠ the NAMED consequence: two such calls derive DIFFERENT lastAckKeys, so a duplicate double-applies", async () => {
     const h = await harness();
     const { id, handle } = await seedRow(h);
@@ -746,6 +783,9 @@ describe("the INTAKE_DEADLINE_MS seam", () => {
 
     await expect(call).resolves.toEqual({ state: "unavailable" });
     expect(h.snapshot().intakeUnavailable).toBe(1);
+    // Logged as a DEADLINE, distinguishable from a storage fault (below).
+    expect(warnLines("ops intake deadline elapsed")).toHaveLength(1);
+    expect(warnLines("ops intake work failed")).toHaveLength(0);
 
     // The losing side keeps running to completion — deliberately.
     gate.release();
@@ -756,6 +796,25 @@ describe("the INTAKE_DEADLINE_MS seam", () => {
     // ⚠ The one sentence KPR-455's edge needs: unavailable means UNKNOWN, and
     // retrying the SAME (actorId, act, at) is the correct response.
     await expect(h.notifier.accept(input)).resolves.toEqual({ state: "noop", reason: "already-applied" });
+  });
+});
+
+describe("a storage fault inside intake", () => {
+  it("answers unavailable AND logs the underlying reason — it is not silent, and not logged as a deadline", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE: the deadline wrapper turned a rejection into
+    // `unavailable` and dropped the reason, and accept()'s own warn could not
+    // fire because that wrapper never rejects — a Mongo fault left no trace.
+    const h = await harness();
+    const { handle } = await seedRow(h);
+    h.db.failNext(OPS_NOTIFICATIONS_COLLECTION, "findOne", new Error("injected storage fault"));
+
+    await expect(h.notifier.accept(ack(handle))).resolves.toEqual({ state: "unavailable" });
+
+    const lines = warnLines("ops intake work failed");
+    expect(lines).toHaveLength(1);
+    expect(String(lines[0]![1].error)).toContain("injected storage fault");
+    expect(warnLines("ops intake deadline elapsed")).toHaveLength(0);
+    expect(h.snapshot().intakeUnavailable).toBe(1);
   });
 });
 
@@ -856,6 +915,7 @@ describe("availability", () => {
     const notifier = new OpsNotifier(
       db.db,
       90,
+      () => true,
       () => BASE,
       async () => {},
     );
@@ -863,6 +923,43 @@ describe("availability", () => {
     await expect(notifier.accept(ack(ABSENT_HANDLE))).resolves.toEqual({ state: "unavailable" });
     expect(db.operations).toHaveLength(0);
     expect(notifier.getSnapshot().intakeUnavailable).toBe(1);
+  });
+
+  it.each([
+    ["undefined", undefined],
+    ["null", null],
+    ["a string", "0".repeat(24)],
+    ["a number", 42],
+  ])("an input that is %s is REFUSED, never thrown, and reads nothing", async (_label, input) => {
+    // The seam is documented as never throwing; before this, `accept(undefined)`
+    // threw on its first property read.
+    const h = await harness();
+    const mark = h.db.operations.length;
+
+    await expect(h.notifier.accept(input as unknown as OpsAcknowledgement)).resolves.toEqual({
+      state: "refused",
+      reason: "unknown-handle",
+    });
+    expect(h.db.operations.slice(mark)).toHaveLength(0);
+    expect(h.snapshot().intakeRefused).toBe(1);
+  });
+
+  it("answers unavailable and reads nothing while the DB identity guard is engaged, and applies once it clears", async () => {
+    // KPR-456's `discover` answers the same way. An engaged guard means a read
+    // may answer out of ANOTHER instance's database, where this handle could
+    // resolve to nothing and be REFUSED `unknown-handle` — an answer an edge
+    // must not retry, for an act that is real. `unavailable` is retry-safe.
+    const guard = new WriteGuard({ instanceId: "test", dbName: "test" });
+    const h = await harness({ writeGuard: guard });
+    const { handle } = await seedRow(h);
+
+    guard.engage("mismatch");
+    const mark = h.db.operations.length;
+    await expect(h.notifier.accept(ack(handle))).resolves.toEqual({ state: "unavailable" });
+    expect(h.db.operations.slice(mark)).toHaveLength(0);
+
+    guard.disengage();
+    await expect(h.notifier.accept(ack(handle))).resolves.toEqual({ state: "applied", rowState: "seen" });
   });
 
   it("an accept after stop() returns unavailable and reads nothing", async () => {

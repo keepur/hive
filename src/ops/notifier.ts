@@ -9,6 +9,7 @@
  */
 import type { Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
+import { clipForLog } from "./ids.js";
 import { OpsStore, type LoadedReason } from "./store.js";
 import type { OpsSubscription } from "./types.js";
 import type { OpsTransport } from "./transport.js";
@@ -29,7 +30,7 @@ import {
 import { OpsNotificationStore } from "./notification-store.js";
 import { IngestPhase } from "./ingest.js";
 import { DeliveryPhase, type DeliveryResult } from "./delivery.js";
-import { OpsIntake, parseHandle } from "./intake.js";
+import { OpsIntake, isOpsAck, parseHandle } from "./intake.js";
 
 const log = createLogger("ops-notifier");
 
@@ -86,12 +87,31 @@ export class OpsNotifier {
   private timer?: ReturnType<typeof setInterval>;
   private reloadTimer?: ReturnType<typeof setInterval>;
   private flight?: Promise<void>;
+  /** Edge latch for skipForIdentity's warn-once-per-engagement. */
+  private identityPaused = false;
   private lastSuccessfulSweep?: Date;
   private lastCursorAt?: Date;
 
   constructor(
     db: Db,
     activityRetentionDays: number,
+    /**
+     * KPR-294's write guard, in KPR-456's shape and position: index.ts passes
+     * `() => !writeGuard.engaged` here exactly as it does to ObligationRuntime.
+     * `db` there is guardDb(rawDb, writeGuard) — reads pass through an engaged
+     * guard and only writes are refused — so without this the sweep read due
+     * rows, posted them, had the record refused, and re-posted the same rows
+     * on every tick for as long as the guard stayed engaged. While it returns
+     * false: no tick runs, no subscription reload replaces the map, and intake
+     * answers `unavailable`.
+     *
+     * DEFAULTED, not required, for one named consumer: KPR-455's CLI path
+     * constructs `new OpsNotifier(db, days)` for intake only, after its own
+     * `verifySentinel` has returned verified and with no identity monitor to
+     * ever engage its guard. The engine's boot (index.ts) is the one
+     * construction that runs a sweep, and it must pass the guard.
+     */
+    private readonly canWrite: () => boolean = () => true,
     private readonly clock: () => Date = () => new Date(),
     private readonly sleep: (ms: number) => Promise<void> = (ms) =>
       new Promise((resolve) => setTimeout(resolve, ms).unref?.()),
@@ -235,6 +255,12 @@ export class OpsNotifier {
    * cache with two shapes and two readiness points.
    */
   async reloadSubscriptions(rethrow = false): Promise<void> {
+    // An engaged guard means this read may answer out of ANOTHER instance's
+    // database, and the map outlives the engagement by up to a reload
+    // interval. Treated like a reload fault — the previous set stays in
+    // place — minus the counter and the warn, which the tick's own
+    // identityUnverifiedSkips and edge-triggered warn already carry.
+    if (!this.canWrite()) return;
     try {
       const rows = await this.opsStore.loadSubscriptions();
       const next = new Map<string, OpsSubscription>();
@@ -265,9 +291,10 @@ export class OpsNotifier {
           if (!malformedWarned.has(key)) {
             malformedWarned.add(key);
             // Only a string id is logged: a hand-written row's `_id` can be
-            // anything, and this line must not carry an arbitrary value.
+            // anything, and this line must not carry an arbitrary value — nor
+            // an arbitrarily LONG one, hence KPR-454's clip (C13).
             log.warn("ops subscription row has no usable transport binding — unloaded in memory", {
-              subscriptionId: typeof id === "string" ? id : undefined,
+              subscriptionId: typeof id === "string" ? clipForLog(id) : undefined,
             });
           }
           continue;
@@ -290,8 +317,12 @@ export class OpsNotifier {
             // rejected subscription per minute.
             if (!unloadWarned.has(sub._id)) {
               unloadWarned.add(sub._id);
+              // `_id` is operator-written and unbounded, so it is clipped the
+              // way KPR-454 clips the same row's `_id` (publisher.ts, C13).
+              // `adapterId` needs no clip on this branch: it just resolved to a
+              // REGISTERED adapter, so it is a code-resident id.
               log.warn("ops subscription target rejected by its adapter — unloaded in memory", {
-                subscriptionId: sub._id,
+                subscriptionId: clipForLog(sub._id),
                 adapterId: sub.transport.adapterId,
               });
             }
@@ -363,13 +394,46 @@ export class OpsNotifier {
    */
   private async run(): Promise<void> {
     const now = this.clock();
+    // KPR-456's sweeper.ts `run()` opens the same way. The WHOLE tick is
+    // skipped, reads included: an engaged guard means ingest, the policy read
+    // and every delivery scan may be reading ANOTHER instance's database, and
+    // every write — the heartbeat's too — would be refused. Nothing is
+    // half-done by skipping: ingest's cursor has not moved, and every due row
+    // is still due on the first tick after the guard disengages.
+    if (!this.canWrite()) {
+      this.skipForIdentity();
+      return;
+    }
+    if (this.identityPaused) {
+      this.identityPaused = false;
+      log.info("ops sweep resumed — DB identity verified");
+    }
     try {
       await this.runPhases(now);
     } catch (err) {
       this.counters.sweepFaults += 1;
       log.warn("ops sweep phase fault — writing a degraded heartbeat", { error: String(err) });
+      // A guard that engaged mid-tick is the likeliest cause of a write fault
+      // here, and it would refuse the degraded heartbeat too.
+      if (!this.canWrite()) {
+        this.skipForIdentity();
+        return;
+      }
       await this.writeDegradedHeartbeat(now);
     }
+  }
+
+  /**
+   * One count per tick that the guard skipped or cut short, and ONE warn per
+   * engagement rather than per tick: an engagement is already an alarm state
+   * surfaced by `hive doctor`'s Datastore identity section, and a line every
+   * 30 s for its duration would bury the one that says when it started.
+   */
+  private skipForIdentity(): void {
+    this.counters.identityUnverifiedSkips += 1;
+    if (this.identityPaused) return;
+    this.identityPaused = true;
+    log.warn("ops sweep paused — DB identity unverified; nothing is posted, recorded or expired until it verifies");
   }
 
   /**
@@ -430,6 +494,9 @@ export class OpsNotifier {
     // No heartbeat on this path: a stop is not a tick outcome, `stop()` runs
     // before mongoClient.close() and the next boot's first tick writes one.
     if (this.stopping) return;
+    // The same seams for the identity guard, which can engage mid-tick (the
+    // monitor runs on its own timer). No heartbeat either: it would be refused.
+    if (!this.canWrite()) return this.skipForIdentity();
 
     const ctx = {
       subscriptions: this.subscriptions,
@@ -438,12 +505,14 @@ export class OpsNotifier {
       policy: this.policy ?? null,
       lock: <T>(rowId: string, fn: () => Promise<T>) => this.withRowLock(rowId, fn),
       stopped: () => this.stopping,
+      canWrite: this.canWrite,
       clock: this.clock,
       sleep: this.sleep,
     };
 
     const expiryOk = await this.deliveryPhase.expire(now, ctx);
     if (this.stopping) return;
+    if (!this.canWrite()) return this.skipForIdentity();
 
     // D5: a tick whose read THREW and which has NO retained result — the first
     // tick of a process — skips the delivery phase ENTIRELY. No row is marked,
@@ -456,6 +525,7 @@ export class OpsNotifier {
     } else {
       delivery = await this.deliveryPhase.run(now, ctx);
     }
+    if (!this.canWrite()) return this.skipForIdentity();
 
     const allOk = ingest.ok && expiryOk && delivery.ok;
     if (allOk) this.lastSuccessfulSweep = now;
@@ -566,10 +636,15 @@ export class OpsNotifier {
   /**
    * D6/D7/D10: the seam KPR-455's inbound edge calls. NEVER THROWS.
    *
-   * `{ state: "unavailable" }` means exactly four things and no others: the
+   * `{ state: "unavailable" }` means exactly six things and no others: the
    * singleton is unset (pre-wiring, or a bare test construction — handled in
-   * notifier-singleton.ts), init() did not complete, stop() has begun, or the
-   * work did not finish inside INTAKE_DEADLINE_MS.
+   * notifier-singleton.ts), init() did not complete, stop() has begun, the DB
+   * identity guard is engaged (KPR-456's `discover` answers the same way: a
+   * read out of an unverified database could REFUSE a real act as
+   * `unknown-handle`, which an edge must not retry), the work failed with a
+   * storage fault, or it did not finish inside INTAKE_DEADLINE_MS. The last
+   * two are each logged with their own line, so they are distinguishable in
+   * the log even though the edge sees one answer.
    * It is deliberately NOT gated on start(): intake depends on nothing start()
    * provides, and gating it there would widen its dead window across the whole
    * Slack connect for no gain.
@@ -596,13 +671,28 @@ export class OpsNotifier {
    * interaction callback that must answer its vendor in 3 s.
    */
   async accept(input: OpsAcknowledgement): Promise<OpsIntakeResult> {
-    if (!this.initialized || this.stopping) return this.tallyIntake({ state: "unavailable" });
+    if (!this.initialized || this.stopping || !this.canWrite()) return this.tallyIntake({ state: "unavailable" });
+    // `OpsAcknowledgement` is a compile-time claim at a seam D6 opens to an
+    // agent tool call and an operator CLI. Every FIELD is already checked
+    // (handle here, the rest in intake.ts), but a missing or non-object input
+    // threw on the first property read below — out of a seam documented as
+    // never throwing. Refused as `unknown-handle`: with no object there is no
+    // handle, which is exactly what parseHandle concludes of one.
+    const raw: unknown = input;
+    if (raw === null || typeof raw !== "object") {
+      return this.tallyIntake({ state: "refused", reason: "unknown-handle" });
+    }
     if (!(input.at instanceof Date) || Number.isNaN(input.at.getTime())) {
       // Counted at the seam; intake.ts substitutes `now`. See its step-3
       // comment: the cost is a per-retry lastAckKey, so this is a real signal
       // about a mis-serializing edge, not noise.
       this.counters.intakeInvalidAt += 1;
-      log.warn("ops intake received an unusable `at` — substituting the server clock", { act: input.act });
+      // `act` is logged only when it is one of D7's three: this runs BEFORE
+      // intake.ts validates it, and a caller-supplied value must not reach a
+      // log line unchecked (C13).
+      log.warn("ops intake received an unusable `at` — substituting the server clock", {
+        act: isOpsAck(input.act) ? input.act : "invalid",
+      });
     }
     // Step 1 of D7's order is split across two files ON PURPOSE: the parsed id
     // is the per-row latch's key, so it must be resolved before the lock is
@@ -629,15 +719,27 @@ export class OpsNotifier {
    */
   private withDeadline<T extends OpsIntakeResult>(work: Promise<T>): Promise<T | OpsIntakeResult> {
     return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve({ state: "unavailable" }), INTAKE_DEADLINE_MS);
+      const timer = setTimeout(() => {
+        log.warn("ops intake deadline elapsed — answered unavailable; the abandoned work may still land", {
+          deadlineMs: INTAKE_DEADLINE_MS,
+        });
+        resolve({ state: "unavailable" });
+      }, INTAKE_DEADLINE_MS);
       timer.unref?.();
       void work.then(
         (value) => {
           clearTimeout(timer);
           resolve(value);
         },
-        () => {
+        (err: unknown) => {
           clearTimeout(timer);
+          // ⚠ The reason is LOGGED HERE, because it is dropped here: the edge
+          // is answered `unavailable` either way, and before this line a real
+          // storage fault left no trace at all — accept()'s own catch never
+          // fires, since this promise never rejects. Also fires when the work
+          // fails AFTER the deadline already answered, so an abandoned write
+          // that did NOT land is logged as well as one that did.
+          log.warn("ops intake work failed — answered unavailable", { error: String(err) });
           resolve({ state: "unavailable" });
         },
       );

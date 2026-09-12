@@ -160,18 +160,20 @@ function compareOperand(actual: any, op: ComparisonOperator, expected: any): boo
 }
 
 /**
- * Equality, KPR-468's four comparison operators, $ne, $in, and $exists. Any
- * OTHER operator-shaped term throws rather than silently matching nothing, so
- * a future test reaching for one fails loudly instead of reporting coverage
+ * Equality, KPR-468's four comparison operators, $ne, $in, $nin and $exists.
+ * Any OTHER operator-shaped term throws rather than silently matching nothing,
+ * so a future test reaching for one fails loudly instead of reporting coverage
  * it lacks.
  *
- * $ne, $in and $exists are NOT in COMPARISON_OPERATORS (none is order-based —
- * $ne is `same()` inverted, $in is membership by `same()`, $exists tests
- * presence) but are admitted here for the same reason the other four are:
- * delivery.ts/notifier.ts's `state: { $in: [...OPS_NUDGE_STATES] }` needs
- * $in, ingest.ts's `state: { $ne: "cleared" }` needs $ne, and intake.ts's CAS
- * filter (`{ lastAckKey: { $exists: false } }`, when the row has no prior
- * acknowledgement) needs $exists. Nothing else needs any of the three.
+ * $ne, $in, $nin and $exists are NOT in COMPARISON_OPERATORS (none is
+ * order-based — $ne is `same()` inverted, $in is membership by `same()`, $nin
+ * is its negation, $exists tests presence) but are admitted here for the same
+ * reason the other four are: delivery.ts/notifier.ts's
+ * `state: { $in: [...OPS_NUDGE_STATES] }` needs $in, delivery.ts's arm passes
+ * (`stalledReason: { $nin: [...] }`) need $nin, ingest.ts's
+ * `state: { $ne: "cleared" }` needs $ne, and intake.ts's CAS filter
+ * (`{ lastAckKey: { $exists: false } }`, when the row has no prior
+ * acknowledgement) needs $exists. Nothing else needs any of the four.
  */
 function predicate(actual: any, expected: any): boolean {
   if (
@@ -187,6 +189,7 @@ function predicate(actual: any, expected: any): boolean {
         (key) =>
           key !== "$ne" &&
           key !== "$in" &&
+          key !== "$nin" &&
           key !== "$exists" &&
           !(COMPARISON_OPERATORS as readonly string[]).includes(key),
       );
@@ -196,10 +199,14 @@ function predicate(actual: any, expected: any): boolean {
       return operatorKeys.every((key) => {
         if (key === "$ne") return !same(actual, expected[key]);
         if (key === "$exists") return (actual !== undefined) === Boolean(expected[key]);
-        if (key === "$in") {
+        if (key === "$in" || key === "$nin") {
           const options = expected[key];
-          if (!Array.isArray(options)) throw new Error("unsupported_filter_$in_shape");
-          return options.some((option) => same(actual, option));
+          if (!Array.isArray(options)) throw new Error(`unsupported_filter_${key}_shape`);
+          // `$nin` is `$in` negated, and — as in real MongoDB — therefore
+          // matches a document where the field is ABSENT, which is exactly the
+          // property delivery.ts's not-blocked pass depends on.
+          const member = options.some((option) => same(actual, option));
+          return key === "$in" ? member : !member;
         }
         return compareOperand(actual, key as ComparisonOperator, expected[key]);
       });

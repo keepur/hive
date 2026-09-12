@@ -347,6 +347,11 @@ describe("renewal (D7 rule 4): the same condition, seen again", () => {
       stalledAt: at(59),
       stalledReason: "cadence",
       attemptCount: 4,
+      // The PREVIOUS occurrence's accepted delivery. A reopen is the
+      // occurrence boundary, and snooze expiry reads this field as "accepted
+      // in this occurrence" (delivery.ts, expire).
+      deliveryReference: { kind: "fake", id: "previous-occurrence" },
+      lastOutcome: "accepted",
     });
     const [e] = await h.seed({ publishedAt: at(200) });
 
@@ -367,9 +372,12 @@ describe("renewal (D7 rule 4): the same condition, seen again", () => {
       attemptCount: 4,
       eventCount: 2,
     });
-    for (const field of ["expiresAt", "stalledAt", "stalledReason"]) {
-      expect(Object.prototype.hasOwnProperty.call(row, field)).toBe(false);
+    for (const field of ["expiresAt", "stalledAt", "stalledReason", "deliveryReference"]) {
+      expect(Object.prototype.hasOwnProperty.call(row, field), field).toBe(false);
     }
+    // lastOutcome is the LAST ATTEMPT's, and no attempt has happened yet in
+    // the new occurrence — it is left alone (notification-types.ts).
+    expect(row.lastOutcome).toBe("accepted");
     expect(h.counters.rowsRenewed).toBe(1);
   });
 });
