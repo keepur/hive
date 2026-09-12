@@ -68,6 +68,9 @@ import { OutageEpisodeTracker } from "./outage/outage-notices.js";
 import { OutageReplayProcessor } from "./outage/outage-replay-processor.js";
 import { OpsPublisher } from "./ops/publisher.js";
 import { setOpsPublisher } from "./ops/publisher-singleton.js";
+import { OpsNotifier } from "./ops/notifier.js";
+import { setOpsNotifier } from "./ops/notifier-singleton.js";
+import { SlackOpsTransport } from "./ops/slack-transport.js";
 import {
   AUDIT_ROUTING_DOC_ID,
   createAuditRoutingControl,
@@ -573,6 +576,40 @@ async function main(): Promise<void> {
     log.error("Ops publisher init failed — tool-failure publishing is OFF this boot", { error: String(err) });
   }
 
+  // KPR-468 (D10): the ops notifier — the acknowledgement ledger and its
+  // sweep. Construction, init() and singleton registration sit ABOVE the
+  // spawn-capable boundary below because INTAKE IS REACHABLE FROM A TURN: D6
+  // names an agent tool call among the inbound acknowledgement surfaces, so
+  // once KPR-455 wires an agent-facing edge the intake singleton is a
+  // per-spawn read. Guarded by src/boot-order.test.ts, which carries both
+  // anchors in all three of its lists.
+  //
+  // registerTransport() + start() deliberately sit LOWER, after
+  // dispatcher.registerAdapter(slackAdapter) — the workerPool.start()
+  // disjoint-range precedent. A sweep that began before its adapters exist
+  // would burn attempts against nothing: every due row would resolve
+  // transportUnbound and the counter would fill with boot noise.
+  //
+  // init() is NON-FATAL to boot, with a split posture (D10):
+  //  - the (subscriptionId, dedupeKey) UNIQUE index failing THROWS, so
+  //    setOpsNotifier never runs, the singleton stays unset, every intake call
+  //    answers { state: "unavailable" } and the sweep never starts. Running
+  //    the ledger without its identity guarantee is worse than not running it.
+  //  - a REASON-MAP fault does not throw: the singleton IS set, intake is
+  //    live, and only the sweep stays off — reasons feed remediation at
+  //    delivery and intake consumes none of them.
+  //  - every other index fault is contained, counted, and keeps it usable.
+  const opsNotifier = new OpsNotifier(db, config.activity.retentionDays);
+  try {
+    await opsNotifier.init();
+    setOpsNotifier(opsNotifier);
+    log.info("Ops notifier wired (KPR-468)");
+  } catch (err) {
+    log.error("Ops notifier init failed — the acknowledgement ledger is OFF this boot", {
+      error: String(err),
+    });
+  }
+
   // ── Spawn-capable boundary (KPR-394, restated by KPR-414) ──────────────
   // Everything BELOW this line can dispatch a turn: bgTaskManager /
   // codeTaskManager orphan-completion callbacks, meetingMonitor, every
@@ -682,6 +719,21 @@ async function main(): Promise<void> {
     // signal handler is not a per-spawn read, and the publisher's own wiring
     // (the thing a turn reads) is above the marker.
     void opsPublisher.reloadSubscriptions();
+    // KPR-468 D6: refresh the notifier's own loaded subscription set. The
+    // reload is deliberately DUPLICATED with the publisher's — the two are
+    // different projections of the same rows for different purposes at
+    // different lifecycle points (compiled filters above the boundary vs.
+    // transport bindings validated against registered adapters, which cannot
+    // load before start()). See notifier.ts's reloadSubscriptions comment
+    // before consolidating them.
+    //
+    // A SIGUSR1 arriving BEFORE start() is harmless: the reload loads the
+    // subscriptions UNVALIDATED (no adapter is registered yet, which is D6's
+    // already-specified "unjudged binding" branch), no sweep is running to
+    // consume the result, and start()'s own first load runs afterwards with
+    // the adapters bound and re-validates every target. Worst case: one
+    // wasted find().
+    void opsNotifier.reloadSubscriptions();
   });
   log.info("Hot-reload enabled", { signal: "SIGUSR1" });
 
@@ -744,6 +796,21 @@ async function main(): Promise<void> {
     });
   });
   await obligations.start(config.slack.botToken, (channel, ts) => slack.registerOutboundTs(channel, ts));
+  // KPR-468 (D6, D10, C14): bind the one transport, then start the sweep —
+  // AFTER dispatcher.registerAdapter(slackAdapter) and await
+  // slackAdapter.start(). The echo callback is not hygiene: without it an ops
+  // post into a channel the bot listens to is re-ingested as a WorkItem and
+  // SPAWNS AN AGENT TURN (D10 invariant (b)), and a turn that then fails a
+  // tool republishes and the loop closes. Same shape as obligations.start()
+  // one line above.
+  opsNotifier.registerTransport(
+    new SlackOpsTransport(config.slack.botToken, (channel, ts) => slack.registerOutboundTs(channel, ts)),
+  );
+  // start() does the FIRST subscription load — which is what puts every
+  // validateTarget after every registerTransport — arms the 60 s reload timer,
+  // and begins the sweep. A first-load fault is contained inside start(),
+  // leaving the notifier unstarted with intake still live.
+  await opsNotifier.start();
   log.info("Slack adapter connected");
 
   // KPR-452: resolve the Slack channel name→id map, then hand it plus the
@@ -1053,6 +1120,15 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     log.info("Shutdown signal received", { signal });
     await obligations.stop();
+    // KPR-468 D10: sets the stopped latch, clears the reload and sweep timers,
+    // stops accepting new intake, and awaits the in-flight tick. The tick exits
+    // at its next checkpoint — between events inside ingest, between rows
+    // inside expiry and delivery, and between the three phases — so the wait is
+    // bounded by whichever unit of work is in hand: one event's application, or
+    // one attempt at the adapter's own deadline. NOT open-ended, and NOT a full
+    // ingest budget (which is what an ingest phase with no stopped latch would
+    // have made it — see IngestPhase's `stopped` parameter).
+    await opsNotifier.stop();
     // KPR-454 D10: clear the reload timer and stop accepting first, then
     // drain within SHUTDOWN_DRAIN_MS. Before slackAdapter.stop() and
     // mongoClient.close() — the queue's inserts need a live client. Safe on a

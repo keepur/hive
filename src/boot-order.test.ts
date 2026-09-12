@@ -73,6 +73,11 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     // after boot can fail a tool), so both anchors are order-pinned below.
     offsetOf("await opsPublisher.init()");
     offsetOf("setOpsPublisher(");
+    // KPR-468: the ops notifier's intake is a spawn-read surface (D6 names an
+    // agent tool call among the inbound acknowledgement edges KPR-455 will
+    // build), so both anchors are order-pinned below.
+    offsetOf("await opsNotifier.init()");
+    offsetOf("setOpsNotifier(");
     offsetOf("await bgTaskManager.start()");
     offsetOf("await bgTaskManager.scanOrphans()");
     offsetOf("await codeTaskManager.start()");
@@ -91,6 +96,8 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("setAuditRoutingControl("),
       offsetOf("await opsPublisher.init()"),
       offsetOf("setOpsPublisher("),
+      offsetOf("await opsNotifier.init()"),
+      offsetOf("setOpsNotifier("),
     ];
     const surfaceOffsets = [
       offsetOf("await bgTaskManager.start()"),
@@ -121,6 +128,8 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("setAuditRoutingControl("),
       offsetOf("await opsPublisher.init()"),
       offsetOf("setOpsPublisher("),
+      offsetOf("await opsNotifier.init()"),
+      offsetOf("setOpsNotifier("),
     );
     // Known non-spawn-capable `.start(`/`.scanOrphans(` calls that legitimately
     // precede the wiring. Adding to this list is a deliberate, reviewed
@@ -191,6 +200,15 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       expect(at, `${later} must run AFTER the ops queue drains`).toBeGreaterThan(stop);
     }
   });
+
+  it("(f) opsNotifier.start( follows the wiring, so (c)'s allowlist needs no entry (KPR-468 AC14)", () => {
+    // Scope: this scans index.ts, not src/ops/. A later refactor that moves
+    // `await opsNotifier.start()` above the wiring must either move it back or
+    // add it to (c)'s allowlist under the reviewed-classification discipline
+    // that list's own comment demands.
+    const wiringStart = Math.max(offsetOf("await opsNotifier.init()"), offsetOf("setOpsNotifier("));
+    expect(offsetOf("await opsNotifier.start()")).toBeGreaterThan(wiringStart);
+  });
 });
 
 describe("KPR-456 obligation readiness and drain order", () => {
@@ -222,5 +240,46 @@ describe("KPR-456 obligation readiness and drain order", () => {
     expect(stop).toBeGreaterThanOrEqual(0);
     expect(shutdown.indexOf("await slackAdapter.stop()")).toBeGreaterThan(stop);
     expect(shutdown.indexOf("await mongoClient.close()")).toBeGreaterThan(stop);
+  });
+});
+
+describe("KPR-468 ops notifier readiness and drain order", () => {
+  const code = readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf8")
+    .split("\n")
+    .map((line) => line.replace(/\/\/.*$/, ""))
+    .join("\n");
+  function at(text: string): number {
+    const offset = code.indexOf(text);
+    expect(offset, "missing lifecycle anchor " + text).toBeGreaterThanOrEqual(0);
+    return offset;
+  }
+
+  it("registers the singleton before every spawn-capable surface", () => {
+    for (const surface of [
+      "await bgTaskManager.start()",
+      "await bgTaskManager.scanOrphans()",
+      "await codeTaskManager.start()",
+      "await slackAdapter.start(",
+      "scheduler.start()",
+    ])
+      expect(at("setOpsNotifier(")).toBeLessThan(at(surface));
+  });
+
+  it("binds the transport before starting the sweep, and starts it after the adapters", () => {
+    expect(at("opsNotifier.registerTransport(")).toBeLessThan(at("await opsNotifier.start()"));
+    expect(at("await opsNotifier.start()")).toBeGreaterThan(at("dispatcher.registerAdapter(slackAdapter)"));
+    expect(at("await opsNotifier.start()")).toBeGreaterThan(at("await slackAdapter.start("));
+  });
+
+  it("drains the notifier before closing Slack or Mongo", () => {
+    const shutdown = code.slice(at("const shutdown = async"));
+    const stop = shutdown.indexOf("await opsNotifier.stop()");
+    expect(stop).toBeGreaterThanOrEqual(0);
+    expect(shutdown.indexOf("await slackAdapter.stop()")).toBeGreaterThan(stop);
+    expect(shutdown.indexOf("await mongoClient.close()")).toBeGreaterThan(stop);
+  });
+
+  it("adds no second SIGUSR1 listener", () => {
+    expect(code.split('process.on("SIGUSR1"').length - 1).toBe(1);
   });
 });
