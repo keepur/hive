@@ -160,15 +160,17 @@ function compareOperand(actual: any, op: ComparisonOperator, expected: any): boo
 }
 
 /**
- * Equality, KPR-468's four comparison operators, and $ne. Any OTHER
+ * Equality, KPR-468's four comparison operators, $ne, and $in. Any OTHER
  * operator-shaped term throws rather than silently matching nothing, so a
  * future test reaching for one fails loudly instead of reporting coverage it
  * lacks.
  *
- * $ne is NOT one of COMPARISON_OPERATORS (it is not order-based — it is
- * `same()` inverted) but is admitted here for the same reason the other four
- * are: ingest.ts's clearing/renewal filters (`state: { $ne: "cleared" }`)
- * need it and nothing else does.
+ * $ne and $in are NOT in COMPARISON_OPERATORS (neither is order-based — $ne is
+ * `same()` inverted, $in is membership by `same()`) but are admitted here for
+ * the same reason the other four are: delivery.ts/notifier.ts's
+ * `state: { $in: [...OPS_NUDGE_STATES] }` (the arm-2 filter, the stall
+ * precondition, the heartbeat's `working` gauges) needs $in, and ingest.ts's
+ * `state: { $ne: "cleared" }` needs $ne. Nothing else needs either.
  */
 function predicate(actual: any, expected: any): boolean {
   if (
@@ -181,14 +183,20 @@ function predicate(actual: any, expected: any): boolean {
     const operatorKeys = Object.keys(expected).filter((key) => key.startsWith("$"));
     if (operatorKeys.length > 0) {
       const unsupported = operatorKeys.find(
-        (key) => key !== "$ne" && !(COMPARISON_OPERATORS as readonly string[]).includes(key),
+        (key) => key !== "$ne" && key !== "$in" && !(COMPARISON_OPERATORS as readonly string[]).includes(key),
       );
       if (unsupported !== undefined) throw new Error("unsupported_filter_" + unsupported);
       // A real filter may combine bounds (`{ $gt: x, $lte: y }`); `every` is
       // what makes that one conjunction rather than a special case.
-      return operatorKeys.every((key) =>
-        key === "$ne" ? !same(actual, expected[key]) : compareOperand(actual, key as ComparisonOperator, expected[key]),
-      );
+      return operatorKeys.every((key) => {
+        if (key === "$ne") return !same(actual, expected[key]);
+        if (key === "$in") {
+          const options = expected[key];
+          if (!Array.isArray(options)) throw new Error("unsupported_filter_$in_shape");
+          return options.some((option) => same(actual, option));
+        }
+        return compareOperand(actual, key as ComparisonOperator, expected[key]);
+      });
     }
   }
   return same(actual, expected);
