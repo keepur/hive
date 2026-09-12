@@ -348,6 +348,60 @@ describe("D3 — recovery", () => {
     expect(recoveries()[0]!.clears).toBe(failures()[0]!.dedupeKey);
   });
 
+  // Found by KPR-454's retroactive Frontier hard-gate review (KPR-451 register,
+  // merge c068ee33): BuiltinExecutor and the delegate Task runner are
+  // contractually never-throw — a Bash non-zero exit, a missing Read/Edit
+  // target, or a failed delegate Task all RESOLVE as result text rather than
+  // rejecting. Before the fix, the success site called `observeToolSuccess`
+  // unconditionally and stored a FALSE `tool-recovered` fact for exactly this
+  // shape. Mutation proof: reverting the `EXECUTOR_BACKED_BUILTIN_NAMES`/`Task`
+  // guard in tool-bridge.ts's success branch turns this red (recoveries() would
+  // have length 1).
+  it.each(["Bash", "Task"])(
+    "Lane B: %s resolving with failure-shaped TEXT (never throwing) publishes no recovery",
+    async (name) => {
+      let fail = true;
+      const failureText = `Tool execution failed (${name}): nonzero exit`;
+      const harness = buildLaneBHarness({
+        tools: {
+          [name]: async () => {
+            if (fail) throw new Error("boom"); // opens the condition once, as any real first failure would
+            return failureText; // the never-throw contract: a LOGICAL failure resolves, it does not reject
+          },
+        },
+      });
+      await harness.call(name);
+      await fixture.drain();
+      expect(failures()).toHaveLength(1);
+
+      fail = false;
+      await expect(harness.call(name)).resolves.toBe(failureText);
+      await fixture.drain();
+      expect(recoveries()).toHaveLength(0);
+      expect(failures()).toHaveLength(1); // unchanged — no second failure either, honestly no signal
+    },
+  );
+
+  it("Lane B: an MCP-discovered tool (not executor-backed) is unaffected — real success still recovers", async () => {
+    let fail = true;
+    const harness = buildLaneBHarness({
+      tools: {
+        mcp__server__flaky: async () => {
+          if (fail) throw new Error("kaboom");
+          return "ok";
+        },
+      },
+    });
+    await harness.call("mcp__server__flaky");
+    await fixture.drain();
+    expect(failures()).toHaveLength(1);
+
+    fail = false;
+    await expect(harness.call("mcp__server__flaky")).resolves.toBe("ok");
+    await fixture.drain();
+    expect(recoveries()).toHaveLength(1);
+  });
+
   it("Claude lane: a success with NO open condition publishes nothing", async () => {
     const harness = buildClaudeLaneHarness();
     await harness.fireSuccess(SUCCESS_INPUT);

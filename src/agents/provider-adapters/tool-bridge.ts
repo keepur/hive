@@ -373,7 +373,29 @@ export class ToolBridge {
           // boundary, with opposite signs; the consequence for a reader is that
           // a cross-lane tool-health view sees Lane B epochs advancing slightly
           // more eagerly than Claude-lane ones for the same tool.
-          observeToolSuccess({ tool: name, lane: "laneB" });
+          //
+          // ⚠ EXECUTOR-BACKED BUILTINS AND `Task` ARE SKIPPED HERE, found by
+          // KPR-454's retroactive Frontier hard-gate review (KPR-451#comment
+          // register, merge c068ee33). `BuiltinExecutor` and the delegate Task
+          // runner are contractually never-throw: a Bash non-zero exit, a
+          // missing Read/Edit target, or a failed delegate Task all RESOLVE as
+          // result text (`Tool execution failed (Bash): …`, `Read failed: …`,
+          // `Task failed: …`), so this success branch cannot tell a real
+          // success from a logical failure without sniffing that text — which
+          // C12 forbids (outcome must come from control flow, not inferred
+          // from a string). Calling `observeToolSuccess` anyway would store a
+          // FALSE `tool-recovered` fact and close a condition (possibly one
+          // the Claude lane correctly opened for the same tool), which is
+          // worse than the accepted gap: the failure side already cannot
+          // observe these failures either (they never reach the catch below),
+          // so this keeps the asymmetry honestly one-sided — no signal — in
+          // place of a wrong one. MCP-discovered tools are unaffected: a
+          // handler-side error is converted to a throw in `discover()`
+          // specifically so it reaches the catch, so a resolved result here
+          // for those really is a success.
+          if (!EXECUTOR_BACKED_BUILTIN_NAMES.has(name) && name !== "Task") {
+            observeToolSuccess({ tool: name, lane: "laneB" });
+          }
           return result;
         } catch (err) {
           this.record(name, Date.now() - t0);
