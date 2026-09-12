@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Dispatcher } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
 import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
@@ -1068,71 +1068,147 @@ describe("origin routing", () => {
   });
 });
 
-describe("per-agent audit routing", () => {
+// ---------------------------------------------------------------------------
+// KPR-452: audit routing. homeBase is no longer an audit destination; every
+// surviving copy goes to the one configured audit channel.
+// ---------------------------------------------------------------------------
+
+describe("audit routing (KPR-452)", () => {
   let dispatcher: Dispatcher;
   let registry: ReturnType<typeof makeMockRegistry>;
   let agentManager: ReturnType<typeof makeMockAgentManager>;
   let slackAdapter: ReturnType<typeof makeMockAdapter>;
   let wsAdapter: ReturnType<typeof makeMockAdapter>;
+  let smsAdapter: ReturnType<typeof makeMockAdapter>;
+  let listChannels: ReturnType<typeof vi.fn>;
+  let nowMs: number;
+
+  // The channel map deliberately CONTAINS the homeBase entries. AC6 is only
+  // discriminating if a homeBase read would have succeeded.
+  const CHANNELS = () =>
+    new Map([
+      ["agent-sige", "C-SIGE"],
+      ["agent-jessica", "C-JESSICA"],
+      ["ops-audit", "C-OPS"],
+    ]);
 
   beforeEach(() => {
     vi.clearAllMocks();
     workItemCounter = 0;
+    nowMs = 1_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => nowMs);
     registry = makeMockRegistry();
     agentManager = makeMockAgentManager();
     const healthReporter = makeMockHealthReporter();
     slackAdapter = makeMockAdapter();
     wsAdapter = { ...makeMockAdapter(), id: "ws", kind: "app" as any };
+    smsAdapter = { ...makeMockAdapter(), id: "sms", kind: "sms" as any };
+    listChannels = vi.fn().mockResolvedValue({ channels: [{ name: "late-audit", id: "C-LATE" }] });
     dispatcher = new Dispatcher(registry as any, agentManager as any, healthReporter as any, "executive-assistant");
     dispatcher.registerAdapter(slackAdapter as any);
     dispatcher.registerAdapter(wsAdapter as any);
+    dispatcher.registerAdapter(smsAdapter as any);
+    dispatcher.setSlackAdapter({ client: { conversations: { list: listChannels } } } as any);
   });
 
-  function auditCall() {
-    return slackAdapter.deliver.mock.calls.find((c: any[]) => c[0]?.workItem?.source?.label === "audit");
+  afterEach(() => vi.restoreAllMocks());
+
+  function wire(name: string | undefined, channels = CHANNELS()) {
+    dispatcher.setAuditChannel(slackAdapter as any, channels);
+    dispatcher.setAuditChannelName(name);
   }
 
-  it("posts audit to the handling agent's homeBase channel", async () => {
-    dispatcher.setAuditChannel(
-      slackAdapter as any,
-      new Map([
-        ["agent-sige", "C-SIGE"],
-        ["agent-jessica", "C-JESSICA"],
-      ]),
-      "C-JESSICA",
-    );
-    await dispatcher.dispatch(
-      makeWorkItem({
-        source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
-        text: "hi",
-        meta: { origin: "dodi-shop", deviceId: "dev1" },
-      }),
-    );
-    const call = auditCall();
-    expect(call).toBeDefined();
-    expect(call![0].workItem.source.id).toBe("C-SIGE");
+  const auditCalls = () =>
+    slackAdapter.deliver.mock.calls.filter((c: any[]) => c[0]?.workItem?.source?.label === "audit");
+  const auditCall = () => auditCalls()[0];
+
+  function internalItem(id: string) {
+    return makeWorkItem({
+      id,
+      source: { kind: "internal", id: "team-chan-1", label: "team" },
+      sender: "jasper",
+      text: "peer ping",
+      meta: { targetAgentId: "production-support" },
+    });
+  }
+
+  // AC1 — the ops stream, single-dispatch site.
+  it.each([
+    ["team- agent→agent DM", "team-abc"],
+    ["event: bus delivery", "event:evt-1:production-support"],
+  ])("AC1: posts one copy of an internal %s to the audit channel", async (_label, id) => {
+    wire("ops-audit");
+    await dispatcher.dispatch(internalItem(id));
+    expect(auditCalls()).toHaveLength(1);
+    expect(auditCall()[0].workItem.source.id).toBe("C-OPS");
   });
 
-  it("falls back to the global channel when homeBase is not resolvable", async () => {
-    dispatcher.setAuditChannel(
-      slackAdapter as any,
-      new Map([["agent-jessica", "C-JESSICA"]]), // no agent-sige
-      "C-JESSICA",
-    );
-    await dispatcher.dispatch(
-      makeWorkItem({
-        source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
-        text: "hi",
-        meta: { origin: "dodi-shop", deviceId: "dev1" },
-      }),
-    );
-    const call = auditCall();
-    expect(call).toBeDefined();
-    expect(call![0].workItem.source.id).toBe("C-JESSICA");
+  it("AC1: never posts to a homeBase channel even though it resolves", async () => {
+    wire("ops-audit");
+    await dispatcher.dispatch(internalItem("team-abc"));
+    const targets = slackAdapter.deliver.mock.calls.map((c: any[]) => c[0]?.workItem?.source?.id);
+    expect(targets).not.toContain("C-SIGE");
   });
 
-  it("skips audit when neither homeBase nor fallback resolves", async () => {
-    dispatcher.setAuditChannel(slackAdapter as any, new Map(), undefined);
+  // AC2 — policy-skip on a non-Slack source kind.
+  it("AC2: posts no copy for a sched: item on a non-Slack kind", async () => {
+    wire("ops-audit");
+    await dispatcher.dispatch(
+      makeWorkItem({
+        id: "sched:daily-brief",
+        source: { kind: "sms", id: "PN_X", label: "quo-may", adapterId: "sms" },
+        sender: "system",
+        meta: { targetAgentId: "production-support" },
+      }),
+    );
+    expect(auditCalls()).toHaveLength(0);
+  });
+
+  // AC3 — the Gate 1 boundary. Explicit, not implied.
+  it.each([
+    ["human slack message", "1788764967.970169", "user1"],
+    ["cron item (kind slack, sender system)", "sched:daily-brief", "system"],
+    ["slack-sourced callback item", "callback:cb-1", "system"],
+  ])("AC3: %s posts no audit copy and its own delivery is unchanged", async (_label, id, sender) => {
+    wire("ops-audit");
+    const item = makeWorkItem({
+      id,
+      source: { kind: "slack", id: "C-HOME", label: "agent-sige" },
+      sender,
+      text: "do the thing",
+      meta: { targetAgentId: "production-support", slackTs: "100.2", slackThreadTs: "100.1" },
+    });
+    await dispatcher.dispatch(item);
+    expect(auditCalls()).toHaveLength(0);
+    // The turn's own delivery is untouched: same adapter, same WorkItem
+    // object, same text, thread metadata intact.
+    expect(slackAdapter.deliver).toHaveBeenCalledTimes(1);
+    const delivered = slackAdapter.deliver.mock.calls[0][0];
+    expect(delivered.workItem).toBe(item);
+    expect(delivered.agentId).toBe("production-support");
+    expect(delivered.text).toBe("turn response");
+    expect(delivered.workItem.meta.slackThreadTs).toBe("100.1");
+  });
+
+  // AC4 — the one class where "callback" and "audit copy" genuinely overlap.
+  it("AC4: a callback: item sourced from SMS produces exactly one audit copy", async () => {
+    wire("ops-audit");
+    await dispatcher.dispatch(
+      makeWorkItem({
+        id: "callback:cb-2",
+        source: { kind: "sms", id: "PN_X", label: "quo-may", adapterId: "sms" },
+        sender: "system",
+        meta: { targetAgentId: "production-support" },
+      }),
+    );
+    expect(auditCalls()).toHaveLength(1);
+    expect(auditCall()[0].workItem.source.id).toBe("C-OPS");
+  });
+
+  // AC5 — notify-class non-Slack turns, including the fire-and-forget voice
+  // site and its non-fatality.
+  it("AC5: a team(ws) item produces one copy in the audit channel", async () => {
+    wire("ops-audit");
     await dispatcher.dispatch(
       makeWorkItem({
         source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
@@ -1140,7 +1216,240 @@ describe("per-agent audit routing", () => {
         meta: { origin: "dodi-shop", deviceId: "dev1" },
       }),
     );
-    expect(auditCall()).toBeUndefined();
+    expect(auditCalls()).toHaveLength(1);
+    expect(auditCall()[0].workItem.source.id).toBe("C-OPS");
+  });
+
+  // ⚠ Both audit assertions below MUST go through `vi.waitFor`. The voice
+  // site is fire-and-forget: `routeVoiceTurn` resolves without awaiting
+  // `postAuditLog`, and `postAuditLog` now takes at least one await
+  // (`resolveAuditChannelId`) before `deliver` and another before its catch.
+  // Traced microtask order for the rejecting leg: postAuditLog's resume is
+  // queued BEFORE the test's own `await` continuation, but the deliver
+  // REJECTION handler is queued AFTER it — so a bare
+  // `expect(mockLogWarn).toHaveBeenCalledWith("Audit post failed", …)` runs
+  // before the catch and fails every time. The `toHaveLength(1)` assertion
+  // happens to pass today on a one-tick margin and breaks the moment another
+  // await is added ahead of `deliver`. `vi.waitFor` is already this file's
+  // idiom for exactly this shape — the pre-existing KPR-307 outage-interception
+  // and KPR-402 continuation assertions use it throughout (12 call sites today);
+  // the AC10 race test below is a new one, not the precedent.
+  it("AC5: a voice turn produces one copy, and a rejected audit post never fails it", async () => {
+    wire("ops-audit");
+    const voiceItem = makeWorkItem({
+      id: "vapi-call-1",
+      source: { kind: "voice", id: "call-1", label: "voice", adapterId: "voice" },
+      sender: "+15550001",
+    });
+    const ctx = {
+      agentId: "production-support",
+      sessionId: undefined,
+      channelId: "call-1",
+      threadId: "call-1",
+      workItem: voiceItem,
+      channel: "voice",
+    };
+    const ok = await dispatcher.routeVoiceTurn(ctx as any);
+    expect(ok.finalMessage).toBe("turn response");
+    await vi.waitFor(() => expect(auditCalls()).toHaveLength(1));
+    expect(auditCall()[0].workItem.source.id).toBe("C-OPS");
+
+    slackAdapter.deliver.mockRejectedValueOnce(new Error("slack 429"));
+    const still = await dispatcher.routeVoiceTurn(ctx as any);
+    expect(still.finalMessage).toBe("turn response");
+    await vi.waitFor(() =>
+      expect(mockLogWarn).toHaveBeenCalledWith(
+        "Audit post failed",
+        expect.objectContaining({ error: expect.any(String) }),
+      ),
+    );
+  });
+
+  // AC6 — no configured channel ⇒ mirror off, one warn, and NO homeBase read.
+  it("AC6: with no configured channel nothing posts, one warn fires, homeBase is never used", async () => {
+    wire(undefined);
+    await dispatcher.dispatch(internalItem("team-abc"));
+    expect(auditCalls()).toHaveLength(0);
+    // The map contains agent-sige → C-SIGE, so a homeBase lookup would have
+    // succeeded. Nothing was addressed there.
+    const targets = slackAdapter.deliver.mock.calls.map((c: any[]) => c[0]?.workItem?.source?.id);
+    expect(targets).not.toContain("C-SIGE");
+    expect(mockLogWarn).toHaveBeenCalledWith(
+      "No audit channel resolved",
+      expect.objectContaining({ agentId: "production-support", auditChannel: null }),
+    );
+    expect(listChannels).not.toHaveBeenCalled();
+  });
+
+  // AC7 — no cross-channel thread metadata.
+  it("AC7: audit copies carry no slackThreadTs/slackTs", async () => {
+    wire("ops-audit");
+    const item = internalItem("team-abc");
+    item.meta = { ...item.meta, slackTs: "100.2", slackThreadTs: "100.1" };
+    await dispatcher.dispatch(item);
+    const copy = auditCall()[0].workItem;
+    expect(copy.meta?.slackThreadTs).toBeUndefined();
+    expect(copy.meta?.slackTs).toBeUndefined();
+  });
+
+  // AC8 — a runtime repoint applies on the next audit post, no restart.
+  it("AC8: setAuditChannelName repoints the very next audit post", async () => {
+    const channels = CHANNELS();
+    wire("ops-audit", channels);
+    await dispatcher.dispatch(internalItem("team-1"));
+    expect(auditCalls()).toHaveLength(1);
+    channels.set("ops-audit-2", "C-OPS2");
+    dispatcher.setAuditChannelName("ops-audit-2");
+    await dispatcher.dispatch(internalItem("team-2"));
+    expect(auditCalls().map((c: any[]) => c[0].workItem.source.id)).toEqual(["C-OPS", "C-OPS2"]);
+    expect(dispatcher.peekAuditChannelId()).toBe("C-OPS2");
+  });
+
+  // AC10 — the lazy refresh.
+  it("AC10: refreshes on a miss, one page, no cursor, at most once per 60s", async () => {
+    wire("late-audit");
+    await dispatcher.dispatch(internalItem("team-1"));
+    expect(listChannels).toHaveBeenCalledTimes(1);
+    expect(listChannels.mock.calls[0][0]).toEqual({ types: "public_channel,private_channel", limit: 1000 });
+    // NOT redundant with the toEqual above, and not to be deleted as such:
+    // vitest's `toEqual` ignores undefined-valued keys, so a regression to
+    // `{ types, limit, cursor }` with `cursor === undefined` would still pass
+    // it. `toHaveProperty` is key-existence, so this line is the one that
+    // actually pins "the cursor parameter is not threaded through".
+    expect(listChannels.mock.calls[0][0]).not.toHaveProperty("cursor");
+    expect(auditCall()[0].workItem.source.id).toBe("C-LATE");
+
+    // Second miss inside the window: no second call.
+    dispatcher.setAuditChannelName("never-there");
+    nowMs += 59_000;
+    await dispatcher.dispatch(internalItem("team-2"));
+    expect(listChannels).toHaveBeenCalledTimes(1);
+
+    // Past the window: one more.
+    nowMs += 2_000;
+    await dispatcher.dispatch(internalItem("team-3"));
+    expect(listChannels).toHaveBeenCalledTimes(2);
+  });
+
+  it("AC10: a concurrent fan-out of audit posts issues exactly one refresh", async () => {
+    wire("late-audit");
+    let release: (() => void) | undefined;
+    listChannels.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({ channels: [{ name: "late-audit", id: "C-LATE" }] });
+        }),
+    );
+    const races = [
+      dispatcher.dispatch(internalItem("team-1")),
+      dispatcher.dispatch(internalItem("team-2")),
+      dispatcher.dispatch(internalItem("team-3")),
+    ];
+    await vi.waitFor(() => expect(release).toBeDefined());
+    release!();
+    await Promise.all(races);
+    expect(listChannels).toHaveBeenCalledTimes(1);
+    expect(auditCalls()).toHaveLength(3);
+  });
+
+  it("AC10: no refresh is attempted when the Slack adapter is unset", async () => {
+    const bare = new Dispatcher(
+      registry as any,
+      agentManager as any,
+      makeMockHealthReporter() as any,
+      "executive-assistant",
+    );
+    bare.registerAdapter(slackAdapter as any);
+    bare.setAuditChannel(slackAdapter as any, CHANNELS());
+    bare.setAuditChannelName("late-audit");
+    await bare.dispatch(internalItem("team-1"));
+    expect(listChannels).not.toHaveBeenCalled();
+    expect(auditCalls()).toHaveLength(0);
+    expect(bare.auditRoutingReady()).toBe(false);
+  });
+
+  // AC13 — the audit path cannot fail an already-delivered turn.
+  //
+  // ⚠ The fixture is a ws/app item, NOT `internalItem`, and that choice is
+  // what makes the two absence assertions mean anything. An `internal` item
+  // resolves no adapter (none is registered for kind `internal`), so BOTH
+  // `deliverAgentResult` (`if (!sourceAdapter) return;`) and
+  // `handleTurnFailure` (`if (adapter) { … }`) early-return: no "Something
+  // went wrong" text could reach `slackAdapter` no matter what the code under
+  // test did, and the assertion would pass against a broken implementation.
+  // With a ws/app item the delivery adapter is `wsAdapter` while the AUDIT
+  // adapter is `slackAdapter`, so the two are separable: only the audit copy
+  // is made to fail, and a containment break would show up as a real failure
+  // notice on `wsAdapter`. (`outageStore.enqueue` stays a belt-and-braces
+  // assertion — it is reachable only via `ProviderCircuitOpenError`, never
+  // from a thrown audit fault — and is kept because AC13 names it.) This is
+  // the same shape Task 6 uses at the fan-out site.
+  function appItem() {
+    return makeWorkItem({
+      source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
+      text: "hi",
+      meta: { origin: "dodi-shop", deviceId: "dev1" },
+    });
+  }
+
+  // The THIRD tuple element is the warn each row must actually reach, and it
+  // is what makes the rows discriminating. Row 1 never reaches `deliver` at
+  // all — the rejecting refresh leaves the name unresolved, so the only
+  // fault-path warn is the refresh one — while row 2 resolves and fails in
+  // `deliver`. A shared `"Audit post failed" || "Audit channel refresh failed"`
+  // disjunction would pass on either row regardless of which fault the
+  // arrangement actually produced.
+  it.each([
+    [
+      "conversations.list rejects",
+      () => {
+        listChannels.mockRejectedValue(new Error("slack 429"));
+        return "late-audit"; // not in CHANNELS() ⇒ forces the refresh path
+      },
+      "Audit channel refresh failed",
+    ],
+    [
+      "auditAdapter.deliver rejects",
+      () => {
+        // Only the AUDIT adapter fails. wsAdapter.deliver — the turn's own
+        // delivery — is untouched, so its call list is a real observation.
+        slackAdapter.deliver.mockRejectedValue(new Error("slack transport reset"));
+        return "ops-audit"; // resolves from the map ⇒ reaches deliver
+      },
+      "Audit post failed",
+    ],
+  ])("AC13: single-dispatch site survives when %s", async (_label, arrange, expectedWarn) => {
+    const outageStore = { enqueue: vi.fn(), release: vi.fn(), markDone: vi.fn() };
+    dispatcher.setOutageHandling({
+      store: outageStore,
+      config: { enabled: true, replayIntervalMs: 15_000, maxAgeHours: 4, maxDepth: 500, maxReplayAttempts: 3 },
+      // ⚠ PLAN FENCE CORRECTION: the plan wrote `tracker:`. The real
+      // `OutageHandlingDeps` field is `episodes` (dispatcher.ts:172-176), and
+      // with the wrong key `recordTurnSuccess` throws on
+      // `outage.episodes.hasActiveEpisode` — which handleTurnFailure then
+      // renders as a "Something went wrong" notice, i.e. the very failure this
+      // case exists to forbid, produced by the harness rather than by the code
+      // under test.
+      episodes: new OutageEpisodeTracker(),
+    } as any);
+    wire(arrange());
+    await dispatcher.dispatch(appItem());
+
+    // The turn's own delivery stands and handleTurnFailure was never entered:
+    // exactly one ws delivery, and it is the agent's answer, not a notice.
+    const texts = wsAdapter.deliver.mock.calls.map((c: any[]) => String(c[0]?.text ?? ""));
+    expect(texts).toEqual(["turn response"]);
+    // Strictly implied by the toEqual above — KEPT AS DOCUMENTATION, because
+    // AC13 names the failure notice by its text and a reader scanning for
+    // "Something went wrong" should find the assertion that forbids it. Do not
+    // read it as independent coverage.
+    expect(texts.some((t: string) => t.startsWith("Something went wrong"))).toBe(false);
+    expect(outageStore.enqueue).not.toHaveBeenCalled();
+    expect(mockLogWarn.mock.calls.some((c: any[]) => c[0] === expectedWarn)).toBe(true);
+    expect(mockLogInfo).toHaveBeenCalledWith(
+      "Work item dispatched",
+      expect.objectContaining({ agentId: "production-support" }),
+    );
   });
 });
 

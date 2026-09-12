@@ -12,11 +12,15 @@ import { deadlineContinuationWrap, MAX_DEADLINE_CONTINUATIONS } from "./deadline
 // to `info`. vi.hoisted is required: vi.mock factories run before top-level
 // statements. (Same shape as dispatcher.test.ts.) `vi.clearAllMocks()` in the
 // suite beforeEach resets it between tests.
-const { mockLogInfo } = vi.hoisted(() => ({ mockLogInfo: vi.fn() }));
+// KPR-452 Task 6: `warn` is hoisted too, so the fan-out audit block can pin
+// the skip-and-warn containment behavior. Additive — no pre-existing block in
+// this file asserts on warn, and the suite's vi.clearAllMocks() resets it
+// exactly as it does mockLogInfo.
+const { mockLogInfo, mockLogWarn } = vi.hoisted(() => ({ mockLogInfo: vi.fn(), mockLogWarn: vi.fn() }));
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
     info: mockLogInfo,
-    warn: vi.fn(),
+    warn: mockLogWarn,
     error: vi.fn(),
     debug: vi.fn(),
   }),
@@ -3412,5 +3416,114 @@ Meeting rules:
       expect(dispatched).toEqual(["jasper", "jessica"]);
       expect(agentManager._sessionStore.setMeetingMark).toHaveBeenCalledWith("jasper", threadId, "1000.0004");
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// KPR-452: the fan-out / conference call site (dispatcher.ts:1885-1887) — the
+// third of three. AC1 (destination) and AC13 (containment at the second
+// AWAITED site, inside the try whose catch is handleTurnFailure at :1900).
+// ---------------------------------------------------------------------------
+
+describe("audit routing at the fan-out site (KPR-452)", () => {
+  let dispatcher: Dispatcher;
+  let registry: ReturnType<typeof makeMockRegistry>;
+  let agentManager: ReturnType<typeof makeMockAgentManager>;
+  let adapter: ReturnType<typeof makeMockAdapter>;
+  let auditAdapter: ReturnType<typeof makeMockAdapter>;
+  let listChannels: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    workItemCounter = 0;
+    registry = makeMockRegistry();
+    agentManager = makeMockAgentManager();
+    adapter = { ...makeMockAdapter(), id: "ws", kind: "app" as any };
+    auditAdapter = makeMockAdapter(); // kind: "slack"
+    listChannels = vi.fn().mockResolvedValue({ channels: [] });
+    dispatcher = new Dispatcher(
+      registry as any,
+      agentManager as any,
+      makeMockHealthReporter() as any,
+      "executive-assistant",
+    );
+    dispatcher.registerAdapter(adapter as any);
+    dispatcher.setSlackAdapter({ client: { conversations: { list: listChannels } } } as any);
+    dispatcher.setAuditChannel(auditAdapter as any, new Map([["ops-audit", "C-OPS"]]));
+    dispatcher.setAuditChannelName("ops-audit");
+  });
+
+  const auditCalls = () =>
+    auditAdapter.deliver.mock.calls.filter((c: any[]) => c[0]?.workItem?.source?.label === "audit");
+
+  /** A ws/app item mentioning two agents by name → the fan-out leg. */
+  function fanOutItem() {
+    return makeWorkItem({
+      source: { kind: "app", id: "dev1", label: "app:May", adapterId: "ws" },
+      text: "Jasper, and River, coordinate",
+      meta: { deviceId: "dev1" },
+    });
+  }
+
+  it("AC1: each fanned-out agent's turn produces one audit copy in the audit channel", async () => {
+    await dispatcher.dispatch(fanOutItem());
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledTimes(2);
+    expect(auditCalls()).toHaveLength(2);
+    for (const call of auditCalls()) {
+      expect(call[0].workItem.source.id).toBe("C-OPS");
+      expect(call[0].workItem.meta?.slackThreadTs).toBeUndefined();
+      expect(call[0].workItem.meta?.slackTs).toBeUndefined();
+    }
+  });
+
+  // ⚠ The channel name is set PER ROW, not once before both. Row 1 needs a
+  // name absent from the map so the resolver is forced onto the refresh path;
+  // row 2 needs a name that RESOLVES, or the turn returns at "No audit channel
+  // resolved" and `deliver` is never reached — which would make the
+  // deliver-rejection row assert nothing and leave AC13's mandated
+  // deliver-rejection coverage at the fan-out site missing entirely.
+  //
+  // The third tuple element is the warn each row must actually reach — same
+  // discriminating shape as the single-dispatch rows in Task 5, and what
+  // carries the Testing Contract's "one warn" minimum to this site.
+  it.each([
+    [
+      "conversations.list rejects",
+      () => {
+        listChannels.mockRejectedValue(new Error("slack 429"));
+        return "not-in-map"; // miss ⇒ refresh ⇒ the rejecting call
+      },
+      "Audit channel refresh failed",
+    ],
+    [
+      "auditAdapter.deliver rejects",
+      () => {
+        auditAdapter.deliver.mockRejectedValue(new Error("transport reset"));
+        return "ops-audit"; // resolves from the map ⇒ reaches deliver
+      },
+      "Audit post failed",
+    ],
+  ])("AC13: the awaited fan-out site survives when %s", async (_label, arrange, expectedWarn) => {
+    dispatcher.setAuditChannelName(arrange());
+    const outageStore = { enqueue: vi.fn(), release: vi.fn(), markDone: vi.fn() };
+    dispatcher.setOutageHandling({
+      store: outageStore,
+      config: { enabled: true, replayIntervalMs: 15_000, maxAgeHours: 4, maxDepth: 500, maxReplayAttempts: 3 },
+      // ⚠ PLAN FENCE CORRECTION (same as Task 5): the real OutageHandlingDeps
+      // field is `episodes`, not `tracker` (dispatcher.ts:172-176). With the
+      // wrong key `recordTurnSuccess` throws and handleTurnFailure renders the
+      // very "Something went wrong" notice this case forbids.
+      episodes: new OutageEpisodeTracker(),
+    } as any);
+
+    await dispatcher.dispatch(fanOutItem());
+
+    // Both agents' own deliveries stand; handleTurnFailure was never entered.
+    const texts = adapter.deliver.mock.calls.map((c: any[]) => String(c[0]?.text ?? ""));
+    expect(texts).toHaveLength(2);
+    expect(texts.some((t: string) => t.startsWith("Something went wrong"))).toBe(false);
+    expect(outageStore.enqueue).not.toHaveBeenCalled();
+    // The audit fault is contained AND observable: skip-and-warn, not silence.
+    expect(mockLogWarn.mock.calls.some((c: any[]) => c[0] === expectedWarn)).toBe(true);
   });
 });
