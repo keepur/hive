@@ -237,6 +237,8 @@ export interface TurnResult {
     spawnPrepMs: number;
     bootToInitMs?: number;
     initToFirstTokenMs?: number;
+    /** KPR-465 §3.2: warm turns only — spawnTurn warm-branch entry → consume start (opener: → open call). */
+    queueWaitMs?: number;
   };
   /** KPR-323 C2: true when the turn ran on a warm voice lease. */
   warmPath?: boolean;
@@ -1362,7 +1364,16 @@ export class AgentManager {
    * (mirrors voice-adapter.ts:316-348 — KPR-219 ropes voice through this
    * same API), retry once with sessionId stripped.
    */
-  async spawnTurn(ctx: TurnContext, onStream?: SpawnTurnStreamCallback): Promise<TurnResult> {
+  async spawnTurn(
+    ctx: TurnContext,
+    onStream?: SpawnTurnStreamCallback,
+    /**
+     * KPR-465 §3.2: INTERNAL. The original warm-branch entry time, carried
+     * across the pending-opening recursion below so a joiner's queueWaitMs
+     * spans its first entry, not its re-entry. Adapters never pass it.
+     */
+    warmEnteredAt?: number,
+  ): Promise<TurnResult> {
     checkVoiceRequest(ctx.voiceRequestSignal);
     this.ensureState(ctx.agentId);
 
@@ -1374,6 +1385,7 @@ export class AgentManager {
     }
 
     const enteredAt = Date.now(); // KPR-323 C1: T1 anchor (admission start)
+    const queueAnchor = warmEnteredAt ?? enteredAt; // KPR-465: warm queue anchor
 
     // KPR-323 C2: warm voice path. The branch lives HERE — behind
     // dispatcher.routeVoiceTurn and the adapter seam — so taskLedger/audit,
@@ -1384,14 +1396,14 @@ export class AgentManager {
       const threadKey = `${ctx.agentId}:${ctx.threadId}`;
       const lease = this.warmLeases.get(threadKey);
       if (lease && !lease.isClosed) {
-        return this.runWarmTurn(lease, ctx, onStream);
+        return this.runWarmTurn(lease, ctx, onStream, queueAnchor);
       }
       const pending = this.pendingWarmOpenings.get(threadKey);
       if (pending) {
         await waitForVoiceOpening(pending, ctx.voiceRequestSignal);
-        return this.spawnTurn(ctx, onStream);
+        return this.spawnTurn(ctx, onStream, queueAnchor);
       }
-      if (this.isWarmPathEligible(ctx)) return this.openWarmLease(ctx, onStream);
+      if (this.isWarmPathEligible(ctx)) return this.openWarmLease(ctx, onStream, queueAnchor);
     }
 
     return this.withSpawnTicket(ctx, async (ticket) => {
@@ -1800,7 +1812,11 @@ export class AgentManager {
    * rejects); the handler is belt-and-braces above the process-level
    * unhandledRejection logger.
    */
-  private async openWarmLease(ctx: TurnContext, onStream?: SpawnTurnStreamCallback): Promise<TurnResult> {
+  private async openWarmLease(
+    ctx: TurnContext,
+    onStream: SpawnTurnStreamCallback | undefined,
+    queueAnchor: number,
+  ): Promise<TurnResult> {
     const threadKey = `${ctx.agentId}:${ctx.threadId}`;
     let wake!: () => void;
     const pending = new Promise<void>((resolve) => {
@@ -1814,7 +1830,7 @@ export class AgentManager {
       wake();
     };
     try {
-      return await this.openWarmLeaseAttempt(ctx, onStream, published);
+      return await this.openWarmLeaseAttempt(ctx, onStream, published, queueAnchor);
     } finally {
       published();
     }
@@ -1824,6 +1840,7 @@ export class AgentManager {
     ctx: TurnContext,
     onStream: SpawnTurnStreamCallback | undefined,
     published: () => void,
+    queueAnchor: number,
   ): Promise<TurnResult> {
     const threadKey = `${ctx.agentId}:${ctx.threadId}`;
 
@@ -1943,7 +1960,7 @@ export class AgentManager {
         },
       });
 
-      openingTurn = this.runWarmTurn(pinnedLease, ctx, onStream);
+      openingTurn = this.runWarmTurn(pinnedLease, ctx, onStream, queueAnchor);
       void openingTurn.catch(() => {});
       checkOpeningLifetime();
       this.warmLeases.set(threadKey, pinnedLease);
@@ -1976,6 +1993,7 @@ export class AgentManager {
         { config: definition, eventSubscribersJson: JSON.stringify(this.registry.getSubscriberMap()) },
       );
       checkOpeningLifetime();
+      const openCalledAt = Date.now(); // KPR-465 §3.2: boot stage anchor
       const q = await runner.openVoiceStreamingSession({
         input: lease.inputQueue,
         sessionId: openingCtx.sessionId,
@@ -1993,7 +2011,7 @@ export class AgentManager {
         // the `?? ""` here is a type narrowing, not a silent-empty fallback.
         systemPromptOverride: ctx.systemPromptOverride ?? "",
       });
-      lease.start(q, { resumedSessionId: openingCtx.sessionId });
+      lease.start(q, { resumedSessionId: openingCtx.sessionId, openCalledAt });
       checkOpeningLifetime();
     } catch (err) {
       const failure = getOpeningStopError() ?? err;
@@ -2041,7 +2059,8 @@ export class AgentManager {
   private async runWarmTurn(
     lease: WarmVoiceLease,
     ctx: TurnContext,
-    onStream?: SpawnTurnStreamCallback,
+    onStream: SpawnTurnStreamCallback | undefined,
+    queueAnchor: number,
   ): Promise<TurnResult> {
     const { route, model, timeoutMs } = lease.opening;
     checkVoiceRequest(ctx.voiceRequestSignal);
@@ -2064,6 +2083,7 @@ export class AgentManager {
         onStream,
         timeoutMs,
         voiceRequestSignal: ctx.voiceRequestSignal,
+        enqueuedAt: queueAnchor,
         selectText: (admission) => {
           selected = admission;
           admittedCtx = this.shapeVoicePrompt(
@@ -2108,14 +2128,17 @@ export class AgentManager {
     turnResult.voiceLifetimeSignal = runResult.voiceLifetimeSignal;
     turnResult.warmPath = true;
     turnResult.warmTurnSeq = warmTurnSeq;
-    // C1 on warm turns (plan review r1 adv. 3): admission/spawn stages do
-    // not exist on a warm turn — zeros by definition — and
-    // initToFirstTokenMs is the lease's push → first-delta measurement
-    // (RunResult field comment, Task 2). Populated so the adapter's log
-    // spread carries it instead of computing-and-dropping it.
+    // C1 on warm turns (plan review r1 adv. 3): lock/spawn stages do not
+    // exist (zeros by definition); KPR-465 adds the queue stage and, on the
+    // opener only, the boot stage. initToFirstTokenMs is the lease's
+    // push → first-delta measurement on turns ≥ 2 and init → first delta on
+    // the opener (WarmRunResult field comment). Populated so the adapter's
+    // log spread carries them instead of computing-and-dropping them.
     turnResult.stageTimings = {
       lockWaitMs: 0,
       spawnPrepMs: 0,
+      ...(runResult.queueWaitMs !== undefined ? { queueWaitMs: runResult.queueWaitMs } : {}),
+      ...(runResult.bootToInitMs !== undefined ? { bootToInitMs: runResult.bootToInitMs } : {}),
       initToFirstTokenMs: runResult.initToFirstTokenMs,
     };
     // The warm lane's shaping is exactly what prepareSpawn's voice carve-out

@@ -836,6 +836,13 @@ describe("AgentManager", () => {
       expect(result.stageTimings!.initToFirstTokenMs).toBeUndefined();
     });
 
+    it("KPR-465: cold stageTimings carry no queueWaitMs key (byte-identical cold shape)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ bootToInitMs: 741, initToFirstTokenMs: 1263 }));
+      const result = await manager.spawnTurn(makeVoiceCtx({ agentId: "agent-a" }));
+      expect(Object.keys(result.stageTimings!).sort()).toEqual(["bootToInitMs", "initToFirstTokenMs", "lockWaitMs", "spawnPrepMs"]);
+    });
+
     it("leaves stageTimings undefined for an SMS ctx", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
       const result = await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
@@ -7601,7 +7608,13 @@ describe("AgentManager", () => {
       expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
       const telDoc1 = turnTelemetryStore.record.mock.calls[0]![0];
       expect(telDoc1.resumedSession).toBe(true);
-      expect(r1.stageTimings).toEqual({ lockWaitMs: 0, spawnPrepMs: 0, initToFirstTokenMs: expect.any(Number) });
+      expect(r1.stageTimings).toEqual({
+        lockWaitMs: 0,
+        spawnPrepMs: 0,
+        queueWaitMs: expect.any(Number),
+        bootToInitMs: expect.any(Number), // KPR-465: opener carries the boot stage
+        initToFirstTokenMs: expect.any(Number),
+      });
       // Ticket outlives the turn — the lease holds lock + one budget slot.
       const snap1 = manager.getSnapshot().perAgent["agent-a"]!;
       expect(snap1.activeSpawns).toBe(1);
@@ -7617,6 +7630,7 @@ describe("AgentManager", () => {
       // Turn 2 rides the already-open streaming query() — no fresh resume,
       // so resumedSession must be false even though ctx.sessionId is set.
       expect(r2.resumedSession).toBe(false);
+      expect(r2.stageTimings).toEqual({ lockWaitMs: 0, spawnPrepMs: 0, queueWaitMs: expect.any(Number), initToFirstTokenMs: expect.any(Number) });
       expect(turnTelemetryStore.record).toHaveBeenCalledTimes(2);
       const telDoc2 = turnTelemetryStore.record.mock.calls[1]![0];
       expect(telDoc2.resumedSession).toBe(false);
@@ -7631,6 +7645,40 @@ describe("AgentManager", () => {
       expect(sessionStore.set).toHaveBeenCalledTimes(2);
       expect(sessionStore.set).toHaveBeenCalledWith("agent-a", "voice:call-1", "sess-warm-1", "claude", expect.anything(), undefined);
       expect(sessionStore.set).toHaveBeenCalledWith("agent-a", "voice:call-1", "sess-warm-2", "claude", expect.anything(), null);
+    });
+
+    it("KPR-465: a request queued behind a pending opening reports queueWaitMs spanning its FIRST warm-branch entry", async () => {
+      let now = 10_000;
+      const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+      try {
+        let openGateResolve!: () => void;
+        const openGate = new Promise<void>((r) => (openGateResolve = r));
+        installEchoStreamingRunner({ openGate });
+        // Back-to-back, synchronously: t2 must observe the pending opening
+        // (registered before openWarmLease's first await) to take the
+        // recursion path. Do NOT drain between these two lines.
+        const t1 = manager.spawnTurn(makeVoiceCtx({ sessionId: undefined }));
+        const t2 = manager.spawnTurn(makeVoiceCtx({ sessionId: undefined })); // joiner, first entry at 10_000
+        void t1.catch(() => {});
+        void t2.catch(() => {});
+        expect(pendingWarmOpenings(manager).size).toBe(1);
+        now = 10_300; // publication + t2's re-entry + the open call all land here
+        await vi.waitFor(() => expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1));
+        expect(pendingWarmOpenings(manager).size).toBe(0);
+        now = 10_700; // the opening was held 400 ms past the open call
+        openGateResolve();
+        const r1 = await t1;
+        const r2 = await t2;
+        expect(r1.warmTurnSeq).toBe(1);
+        expect(r2.warmTurnSeq).toBe(2);
+        // Opener: entry 10_000 → open call 10_300 (queue), open call → init at 10_700 (boot), init → delta both at 10_700.
+        expect(r1.stageTimings).toEqual({ lockWaitMs: 0, spawnPrepMs: 0, queueWaitMs: 300, bootToInitMs: 400, initToFirstTokenMs: 0 });
+        // Joiner: FIRST entry 10_000 → consume start 10_700. An un-threaded
+        // anchor (re-entry at 10_300) measures 400 and fails here.
+        expect(r2.stageTimings).toEqual({ lockWaitMs: 0, spawnPrepMs: 0, queueWaitMs: 700, initToFirstTokenMs: 0 });
+      } finally {
+        nowSpy.mockRestore();
+      }
     });
 
     it("(2b) a first-turn ctx with no stored session opens with resume undefined — never a store re-read", async () => {
