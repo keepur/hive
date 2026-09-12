@@ -37,6 +37,7 @@ import {
   OPS_SYSTEM_PRINCIPAL,
   STALL_JITTER_FRACTION,
   STALL_RECHECK_MS,
+  SWEEP_INTERVAL_MS,
   freshCounters,
   type OpsNotification,
   type OpsPolicy,
@@ -138,16 +139,16 @@ describe("resolveCadence — D5's data-sourced cadence, with no merge and no fal
   const row = { class: "integrity", retry: "deterministic" } as Pick<OpsNotification, "class" | "retry">;
 
   it("reads the (class, retry) table exactly as it is keyed", () => {
-    expect(resolveCadence(row, sub("s1"), policyWith())).toBe(CADENCE);
+    expect(resolveCadence(row, sub("s1"), policyWith(), BASE)).toBe(CADENCE);
     // A key for a DIFFERENT (class, retry) pair is not consulted.
-    expect(resolveCadence(row, sub("s1"), { _id: OPS_POLICY_ID, cadence: { "integrity:transient": 1 } })).toBe(
+    expect(resolveCadence(row, sub("s1"), { _id: OPS_POLICY_ID, cadence: { "integrity:transient": 1 } }, BASE)).toBe(
       undefined,
     );
   });
 
   it("a cadenceProfile SUBSTITUTES the table wholesale", () => {
     const policy = policyWith({ profiles: { hourly: 3_600_000 } });
-    expect(resolveCadence(row, sub("s1", { cadenceProfile: "hourly" }), policy)).toBe(3_600_000);
+    expect(resolveCadence(row, sub("s1", { cadenceProfile: "hourly" }), policy, BASE)).toBe(3_600_000);
   });
 
   it("an UNKNOWN profile resolves undefined and does NOT fall back to the table", () => {
@@ -155,28 +156,28 @@ describe("resolveCadence — D5's data-sourced cadence, with no merge and no fal
     // The table holds a live entry for this row's (class, retry) pair; the
     // point is that naming a profile takes the row out of the table entirely.
     expect(policy.cadence!["integrity:deterministic"]).toBe(CADENCE);
-    expect(resolveCadence(row, sub("s1", { cadenceProfile: "nope" }), policy)).toBe(undefined);
+    expect(resolveCadence(row, sub("s1", { cadenceProfile: "nope" }), policy, BASE)).toBe(undefined);
   });
 
   it("a below-floor PROFILE clamps up and warns exactly once per (name, value)", () => {
     const policy = policyWith({ profiles: { fast: 1_000 }, minNudgeIntervalMs: 60_000 });
     const s = sub("s1", { cadenceProfile: "fast" });
-    expect(resolveCadence(row, s, policy)).toBe(60_000);
-    expect(resolveCadence(row, s, policy)).toBe(60_000);
-    expect(resolveCadence(row, s, policy)).toBe(60_000);
+    expect(resolveCadence(row, s, policy, BASE)).toBe(60_000);
+    expect(resolveCadence(row, s, policy, BASE)).toBe(60_000);
+    expect(resolveCadence(row, s, policy, BASE)).toBe(60_000);
     expect(warnLines("ops cadence profile below the registered minimum")).toHaveLength(1);
 
     // A DIFFERENT value under the same name warns again — the memo is keyed on
     // the pair, so a corrected-then-re-broken profile is not silenced forever.
     const changed = policyWith({ profiles: { fast: 2_000 }, minNudgeIntervalMs: 60_000 });
-    expect(resolveCadence(row, s, changed)).toBe(60_000);
+    expect(resolveCadence(row, s, changed, BASE)).toBe(60_000);
     expect(warnLines("ops cadence profile below the registered minimum")).toHaveLength(2);
   });
 
   it("an operator-written profile NAME reaches that warn CLIPPED, never raw (C13)", () => {
     const long = `fast-${"p".repeat(10_000)}`;
     const policy = policyWith({ profiles: { [long]: 1_000 }, minNudgeIntervalMs: 60_000 });
-    expect(resolveCadence(row, sub("s1", { cadenceProfile: long }), policy)).toBe(60_000);
+    expect(resolveCadence(row, sub("s1", { cadenceProfile: long }), policy, BASE)).toBe(60_000);
 
     const lines = warnLines("ops cadence profile below the registered minimum");
     expect(lines).toHaveLength(1);
@@ -189,28 +190,53 @@ describe("resolveCadence — D5's data-sourced cadence, with no merge and no fal
       cadence: { "integrity:deterministic": 1_000 },
       minNudgeIntervalMs: 60_000,
     };
-    expect(resolveCadence(row, sub("s1"), policy)).toBe(60_000);
+    expect(resolveCadence(row, sub("s1"), policy, BASE)).toBe(60_000);
     expect(warnLines("ops cadence profile below the registered minimum")).toHaveLength(0);
   });
 
   it("a null policy and every non-positive or non-finite interval resolve undefined", () => {
-    expect(resolveCadence(row, sub("s1"), null)).toBe(undefined);
-    expect(resolveCadence(row, sub("s1"), { _id: OPS_POLICY_ID })).toBe(undefined);
+    expect(resolveCadence(row, sub("s1"), null, BASE)).toBe(undefined);
+    expect(resolveCadence(row, sub("s1"), { _id: OPS_POLICY_ID }, BASE)).toBe(undefined);
     for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(resolveCadence(row, sub("s1"), { _id: OPS_POLICY_ID, cadence: { "integrity:deterministic": bad } })).toBe(
-        undefined,
-      );
+      expect(
+        resolveCadence(row, sub("s1"), { _id: OPS_POLICY_ID, cadence: { "integrity:deterministic": bad } }, BASE),
+      ).toBe(undefined);
     }
+  });
+
+  it("an interval `now + interval` cannot represent as a Date resolves undefined — table, profile and floor alike", () => {
+    // Each value below passes the checks that came before it (Number.isFinite
+    // for the table and the profile, `typeof === "number"` for the floor), and
+    // each makes record()'s `new Date(now + interval)` an Invalid Date.
+    const huge = Number.MAX_SAFE_INTEGER;
+    const table = (value: number) => ({ _id: OPS_POLICY_ID, cadence: { "integrity:deterministic": value } });
+    expect(resolveCadence(row, sub("s1"), table(huge), BASE)).toBe(undefined);
+    expect(
+      resolveCadence(row, sub("s1", { cadenceProfile: "never" }), policyWith({ profiles: { never: huge } }), BASE),
+    ).toBe(undefined);
+    for (const floor of [huge, Number.POSITIVE_INFINITY]) {
+      expect(resolveCadence(row, sub("s1"), policyWith({ minNudgeIntervalMs: floor }), BASE)).toBe(undefined);
+      const fast = policyWith({ profiles: { fast: 1_000 }, minNudgeIntervalMs: floor });
+      expect(resolveCadence(row, sub("s1", { cadenceProfile: "fast" }), fast, BASE)).toBe(undefined);
+    }
+    // An unschedulable floor clamps nothing, so it claims no clamp in the log.
+    expect(warnLines("ops cadence profile below the registered minimum")).toHaveLength(0);
+
+    // The boundary is Date's own representable range (±8.64e15 ms), not a
+    // cadence cap: the largest interval still representable from `now` resolves.
+    const largest = 8.64e15 - BASE.getTime();
+    expect(resolveCadence(row, sub("s1"), table(largest), BASE)).toBe(largest);
+    expect(resolveCadence(row, sub("s1"), table(largest + 1), BASE)).toBe(undefined);
   });
 
   it("a profile named `constructor` does not read the prototype chain", () => {
     const policy = policyWith({ profiles: {} });
-    expect(resolveCadence(row, sub("s1", { cadenceProfile: "constructor" }), policy)).toBe(undefined);
-    expect(resolveCadence(row, sub("s1", { cadenceProfile: "toString" }), policy)).toBe(undefined);
+    expect(resolveCadence(row, sub("s1", { cadenceProfile: "constructor" }), policy, BASE)).toBe(undefined);
+    expect(resolveCadence(row, sub("s1", { cadenceProfile: "toString" }), policy, BASE)).toBe(undefined);
     // And the same for the (class, retry) table, which is read through the
     // same `own` helper.
     const proto = { _id: OPS_POLICY_ID, cadence: {} } as OpsPolicy;
-    expect(resolveCadence({ class: "constructor", retry: "x" } as never, sub("s1"), proto)).toBe(undefined);
+    expect(resolveCadence({ class: "constructor", retry: "x" } as never, sub("s1"), proto, BASE)).toBe(undefined);
   });
 });
 
@@ -399,6 +425,34 @@ describe("the stall — a declined row is PUSHED FORWARD, never left untouched",
     expect(h.snapshot().cadenceUnresolved).toBe(1);
     // Still exactly one delivery — the second tick declined.
     expect(h.transport.views).toHaveLength(1);
+  });
+
+  it("a cadence `new Date()` cannot represent takes the no-interval path instead of nudging on every tick", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE, and the failure is a flood. MAX_SAFE_INTEGER —
+    // the natural way to write "effectively never" — passes Number.isFinite,
+    // and `new Date(now + it)` is an Invalid Date, which the driver (and the
+    // double) writes as the epoch. The row was then due on every tick and was
+    // re-posted on every one.
+    const h = await harness({
+      subscriptions: [sub("s1")],
+      policy: { _id: OPS_POLICY_ID, cadence: { "integrity:deterministic": Number.MAX_SAFE_INTEGER } },
+    });
+    const e = await h.seedEvent();
+    await h.tick();
+    for (let i = 0; i < 5; i += 1) {
+      h.advance(SWEEP_INTERVAL_MS);
+      await h.tick();
+    }
+
+    // Six ticks, one post: the first delivery, still owed and still made
+    // (attemptCount === 0). Without the check this read six.
+    expect(h.transport.views).toHaveLength(1);
+    const row = await h.row("s1", e.dedupeKey);
+    expect(row.attemptCount).toBe(1);
+    // Recorded on the no-interval branch — a cadence stall with a valid,
+    // future re-check measured from the first tick — not the epoch.
+    expect(row.stalledReason).toBe("cadence");
+    inRecheckWindow(row.nextNudgeAt, BASE);
   });
 
   it("nextNudgeAt is never unset by a stall — the row stays visible to the due-scan", async () => {

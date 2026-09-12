@@ -67,10 +67,21 @@ type Row = Record<string, any>;
  * exists to exercise (verified: `String(structuredClone(new ObjectId()))` is
  * `"[object Object]"`). `ObjectId` is copied by reference; it is immutable in
  * every use here.
+ *
+ * KPR-468: an INVALID Date is copied as the EPOCH, because that is what the
+ * driver writes. Its BSON serializer stores `Long.fromNumber(date.getTime())`,
+ * and `Long.fromNumber(NaN)` is zero, so a real collection reads back
+ * `1970-01-01` — a date that satisfies every `$lte: now` range. Copied as an
+ * Invalid Date instead, every comparison against it is `NaN`-false, so a row
+ * scheduled at an unrepresentable instant looked NEVER due here while it was
+ * due on EVERY tick in production (delivery.ts, `schedulable`).
  */
 function copy<T>(value: T): T {
   if (value === null || typeof value !== "object") return value;
-  if (value instanceof Date) return new Date(value.getTime()) as unknown as T;
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return new Date(Number.isNaN(ms) ? 0 : ms) as unknown as T;
+  }
   if (value instanceof ObjectId) return value as unknown as T;
   if (Array.isArray(value)) return value.map((entry) => copy(entry)) as unknown as T;
   const out: Row = {};

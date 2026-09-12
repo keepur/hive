@@ -42,6 +42,24 @@ const own = (record: Record<string, number> | undefined, key: string): number | 
   record && Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
 
 /**
+ * Whether `now + interval` is a VALID Date — i.e. whether record() can write
+ * the `nextNudgeAt` this interval implies.
+ *
+ * ⚠ Not defensive, and the failure it closes is a FLOOD. `Number.isFinite`
+ * admits an interval `new Date()` cannot represent (`Number.MAX_SAFE_INTEGER`,
+ * the natural way to write "effectively never"), and the floor check admits
+ * `Infinity`; either way `new Date(now + interval)` is an Invalid Date. The
+ * driver's BSON serializer writes an Invalid Date as the EPOCH (its
+ * `getTime()` is NaN, and `Long.fromNumber(NaN)` is zero), so the row's
+ * nextNudgeAt read `1970-01-01`, was due on every tick, and was re-posted
+ * every tick — operator data meant as "never nudge" producing the exact nudge
+ * storm this epic removes. No bound is chosen here: the test is Date's own
+ * representable range, and an interval outside it is treated as NO interval.
+ */
+const schedulable = (now: Date, interval: number): boolean =>
+  !Number.isNaN(new Date(now.getTime() + interval).getTime());
+
+/**
  * D5. Cadence comes from the contract's DATA, never from this component.
  *
  * The anti-merge rule is ENFORCED rather than documented: a subscription
@@ -54,11 +72,18 @@ const own = (record: Record<string, number> | undefined, key: string): number | 
  *
  * Returns `undefined` for "no cadence resolved", which is the shipped default
  * (zero ops_policy rows) and is a DEPLOYMENT GATE, not a failure.
+ *
+ * A resolved interval — the table's or profile's value, or the floor it was
+ * clamped up to — that `now + interval` cannot represent as a Date also
+ * returns `undefined` (see `schedulable`), so the attempt gate and record()
+ * take the same no-interval path an unregistered cadence takes. `now` is the
+ * tick's instant, the same one record() schedules from.
  */
 export function resolveCadence(
   row: Pick<OpsNotification, "class" | "retry">,
   sub: OpsSubscription,
   policy: OpsPolicy | null,
+  now: Date,
 ): number | undefined {
   if (!policy) return undefined;
   const raw =
@@ -68,6 +93,9 @@ export function resolveCadence(
   if (raw === undefined || !Number.isFinite(raw) || raw <= 0) return undefined;
   const floor = policy.minNudgeIntervalMs;
   if (typeof floor === "number" && floor > raw) {
+    // Checked BEFORE the warn: an unschedulable floor clamps nothing, so a
+    // "clamped up" line would name a value no row is ever scheduled on.
+    if (!schedulable(now, floor)) return undefined;
     if (sub.cadenceProfile !== undefined) {
       // D5 says "loudly, at registration", and registration here is a Mongo
       // write no code path observes, so load time is the honest substitution.
@@ -91,7 +119,7 @@ export function resolveCadence(
     }
     return floor;
   }
-  return raw;
+  return schedulable(now, raw) ? raw : undefined;
 }
 
 /** Test-only: the warn-once memo is process-global by design. */
@@ -370,7 +398,7 @@ export class DeliveryPhase {
     }
 
     // 2. Resolve the cadence and apply the THREE-DISJUNCT attempt gate.
-    const interval = resolveCadence(row, sub, ctx.policy);
+    const interval = resolveCadence(row, sub, ctx.policy, now);
     if (!(row.attemptCount === 0 || row.forceDeliver === true || interval !== undefined)) {
       this.counters.cadenceUnresolved += 1;
       await this.stall(row, "cadence", now);
