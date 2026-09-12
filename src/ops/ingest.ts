@@ -83,15 +83,19 @@ export function newerThan(e: OpsEvent): Filter<OpsNotification> {
  * and restricted to what the envelope makes checkable — this component judges
  * nothing.
  *
- * The same-producer clause is NOT defence-in-depth; it closes a case
- * publish-time validation genuinely misses. D4 requires clearsReasonIds to
- * name reasons of the same producer and C19 enforces that at publish — but
- * the enforcement is over the REASONID COMPONENT ONLY (KPR-454's accept path
- * tests reasonIdOfDedupeKey(input.clears) for membership). dedupeKey is
- * producer:subjectKind:subjectId:reasonId:generation, so the PRODUCER
- * component of a `clears` key is never constrained, and a clears naming
- * another producer's key whose reasonId happens to collide passes publish
- * intact. This clause is the only check that catches it.
+ * The same-producer clause is DEFENCE-IN-DEPTH, and it is kept deliberately.
+ * D4 requires clearsReasonIds to name reasons of the same producer, and C19's
+ * membership test at publish reads the REASONID COMPONENT ONLY
+ * (reasonIdOfDedupeKey(input.clears)). dedupeKey is
+ * producer:subjectKind:subjectId:reasonId:generation, so that test alone
+ * would let a clears naming another producer's key whose reasonId happens to
+ * collide through. KPR-454's accept path as merged ALSO refuses it, one step
+ * earlier: `clears-producer` rejects a clears whose leading component is not
+ * the publishing producer (publisher.ts). This clause is therefore not the
+ * only check that catches a cross-producer clear. It stays because the
+ * ledger's guarantee should not rest on one accept path: an event that never
+ * passed that check — a hand-inserted ops_events document, or a future second
+ * producer whose accept path does not carry it — is still refused here.
  */
 export function clearingProvenanceOk(row: OpsNotification, e: OpsEvent): boolean {
   if (e.producer !== row.producer) return false;
@@ -105,6 +109,26 @@ export function clearingProvenanceOk(row: OpsNotification, e: OpsEvent): boolean
     default:
       return false;
   }
+}
+
+/**
+ * D8(b): the two ops_events fields this phase places VERBATIM in a ledger
+ * filter as an equality operand — `dedupeKey` (renewal) and `clears` (the
+ * clearing fan-out) — must be strings before either is used.
+ *
+ * ⚠ Not a type nicety. A filter value that is an OBJECT is not compared, it is
+ * EVALUATED: a stored `clears: { $ne: null }` makes `{ dedupeKey: e.clears }`
+ * match every row on the ledger and clear whichever pass provenance, and the
+ * same shape in `dedupeKey` renews other conditions' rows. Only engine code
+ * writes ops_events today, so this is defence-in-depth — but D8(b) names "a
+ * `clears` field of an unexpected shape" as a fault that stops ingest at its
+ * event, not as a value to be used as-is. The throw is caught by run()'s
+ * event-level catch like any other application fault: counted on
+ * ingestFaults, the cursor held at the predecessor, and — being deterministic —
+ * the wedge signature D8(b) accepts. The message never carries the value (C13).
+ */
+function requireFilterString(value: unknown, field: "dedupeKey" | "clears"): void {
+  if (typeof value !== "string") throw new Error(`ops event ${field} is not a string — not usable in a ledger filter`);
 }
 
 export class IngestPhase {
@@ -253,7 +277,15 @@ export class IngestPhase {
 
   /** D4: two INDEPENDENT applications, in this order. */
   private async applyEvent(e: OpsEvent, now: Date): Promise<void> {
-    if (e.clears) await this.applyClearing(e, now);
+    // Both shapes are checked BEFORE either application writes, so a malformed
+    // event faults before anything lands — not after its clearing fan-out
+    // applied and its renewal then refused. A FALSY `clears` stays "no
+    // clearing", exactly as before: it never reaches a filter.
+    requireFilterString(e.dedupeKey, "dedupeKey");
+    if (e.clears) {
+      requireFilterString(e.clears, "clears");
+      await this.applyClearing(e, now);
+    }
     await this.applyRenewal(e, now);
   }
 
@@ -271,6 +303,7 @@ export class IngestPhase {
    * AC8 asserts no code path issues an updateMany against ops_notifications.
    */
   private async applyClearing(e: OpsEvent, now: Date): Promise<void> {
+    // `e.clears` is string-checked by applyEvent (requireFilterString).
     const rows = await this.store.notifications.find({ dedupeKey: e.clears! }).toArray();
     if (rows.length === 0) {
       // Nobody was listening. D8 answers openness from the LOG, not the ledger.

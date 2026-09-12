@@ -467,8 +467,9 @@ describe("clearing (D4(a)): scope, provenance and the cleared-row no-op", () => 
     ["integrity, no evidence, same producer", "integrity", 0, "hive-runtime", false],
     ["integrity, with evidence, same producer", "integrity", 1, "hive-runtime", true],
     ["informational, with evidence, same producer", "informational", 1, "hive-runtime", false],
-    // The clause that closes C19's reasonId-only publish check: the PRODUCER
-    // component of a `clears` key is never constrained at publish.
+    // The same-producer clause, defence-in-depth behind KPR-454's publish-time
+    // `clears-producer` refusal (C19's own membership test reads only the
+    // reasonId component). Seeded straight into ops_events, past that check.
     ["resource, with evidence, ANOTHER producer", "resource", 1, "other-producer", false],
   ] as const)("%s", async (_label, rowClass, evidenceCount, producer, expectCleared) => {
     const h = await harness({ cursor: FROM_START });
@@ -682,6 +683,59 @@ describe("event-level containment (D8(b))", () => {
       publishedAt: seeded[4]!.publishedAt,
       eventId: String(seeded[4]!._id),
     });
+  });
+
+  // ⚠ ABLE-TO-FAIL against a phase that uses either field as-is. An object in
+  // an equality position is EVALUATED as a query operator, so `{ $ne: null }`
+  // matches every row rather than none.
+  const operatorShaped = { $ne: null } as unknown as string;
+
+  it("an object-shaped `clears` faults at its event and clears nothing — it is not used as a filter", async () => {
+    const h = await harness({ cursor: FROM_START });
+    await h.seedRow({ dedupeKey: KEY });
+    await h.seedRow({
+      dedupeKey: "hive-runtime:work-item:wi-2:tool-failed:1",
+      subject: { kind: "work-item", id: "wi-2" },
+    });
+    await h.seed({
+      publishedAt: at(200),
+      class: "informational",
+      dedupeKey: "hive-runtime:work-item:wi-1:tool-recovered:1",
+      clears: operatorShaped,
+      matchedSubscriptions: 0,
+      matchedSubscriptionIds: [],
+    });
+
+    const first = await h.phase.run(NOW);
+
+    expect(first.ok).toBe(false);
+    expect(h.counters.ingestFaults).toBe(1);
+    expect(h.counters.eventsApplied).toBe(0);
+    expect(h.rows().map((r) => r.state)).toEqual(["pending", "pending"]);
+    expect(h.counters.rowsCleared).toBe(0);
+    // Deterministic, so it is D8(b)'s wedge rather than a skip: the cursor
+    // stays where it was and the next tick faults on the same event.
+    expect(await h.store.readCursor()).toEqual(FROM_START);
+    await h.phase.run(NOW);
+    expect(h.counters.ingestFaults).toBe(2);
+    expect(await h.store.readCursor()).toEqual(FROM_START);
+  });
+
+  it("an object-shaped `dedupeKey` faults at its event and renews no other condition's row", async () => {
+    const h = await harness({ cursor: FROM_START });
+    const before = await h.seedRow({ dedupeKey: KEY });
+    await h.seed({ publishedAt: at(200), dedupeKey: operatorShaped });
+
+    const result = await h.phase.run(NOW);
+
+    expect(result.ok).toBe(false);
+    expect(h.counters.ingestFaults).toBe(1);
+    expect(h.counters.eventsApplied).toBe(0);
+    expect(h.counters.rowsRenewed).toBe(0);
+    expect(h.rows()).toHaveLength(1);
+    expect(h.rows()[0]!.eventCount).toBe(before.eventCount);
+    expect(h.rows()[0]!.latestEventId).toBe(before.latestEventId);
+    expect(await h.store.readCursor()).toEqual(FROM_START);
   });
 });
 

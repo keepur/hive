@@ -631,10 +631,12 @@ describe("AC6 — clearing (D4, D8)", () => {
 
   it("a clearing event from ANOTHER producer does not clear, and increments clearRefused", async () => {
     // ⚠ ITS OWN ROW rather than riding along incidentally. C19 enforces
-    // clearsReasonIds membership at publish over the REASONID COMPONENT ONLY,
-    // so a `clears` naming another producer's dedupeKey whose reasonId happens
-    // to collide passes publish intact. This clause is the only check that
-    // catches it.
+    // clearsReasonIds membership at publish over the REASONID COMPONENT ONLY;
+    // what refuses a `clears` naming another producer's dedupeKey at publish
+    // is KPR-454's separate `clears-producer` check. The ledger's same-producer
+    // clause is defence-in-depth behind it, and this event is seeded straight
+    // into ops_events — past the accept path — which is exactly the case that
+    // clause is kept for.
     const h = await harness({ subscriptions: [sub("s1")] });
     await openCondition(h); // producer "tool", class resource
     const before = await h.row("s1", CONDITION_KEY);
