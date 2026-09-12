@@ -103,6 +103,10 @@ export function postTurn(
                 void hooks.onFirstText?.();
                 if (hooks.closeAfterFirstTextMs !== undefined) {
                   setTimeout(() => {
+                    // Same guard as closeAfterMs. A response that ended before the barge-in point already resolved
+                    // with its honest "stop"; don't lean on Node treating a destroy() of a released keep-alive
+                    // request (whose socket may now carry the next turn) as a no-op.
+                    if (settled) return;
                     finish = "closed";
                     req.destroy();
                     done();
