@@ -16,6 +16,67 @@ import {
 
 const log = createLogger("slack-gateway");
 
+/**
+ * KPR-492 D2: a per-call sink that carries the real Slack error out of
+ * `postSingle`'s catch. Deliberately NOT the `lastReadError` instance-field
+ * precedent (`:54`): reads are one-at-a-time per tool call, but posts fan out
+ * (meeting mode, conference rounds, cron bursts), and an error string
+ * attributed to the wrong agent's tool result is worse than a generic one.
+ * `postAndRegister` allocates a fresh sink per call.
+ *
+ * Multi-write on one sink is safe and intentional. A single `postAndRegister`
+ * can drive `postSingle` more than once against the same sink: `postSplit`
+ * posts every chunk (`:505`), and `postAsFile`'s upload catch falls back to
+ * `postSplit` AFTER the summary post already ran (`:554-558`). Last-write-wins
+ * is correct because `postAndRegister` reads the sink ONLY when `ts === undefined`
+ * — i.e. only when nothing landed at all — so the string the agent sees always
+ * describes a genuinely-failed send. No ordering discipline, no per-chunk array.
+ */
+export interface PostErrorSink {
+  error?: string;
+}
+
+/** KPR-492 D4: resolution result for a send/read target. No `kind` discriminator — it had no reader (spec D4). */
+export type ResolvedConversation = { ok: true; id: string } | { ok: false; error: string };
+/** KPR-492 D4: resolution result for a user handle / id. */
+export type ResolvedUser = { ok: true; id: string } | { ok: false; error: string };
+
+/**
+ * KPR-492 D4 rung 0: Slack's own mention encodings, unwrapped purely
+ * syntactically before the shape rungs run. `slack_read_channel` returns raw
+ * `conversations.history` objects (`readChannel`, `:798-799`), so an agent that
+ * reads a thread and then DMs the person it saw mentioned hands us `<@U0123>`
+ * verbatim — the exact flow this ticket serves. In-repo regex precedent:
+ * `resolveUserMentions` (`:597`, `/<@(U[A-Z0-9]+)>/g`). Group 1 is the id.
+ */
+const MENTION_USER = /^<@([UW][A-Z0-9]+)(?:\|[^>]*)?>$/;
+const MENTION_CHANNEL = /^<#([CG][A-Z0-9]+)(?:\|[^>]*)?>$/;
+
+/**
+ * KPR-492 D4 redaction: what a resolver-failure log line may carry. The Slack
+ * code when `raw` is a platform error (`…occurred: <code>`); otherwise a class
+ * for the two hive-authored failures. NEVER the target, handle, email or any
+ * candidate handle — those belong in the tool result, which is not a log.
+ */
+function resolutionFailureCode(raw: string): string {
+  const m = /occurred: ([a-z_]+)/.exec(raw);
+  if (m) return m[1];
+  return raw.startsWith("ambiguous") ? "ambiguous" : "no_match";
+}
+
+/**
+ * KPR-492 D3: one `log.error` per process the first time an identity-mode post
+ * falls back to a plain post THAT THEN LANDS — the state its text asserts.
+ * Warn-once is the house idiom (`clampLaneAEffort`, the orphan-prefix warns).
+ * Module-level, so tests reset it explicitly.
+ */
+let identityFallbackReported = false;
+
+/** Test-only: reset the D3 once-per-process latch so ordering across describes cannot decide the assertion. */
+export function __resetIdentityFallbackLatchForTests(): void {
+  identityFallbackReported = false;
+}
+
 type MessageHandler = (msg: IncomingMessage) => void;
 
 export interface ThreadStartedEvent {
@@ -47,6 +108,30 @@ export class SlackGateway {
   private channelNameCache = new Map<string, string>(); // id → name
   private channelIdCache = new Map<string, string>(); // name → id (inverse of channelNameCache, lazy-populated)
   private userNameCache = new Map<string, string>(); // userId → display name
+  // ── KPR-492 D4: user + IM resolution caches ────────────────────────────
+  // The spec names one `userIdByHandle` map; it becomes three here because a
+  // Map<string,string> cannot express the ambiguity guard the same paragraph
+  // requires (">1 distinct match errors and names the candidates"). Same
+  // lifecycle as the single map: lazily built, all cleared in sweep().
+  /** lowercased Slack `user.name` (workspace-unique) → user id */
+  private userIdByName = new Map<string, string>();
+  /** lowercased display_name / real_name → every matching user id */
+  private userIdsByDisplayName = new Map<string, Set<string>>();
+  /** user id → "@name", for naming candidates in the ambiguity error */
+  private userHandleById = new Map<string, string>();
+  /** user id → the bot↔user IM (D…) id returned by conversations.open */
+  private imIdByUserId = new Map<string, string>();
+  private userHandleMapBuilt = false;
+  /**
+   * The Slack error from the most recent `users.list` page-through, if it failed.
+   * Read ONLY on the post-rebuild miss in `resolveUserId`, so a transport fault,
+   * `ratelimited` or `missing_scope` reaches the agent as what it is rather than
+   * as a false "no active Slack user matches" — exactly the false does-not-exist
+   * the miss policy was added to avoid (plan-review round 3 advisory). An
+   * instance field is correct HERE, unlike the post sink: the handle map is
+   * shared state and this describes the shared build, not any one caller's send.
+   */
+  private lastUserListError: string | undefined;
   private outboundTsCache = new OutboundTsCache();
   private integrationChannels = new Set<string>(); // channel names that accept bot messages
   private botToken: string;
@@ -380,16 +465,17 @@ export class SlackGateway {
     text: string,
     threadTs?: string,
     identity?: { name: string; icon?: string },
+    errorSink?: PostErrorSink,
   ): Promise<string | undefined> {
     if (text.length <= SlackGateway.SLACK_MAX_CHARS) {
-      return this.postSingle(channel, text, threadTs, identity);
+      return this.postSingle(channel, text, threadTs, identity, errorSink);
     }
 
     if (text.length <= SlackGateway.SPLIT_MAX_CHARS) {
-      return this.postSplit(channel, text, threadTs, identity);
+      return this.postSplit(channel, text, threadTs, identity, errorSink);
     }
 
-    return this.postAsFile(channel, text, threadTs, identity);
+    return this.postAsFile(channel, text, threadTs, identity, errorSink);
   }
 
   private async postSingle(
@@ -397,8 +483,21 @@ export class SlackGateway {
     text: string,
     threadTs?: string,
     identity?: { name: string; icon?: string },
+    errorSink?: PostErrorSink,
   ): Promise<string | undefined> {
     // Try with agent identity first, fall back to plain bot post
+    // KPR-492 D3 (pre-PR Frontier round): set when the identity post throws, and
+    // read only after the plain retry LANDS. The once-per-process error asserts
+    // "the message went out, rendering as the plain Hive bot", which is true only
+    // in that state. A not_in_channel / channel_not_found / is_archived / 5xx
+    // identity failure posts nothing at all and is not a chat:write.customize
+    // degradation: emitting there would hand the operator a confident wrong
+    // diagnosis in exactly the rollout scenario (not_in_channel is this ticket's
+    // own named risk) AND exhaust the latch before a genuine scope degradation
+    // could use it. Resolves the spec's internal inconsistency toward edge 4's
+    // intent, not D3's looser "the first time". The warn below is unnarrowed and
+    // still fires on every identity failure.
+    let identityFailure: { username: string; error: string } | undefined;
     if (identity) {
       try {
         const iconOpts: Record<string, string> = {};
@@ -423,7 +522,18 @@ export class SlackGateway {
         }
         return result.ts;
       } catch (err) {
-        log.warn("Failed to post with identity, falling back to plain post", { error: String(err) });
+        // KPR-492 D2: record it even though the plain retry follows — the sink is
+        // read only when nothing landed, so this surfaces only if the retry also
+        // yields no ts without throwing its own error.
+        if (errorSink) errorSink.error = String(err);
+        // KPR-492 D3: the fallback stays (⚠A3 — a generically-labelled post beats
+        // no post, and the floor is "not a human"), but it stops being quiet.
+        log.warn("Failed to post with identity, falling back to plain post", {
+          channel,
+          username: identity.name,
+          error: String(err),
+        });
+        identityFailure = { username: identity.name, error: String(err) };
       }
     }
 
@@ -437,8 +547,16 @@ export class SlackGateway {
       if (result.ok && result.ts && result.channel) {
         this.outboundTsCache.register(result.channel, result.ts);
       }
+      if (identityFailure && result.ts && !identityFallbackReported) {
+        identityFallbackReported = true;
+        log.error(
+          "Slack identity-mode post failed — agent posts are rendering as the plain Hive bot. Grant chat:write.customize to the Slack app and reinstall; the boot scope preflight reports it.",
+          { channel, username: identityFailure.username, error: identityFailure.error },
+        );
+      }
       return result.ts;
     } catch (err) {
+      if (errorSink) errorSink.error = String(err);
       log.error("Failed to post message", { channel, error: String(err) });
       return undefined;
     }
@@ -495,6 +613,7 @@ export class SlackGateway {
     text: string,
     threadTs?: string,
     identity?: { name: string; icon?: string },
+    errorSink?: PostErrorSink,
   ): Promise<string | undefined> {
     const chunks = this.splitText(text);
     log.info("Splitting oversized message", { channel, totalLength: text.length, chunks: chunks.length });
@@ -502,7 +621,7 @@ export class SlackGateway {
     let firstTs: string | undefined;
     for (let i = 0; i < chunks.length; i++) {
       const chunk = i === 0 ? chunks[i] : `_(cont.)_ ${chunks[i]}`;
-      const ts = await this.postSingle(channel, chunk, threadTs, identity);
+      const ts = await this.postSingle(channel, chunk, threadTs, identity, errorSink);
       if (i === 0) firstTs = ts;
     }
     return firstTs;
@@ -513,6 +632,7 @@ export class SlackGateway {
     text: string,
     threadTs?: string,
     identity?: { name: string; icon?: string },
+    errorSink?: PostErrorSink,
   ): Promise<string | undefined> {
     // Build summary: first SUMMARY_LENGTH chars, trimmed to last complete sentence or line break
     const summaryRaw = text.slice(0, SlackGateway.SUMMARY_LENGTH);
@@ -542,7 +662,7 @@ export class SlackGateway {
     const filename = `${agentName.toLowerCase()}-${timestamp}.md`;
 
     // Post summary message first for context
-    const summaryTs = await this.postSingle(channel, summary, threadTs, identity);
+    const summaryTs = await this.postSingle(channel, summary, threadTs, identity, errorSink);
 
     // Upload full text as .md file
     try {
@@ -554,7 +674,7 @@ export class SlackGateway {
     } catch (err) {
       log.warn("File upload failed, falling back to split", { channel, error: String(err) });
       // Fallback: split the remaining text (summary already posted)
-      return this.postSplit(channel, text, threadTs, identity);
+      return this.postSplit(channel, text, threadTs, identity, errorSink);
     }
   }
 
@@ -631,18 +751,27 @@ export class SlackGateway {
    * where the cache write happens. Returns the first chunk's ts (sufficient for the caller —
    * every chunk's ts is registered independently).
    *
-   * Caller should resolve `channel` to a Slack channel ID first (via `resolveChannelId`) — this
-   * method does not re-resolve, and does not return a canonical channel ID.
+   * Caller should resolve `channel` to a Slack conversation ID first (via
+   * `resolveConversation`) — this method does not re-resolve, and does not return
+   * a canonical channel ID.
+   *
+   * KPR-492 D1: `identity` is the same `{ name, icon }` Path A passes
+   * (`slack-adapter.ts:196-197`). It used to be dropped here, so every Path B post
+   * rendered as a generic "Hive" bot even on the bot transport.
+   * KPR-492 D2: a fresh `PostErrorSink` per call carries the real Slack error out,
+   * replacing the useless `"postMessage returned no ts"` whenever one is available.
    */
   async postAndRegister(
     channel: string,
     text: string,
     threadTs?: string,
+    identity?: { name: string; icon?: string },
   ): Promise<{ ok: boolean; ts?: string; error?: string }> {
+    const sink: PostErrorSink = {};
     try {
-      const ts = await this.postMessage(channel, text, threadTs);
+      const ts = await this.postMessage(channel, text, threadTs, identity, sink);
       if (ts) return { ok: true, ts };
-      return { ok: false, error: "postMessage returned no ts" };
+      return { ok: false, error: sink.error ?? "postMessage returned no ts" };
     } catch (err) {
       return { ok: false, error: (err as Error).message };
     }
@@ -770,6 +899,249 @@ export class SlackGateway {
     return this.channelIdCache.get(name) ?? null;
   }
 
+  /**
+   * KPR-492 D4: resolve a send/read target to a Slack conversation id.
+   *
+   * Rung 0 unwraps Slack mention syntax (`<@U…>`, `<@U…|label>`, `<#C…|name>`,
+   * `<#C…>`) to the bare id it encodes — two regexes, zero API calls — and the
+   * result is then treated exactly as if the agent had typed it. It widens the
+   * accepted ENCODINGS, not the resolution paths: an unwrapped `<@U…>` still
+   * shape-rejects under `allowUserForms: false`. Only the mention match sees a
+   * trimmed string; a non-matching target proceeds UNTRIMMED, so rung 6 stays
+   * byte-equivalent to today's `resolveChannelId` behaviour (§5.3).
+   *
+   * Then six rungs, first match wins:
+   *   1. `C…`/`G…` channel id       → verbatim
+   *   2. `D…` IM id                 → verbatim (may be a DM the bot is not in — D2 explains the failure)
+   *   3. `U…`/`W…` user id          → conversations.open        (`im:write`)
+   *   4. email                      → users.lookupByEmail → open (`users:read.email`)
+   *   5. leading `@`                → resolveUserId → open       (`users:read`, `im:write`)
+   *   6. otherwise                  → today's channel-name path, `resolveChannelId` unchanged
+   *
+   * `allowUserForms` is REQUIRED, not an option with a default: it code-enforces
+   * §5.3's read/send asymmetry at every call site instead of leaving it to a
+   * default a future caller inherits by omission. `handleSend` passes `true`,
+   * `handleRead` passes `false`.
+   *
+   * Under `false` the user forms are shape-matched and rejected with ZERO API
+   * calls — NOT fallen through to rung 6, which could neither produce the
+   * person-flavoured error nor avoid paging the whole workspace on every
+   * mistargeted read. The tests assert all three call counts, because the return
+   * value alone cannot distinguish the two implementations.
+   *
+   * Rungs 1-3 use the tighter `/^[CDG][A-Z0-9]+$/`-family regexes (in-repo
+   * precedent: `:653`, `:661`, `:712`) rather than `startsWith("C")`, so a bare
+   * name that merely begins with an uppercase letter is not matched AS AN ID HERE.
+   * It is NOT a workspace-wide fix: rung 6 delegates to `resolveChannelId`, which
+   * keeps its own `startsWith("C"|"D"|"G")` passthrough (`:742-744`) and still
+   * returns e.g. `"D-team"` verbatim. That residual is deliberate — this ticket
+   * preserves rung 6's behaviour byte-for-byte (§5.3 asks for today's input set
+   * "modulo the tighter id regex" on rungs 1-3 only), and `slack-gateway.test.ts`'s
+   * `resolveChannelId` describe still pins the loose check as-is.
+   * Bare names stay channel-first — `@` is the disambiguator.
+   *
+   * Log redaction (D4, round 5): the single warn below carries `form` + `code`
+   * and never the target. `users:read.email` makes every colleague's address
+   * reachable to this process; the logs must not become where it lands.
+   */
+  async resolveConversation(target: string, allowUserForms: boolean): Promise<ResolvedConversation> {
+    if (!target) return { ok: false, error: "channel is required" };
+
+    // rung 0 — unwrap mention syntax; a non-match leaves `target` untouched.
+    const trimmed = target.trim();
+    const mention = MENTION_USER.exec(trimmed) ?? MENTION_CHANNEL.exec(trimmed);
+    if (mention) target = mention[1];
+
+    if (/^[CG][A-Z0-9]+$/.test(target)) return { ok: true, id: target }; // rung 1
+    if (/^D[A-Z0-9]+$/.test(target)) return { ok: true, id: target }; // rung 2
+
+    const isUserId = /^[UW][A-Z0-9]+$/.test(target); // rung 3
+    const isEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(target); // rung 4
+    const isHandle = target.startsWith("@"); // rung 5
+    if (isUserId || isEmail || isHandle) {
+      if (!allowUserForms) {
+        return {
+          ok: false,
+          error: `"${target}" is a person, not a channel — this tool reads channels only (DM history is not available on the bot transport)`,
+        };
+      }
+      const form = isUserId ? "id" : isEmail ? "email" : "handle";
+      let result: ResolvedConversation;
+      if (isUserId) {
+        result = await this.openIm(target);
+      } else if (isEmail) {
+        const looked = await this.lookupUserByEmail(target);
+        result = looked.ok ? await this.openIm(looked.id) : looked;
+      } else {
+        const resolved = await this.resolveUserId(target.slice(1));
+        result = resolved.ok ? await this.openIm(resolved.id) : resolved;
+      }
+      if (!result.ok) {
+        // The ONE resolver-failure log line. Form class + code only (D4 redaction).
+        log.warn("slack target resolution failed", { form, code: resolutionFailureCode(result.error) });
+      }
+      return result;
+    }
+
+    // rung 6 — today's channel-name path verbatim (# strip, channelIdCache,
+    // paged conversations.list). `resolveChannelId` survives as this rung's
+    // implementation; it has no other production caller once the internal API
+    // moves, and `slack-gateway.test.ts`'s resolveChannelId describe keeps
+    // pinning rung 6 directly. Do not delete either as dead weight.
+    const id = await this.resolveChannelId(target);
+    return id ? { ok: true, id } : { ok: false, error: `unknown channel: ${target}` };
+  }
+
+  /**
+   * KPR-492 D4: resolve a handle or a user id to a user id. NOT an email — email
+   * is rung 4 and is served by `users.lookupByEmail` inside `resolveConversation`.
+   *
+   * `U…`/`W…` returns verbatim with NO `users.list` page-through and no map
+   * consultation. That passthrough is load-bearing for `handleUsers`:
+   * `slack_read_user_profile` advertises "user ID (U…) or display name" and
+   * passes its raw input to `users.info` today, so a map-only implementation
+   * would regress every id lookup into a re-page plus a false "no active Slack
+   * user matches".
+   */
+  async resolveUserId(handle: string): Promise<ResolvedUser> {
+    if (/^[UW][A-Z0-9]+$/.test(handle)) return { ok: true, id: handle };
+
+    // Strip a leading `@` HERE, not only at rung 5 (spec D4, round 6): `handleUsers`
+    // passes slack_read_user_profile's raw input straight in, so without this an
+    // `@alice` would miss the map, burn the one rebuild, and 400 as a false "no such
+    // user". Rung 5's own `slice(1)` becomes redundant and harmless.
+    const key = handle.replace(/^@/, "").trim().toLowerCase();
+    if (!key) return { ok: false, error: `no active Slack user matches "${handle}"` };
+
+    if (!this.userHandleMapBuilt) await this.buildUserHandleMap();
+    let hit = this.matchHandle(key);
+    if (hit.kind === "miss") {
+      // Miss policy: ONE rebuild, then error. A user who joined (or changed their
+      // display name) after the map was built is otherwise unresolvable until the
+      // next sweep(), and the agent sees "no such person" for someone who plainly
+      // exists. Per-miss, not per-call, and not itself retried.
+      await this.buildUserHandleMap(true);
+      hit = this.matchHandle(key);
+    }
+    if (hit.kind === "exact") return { ok: true, id: hit.id };
+    if (hit.kind === "ambiguous") {
+      return {
+        ok: false,
+        error: `ambiguous — ${hit.labels.length} users match "${handle}": ${hit.labels.join(", ")} (use their @handle, user id, or email)`,
+      };
+    }
+    if (this.lastUserListError) {
+      // The map is empty (or stale) because users.list FAILED, not because the
+      // person is absent. Say so, carrying Slack's code so describeSendFailure
+      // maps missing_scope / ratelimited on the send path. A false "does not
+      // exist" is the one answer this method must never give.
+      return {
+        ok: false,
+        error: `could not list Slack users to resolve "${handle}" (slack error: ${this.lastUserListError})`,
+      };
+    }
+    return { ok: false, error: `no active Slack user matches "${handle}" — try their @handle, user id, or email` };
+  }
+
+  /** KPR-492 D4: open (or reuse) the bot↔user IM. `conversations.open` is a WRITE — send path only (§5.3). */
+  private async openIm(userId: string): Promise<ResolvedConversation> {
+    const cached = this.imIdByUserId.get(userId);
+    if (cached) return { ok: true, id: cached };
+    try {
+      const res = await this.web.conversations.open({ users: userId });
+      const id = (res.channel as { id?: string } | undefined)?.id;
+      if (!id) return { ok: false, error: `conversations.open returned no channel for ${userId}` };
+      this.imIdByUserId.set(userId, id);
+      return { ok: true, id };
+    } catch (err) {
+      // Carries Slack's code (cannot_dm_bot, missing_scope, …) — handleSend maps it.
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
+  private async lookupUserByEmail(email: string): Promise<ResolvedUser> {
+    try {
+      const res = await this.web.users.lookupByEmail({ email });
+      const id = res.user?.id;
+      if (!id) return { ok: false, error: `no active Slack user matches ${email}` };
+      return { ok: true, id };
+    } catch (err) {
+      // Carries user_not_found / users_not_found / missing_scope — handleSend maps it.
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
+  /**
+   * Page `users.list` once and index it three ways. Skips `deleted` and `is_bot`.
+   * Stores NO emails (D4: the `users:read.email` grant must not be amplified into
+   * an in-memory directory). On failure the flag is still set, so a broken token
+   * cannot hot-loop the API — a later miss still gets its one forced rebuild, and
+   * `sweep()` clears the flag — but the failure is REMEMBERED in
+   * `lastUserListError` so the post-rebuild miss reports it instead of "no such
+   * user". Cost: one paged page-through per process (or per sweep, plus one per
+   * miss) — the same class as the existing `conversations.list` channel-name cache.
+   */
+  private async buildUserHandleMap(force = false): Promise<void> {
+    if (this.userHandleMapBuilt && !force) return;
+    // Page into LOCAL maps and publish them in one synchronous step at the end
+    // (pre-PR review round 1). Clearing the shared maps UP FRONT left them
+    // observably empty across every `await` of the page-through, and there is no
+    // single-flight guard: a concurrent `resolveUserId` for a handle the map
+    // already holds would see `userHandleMapBuilt === true`, skip the build,
+    // miss the emptied map, and burn its own one allowed rebuild — and with a
+    // third concurrent miss straddling that rebuild it could answer the false
+    // "no active Slack user matches" `resolveUserId` must never give. Posts fan
+    // out concurrently by design (meeting mode, conference rounds, cron bursts
+    // — see `PostErrorSink`), so this is not hypothetical. The FAILURE path
+    // publishes too, deliberately: the partial pages replace the old map exactly
+    // as the clear-first version left them, so only the timing changes.
+    const userIdByName = new Map<string, string>();
+    const userIdsByDisplayName = new Map<string, Set<string>>();
+    const userHandleById = new Map<string, string>();
+    this.lastUserListError = undefined;
+    try {
+      let cursor: string | undefined;
+      do {
+        const res = await this.web.users.list({ limit: 200, cursor });
+        for (const m of res.members ?? []) {
+          if (!m.id || m.deleted || m.is_bot) continue;
+          if (m.name) {
+            userIdByName.set(m.name.toLowerCase(), m.id);
+            userHandleById.set(m.id, `@${m.name}`);
+          }
+          for (const alt of [m.profile?.display_name, m.profile?.real_name, m.real_name]) {
+            if (!alt) continue;
+            const k = alt.toLowerCase();
+            const set = userIdsByDisplayName.get(k) ?? new Set<string>();
+            set.add(m.id);
+            userIdsByDisplayName.set(k, set);
+          }
+        }
+        cursor = res.response_metadata?.next_cursor || undefined;
+      } while (cursor);
+    } catch (err) {
+      // No target in this line either — it is a build failure, not a lookup.
+      this.lastUserListError = String(err);
+      log.warn("users.list page-through failed", { error: String(err) });
+    }
+    this.userIdByName = userIdByName;
+    this.userIdsByDisplayName = userIdsByDisplayName;
+    this.userHandleById = userHandleById;
+    this.userHandleMapBuilt = true;
+  }
+
+  /** Exact `user.name` wins outright; otherwise display/real-name matches, with an ambiguity guard. Never guesses. */
+  private matchHandle(
+    key: string,
+  ): { kind: "exact"; id: string } | { kind: "ambiguous"; labels: string[] } | { kind: "miss" } {
+    const exact = this.userIdByName.get(key);
+    if (exact) return { kind: "exact", id: exact };
+    const ids = [...(this.userIdsByDisplayName.get(key) ?? [])];
+    if (ids.length === 1) return { kind: "exact", id: ids[0] };
+    if (ids.length > 1) return { kind: "ambiguous", labels: ids.map((id) => this.userHandleById.get(id) ?? id) };
+    return { kind: "miss" };
+  }
+
   private async resolveChannelName(channelId: string): Promise<string> {
     const cached = this.channelNameCache.get(channelId);
     if (cached) return cached;
@@ -895,10 +1267,25 @@ export class SlackGateway {
   }
 
   sweep(): SweepResult {
-    const pruned = this.channelNameCache.size + this.channelIdCache.size + this.userNameCache.size;
+    const pruned =
+      this.channelNameCache.size +
+      this.channelIdCache.size +
+      this.userNameCache.size +
+      // KPR-492 D4 — all FOUR new maps. `pruned` is sweep()'s only observable
+      // output, so a map that is cleared but not counted under-reports silently.
+      this.userIdByName.size +
+      this.userIdsByDisplayName.size +
+      this.userHandleById.size +
+      this.imIdByUserId.size;
     this.channelNameCache.clear();
     this.channelIdCache.clear();
     this.userNameCache.clear();
+    this.userIdByName.clear();
+    this.userIdsByDisplayName.clear();
+    this.userHandleById.clear();
+    this.imIdByUserId.clear();
+    this.userHandleMapBuilt = false;
+    this.lastUserListError = undefined;
     return { component: "slack-gateway", pruned, retried: 0, bytesFreed: 0, errors: [] };
   }
 

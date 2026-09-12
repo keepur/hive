@@ -300,6 +300,29 @@ export function resolveVoiceToolAckConfig(raw: unknown): VoiceToolAckConfig {
 }
 
 /**
+ * KPR-492 D6: resolve hive.yaml `slack.localMcpServer`. The default INVERTS to
+ * `true` — the local stdio server on the bot token is the paved path; the hosted
+ * HTTP server on a user token is the opt-out, and it attributes every agent post
+ * to that token's human owner.
+ *
+ * `false` is deliberately KEPT reachable: it is the only CONFIG-level rollback
+ * for a change whose named rollout risk (which channels the bot is in) is
+ * operational and operator-owned, and the hosted path is a 15-tool surface no
+ * local tool replaces. The boot warning in index.ts states the consequence, so
+ * `false` can never again silently outlive its reason.
+ *
+ * Semantics, precisely — the config test is written from this sentence: `??`
+ * falls back on **null/undefined only**, so an absent key AND an explicit
+ * `localMcpServer: null` both resolve `true`. Disabling requires a present,
+ * non-null, falsy scalar — in practice `false` (YAML `0` and `""` also disable
+ * via the Boolean() wrap; the STRING "false" does not).
+ * Exported pure for unit tests.
+ */
+export function resolveLocalMcpServer(raw: unknown): boolean {
+  return Boolean(raw ?? true);
+}
+
+/**
  * KPR-322: env-first / Honeypot-second secret resolution for out-of-engine
  * processes (the voice worker reuses the engine loader). Delegates to the
  * loader's own `optional()` so the semantics can never drift from the
@@ -399,7 +422,7 @@ export const config = {
     botToken: required("SLACK_BOT_TOKEN"),
     mcpToken: optional("SLACK_MCP_TOKEN", ""),
     auditChannel: optional("SLACK_AUDIT_CHANNEL", hive.slack?.auditChannel ?? ""),
-    localMcpServer: Boolean(hive.slack?.localMcpServer ?? false),
+    localMcpServer: resolveLocalMcpServer(hive.slack?.localMcpServer),
   },
   anthropic: {
     apiKey: optional("ANTHROPIC_API_KEY", ""),

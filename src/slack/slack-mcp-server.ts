@@ -2,8 +2,9 @@
 
 /**
  * Slack MCP Server (local stdio shim) — forwards tool calls to the hive process
- * internal HTTP API via fetch. Replaces the hosted Slack MCP (`mcp.slack.com/mcp`)
- * when `slack.localMcpServer: true` is set in hive.yaml.
+ * internal HTTP API via fetch. The DEFAULT Slack MCP since KPR-492 (bot token,
+ * per-agent identity); the hosted Slack MCP (`mcp.slack.com/mcp`, user token)
+ * is the opt-out via `slack.localMcpServer: false` in hive.yaml.
  *
  * Using the bot token held by the hive process means every outbound post is
  * registered in the echo cache before the Slack event arrives — eliminating
@@ -86,7 +87,11 @@ server.registerTool(
     inputSchema: {
       channel: z
         .string()
-        .describe("Channel ID (C…/D…/G…) or bare channel name (e.g. agent-river). The server resolves names to IDs."),
+        .describe(
+          "Channel ID (C…/G…), DM ID (D…), user ID (U…), @handle, an email address, or a bare channel name; " +
+            "Slack mention syntax (<@U…>, <#C…|name>) is accepted as-is. " +
+            "Bare names resolve as channels — prefix with @ to address a person. The server resolves all of these to IDs.",
+        ),
       text: z.string().describe("Message text (Slack mrkdwn supported)."),
       thread_ts: z
         .string()
@@ -139,7 +144,12 @@ server.registerTool(
     title: "Read Slack Channel",
     description: "Fetch recent messages from a Slack channel. Returns message history in reverse-chronological order.",
     inputSchema: {
-      channel: z.string().describe("Channel ID (C…/D…/G…) or bare name (e.g. agent-river)."),
+      channel: z
+        .string()
+        .describe(
+          "Channel ID (C…/G…) or bare name (e.g. agent-river). Reads channels only — a DM/IM id (D…) is passed through but is not a supported form: " +
+            "DM history needs im:history, which hive does not require of the bot token, so it may fail.",
+        ),
       limit: z
         .number()
         .int()
@@ -153,36 +163,6 @@ server.registerTool(
     try {
       const result = await apiPost("/internal/slack/read", {
         channel,
-        ...(limit !== undefined && { limit }),
-      });
-      return { content: [{ type: "text", text: JSON.stringify(result) }] };
-    } catch (err) {
-      return {
-        content: [{ type: "text", text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
-    }
-  },
-);
-
-// ── Tool: slack_search_messages ─────────────────────────────────────────────
-
-server.registerTool(
-  "slack_search_messages",
-  {
-    title: "Search Slack Messages",
-    description:
-      "Search Slack messages by query. Note: search is currently deferred pending tool-parity audit — " +
-      "calls will return a not-implemented response.",
-    inputSchema: {
-      query: z.string().describe("Search query string."),
-      limit: z.number().int().min(1).max(100).optional().describe("Maximum number of results to return."),
-    },
-  },
-  async ({ query, limit }) => {
-    try {
-      const result = await apiPost("/internal/slack/search", {
-        query,
         ...(limit !== undefined && { limit }),
       });
       return { content: [{ type: "text", text: JSON.stringify(result) }] };

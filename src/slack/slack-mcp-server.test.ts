@@ -2,13 +2,13 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Mock MCP SDK — capture registered tools so we can drive handlers directly.
 type ToolHandler = (...args: any[]) => any;
-const registeredTools = new Map<string, { handler: ToolHandler }>();
+const registeredTools = new Map<string, { opts: any; handler: ToolHandler }>();
 
 vi.mock("@modelcontextprotocol/sdk/server/mcp.js", () => ({
   McpServer: vi.fn().mockImplementation(function () {
     return {
-      registerTool: vi.fn((name: string, _opts: any, handler: ToolHandler) => {
-        registeredTools.set(name, { handler });
+      registerTool: vi.fn((name: string, opts: any, handler: ToolHandler) => {
+        registeredTools.set(name, { opts, handler });
       }),
       connect: vi.fn().mockResolvedValue(undefined),
     };
@@ -109,6 +109,39 @@ describe("slack-mcp-server (local stdio)", () => {
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("unknown channel");
+    });
+  });
+
+  describe("tool surface (KPR-492 D4/D5)", () => {
+    it("registers exactly the four remaining tools — slack_search_messages is gone", async () => {
+      await loadServer({});
+      expect([...registeredTools.keys()].sort()).toEqual([
+        "slack_list_channels",
+        "slack_read_channel",
+        "slack_read_user_profile",
+        "slack_send_message",
+      ]);
+      expect(registeredTools.has("slack_search_messages")).toBe(false);
+    });
+
+    it("slack_send_message.channel advertises the full ladder, incl. Slack mention syntax (rung 0)", async () => {
+      await loadServer({});
+      const desc = registeredTools.get("slack_send_message")!.opts.inputSchema.channel.description as string;
+      expect(desc).toContain("user ID (U…)");
+      expect(desc).toContain("@handle");
+      expect(desc).toContain("email");
+      expect(desc).toContain("<@U…>");
+      expect(desc).toContain("prefix with @ to address a person");
+    });
+
+    it("slack_read_channel.channel does NOT advertise @handle/email and DOES name the im:history dependency", async () => {
+      await loadServer({});
+      const desc = registeredTools.get("slack_read_channel")!.opts.inputSchema.channel.description as string;
+      expect(desc).not.toContain("@handle");
+      expect(desc).not.toContain("email");
+      expect(desc).not.toContain("<@U…>"); // the §5.3 sync guard, in both directions
+      expect(desc).toContain("im:history");
+      expect(desc).toContain("not a supported form");
     });
   });
 });

@@ -108,7 +108,7 @@ Synchronous, ephemeral, returns into the caller's turn. Driven by the SDK's `age
 
 ## Channels
 
-- **Slack** — Socket Mode + Web API. Agents have their own bot identities; outbound posts use `chat:write.customize`.
+- **Slack** — Socket Mode + Web API. Agents have their own bot identities on **both** send paths — turn-output delivery and the `slack_send_message` MCP tool — using `chat:write.customize` (per-message `username` + icon; the conversation still belongs to the Hive app). Agents can address a DM by user ID (`U…`), `@handle`, or email; the bot opens its own IM via `conversations.open`.
 - **SMS** — Quo/OpenPhone webhook → adapter → dispatcher.
 - **WebSocket** — long-lived connection from clients. Hive registers as a `?channel=` capability on a sibling beekeeper gateway (loopback on `127.0.0.1:3200`); see [beekeeper's federation doc](https://github.com/keepur/beekeeper/blob/main/docs/federation.md).
 - **Scheduler** — `schedule-mcp-server` fires `WorkItem`s on cron expressions defined per agent.

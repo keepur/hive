@@ -1,11 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { SlackGateway } from "./slack-gateway.js";
+import { SlackGateway, __resetIdentityFallbackLatchForTests } from "./slack-gateway.js";
+
+const warnSpy = vi.fn();
+const errorSpy = vi.fn();
 
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({
     info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
+    warn: (...args: unknown[]) => warnSpy(...args),
+    error: (...args: unknown[]) => errorSpy(...args),
     debug: vi.fn(),
   }),
 }));
@@ -24,6 +27,9 @@ const mocks = vi.hoisted(() => {
   const notificationConversationsListMock = vi
     .fn()
     .mockResolvedValue({ ok: true, channels: [], response_metadata: { next_cursor: "" } });
+  const conversationsOpenMock = vi.fn().mockResolvedValue({ ok: true, channel: { id: "D0LAUREN" } });
+  const usersListMock = vi.fn().mockResolvedValue({ members: [], response_metadata: { next_cursor: "" } });
+  const usersLookupByEmailMock = vi.fn().mockResolvedValue({ ok: true, user: { id: "UEMAIL1" } });
   const authTestMock = vi.fn().mockResolvedValue({ ok: true, user_id: "UBOT", bot_id: "BBOT" });
   const socketHandlers = new Map<string, (...args: unknown[]) => unknown>();
   const socketStartMock = vi.fn().mockResolvedValue(undefined);
@@ -42,7 +48,8 @@ const mocks = vi.hoisted(() => {
       auth: { test: authTestMock },
       chat: { postMessage: postMessageMock },
       files: { uploadV2: uploadV2Mock },
-      conversations: { list: conversationsListMock },
+      conversations: { list: conversationsListMock, open: conversationsOpenMock },
+      users: { list: usersListMock, lookupByEmail: usersLookupByEmailMock },
     };
   });
   return {
@@ -50,6 +57,9 @@ const mocks = vi.hoisted(() => {
     notificationPostMessageMock,
     uploadV2Mock,
     conversationsListMock,
+    conversationsOpenMock,
+    usersListMock,
+    usersLookupByEmailMock,
     notificationConversationsListMock,
     webClientConstructorMock,
     socketHandlers,
@@ -63,6 +73,9 @@ const {
   notificationPostMessageMock,
   uploadV2Mock,
   conversationsListMock,
+  conversationsOpenMock,
+  usersListMock,
+  usersLookupByEmailMock,
   notificationConversationsListMock,
   webClientConstructorMock,
   socketHandlers,
@@ -477,5 +490,519 @@ describe("SlackGateway — explicit notification receipts", () => {
 
     expect(ack).toHaveBeenCalledTimes(1);
     expect(onMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("SlackGateway — per-agent identity + error sink (KPR-492 D1/D2/D3)", () => {
+  let gateway: SlackGateway;
+
+  // The hoisted defaults, re-established around EVERY test in this describe.
+  // `vi.clearAllMocks()` clears call history but NOT implementations, and several
+  // tests below use the non-`Once` `mockRejectedValue` (the split path posts an
+  // unknown number of chunks, so counting `Once`s would be a guess). Without the
+  // afterEach the LAST test's persistent rejection leaks forward to every later
+  // describe in the file — harmless today only because Task 3's describes never
+  // post, which is not a property to rely on.
+  const restoreDefaults = () => {
+    postMessageMock.mockResolvedValue({ ok: true, ts: "1234.5678", channel: "C123" });
+    uploadV2Mock.mockResolvedValue({ ok: true });
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    restoreDefaults();
+    __resetIdentityFallbackLatchForTests();
+    gateway = new SlackGateway("xapp-test", "xoxb-test");
+  });
+
+  afterEach(() => {
+    restoreDefaults();
+  });
+
+  it("forwards an emoji identity as username + icon_emoji", async () => {
+    await gateway.postAndRegister("C123", "hello", undefined, { name: "Grant", icon: ":seedling:" });
+    expect(postMessageMock).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: "C123", username: "Grant", icon_emoji: ":seedling:" }),
+    );
+  });
+
+  it("forwards a URL identity as icon_url", async () => {
+    await gateway.postAndRegister("C123", "hello", undefined, {
+      name: "Grant",
+      icon: "https://example.com/grant.png",
+    });
+    expect(postMessageMock).toHaveBeenCalledWith(
+      expect.objectContaining({ username: "Grant", icon_url: "https://example.com/grant.png" }),
+    );
+  });
+
+  it('sends username only when icon is "" (the five agents with an empty icon — §10 step 1 owns the data)', async () => {
+    await gateway.postAndRegister("C123", "hello", undefined, { name: "Grant", icon: "" });
+    const payload = postMessageMock.mock.calls[0][0];
+    expect(payload.username).toBe("Grant");
+    expect(payload.icon_emoji).toBeUndefined();
+    expect(payload.icon_url).toBeUndefined();
+  });
+
+  it("returns the real Slack error instead of 'postMessage returned no ts'", async () => {
+    postMessageMock.mockRejectedValueOnce(new Error("An API error occurred: not_in_channel"));
+    const result = await gateway.postAndRegister("C123", "hello");
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("not_in_channel");
+    expect(result.error).not.toBe("postMessage returned no ts");
+  });
+
+  it("never cross-attributes errors between concurrent sends (the per-call sink)", async () => {
+    postMessageMock
+      .mockRejectedValueOnce(new Error("An API error occurred: not_in_channel"))
+      .mockRejectedValueOnce(new Error("An API error occurred: is_archived"));
+    const [a, b] = await Promise.all([gateway.postAndRegister("C111", "one"), gateway.postAndRegister("C222", "two")]);
+    const errors = [a.error, b.error].sort();
+    expect(errors[0]).toContain("is_archived");
+    expect(errors[1]).toContain("not_in_channel");
+  });
+
+  it("retries plain exactly once when the identity post throws, and posts the message", async () => {
+    postMessageMock
+      .mockRejectedValueOnce(new Error("An API error occurred: missing_scope"))
+      .mockResolvedValueOnce({ ok: true, ts: "1.1", channel: "C123" });
+    const result = await gateway.postAndRegister("C123", "hello", undefined, { name: "Grant", icon: ":seedling:" });
+    expect(result.ok).toBe(true);
+    expect(postMessageMock).toHaveBeenCalledTimes(2);
+    expect(postMessageMock.mock.calls[1][0].username).toBeUndefined();
+  });
+
+  // ── Step 4's forwarding, pinned per branch ──────────────────────────────
+  // Every assertion above posts a SHORT message, so all of them route through
+  // postMessage's postSingle branch and would stay green with the errorSink
+  // argument dropped from postSplit and/or postAsFile. The THREE below are the
+  // only ones that fail in that state, and they fail in a known pattern (Task 11
+  // rows g/h): dropping `:505` fails the first two (the upload-failure fallback
+  // re-enters postSplit and hits `:505` too); dropping `:557` fails exactly the
+  // second; dropping `:545` fails exactly the third.
+
+  it("carries the real error out of the postSplit branch (>SLACK_MAX_CHARS)", async () => {
+    postMessageMock.mockRejectedValue(new Error("An API error occurred: not_in_channel"));
+    const result = await gateway.postAndRegister("C123", "x".repeat(5000));
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("not_in_channel");
+    expect(result.error).not.toBe("postMessage returned no ts");
+  });
+
+  it("carries the real error out of the postAsFile upload-failure fallback (`:557`)", async () => {
+    // The third forwarding. Summary post succeeds, uploadV2 FAILS, so postAsFile
+    // falls back into postSplit (`:557`) and every chunk then fails. With `:557`
+    // alone dropped, postSplit receives errorSink: undefined, `:505` forwards
+    // nothing, and the result regresses to "postMessage returned no ts" while
+    // the postSplit-branch test above and the postAsFile-branch test below both
+    // still pass. This is the only case that pins `:557` (Task 11 row h).
+    postMessageMock.mockResolvedValueOnce({ ok: true, ts: "1.0", channel: "C123" });
+    postMessageMock.mockRejectedValue(new Error("An API error occurred: not_in_channel"));
+    uploadV2Mock.mockRejectedValueOnce(new Error("upload failed"));
+    const result = await gateway.postAndRegister("C123", "x".repeat(9000));
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("not_in_channel");
+    expect(result.error).not.toBe("postMessage returned no ts");
+  });
+
+  it("carries the real error out of the postAsFile branch (>SPLIT_MAX_CHARS)", async () => {
+    // The summary post fails; the upload SUCCEEDS, so postAsFile returns the
+    // summary's undefined ts and postAndRegister reads the sink. This pins the
+    // `:545` forwarding specifically — the upload-failure fallback at `:557`
+    // would otherwise mask it by re-entering postSplit.
+    postMessageMock.mockRejectedValue(new Error("An API error occurred: is_archived"));
+    // uploadV2 keeps the beforeEach default ({ ok: true }) — deliberately.
+    const result = await gateway.postAndRegister("C123", "x".repeat(9000));
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("is_archived");
+    expect(result.error).not.toBe("postMessage returned no ts");
+  });
+
+  // ── D3: the once-per-process latch (INSIDE this describe — needs its beforeEach) ──
+  it("stays silent on an identity failure that landed nothing, and leaves the latch unspent", async () => {
+    // The rollout shape, reachable on both live instances at deploy: the bot is
+    // not in the channel, so the identity post AND the plain retry both fail and
+    // NOTHING rendered — as the agent or as the plain bot. chat:write.customize
+    // is not the cause. Pre-fix, the identity catch emitted its confident wrong
+    // diagnosis here and burned the once-per-process latch doing it, so the
+    // genuine degradation below could never report itself. Discriminating on
+    // both counts: the pre-fix code fails the first assertion and the last.
+    postMessageMock.mockRejectedValue(new Error("An API error occurred: not_in_channel"));
+    const landedNothing = await gateway.postAndRegister("C123", "a", undefined, {
+      name: "Grant",
+      icon: ":seedling:",
+    });
+    expect(landedNothing.ok).toBe(false);
+    expect(errorSpy.mock.calls.filter((c) => String(c[0]).includes("chat:write.customize"))).toHaveLength(0);
+    // Deliberately unnarrowed: the warn still fires on EVERY identity failure.
+    expect(
+      warnSpy.mock.calls.filter((c) => c[0] === "Failed to post with identity, falling back to plain post"),
+    ).toHaveLength(1);
+
+    // The latch is still available for the state the message actually describes:
+    // the identity post fails and the plain retry LANDS — the message went out,
+    // rendering as the plain Hive bot.
+    postMessageMock.mockReset();
+    postMessageMock
+      .mockRejectedValueOnce(new Error("An API error occurred: missing_scope"))
+      .mockResolvedValueOnce({ ok: true, ts: "9.9", channel: "C123" });
+    await gateway.postAndRegister("C123", "b", undefined, { name: "Grant", icon: ":seedling:" });
+    expect(errorSpy.mock.calls.filter((c) => String(c[0]).includes("chat:write.customize"))).toHaveLength(1);
+  });
+
+  // The genuine shape both times: identity post throws, plain retry lands.
+  it("emits the chat:write.customize error exactly once per process across two failures", async () => {
+    postMessageMock
+      .mockRejectedValueOnce(new Error("missing_scope"))
+      .mockResolvedValueOnce({ ok: true, ts: "1.1", channel: "C1" })
+      .mockRejectedValueOnce(new Error("missing_scope"))
+      .mockResolvedValueOnce({ ok: true, ts: "2.2", channel: "C1" });
+    await gateway.postAndRegister("C1", "a", undefined, { name: "Grant", icon: ":seedling:" });
+    await gateway.postAndRegister("C1", "b", undefined, { name: "Grant", icon: ":seedling:" });
+    const customizeErrors = errorSpy.mock.calls.filter((c) => String(c[0]).includes("chat:write.customize"));
+    expect(customizeErrors).toHaveLength(1);
+    const identityWarns = warnSpy.mock.calls.filter(
+      (c) => c[0] === "Failed to post with identity, falling back to plain post",
+    );
+    expect(identityWarns).toHaveLength(2);
+  });
+});
+
+// Shared by both D4 describes below: the hoisted defaults for the mocks Task 3
+// added, re-established after every test because several tests use persistent
+// (non-`Once`) implementations. Same rationale as Task 2's restoreDefaults.
+const restoreResolverDefaults = () => {
+  usersListMock.mockResolvedValue({ members: [], response_metadata: { next_cursor: "" } });
+  conversationsListMock.mockResolvedValue({ channels: [], response_metadata: { next_cursor: "" } });
+  conversationsOpenMock.mockResolvedValue({ ok: true, channel: { id: "D0LAUREN" } });
+  usersLookupByEmailMock.mockResolvedValue({ ok: true, user: { id: "UEMAIL1" } });
+};
+
+describe("SlackGateway — resolveConversation ladder (KPR-492 D4)", () => {
+  let gateway: SlackGateway;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    restoreResolverDefaults();
+    gateway = new SlackGateway("xapp-test", "xoxb-test");
+  });
+
+  afterEach(() => {
+    restoreResolverDefaults();
+  });
+
+  it("rung 0: <@U…> and <@U…|label> unwrap to the id — conversations.open sees the U…, users.list is NEVER called", async () => {
+    // The unwrap yields an ID, not a handle, so rung 3 (not rung 5) serves it.
+    // A users.list call here would mean the mention was treated as "@U0123".
+    await expect(gateway.resolveConversation("<@U0123>", true)).resolves.toEqual({ ok: true, id: "D0LAUREN" });
+    await expect(gateway.resolveConversation("<@U0123|lauren>", true)).resolves.toEqual({ ok: true, id: "D0LAUREN" });
+    expect(conversationsOpenMock).toHaveBeenCalledWith({ users: "U0123" });
+    expect(usersListMock).not.toHaveBeenCalled();
+  });
+
+  it("rung 0: <#C…|name> and <#C…> unwrap to the channel id with no API call", async () => {
+    await expect(gateway.resolveConversation("<#C0456|dev>", true)).resolves.toEqual({ ok: true, id: "C0456" });
+    await expect(gateway.resolveConversation("<#C0456>", true)).resolves.toEqual({ ok: true, id: "C0456" });
+    expect(conversationsListMock).not.toHaveBeenCalled();
+    expect(conversationsOpenMock).not.toHaveBeenCalled();
+  });
+
+  it("rung 0: a <@…> that is not mention-shaped is NOT unwrapped and falls through as today", async () => {
+    // "<@lauren>" carries no id; it reaches rung 6 and fails the name lookup
+    // exactly as it did pre-KPR-492 — the unwrap is two regexes, not a parser.
+    conversationsListMock.mockResolvedValue({ channels: [], response_metadata: { next_cursor: "" } });
+    await expect(gateway.resolveConversation("<@lauren>", true)).resolves.toEqual({
+      ok: false,
+      error: "unknown channel: <@lauren>",
+    });
+    expect(conversationsOpenMock).not.toHaveBeenCalled();
+    expect(usersListMock).not.toHaveBeenCalled();
+  });
+
+  it("rung 1: C…/G… ids pass through with no API call", async () => {
+    await expect(gateway.resolveConversation("C0123456789", true)).resolves.toEqual({ ok: true, id: "C0123456789" });
+    await expect(gateway.resolveConversation("G1122334455", true)).resolves.toEqual({ ok: true, id: "G1122334455" });
+    expect(conversationsListMock).not.toHaveBeenCalled();
+    expect(conversationsOpenMock).not.toHaveBeenCalled();
+  });
+
+  it("rung 2: a D… id passes through verbatim with no API call", async () => {
+    await expect(gateway.resolveConversation("D9876543210", true)).resolves.toEqual({ ok: true, id: "D9876543210" });
+    expect(conversationsOpenMock).not.toHaveBeenCalled();
+    expect(conversationsListMock).not.toHaveBeenCalled();
+  });
+
+  it("rung 3: a U… id opens an IM", async () => {
+    await expect(gateway.resolveConversation("U0LAUREN", true)).resolves.toEqual({ ok: true, id: "D0LAUREN" });
+    expect(conversationsOpenMock).toHaveBeenCalledWith({ users: "U0LAUREN" });
+  });
+
+  it("rung 4: an email resolves through users.lookupByEmail then opens an IM", async () => {
+    await expect(gateway.resolveConversation("lauren@dodihome.com", true)).resolves.toEqual({
+      ok: true,
+      id: "D0LAUREN",
+    });
+    expect(usersLookupByEmailMock).toHaveBeenCalledWith({ email: "lauren@dodihome.com" });
+    expect(conversationsOpenMock).toHaveBeenCalledWith({ users: "UEMAIL1" });
+  });
+
+  it("rung 5: an @handle resolves through users.list then opens an IM", async () => {
+    usersListMock.mockResolvedValueOnce({
+      members: [{ id: "U0LAUREN", name: "lauren", profile: { display_name: "Lauren" } }],
+      response_metadata: { next_cursor: "" },
+    });
+    await expect(gateway.resolveConversation("@lauren", true)).resolves.toEqual({ ok: true, id: "D0LAUREN" });
+    expect(conversationsOpenMock).toHaveBeenCalledWith({ users: "U0LAUREN" });
+  });
+
+  it("rung 6: a bare name (and a #-prefixed one) resolves as a channel", async () => {
+    conversationsListMock.mockResolvedValue({
+      channels: [{ id: "C111AAA", name: "agent-river" }],
+      response_metadata: { next_cursor: "" },
+    });
+    await expect(gateway.resolveConversation("agent-river", true)).resolves.toEqual({ ok: true, id: "C111AAA" });
+    await expect(gateway.resolveConversation("#agent-river", true)).resolves.toEqual({ ok: true, id: "C111AAA" });
+  });
+
+  it("rung 6: an unresolvable name keeps today's error string", async () => {
+    conversationsListMock.mockResolvedValue({ channels: [], response_metadata: { next_cursor: "" } });
+    await expect(gateway.resolveConversation("no-such-channel", true)).resolves.toEqual({
+      ok: false,
+      error: "unknown channel: no-such-channel",
+    });
+  });
+
+  it("allowUserForms=false: channel rungs behave identically", async () => {
+    await expect(gateway.resolveConversation("C0123456789", false)).resolves.toEqual({ ok: true, id: "C0123456789" });
+    await expect(gateway.resolveConversation("D9876543210", false)).resolves.toEqual({ ok: true, id: "D9876543210" });
+  });
+
+  it.each([["U0LAUREN"], ["@lauren"], ["lauren@dodihome.com"], ["<@U0LAUREN>"]])(
+    "allowUserForms=false: %s is rejected on shape with ZERO API calls",
+    async (target) => {
+      // The fourth case pins rung 0 under `false`: an unwrapped mention is a
+      // U… and shape-rejects like one — the unwrap widens encodings, not paths.
+      const result = await gateway.resolveConversation(target, false);
+      expect(result.ok).toBe(false);
+      expect(result.ok === false && result.error).toContain("is a person, not a channel");
+      // All THREE counts. A literal fall-through-to-rung-6 implementation returns
+      // { ok: false } too and would pass a return-value-only assertion while paging
+      // the whole workspace on every mistargeted read — conversations.list is the
+      // count that distinguishes them.
+      expect(conversationsOpenMock).not.toHaveBeenCalled();
+      expect(usersLookupByEmailMock).not.toHaveBeenCalled();
+      expect(conversationsListMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("memoizes the opened IM per user id", async () => {
+    await gateway.resolveConversation("U0LAUREN", true);
+    await gateway.resolveConversation("U0LAUREN", true);
+    expect(conversationsOpenMock).toHaveBeenCalledTimes(1);
+  });
+
+  // ── D4 log redaction (round 5) ────────────────────────────────────────────
+  // `users:read.email` makes every colleague's address reachable to this
+  // process. The tool RESULT carries the target and the candidates (the agent
+  // supplied the target; the list is its remedy); the LOG carries form + code.
+
+  it("redacts the address on an email miss: warn carries form + code, never the email", async () => {
+    usersLookupByEmailMock.mockRejectedValueOnce(new Error("An API error occurred: users_not_found"));
+    const result = await gateway.resolveConversation("lauren@dodihome.com", true);
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toContain("users_not_found"); // the tool result keeps the code
+    const warns = JSON.stringify(warnSpy.mock.calls);
+    expect(warns).toContain("slack target resolution failed");
+    expect(warns).toContain('"form":"email"');
+    expect(warns).toContain('"code":"users_not_found"');
+    expect(warns).not.toContain("lauren@dodihome.com");
+    expect(warns).not.toContain("dodihome");
+  });
+
+  it("redacts the handle and every candidate on an ambiguous @handle", async () => {
+    usersListMock.mockResolvedValue({
+      members: [
+        { id: "U1", name: "alex.a", profile: { display_name: "Alex" } },
+        { id: "U2", name: "alex.b", profile: { display_name: "Alex" } },
+      ],
+      response_metadata: { next_cursor: "" },
+    });
+    const result = await gateway.resolveConversation("@alex", true);
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toContain("@alex.a"); // candidates go to the agent…
+    const warns = JSON.stringify(warnSpy.mock.calls);
+    expect(warns).toContain('"form":"handle"');
+    expect(warns).toContain('"code":"ambiguous"');
+    expect(warns).not.toContain("alex"); // …and never to the log — not the handle, not a candidate
+  });
+});
+
+describe("SlackGateway — resolveUserId (KPR-492 D4)", () => {
+  let gateway: SlackGateway;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    restoreResolverDefaults();
+    gateway = new SlackGateway("xapp-test", "xoxb-test");
+  });
+
+  afterEach(() => {
+    restoreResolverDefaults();
+  });
+
+  it("passes U… and W… through verbatim with users.list never called (the handleUsers regression guard)", async () => {
+    await expect(gateway.resolveUserId("U123ABC")).resolves.toEqual({ ok: true, id: "U123ABC" });
+    await expect(gateway.resolveUserId("W123ABC")).resolves.toEqual({ ok: true, id: "W123ABC" });
+    expect(usersListMock).not.toHaveBeenCalled();
+  });
+
+  it("strips a leading @ itself — @alice and alice resolve to the same id with users.list called exactly once across the pair (the handleUsers raw-pass-through guard)", async () => {
+    // Spec D4 (round 6): rung 5 strips before calling, but handleUsers hands
+    // slack_read_user_profile's raw input to resolveUserId, so the strip must live
+    // here. PERSISTENT mock, deliberately: against an implementation WITHOUT the
+    // strip, `@alice` misses a POPULATED map, rebuilds (count 2) and returns
+    // ok:false — this test then fails on both assertions, not on an exhausted
+    // fixture. Rung 5's own `slice(1)` keeps every ladder test green without the
+    // strip, which is why this pin exists (Task 11 row j).
+    usersListMock.mockResolvedValue({
+      members: [{ id: "UALICE", name: "alice" }],
+      response_metadata: { next_cursor: "" },
+    });
+    await expect(gateway.resolveUserId("@alice")).resolves.toEqual({ ok: true, id: "UALICE" });
+    await expect(gateway.resolveUserId("alice")).resolves.toEqual({ ok: true, id: "UALICE" });
+    expect(usersListMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("prefers an exact user.name over a display-name match, and skips deleted AND bot members", async () => {
+    // PERSISTENT mock, deliberately (plan-review round 3, blocking 3). Every miss
+    // below triggers the one-rebuild miss policy, which re-pages users.list. With
+    // a `Once` fixture the `ghost` lookup's rebuild consumed it and rebuilt from
+    // the hoisted EMPTY default, so `hivebot` then missed whether or not is_bot
+    // was filtered — the bot half certified nothing. With the same roster served
+    // on every page-through, `hivebot` resolving ok:true is exactly what an
+    // implementation that indexes bots (and would then open an IM to one, edge 8)
+    // does, and this test fails against it.
+    usersListMock.mockResolvedValue({
+      members: [
+        { id: "UNAME", name: "sam", profile: { display_name: "Other" } },
+        { id: "UDISPLAY", name: "samantha", profile: { display_name: "sam" } },
+        { id: "UDEAD", name: "ghost", deleted: true },
+        { id: "UBOT", name: "hivebot", is_bot: true },
+      ],
+      response_metadata: { next_cursor: "" },
+    });
+    await expect(gateway.resolveUserId("sam")).resolves.toEqual({ ok: true, id: "UNAME" });
+    await expect(gateway.resolveUserId("ghost")).resolves.toMatchObject({ ok: false });
+    await expect(gateway.resolveUserId("hivebot")).resolves.toMatchObject({ ok: false });
+    // 1 build + 1 rebuild per miss — pins that both misses were REAL misses against
+    // a populated map, not artefacts of an exhausted fixture.
+    expect(usersListMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("a users.list FAILURE surfaces as a Slack-coded error, never as a false 'no such user'", async () => {
+    // Round-3 advisory, applied: pre-fix the catch swallowed the error, the flag
+    // was set, and the empty map produced "no active Slack user matches" for a
+    // ratelimited / missing_scope / transport fault — the exact false
+    // does-not-exist the miss policy exists to avoid.
+    usersListMock.mockRejectedValue(new Error("An API error occurred: missing_scope"));
+    const result = await gateway.resolveUserId("lauren");
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toContain("missing_scope");
+    expect(result.ok === false && result.error).not.toContain("no active Slack user matches");
+    // Still bounded: the first build + the one forced rebuild, no hot loop.
+    expect(usersListMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("errors and names the candidates on an ambiguous display name — never guesses", async () => {
+    usersListMock.mockResolvedValueOnce({
+      members: [
+        { id: "U1", name: "alex.a", profile: { display_name: "Alex" } },
+        { id: "U2", name: "alex.b", profile: { display_name: "Alex" } },
+      ],
+      response_metadata: { next_cursor: "" },
+    });
+    const result = await gateway.resolveUserId("alex");
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toContain("ambiguous");
+    expect(result.ok === false && result.error).toContain("@alex.a");
+    expect(result.ok === false && result.error).toContain("@alex.b");
+  });
+
+  it("caches: a second lookup does not re-page users.list", async () => {
+    usersListMock.mockResolvedValueOnce({
+      members: [{ id: "U0LAUREN", name: "lauren" }],
+      response_metadata: { next_cursor: "" },
+    });
+    await gateway.resolveUserId("lauren");
+    await gateway.resolveUserId("lauren");
+    expect(usersListMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("miss policy: re-pages exactly once and resolves a member added between page-throughs", async () => {
+    usersListMock.mockResolvedValueOnce({ members: [], response_metadata: { next_cursor: "" } }).mockResolvedValueOnce({
+      members: [{ id: "UNEW", name: "newbie" }],
+      response_metadata: { next_cursor: "" },
+    });
+    await expect(gateway.resolveUserId("newbie")).resolves.toEqual({ ok: true, id: "UNEW" });
+    expect(usersListMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("a KNOWN handle still resolves while an unknown-handle rebuild is in flight — the rebuild pages into local maps", async () => {
+    // Pre-PR review round 1. `buildUserHandleMap` used to `.clear()` the three
+    // shared maps BEFORE awaiting `users.list`, with no single-flight guard, so
+    // the maps were observably empty for the whole page-through. A concurrent
+    // lookup of a handle the map already held saw `userHandleMapBuilt === true`,
+    // skipped the build, missed the emptied map, and burned its own one allowed
+    // rebuild — one straddling miss further and it answers the false "no active
+    // Slack user matches" `resolveUserId`'s contract forbids. Posts fan out
+    // concurrently by design (meeting mode, conference rounds, cron bursts).
+    const roster = { members: [{ id: "UALICE", name: "alice" }], response_metadata: { next_cursor: "" } };
+    usersListMock.mockResolvedValue(roster);
+    await expect(gateway.resolveUserId("alice")).resolves.toEqual({ ok: true, id: "UALICE" });
+    expect(usersListMock).toHaveBeenCalledTimes(1);
+
+    // Hold the miss-policy rebuild open mid-page-through.
+    let reached!: () => void;
+    let release!: () => void;
+    const rebuildReached = new Promise<void>((resolve) => (reached = resolve));
+    const rebuildGate = new Promise<void>((resolve) => (release = resolve));
+    usersListMock.mockImplementationOnce(async () => {
+      reached();
+      await rebuildGate;
+      return roster;
+    });
+
+    const ghost = gateway.resolveUserId("ghost");
+    await rebuildReached;
+    // `resolveUserId` runs synchronously through `matchHandle` on the built-map
+    // path, so this consults the maps WHILE the rebuild above is parked.
+    const alice = gateway.resolveUserId("alice");
+    release();
+
+    await expect(alice).resolves.toEqual({ ok: true, id: "UALICE" });
+    await expect(ghost).resolves.toMatchObject({ ok: false });
+    // 1 build + ghost's ONE forced rebuild. A third page-through means the
+    // concurrent lookup saw an emptied map and spent its own rebuild on it.
+    expect(usersListMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("miss policy: a second miss errors and does NOT page a third time", async () => {
+    usersListMock.mockResolvedValue({ members: [], response_metadata: { next_cursor: "" } });
+    const result = await gateway.resolveUserId("nobody");
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toContain("no active Slack user matches");
+    expect(usersListMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("sweep() clears the user and IM caches", async () => {
+    usersListMock.mockResolvedValue({
+      members: [{ id: "U0LAUREN", name: "lauren" }],
+      response_metadata: { next_cursor: "" },
+    });
+    await gateway.resolveConversation("@lauren", true);
+    gateway.sweep();
+    await gateway.resolveConversation("@lauren", true);
+    expect(usersListMock.mock.calls.length).toBeGreaterThan(1);
+    expect(conversationsOpenMock).toHaveBeenCalledTimes(2);
   });
 });

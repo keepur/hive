@@ -9,8 +9,10 @@ import {
   resolveVoiceWarmPathConfig,
   resolveVoiceToolAckConfig,
   resolveMeetingWorkersConfig,
+  resolveLocalMcpServer,
   DEFAULT_TOOL_SEARCH_CONFIG,
 } from "./config.js";
+import { parse as parseYaml } from "yaml";
 import { DEFAULT_CIRCUIT_BREAKER_CONFIG } from "./agents/provider-circuit-breaker.js";
 import { DEFAULT_OUTAGE_QUEUE_CONFIG } from "./outage/outage-queue-store.js";
 import { DEFAULT_MEETING_WORKERS_CONFIG } from "./workers/worker-pool-config.js";
@@ -409,5 +411,39 @@ describe("resolveVoiceToolAckConfig (KPR-324 C6)", () => {
   });
   it("enables on literal true; ignores unknown keys", () => {
     expect(resolveVoiceToolAckConfig({ enabled: true, phrases: ["x"] }).enabled).toBe(true);
+  });
+});
+
+describe("resolveLocalMcpServer (KPR-492 D6)", () => {
+  it("defaults to true when the key is absent", () => {
+    const hive = parseYaml("slack:\n  auditChannel: audit\n") as { slack?: Record<string, unknown> };
+    expect(resolveLocalMcpServer(hive.slack?.localMcpServer)).toBe(true);
+  });
+
+  it("resolves true for an explicit null — `??` falls back on null/undefined only", () => {
+    const hive = parseYaml("slack:\n  localMcpServer: null\n") as { slack?: Record<string, unknown> };
+    expect(hive.slack?.localMcpServer).toBeNull();
+    expect(resolveLocalMcpServer(hive.slack?.localMcpServer)).toBe(true);
+  });
+
+  it("resolves false for an explicit false — the live-instance shape on dodi and keepur", () => {
+    // Both live instances pin `slack.localMcpServer: false` in their gitignored
+    // hive.yaml (dodi `hive.yaml:45`, keepur `hive.yaml:17` per the ticket), which
+    // is why merging and deploying this change is a fleet no-op. Those files are
+    // not fixtures, so the SHAPE is pinned here instead — ONE fixture, because
+    // both instances carry the identical `localMcpServer: false` scalar under
+    // `slack:`; there is no second shape to pin (spec §9 asks for "the two
+    // live-instance shapes" — they are the same shape).
+    const hive = parseYaml("slack:\n  localMcpServer: false\n  auditChannel: audit\n") as {
+      slack?: Record<string, unknown>;
+    };
+    expect(resolveLocalMcpServer(hive.slack?.localMcpServer)).toBe(false);
+  });
+
+  it('treats other falsy scalars as disabling, and the string "false" as enabling', () => {
+    expect(resolveLocalMcpServer(0)).toBe(false);
+    expect(resolveLocalMcpServer("")).toBe(false);
+    expect(resolveLocalMcpServer("false")).toBe(true);
+    expect(resolveLocalMcpServer(true)).toBe(true);
   });
 });
