@@ -28,8 +28,20 @@ export const STAGES = [
   "estimateMs",
 ] as const;
 export type Stage = (typeof STAGES)[number];
-/** The two stages that carry a between-arm claim (§3.4): powered (bench) and confirmatory (live). */
-export const CLAIM_STAGES: readonly Stage[] = ["initToFirstTokenMs", "estimateMs"];
+/**
+ * The stages that carry a between-arm claim (§3.1 — every claim has an interval; §3.4):
+ * `initToFirstTokenMs` (powered, bench), `estimateMs` (confirmatory, live — always
+ * `insufficient_samples` on an engine-only arm, which has no bound speech), and
+ * `engineFirstTextMs` (powered, bench). The bench-composed estimate is one global
+ * constant (pooled live EOU p50 + pooled live TTS TTFB p50) plus `engineFirstTextMs`,
+ * so the `engineFirstTextMs` median-difference interval IS the bench-composed
+ * estimate's between-arm interval; it needs no speech binding.
+ */
+export const CLAIM_STAGES = [
+  "initToFirstTokenMs",
+  "estimateMs",
+  "engineFirstTextMs",
+] as const satisfies readonly Stage[];
 
 export interface CompareCall {
   callId: string;
@@ -136,10 +148,18 @@ export interface PairInterval {
 }
 
 export interface CrossCheck {
+  /** Always `matched + mismatched + missingInJsonl + skippedNonCompleted`. */
   rows: number;
   matched: number;
   mismatched: number;
   missingInJsonl: number;
+  /**
+   * Log rows whose JSONL turn did not complete (cancelled/failed/...): not comparable,
+   * so neither matched nor mismatched. The log row is outcome-blind by design while the
+   * JSONL stage is outcome-aware (§3.2 source gate + this module's completed-only
+   * pooling), so a field comparison there would always disagree without any data fault.
+   */
+  skippedNonCompleted: number;
   mismatches: Array<{
     callId: string;
     turnId: string;
@@ -251,26 +271,43 @@ export function buildTurnRows(
       toolCount: final.toolCount ?? null,
     });
     const lockQueue = warm ? final.queueWaitMs : final.lockWaitMs;
+    // §3.2/§3.4: only a completed final attempt is a valid sample. A barge-in
+    // (`cancelled`), `failed`, `incomplete` or outcome-less attempt stays in its
+    // stratum's `turns` count, but every stage value is excluded here with the
+    // outcome as its reason — the same "stay in the stratum, exclude the value"
+    // pattern as the estimate. The raw rows keep `lockWaitMs`/`spawnPrepMs`/
+    // `initToFirstTokenMs` outcome-blind by chunk A's design, so this aggregation
+    // is where the exclusion has to happen. `bootToInitMs` needs no gate: the
+    // adapter already stamps it `not_observed` on any non-completed outcome
+    // (`bootToInitMeasure`, voice-adapter.ts), so `value()` reads null.
+    const completed = final.outcome === "completed";
+    const outcomeReason = completed ? null : (final.outcome ?? "unknown");
     const stages: Record<Stage, number | null> = {
-      eouMs: speech?.eouMs ?? null,
-      lockQueueMs: value(lockQueue),
+      eouMs: completed ? (speech?.eouMs ?? null) : null,
+      lockQueueMs: completed ? value(lockQueue) : null,
       bootToInitMs: value(final.bootToInitMs),
-      initToFirstTokenMs: value(final.initToFirstTokenMs),
-      engineFirstTextMs: value(final.firstTextMs),
-      bridgeFirstTextMs: speech?.bridgeFirstTextMs ?? null,
-      ttsTtfbMs: speech?.ttsTtfbMs ?? null,
-      estimateMs: ambiguous ? null : (speech?.estimateMs ?? null),
+      initToFirstTokenMs: completed ? value(final.initToFirstTokenMs) : null,
+      engineFirstTextMs: completed ? value(final.firstTextMs) : null,
+      bridgeFirstTextMs: completed ? (speech?.bridgeFirstTextMs ?? null) : null,
+      ttsTtfbMs: completed ? (speech?.ttsTtfbMs ?? null) : null,
+      estimateMs: completed && !ambiguous ? (speech?.estimateMs ?? null) : null,
     };
     const workerReason = ambiguous ? "ambiguous_components" : speech ? null : "no_bound_speech";
+    // A non-completed outcome is the reason for every excluded stage, ahead of the
+    // generic fallbacks. The estimate keeps the speech binding's own exclusion
+    // first (KPR-464's taxonomy; §3.4 names the barge-in exclusion `interrupted`),
+    // so the outcome reason there only covers a binding that reports none.
     const stageReasons: Record<Stage, string | null> = {
-      eouMs: stages.eouMs === null ? (workerReason ?? "missing_eou") : null,
-      lockQueueMs: stages.lockQueueMs === null ? reasonOf(lockQueue) : null,
-      bootToInitMs: stages.bootToInitMs === null ? reasonOf(final.bootToInitMs) : null,
-      initToFirstTokenMs: stages.initToFirstTokenMs === null ? reasonOf(final.initToFirstTokenMs) : null,
-      engineFirstTextMs: stages.engineFirstTextMs === null ? reasonOf(final.firstTextMs) : null,
-      bridgeFirstTextMs: stages.bridgeFirstTextMs === null ? (workerReason ?? "missing_bridge_first_text") : null,
-      ttsTtfbMs: stages.ttsTtfbMs === null ? (workerReason ?? "missing_tts_metric") : null,
-      estimateMs: stages.estimateMs === null ? (workerReason ?? speech?.exclusion ?? "missing") : null,
+      eouMs: stages.eouMs === null ? (outcomeReason ?? workerReason ?? "missing_eou") : null,
+      lockQueueMs: stages.lockQueueMs === null ? (outcomeReason ?? reasonOf(lockQueue)) : null,
+      bootToInitMs: stages.bootToInitMs === null ? (outcomeReason ?? reasonOf(final.bootToInitMs)) : null,
+      initToFirstTokenMs:
+        stages.initToFirstTokenMs === null ? (outcomeReason ?? reasonOf(final.initToFirstTokenMs)) : null,
+      engineFirstTextMs: stages.engineFirstTextMs === null ? (outcomeReason ?? reasonOf(final.firstTextMs)) : null,
+      bridgeFirstTextMs:
+        stages.bridgeFirstTextMs === null ? (outcomeReason ?? workerReason ?? "missing_bridge_first_text") : null,
+      ttsTtfbMs: stages.ttsTtfbMs === null ? (outcomeReason ?? workerReason ?? "missing_tts_metric") : null,
+      estimateMs: stages.estimateMs === null ? (speech?.exclusion ?? outcomeReason ?? workerReason ?? "missing") : null,
     };
     rows.push({
       callId,
@@ -378,6 +415,7 @@ export function crossCheck(log: EngineLogRow[], turns: TurnRow[]): CrossCheck {
     matched: 0,
     mismatched: 0,
     missingInJsonl: 0,
+    skippedNonCompleted: 0,
     mismatches: [],
     warmTurnSeqMonotonic: {},
   };
@@ -391,6 +429,10 @@ export function crossCheck(log: EngineLogRow[], turns: TurnRow[]): CrossCheck {
     const turn = byKey.get(`${row.callId} ${row.turnId}`);
     if (!turn) {
       out.missingInJsonl += 1;
+      continue;
+    }
+    if (turn.outcome !== "completed") {
+      out.skippedNonCompleted += 1;
       continue;
     }
     let rowOk = true;

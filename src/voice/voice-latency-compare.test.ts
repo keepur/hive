@@ -63,13 +63,17 @@ describe("KPR-465 comparison reader (R1)", () => {
     expect(report.ok).toBe(true);
     const cold = report.arms.find((a) => a.arm === "A0-cold")!;
     const warm = report.arms.find((a) => a.arm === "A1-warm")!;
-    // t2, t3, t5, t6: t4 is the tool stratum; t5 (interrupted, selected "resume", no tool) stays steady
-    // with its estimate excluded as `interrupted` — its engine stages still count.
+    // t2, t3, t5, t6: t4 is the tool stratum; t5 (barge-in: engine attempt `cancelled`, selected
+    // "resume", no tool) stays in the steady turn count, but none of its stage values are pooled —
+    // the estimate is excluded as `interrupted`, every other stage as `cancelled`.
     expect(cold.byStratum.steady.turns).toBe(4);
     expect(cold.byStratum.first.turns).toBe(1);
     expect(cold.byStratum.tool.turns).toBe(1);
     expect(cold.byStratum.steady.stages.estimateMs.missingByReason).toEqual({ interrupted: 1 });
-    expect(cold.byStratum.steady.stages.lockQueueMs.samples).toEqual([0, 0, 0, 831]);
+    expect(cold.byStratum.steady.stages.lockQueueMs).toMatchObject({
+      samples: [0, 0, 831],
+      missingByReason: { cancelled: 1 },
+    });
     expect(warm.byStratum.steady.turns).toBe(3); // t2, t3, t6
     expect(warm.byStratum.first.turns).toBe(1);
     expect(warm.byStratum.retried.turns).toBe(1);
@@ -84,19 +88,59 @@ describe("KPR-465 comparison reader (R1)", () => {
       attempts: 2,
       selectedContinuity: "fresh",
     });
-    expect(report.pairs[0]!.intervals.initToFirstTokenMs).toMatchObject({ n1: 3, n2: 4, ci95: expect.any(Array) });
+    // Cold steady n is 3, not 4: the cancelled t5 contributes no engine sample.
+    expect(report.pairs[0]!.intervals.initToFirstTokenMs).toMatchObject({ n1: 3, n2: 3, ci95: expect.any(Array) });
     expect(report.pairs[0]!.intervals.estimateMs).toMatchObject({ n1: 3, n2: 3 });
+    expect(report.pairs[0]!.intervals.engineFirstTextMs).toMatchObject({ n1: 3, n2: 3, ci95: expect.any(Array) });
   });
 
-  it("interrupted turns stay in the stratum but are excluded from the estimate by reason", () => {
+  it("interrupted turns stay in the stratum but are excluded from the estimate and every stage by reason", () => {
     const report = compareVoiceLatency({ calls: calls({ "call-cold-a": "A0-cold" }) });
     const cold = report.arms[0]!;
     const t5 = cold.turns.find((t) => t.turnId === "call-cold-a-t5")!;
-    expect(t5.estimateExclusion).toBe("interrupted");
-    const steadyEstimate = cold.byStratum.steady.stages.estimateMs;
-    expect(steadyEstimate.n + Object.values(steadyEstimate.missingByReason).reduce((a, b) => a + b, 0)).toBe(
-      cold.byStratum.steady.turns,
-    );
+    expect(t5).toMatchObject({ stratum: "steady", outcome: "cancelled", estimateExclusion: "interrupted" });
+    // The raw row keeps outcome-blind initToFirstTokenMs/lockWaitMs (chunk A); pooling must not.
+    expect(Object.values(t5.stages).every((v) => v === null)).toBe(true);
+    expect(t5.stageReasons).toEqual({
+      eouMs: "cancelled",
+      lockQueueMs: "cancelled",
+      bootToInitMs: "cancelled",
+      initToFirstTokenMs: "cancelled",
+      engineFirstTextMs: "cancelled",
+      bridgeFirstTextMs: "cancelled",
+      ttsTtfbMs: "cancelled",
+      estimateMs: "interrupted",
+    });
+    const steady = cold.byStratum.steady;
+    expect(steady.stages.initToFirstTokenMs).toMatchObject({
+      samples: [1300, 1350, 1500],
+      missingByReason: { cancelled: 1 },
+    });
+    expect(steady.stages.engineFirstTextMs).toMatchObject({
+      samples: [2000, 2050, 2200],
+      missingByReason: { cancelled: 1 },
+    });
+    for (const dist of Object.values(steady.stages)) {
+      expect(dist.n + Object.values(dist.missingByReason).reduce((a, b) => a + b, 0)).toBe(steady.turns);
+    }
+  });
+
+  it("R1 (12): an incomplete call report sets ok false with a named failure", () => {
+    const truncated = fixture.jsonl
+      .split("\n")
+      .filter((l) => !(l.includes('"speechId":"call-cold-a-s2"') && l.includes('"event":"speech_terminal"')))
+      .join("\n");
+    expect(truncated).not.toBe(fixture.jsonl);
+    const report = compareVoiceLatency({
+      calls: [
+        { callId: "call-cold-a", arm: "A0-cold", jsonl: truncated },
+        { callId: "call-warm-a", arm: "A1-warm", jsonl: truncated },
+      ],
+    });
+    expect(report.ok).toBe(false);
+    expect(report.failures).toEqual(["call call-cold-a (A0-cold) is incomplete"]);
+    expect(report.arms.find((a) => a.arm === "A0-cold")!.calls[0]).toMatchObject({ complete: false, incomplete: 1 });
+    expect(report.arms.find((a) => a.arm === "A1-warm")!.calls[0]!.complete).toBe(true);
   });
 
   it("fails the run on a warm-labelled arm with a cold steady turn and on a cold-labelled arm with a warm steady turn", () => {
@@ -130,21 +174,53 @@ describe("KPR-465 comparison reader (R1)", () => {
     expect(live.arms[0]!.benchComposedEstimateMs).toEqual({ reason: "not_engine_only" });
   });
 
-  it("engine-log cross-check counts exactly the one disagreeing row and checks warmTurnSeq monotonicity", () => {
+  it("bench-only pair: engineFirstTextMs carries a real interval with no speech binding; cancelled bench turns excluded", () => {
+    const report = compareVoiceLatency({
+      calls: calls({ "call-bench-1": "A1-warm-bench", "call-bench-2": "A0-cold-bench" }),
+      pairs: [{ treatment: "A1-warm-bench", base: "A0-cold-bench" }],
+    });
+    expect(report.ok).toBe(true);
+    const coldBench = report.arms.find((a) => a.arm === "A0-cold-bench")!;
+    expect(coldBench.engineOnly).toBe(true);
+    // t2, t3, t4, t5 steady; t4 is the cancelled barge-in — in the turn count, out of every sample.
+    expect(coldBench.byStratum.steady.turns).toBe(4);
+    expect(coldBench.byStratum.steady.stages.engineFirstTextMs).toMatchObject({
+      samples: [2000, 2050, 2150],
+      missingByReason: { cancelled: 1 },
+    });
+    expect(coldBench.byStratum.steady.stages.initToFirstTokenMs.missingByReason).toEqual({ cancelled: 1 });
+    const intervals = report.pairs[0]!.intervals;
+    expect(intervals.estimateMs).toEqual({ n1: 0, n2: 0, reason: "insufficient_samples" });
+    // warm bench steady [1330, 1370] → median 1330; cold bench [2000, 2050, 2150] → median 2050.
+    expect(intervals.engineFirstTextMs).toMatchObject({ n1: 2, n2: 3, medianDiffMs: -720, excludesZero: true });
+    const ef = intervals.engineFirstTextMs as { ci95: [number, number] };
+    expect(ef.ci95[1]).toBeLessThan(0);
+  });
+
+  it("engine-log cross-check counts exactly the one disagreeing row, skips non-completed turns, checks warmTurnSeq monotonicity", () => {
     const callIds = new Set(["call-cold-a", "call-warm-a"]);
     const parsed = parseEngineLog(fixture.engineLog, callIds);
-    expect(parsed.rows).toHaveLength(7);
+    expect(parsed.rows).toHaveLength(8);
+    // The t5 log row carries outcome-blind real values the JSONL (correctly) excludes.
+    expect(parsed.rows.find((r) => r.turnId === "call-cold-a-t5")).toMatchObject({
+      bootToInitMs: 645,
+      initToFirstTokenMs: 1450,
+    });
     const report = compareVoiceLatency({
       calls: calls({ "call-cold-a": "A0-cold", "call-warm-a": "A1-warm" }),
       engineLog: parsed.rows,
     });
     expect(report.crossCheck).toMatchObject({
-      rows: 7,
+      rows: 8,
       matched: 6,
       mismatched: 1,
       missingInJsonl: 0,
+      skippedNonCompleted: 1,
       warmTurnSeqMonotonic: { "call-warm-a": true },
     });
+    const cc = report.crossCheck!;
+    expect(cc.matched + cc.mismatched + cc.missingInJsonl + cc.skippedNonCompleted).toBe(cc.rows);
+    expect(cc.mismatches).toHaveLength(1);
     expect(report.crossCheck!.mismatches[0]).toMatchObject({
       turnId: "call-warm-a-t2",
       field: "initToFirstTokenMs",

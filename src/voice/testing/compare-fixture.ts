@@ -235,12 +235,16 @@ export function buildCall(callId: string, turns: FixtureTurn[]): string[] {
           ...extra,
         },
       );
+    // Mirrors the adapter (`bootToInitMeasure`/`queueWaitMeasure`): a non-completed
+    // attempt reports both new stages `not_observed`, while the three pre-existing
+    // measures stay outcome-blind (real values on a cancelled attempt).
+    const gateNew = (v: FixtureTurn["boot"]) => (t.interrupted && v !== "omit" && v !== undefined ? null : v);
     const stages = {
       lockWaitMs: t.warm ? m(0) : m(t.lock ?? 0),
       spawnPrepMs: m(2),
       initToFirstTokenMs: m(t.init),
-      ...stage(t.boot, "bootToInitMs"),
-      ...stage(t.queue, "queueWaitMs"),
+      ...stage(gateNew(t.boot), "bootToInitMs"),
+      ...stage(gateNew(t.queue), "queueWaitMs"),
       // `effort` is emitted only when the turn sets it explicitly. The cold/warm
       // defaults below carry the delivered effort (`null` / `"medium"`, KPR-465
       // chunk C); `"omit"` keeps the key absent (KPR-464-era shape, `call-old`).
@@ -368,9 +372,21 @@ export function buildCompareFixture(): { jsonl: string; engineLog: string; bench
       cold(1, { boot: "omit", queue: "omit", effort: "omit" }),
       cold(2, { boot: "omit", queue: "omit", effort: "omit" }),
     ]),
+    // Cold engine-only bench call with a cancelled steady barge-in (t4): pairs with
+    // call-bench-1 for a bench-vs-bench interval that needs no speech binding.
+    ...buildCall("call-bench-2", [
+      cold(1, { engineOnly: true }),
+      cold(2, { engineOnly: true }),
+      cold(3, { engineOnly: true }),
+      cold(4, { engineOnly: true, interrupted: true }),
+      cold(5, { engineOnly: true }),
+    ]),
   ];
   const engineLog = [
-    ...[1, 2, 3, 4, 6].map((i) =>
+    // t5 is the cancelled barge-in: the adapter still logs "Voice turn complete" for an
+    // aborted result, with outcome-blind stage values, while its JSONL row is excluded —
+    // the cross-check must skip it (skippedNonCompleted), never count it as a mismatch.
+    ...[1, 2, 3, 4, 5, 6].map((i) =>
       JSON.stringify({
         ts: ts(i),
         level: "info",
