@@ -122,7 +122,7 @@ Expected: every named Vitest file passes with zero skipped required cases; `npm 
 | --- | --- |
 | Sample-plan derivation (non-blocking, delegated) | Execution chunk Task E2 (re-derivation formula + recording rule) |
 | Contained `mokie-bench` clone (non-blocking, delegated) | Bench chunk Task D5 (definition, lifecycle runbook, three delete-time checks, accepted residuals) |
-| Additive keys under schema v2, reader allowlist extended (non-blocking, delegated; ⚠ version bump) | Instrumentation Task A4, effort Task C4, bench Task D4 — allowlist edited in the same commit as each emitter; the ⚠ version-bump branch is recorded as *not taken* with the reason in Task A4 |
+| Additive keys under schema v2, reader allowlist extended (non-blocking, delegated; ⚠ version bump) | Instrumentation Task A3 (reader allowlist, one commit *before* the Task A4 emitter — plan-review round 3 reorder), effort Task C4, bench Task D4 — allowlist edited in the same commit as each emitter for C4/D4; the ⚠ version-bump branch is recorded as *not taken* with the reason in Task A3 Step 2 |
 | Static `effort` on voice is agent-wide (⚠ for the operator) | Effort Task C6 (`docs/providers.md`) + Execution Task E4 (pre-deploy check of every voice-capable definition for `xhigh`/`max`) |
 | `voice.livekit.endpointing` conditional | Bench Task D4, gated by Execution Task E3's A0 decomposition rule |
 | Production restarts rule-bound | Execution Task E3 (quiescence check commands, cap, block order, timestamps) |

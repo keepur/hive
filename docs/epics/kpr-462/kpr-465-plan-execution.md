@@ -83,7 +83,7 @@ Dependencies stated explicitly: B needs A's keys for its fixtures (it tolerates 
 **Status:** bench/offline verified; live comparison and caller verdict pending
 **Build/pins:** engine <sha>, worker <sha or "pilot ab0d2d68 — pre-464, not usable">, @livekit/agents 1.6.4, SDK <version>, Node <version>
 **Running identities (read back at session start):** pending
-**Schema decision:** additive keys under voice_diagnostic schemaVersion 2 (`bootToInitMs`, `queueWaitMs`, `effort` on engine terminals; endpointing on `session_started`); no version bump (chunk A Task A4 rationale)
+**Schema decision:** additive keys under voice_diagnostic schemaVersion 2 (`bootToInitMs`, `queueWaitMs`, `effort` on engine terminals; endpointing on `session_started`); no version bump (chunk A Task A3 Step 2 rationale)
 
 ## 1. Offline verification (chunks A–D)
 | Row | Suite / test names | Result | Commit |
