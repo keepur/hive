@@ -222,11 +222,9 @@ describe("the harness extensions this ticket added (KPR-468)", () => {
     expect(await db.collection("probe").countDocuments({ n: { $lt: 2 } })).toBe(1);
 
     // Every other operator stays loud, per the double's original design.
-    // ($ne, $or and $in were subsequently admitted too, ahead of Tasks 4/5 —
-    // see fake-db.ts's predicate()/matchesFilter() — so this uses an operator
-    // that stays unsupported.)
-    await expect(db.collection("probe").findOne({ n: { $exists: true } })).rejects.toThrow(
-      "unsupported_filter_$exists",
-    );
+    // ($ne, $or, $in and $exists were subsequently admitted too, ahead of
+    // Tasks 4/5/6 — see fake-db.ts's predicate()/matchesFilter() — so this
+    // uses an operator that stays unsupported.)
+    await expect(db.collection("probe").findOne({ n: { $regex: "x" } })).rejects.toThrow("unsupported_filter_$regex");
   });
 });
