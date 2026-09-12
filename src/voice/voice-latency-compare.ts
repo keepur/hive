@@ -282,10 +282,7 @@ export function buildTurnRows(
       selectedContinuity: final.selectedContinuity ?? null,
       continuity: (final.continuity as TurnRow["continuity"]) ?? null,
       toolCount: final.toolCount ?? null,
-      effort:
-        typeof (final as { effort?: unknown }).effort === "string"
-          ? ((final as { effort?: string }).effort ?? null)
-          : null,
+      effort: final.effort ?? null,
       outcome: final.outcome ?? "unknown",
       speechId: speech?.speechId ?? null,
       stages,
