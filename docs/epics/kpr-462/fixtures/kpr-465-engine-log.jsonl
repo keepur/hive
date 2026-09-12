@@ -1,0 +1,8 @@
+{"ts":"2026-09-11T00:00:00.001Z","level":"info","component":"voice-adapter","msg":"Voice turn complete","callId":"call-cold-a","turnId":"call-cold-a-t1","bootToInitMs":641,"initToFirstTokenMs":1250,"warmPath":false}
+{"ts":"2026-09-11T00:00:00.002Z","level":"info","component":"voice-adapter","msg":"Voice turn complete","callId":"call-cold-a","turnId":"call-cold-a-t2","bootToInitMs":642,"initToFirstTokenMs":1300,"warmPath":false}
+{"ts":"2026-09-11T00:00:00.003Z","level":"info","component":"voice-adapter","msg":"Voice turn complete","callId":"call-cold-a","turnId":"call-cold-a-t3","bootToInitMs":643,"initToFirstTokenMs":1350,"warmPath":false}
+{"ts":"2026-09-11T00:00:00.004Z","level":"info","component":"voice-adapter","msg":"Voice turn complete","callId":"call-cold-a","turnId":"call-cold-a-t4","bootToInitMs":644,"initToFirstTokenMs":1400,"warmPath":false}
+{"ts":"2026-09-11T00:00:00.006Z","level":"info","component":"voice-adapter","msg":"Voice turn complete","callId":"call-cold-a","turnId":"call-cold-a-t6","bootToInitMs":646,"initToFirstTokenMs":1500,"warmPath":false}
+{"ts":"2026-09-11T00:00:00.009Z","level":"info","component":"voice-adapter","msg":"Voice turn complete","callId":"call-warm-a","turnId":"call-warm-a-t1","bootToInitMs":655,"initToFirstTokenMs":1190,"warmPath":true,"warmTurnSeq":1}
+{"ts":"2026-09-11T00:00:00.010Z","level":"info","component":"voice-adapter","msg":"Voice turn complete","callId":"call-warm-a","turnId":"call-warm-a-t2","initToFirstTokenMs":1231,"warmPath":true,"warmTurnSeq":2}
+{"ts":"2026-09-11T00:00:00.011Z","level":"info","component":"other","msg":"unrelated row","callId":"call-warm-a"}

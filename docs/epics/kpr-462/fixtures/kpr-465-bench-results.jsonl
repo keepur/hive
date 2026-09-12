@@ -1,0 +1,4 @@
+{"callId":"call-bench-1","arm":"A1-warm-bench","turnIndex":1,"turnId":"call-bench-1-t1","expectsTool":false,"keywordPass":true,"clientFirstTextMs":1301,"textLength":8,"status":200}
+{"callId":"call-bench-1","arm":"A1-warm-bench","turnIndex":2,"turnId":"call-bench-1-t2","expectsTool":false,"keywordPass":true,"clientFirstTextMs":1302,"textLength":8,"status":200}
+{"callId":"call-bench-1","arm":"A1-warm-bench","turnIndex":3,"turnId":"call-bench-1-t3","expectsTool":false,"keywordPass":true,"clientFirstTextMs":1303,"textLength":8,"status":200}
+{"callId":"call-bench-1","arm":"A1-warm-bench","turnIndex":4,"turnId":"call-bench-1-t4","expectsTool":true,"keywordPass":null,"clientFirstTextMs":1304,"textLength":8,"status":200}
