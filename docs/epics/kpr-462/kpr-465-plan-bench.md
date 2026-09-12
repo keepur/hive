@@ -437,6 +437,8 @@ export async function runBenchCall(opts: BenchOptions, callId = `bench-${opts.ar
 
 async function operatorKillPrompt(phase: string, turn: BenchTurn): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stderr });
+  // Note: this kill-drill instruction assumes a quiet window (Task E3) — pgrep finding wrong process is a real risk
+  // if other agents are live, which is exactly why the quiet window is a precondition, not a suggestion.
   process.stderr.write(
     `\n[kill drill] phase=${phase} turn=${turn.index}. Identify the lease's CLI child NOW, e.g.\n` +
       `  pgrep -P <engine-pid> -nf claude-agent-sdk   # newest matching child of the engine\n` +
@@ -849,20 +851,39 @@ This task runs only inside a chunk E quiet window (Task E3). Nothing here is exe
 
 Per arm: A0/A1 → no `effort` key; A2 → `effort: "medium"` (then `"low"` only under the spec §4 A2 rule) via `agent_update`. `contacts` is deliberately absent (`contacts_create`/`contacts_update` write dodi's live collection). Nothing from `WORKER_SERVER_DENYLIST` (`src/workers/meeting-worker-pool.ts:54`) and no vendor write surface is on the list.
 
-- [ ] **Step 2: Containment, stated honestly (spec §4.2).** The clone runs on an ordinary `AgentRunner`; the four auto-injected servers (`team`, `schedule`, `team-roster`, `skill-author`) cannot be stripped (only worker-mode runners set `suppressAutoInjectedServers`). Containment rests on the fixed script (no line asks for a message, a schedule, or a skill) and the delete window. After `agent_create`: `kill -USR1 <engine-pid>`; readback `agent_get mokie-bench` and record `coreServers`, `channels`, `effort`, `disabled`.
+- [ ] **Step 2: Quiescence pre-check.** Confirm via the freshest `spawn_coordinator_stats` heartbeat (or `hive doctor`'s Spawn coordinator section) that `activeSpawns == 0` for every agent and no other live call is in progress. This quiet-window pre-check is required before proceeding. See spec §6.2 for the full quiescence requirement.
 
-- [ ] **Step 3: Three delete-time checks (record each in the evidence record, with UTC timestamps):**
+- [ ] **Step 2b: Containment, stated honestly (spec §4.2).** The clone runs on an ordinary `AgentRunner`; the four auto-injected servers (`team`, `schedule`, `team-roster`, `skill-author`) cannot be stripped (only worker-mode runners set `suppressAutoInjectedServers`). Containment rests on the fixed script (no line asks for a message, a schedule, or a skill) and the delete window. After `agent_create`: `kill -USR1 <engine-pid>`; readback `agent_get mokie-bench` and record `coreServers`, `channels`, `effort`, `disabled`.
 
+- [ ] **Step 3: Delete-time checks (record each in the evidence record, with UTC timestamps):**
+
+  - [ ] **(3a) Confirm the `team_messages` sender field name first:** Run this query before the count query below to identify the actual field name:
 ```bash
-# (1) no message FROM the clone beyond the scripted lookup exchange
-mongosh "$MONGO_URI" --quiet --eval 'db.team_messages.countDocuments({ fromAgentId: "mokie-bench" })'
-# (2) the clone's own schedule is empty — read back via agent_get immediately before delete; also:
-mongosh "$MONGO_URI" --quiet --eval 'db.agent_definitions.findOne({ _id: "mokie-bench" }, { schedule: 1 })'
-# (3) no on-disk agent dir (skill-author is a real stdio subprocess that could write here)
-ls -la "$HIVE_HOME/agents/mokie-bench" 2>&1   # expected: No such file or directory; if present: record contents, rm -rf, record removal
+mongosh "$MONGO_URI" --quiet --eval 'db.team_messages.findOne({}, {fromAgentId:1, senderId:1, agentId:1})'
 ```
+Use whichever field is actually present (likely `fromAgentId` or `senderId`) as the field name in check (1) below.
 
-Expected: (1) `0`; (2) `{ _id: "mokie-bench", schedule: [] }`; (3) absent (or removed and recorded). Then `agent_delete mokie-bench confirm=true` → `kill -USR1 <engine-pid>` → `agent_list` readback shows no `mokie-bench`. (The `team_messages` field name is whatever `src/team/` writes for the sender — confirm with one `findOne()` on a real doc before relying on `fromAgentId`.)
+  - [ ] **(1) No message FROM the clone beyond the scripted lookup exchange** — use the field name confirmed in (3a):
+```bash
+mongosh "$MONGO_URI" --quiet --eval 'db.team_messages.countDocuments({ <field-name-from-3a>: "mokie-bench" })'
+```
+Expected: `0`
+
+  - [ ] **(2) The clone's own schedule is empty** — read back via `agent_get` immediately before delete; also:
+```bash
+mongosh "$MONGO_URI" --quiet --eval 'db.agent_definitions.findOne({ _id: "mokie-bench" }, { schedule: 1 })'
+```
+Expected: `{ _id: "mokie-bench", schedule: [] }`
+
+  - [ ] **(3) No on-disk agent dir** (skill-author is a real stdio subprocess that could write here):
+```bash
+ls -la "$HIVE_HOME/agents/mokie-bench" 2>&1
+```
+Expected: `No such file or directory`; if present: record contents, `rm -rf`, record removal.
+
+**If any check does not match the expected result, do not proceed to `agent_delete` — record the discrepancy (values observed, timestamp) and escalate to the CoS for a decision before continuing.**
+
+Then, when all checks pass: `agent_delete mokie-bench confirm=true` → `kill -USR1 <engine-pid>` → `agent_list` readback shows no `mokie-bench`.
 
 - [ ] **Step 4: Accepted residuals (record, do not fix):** `memory`/`memory_versions`/`agent_memory` rows keyed `mokie-bench` have no TTL and remain; `sessions` rows expire under the 7-day TTL; one fleet-wide team-summary prefix invalidation on create and one on delete (KPR-432/434 cost class) — both inside the quiet window. A clone found by any later session is deleted, never reused.
 
