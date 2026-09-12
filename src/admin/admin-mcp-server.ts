@@ -29,6 +29,10 @@ import {
   type ResourceTierOverrides,
 } from "../agents/resource-tiers.js";
 import { isLaneAProvider } from "../agents/provider-adapters/passthrough-providers.js";
+// KPR-452 (D5): the audit-routing control reaches this server through a
+// module-global accessor, NOT through a Dispatcher import — that is what
+// keeps the two out of an import cycle.
+import { getAuditRoutingControl } from "../audit/audit-routing.js";
 import { createLogger } from "../logging/logger.js";
 import { config as appConfig } from "../config.js";
 import { envValue } from "../agents/provider-adapters/oauth-credentials.js";
@@ -1440,6 +1444,99 @@ export function buildAdminTools(deps: AdminToolDeps) {
             isError: true,
             content: [{ type: "text", text: `memory_lifecycle_run_consolidation error: ${String(err)}` }],
           };
+        }
+      },
+    ),
+    tool(
+      "audit_channel_get",
+      "Report where this hive's audit mirror posts. The audit mirror copies every non-Slack-sourced agent turn — agent-to-agent team DMs, event-bus deliveries, voice, SMS and iOS turns — into ONE configured Slack channel. Shows the effective channel name, whether it comes from a runtime override or hive.yaml, whether it currently resolves to a Slack channel id, who last changed it, and an advisory if the channel is some agent's own homeBase. Call this before audit_channel_set.",
+      {},
+      async () => {
+        const control = getAuditRoutingControl();
+        if (!control) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: "audit_channel_get: audit routing is not reachable from this process. These tools require the in-process admin server.",
+              },
+            ],
+          };
+        }
+        // No `control.ready()` call here BY DESIGN — describe()/set() each
+        // check readiness internally and return the boot-window NOT_READY
+        // message themselves. A second gate here would duplicate that check
+        // and could disagree with it. `ready()` is deliberately unused.
+        try {
+          return { content: [{ type: "text", text: await control.describe() }] };
+        } catch (err) {
+          return { isError: true, content: [{ type: "text", text: `audit_channel_get error: ${String(err)}` }] };
+        }
+      },
+    ),
+    tool(
+      "audit_channel_set",
+      "Point this hive's audit mirror at a Slack channel. Pass the channel NAME (not its id), with or without a leading '#'. The name is validated against Slack before anything is saved — an unresolvable name is REJECTED and nothing is persisted. On success it applies to the NEXT AUDIT POST: no restart and no SIGUSR1. Pass an empty string to clear the runtime override and revert to the hive.yaml `slack.auditChannel` value; if that is also unset, the audit mirror is then OFF. The bot must be a member of the channel to post there — invite it first.",
+      {
+        channel_name: z
+          .string()
+          .describe(
+            "Slack channel NAME, e.g. 'ops-audit' or '#ops-audit'. Pass an empty string to clear the override and revert to hive.yaml.",
+          ),
+      },
+      async ({ channel_name }) => {
+        const control = getAuditRoutingControl();
+        if (!control) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: "audit_channel_set: audit routing is not reachable from this process. These tools require the in-process admin server.",
+              },
+            ],
+          };
+        }
+        try {
+          const stripped = channel_name.trim().replace(/^#/, "");
+          if (stripped === "") {
+            const cleared = await control.set("", agentId);
+            return cleared.ok
+              ? { content: [{ type: "text", text: cleared.message }] }
+              : { isError: true, content: [{ type: "text", text: cleared.message }] };
+          }
+          // Reject a raw Slack id BEFORE lowercasing — the id form is
+          // uppercase, so the check has to run on the pre-normalized value.
+          if (/^[CGD][A-Z0-9]{7,}$/.test(stripped)) {
+            return {
+              isError: true,
+              content: [
+                {
+                  type: "text",
+                  text: `audit_channel_set: '${stripped}' looks like a raw Slack channel id. Pass the channel NAME instead (e.g. 'ops-audit'). Nothing was saved.`,
+                },
+              ],
+            };
+          }
+          const normalized = stripped.toLowerCase();
+          if (!/^[a-z0-9_.-]{1,80}$/.test(normalized)) {
+            return {
+              isError: true,
+              content: [
+                {
+                  type: "text",
+                  text: `audit_channel_set: '${stripped}' is not a valid Slack channel name (lowercase letters, digits, '-', '_' and '.' only, 1-80 characters). Nothing was saved.`,
+                },
+              ],
+            };
+          }
+          const res = await control.set(normalized, agentId);
+          return res.ok
+            ? { content: [{ type: "text", text: res.message }] }
+            : { isError: true, content: [{ type: "text", text: res.message }] };
+        } catch (err) {
+          return { isError: true, content: [{ type: "text", text: `audit_channel_set error: ${String(err)}` }] };
         }
       },
     ),

@@ -53,6 +53,22 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     // scribeEnabled's own nesting lives (meeting-scribe.ts, not config.ts),
     // so this anchor is what closes the gap at the one live feed.
     offsetOf("dispatcher.setMeetingAckEnabled(config.meetingWorkers.ackEnabled)");
+    // KPR-452: the audit routing control is a spawn-read fact (the admin
+    // audit_channel_get/set tools read the module-global accessor per turn),
+    // so its wiring must precede every spawn-capable surface. Note that
+    // dispatcher.setAuditChannel(...) deliberately stays BELOW — it needs the
+    // started Slack adapter, the same disjoint-valid-range shape as
+    // workerPool.start().
+    offsetOf("setAuditRoutingControl(");
+    // KPR-452, second half of the SAME wiring: the channel NAME is also a
+    // spawn-read fact, and CLAUDE.md documents both calls as above-boundary
+    // wiring — but only the control was pinned (child-PR integration round,
+    // CONSIDER 2). The off-window is degraded-OFF rather than wrong-destination
+    // (rule 4 misses, one warn per turn, no copy), which is why it is a pin and
+    // not a redesign: a refactor that moved this below the Slack-dependent
+    // `dispatcher.setAuditChannel(...)` would leave all seven other anchors
+    // green while the mirror silently stopped mirroring.
+    offsetOf("dispatcher.setAuditChannelName(");
     // KPR-454: the ops publisher is a spawn-read surface (the first turn
     // after boot can fail a tool), so both anchors are order-pinned below.
     offsetOf("await opsPublisher.init()");
@@ -71,6 +87,8 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("await workerPool.ensureIndexes()"),
       offsetOf("dispatcher.setMeetingScribe("),
       offsetOf("dispatcher.setMeetingAckEnabled("),
+      offsetOf("dispatcher.setAuditChannelName("),
+      offsetOf("setAuditRoutingControl("),
       offsetOf("await opsPublisher.init()"),
       offsetOf("setOpsPublisher("),
     ];
@@ -99,6 +117,8 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("await workerPool.ensureIndexes()"),
       offsetOf("dispatcher.setMeetingScribe("),
       offsetOf("dispatcher.setMeetingAckEnabled("),
+      offsetOf("dispatcher.setAuditChannelName("),
+      offsetOf("setAuditRoutingControl("),
       offsetOf("await opsPublisher.init()"),
       offsetOf("setOpsPublisher("),
     );

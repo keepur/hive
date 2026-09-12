@@ -115,6 +115,7 @@ function makeFakeDb(): any {
 
 import { buildAdminTools } from "./admin-mcp-server.js";
 import { invalidateGeminiModelCache } from "./model-catalog-cache.js";
+import { AUDIT_ROUTING_NOT_READY, setAuditRoutingControl, type AuditRoutingControl } from "../audit/audit-routing.js";
 // Ensure the software-engineer archetype is registered in the registry.
 await import("../archetypes/software-engineer/index.js");
 
@@ -1712,5 +1713,148 @@ describe("KPR-433 — effective envelope visibility (agent_get D3, write notes D
     expect(updateRes.content[0].text).not.toContain("Note:");
     expect(updateRes.content[0].text).not.toContain("agent_update error");
     expect(agentDocsStore.get("fable").resourceTiers).toBe(throwingResourceTiers); // the write persisted regardless
+  });
+});
+
+// ---------------------------------------------------------------------------
+// KPR-452: audit_channel_get / audit_channel_set. The TOOL layer owns
+// normalization and the syntax rejection ladder; resolution, persistence and
+// application belong to the control (covered in src/audit/audit-routing.test.ts).
+// ---------------------------------------------------------------------------
+
+describe("admin-mcp-server — audit channel tools (KPR-452)", () => {
+  let control: { ready: any; describe: any; set: any };
+
+  beforeEach(() => {
+    control = {
+      ready: vi.fn(() => true),
+      describe: vi.fn(async () => "Audit channel: #ops-audit\nSource: runtime override"),
+      set: vi.fn(async (name: string) => ({ ok: true, message: `set to ${name || "(cleared)"}` })),
+    };
+    setAuditRoutingControl(control as unknown as AuditRoutingControl);
+  });
+
+  afterEach(() => setAuditRoutingControl(undefined));
+
+  it("audit_channel_get returns the control's description", async () => {
+    const res = await getHandler(makeTools(), "audit_channel_get")({});
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text).toContain("#ops-audit");
+    expect(control.describe).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["a bare name", "ops-audit", "ops-audit"],
+    ["a leading hash", "#Ops-Audit", "ops-audit"],
+    ["surrounding whitespace", "  #ops-audit  ", "ops-audit"],
+  ])("audit_channel_set normalizes %s", async (_label, input, expected) => {
+    const res = await getHandler(
+      makeTools({ agentId: "chief-of-staff" }),
+      "audit_channel_set",
+    )({
+      channel_name: input,
+    });
+    expect(res.isError).toBeFalsy();
+    expect(control.set).toHaveBeenCalledWith(expected, "chief-of-staff");
+  });
+
+  it("AC9: rejects a raw Slack channel id without touching the control", async () => {
+    const res = await getHandler(makeTools(), "audit_channel_set")({ channel_name: "C09ABCDEFG" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("raw Slack channel id");
+    expect(res.content[0].text).toContain("Nothing was saved");
+    expect(control.set).not.toHaveBeenCalled();
+  });
+
+  it.each(["ops audit", "Ops/Audit!", "a".repeat(81)])(
+    "AC9: rejects the invalid name %s without touching the control",
+    async (name) => {
+      const res = await getHandler(makeTools(), "audit_channel_set")({ channel_name: name });
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toContain("not a valid Slack channel name");
+      expect(control.set).not.toHaveBeenCalled();
+    },
+  );
+
+  it("AC9: an empty string clears the override through the control", async () => {
+    const res = await getHandler(makeTools(), "audit_channel_set")({ channel_name: "   " });
+    expect(res.isError).toBeFalsy();
+    expect(control.set).toHaveBeenCalledWith("", "admin");
+  });
+
+  it("surfaces a control rejection as a tool error", async () => {
+    control.set = vi.fn(async () => ({ ok: false, message: "#ghost did not resolve" }));
+    const res = await getHandler(makeTools(), "audit_channel_set")({ channel_name: "ghost" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("did not resolve");
+  });
+
+  // Spec D5: during the boot window the tools must "say so and ask for a
+  // retry" — never a spurious not-found. The CONTRACT lives in the control
+  // (src/audit/audit-routing.test.ts pins it there); this row pins the
+  // SURFACE the agent actually sees, i.e. that the tool layer neither
+  // swallows the message nor reports success. Nothing here reads
+  // `control.ready()` — see the interface note in the tool implementation.
+  //
+  // The message comes from the EXPORTED `AUDIT_ROUTING_NOT_READY`, never a
+  // hand-typed copy (r2 CONSIDER 2 — the `MEETING_ACK_TEXT` precedent). A
+  // mirrored literal here held the RETIRED wording and still passed, because a
+  // passthrough test stubs the control: the copy drifted invisibly the moment
+  // the real control's wording was rewritten. Asserting `toContain` of the
+  // import keeps the whole string in lockstep with its one definition.
+  it("D5: reports the boot-window not-ready state at the tool surface", async () => {
+    control.ready = vi.fn(() => false);
+    control.describe = vi.fn(async () => AUDIT_ROUTING_NOT_READY);
+    control.set = vi.fn(async () => ({ ok: false, message: AUDIT_ROUTING_NOT_READY }));
+
+    const got = await getHandler(makeTools(), "audit_channel_get")({});
+    expect(got.content[0].text).toContain(AUDIT_ROUTING_NOT_READY);
+
+    const setRes = await getHandler(makeTools(), "audit_channel_set")({ channel_name: "ops-audit" });
+    expect(setRes.isError).toBe(true);
+    expect(setRes.content[0].text).toContain(AUDIT_ROUTING_NOT_READY);
+  });
+
+  it("reports honestly when no control is installed (the stdio-fallback limit)", async () => {
+    setAuditRoutingControl(undefined);
+    const tools = makeTools();
+    for (const name of ["audit_channel_get", "audit_channel_set"]) {
+      const res = await getHandler(tools, name)({ channel_name: "ops-audit" });
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toContain("not reachable from this process");
+    }
+  });
+
+  it("a throwing control becomes a tool error, never an unhandled rejection", async () => {
+    control.describe = vi.fn(async () => {
+      throw new Error("mongo down");
+    });
+    const res = await getHandler(makeTools(), "audit_channel_get")({});
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("audit_channel_get error");
+  });
+
+  // The row above covers `audit_channel_get` only, via a throwing `describe()`.
+  // The Testing Contract requires the same of BOTH tools ("a missing control and
+  // a throwing control both become honest tool errors, never a throw"), and
+  // `audit_channel_set`'s own catch was reachable by no test: mutating it to
+  // `throw err;` left the whole file green. Two rows, because `set` has two
+  // distinct awaited control calls on either side of the normalization ladder —
+  // the clear leg (`""`) and the normal leg — and only the second is guarded by
+  // the row above's sibling. Mutation-proven in both directions.
+  it.each([
+    { label: "the normal leg", channel_name: "ops-audit" },
+    { label: "the clear leg", channel_name: "" },
+  ])("a throwing control on audit_channel_set's $label is a tool error, never a throw", async ({ channel_name }) => {
+    control.set = vi.fn(async () => {
+      throw new Error("mongo down");
+    });
+    const handler = getHandler(makeTools(), "audit_channel_set");
+    // The assertion is `resolves`, not `rejects`: the tool must absorb the
+    // fault. An unguarded catch rejects here and fails on the await itself.
+    const res = await handler({ channel_name });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("audit_channel_set error");
+    expect(res.content[0].text).toContain("mongo down");
   });
 });
