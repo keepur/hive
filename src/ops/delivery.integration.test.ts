@@ -23,6 +23,7 @@ import { OpsNotifier } from "./notifier.js";
 import { NOTIFIER_STATS_KIND, OpsNotificationStore } from "./notification-store.js";
 import {
   ATTEMPTS_RING_CAP,
+  DELIVERY_BUDGET_MS,
   GAUGE_COUNT_LIMIT,
   OPS_NOTIFICATIONS_COLLECTION,
   OPS_POLICY_COLLECTION,
@@ -541,6 +542,57 @@ describe("snooze expiry", () => {
     // The attempt CONSUMED the forced re-delivery.
     expect(after.forceDeliver).toBeUndefined();
   });
+
+  it("a RE-SNOOZE landing between the expiry scan and the expiry write is not clobbered", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE for `snoozedUntil: { $lte: now }` in the expiry
+    // WRITE's filter. The scan's copy says "expired"; by the time the write
+    // runs, intake has moved snoozedUntil into the future and answered
+    // `applied`. A write filtered on `state: "snoozed"` alone expires it anyway
+    // and re-delivers on this tick — contradicting what intake told the caller.
+    const h = await harness({ subscriptions: [sub("s1")], policy: policyWith() });
+    const e = await h.seedEvent();
+    await h.tick();
+    const row = await h.row("s1", e.dedupeKey);
+    expect(h.transport.views).toHaveLength(1);
+
+    await snooze(h, row._id!, t(5));
+    h.advance(10 * 60_000);
+
+    // Held AFTER the expiry scan has read its page, before any expiry write.
+    const gate = h.db.pause(OPS_NOTIFICATIONS_COLLECTION, "find", (ctx) => ctx.filter?.state === "snoozed", true);
+    const tick = h.tick();
+    await gate.reached;
+
+    const resnoozedUntil = new Date(h.now().getTime() + 2 * 3_600_000);
+    await expect(
+      h.notifier.accept({
+        handle: String(row._id),
+        act: "snoozed",
+        actorId: "U1",
+        at: h.now(),
+        snoozedUntil: resnoozedUntil,
+      }),
+    ).resolves.toEqual({ state: "applied", rowState: "snoozed", snoozedUntil: resnoozedUntil });
+    gate.release();
+    await tick;
+
+    // The write was attempted — the scan's copy did say "expired" — and missed.
+    // (Filtered on its own $set: intake's re-snooze CAS also filters on
+    // `state: "snoozed"`.)
+    const attempted = expiryWrites(h).filter(
+      (op) => (op.context.update?.$set as Record<string, unknown> | undefined)?.forceDeliver === true,
+    );
+    expect(attempted).toHaveLength(1);
+    expect(attempted[0]!.context.filter).toMatchObject({ state: "snoozed", snoozedUntil: { $lte: h.now() } });
+    const after = await h.row("s1", e.dedupeKey);
+    expect(after.state).toBe("snoozed");
+    expect(after.snoozedUntil).toEqual(resnoozedUntil);
+    expect(after.forceDeliver).toBeUndefined();
+    expect(after.nextNudgeAt).toBeUndefined();
+    // ... and nothing was re-delivered against the pause intake just applied.
+    expect(h.transport.views).toHaveLength(1);
+    expect(after.attemptCount).toBe(1);
+  });
 });
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -572,6 +624,79 @@ describe("record()'s CAS — the one write that follows an irreversible side eff
     expect(row.state).toBe("pending");
     // The concurrent writer's own increment stands; nothing was blended.
     expect(row.attemptCount).toBe(1);
+  });
+
+  it("a record write that THROWS after the post is counted on deliveryRecordLost, not sweepFaults", async () => {
+    const h = await harness({ subscriptions: [sub("s1")], policy: policyWith() });
+    const e = await h.seedEvent();
+    failOn(
+      h.db,
+      OPS_NOTIFICATIONS_COLLECTION,
+      "updateOne",
+      (ctx) => (ctx.update?.$set as Record<string, unknown> | undefined)?.lastOutcome !== undefined,
+    );
+
+    await expect(h.tick()).resolves.toBeUndefined();
+
+    expect(h.transport.views).toHaveLength(1); // the side effect is spent
+    expect(h.snapshot().deliveryRecordLost).toBe(1);
+    expect(h.snapshot().sweepFaults).toBe(0);
+    expect(warnLines("ops delivery record write failed after an external side effect")).toHaveLength(1);
+    expect(warnLines("ops delivery fault")).toHaveLength(0);
+    // Still a phase fault: the heartbeat says so.
+    expect((await h.heartbeat()).state).toBe("degraded");
+
+    // The named consequence the dedicated counter exists to surface: the row is
+    // unrecorded, so the next tick posts it AGAIN.
+    const row = await h.row("s1", e.dedupeKey);
+    expect(row.attemptCount).toBe(0);
+    expect(row.lastOutcome).toBeUndefined();
+    await h.tick();
+    expect(h.transport.views).toHaveLength(2);
+    expect((await h.row("s1", e.dedupeKey)).attemptCount).toBe(1);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// The delivery budget.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("the delivery budget", () => {
+  it("starts at the DELIVERY PHASE, not the tick — a slow ingest does not starve a first delivery", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE: measured from the tick's `now`, an ingest that
+    // alone took DELIVERY_BUDGET_MS leaves the phase with no budget and arm 1's
+    // guaranteed first delivery is deferred — during exactly the surge the
+    // budget exists for.
+    const h = await harness({ subscriptions: [sub("s1")], policy: policyWith() });
+    const e = await h.seedEvent();
+    // The first telemetry updateOne of a tick is ingest's cursor write.
+    const gate = h.db.pause("telemetry", "updateOne");
+    const tick = h.tick();
+    await gate.reached;
+    h.advance(DELIVERY_BUDGET_MS);
+    gate.release();
+    await tick;
+
+    expect(h.transport.views).toHaveLength(1);
+    const row = await h.row("s1", e.dedupeKey);
+    expect(row.state).toBe("delivered");
+    // The rows still record the TICK's instant, not the phase's.
+    expect(row.lastNudgeAt).toEqual(BASE);
+    expect(row.stateAt).toEqual(BASE);
+  });
+
+  it("still stops on its own budget once the phase itself has spent it", async () => {
+    const h = await harness({ subscriptions: [sub("s1"), sub("s2")], policy: policyWith() });
+    await h.seedEvent();
+    // The first post eats the whole phase budget.
+    h.transport.onDeliver = () => {
+      h.advance(DELIVERY_BUDGET_MS);
+      h.transport.onDeliver = undefined;
+    };
+    await h.tick();
+
+    expect(h.transport.views).toHaveLength(1);
+    expect((await h.heartbeat()).state).toBe("backlog");
   });
 });
 
@@ -880,10 +1005,13 @@ describe("init / start / stop", () => {
   });
 
   it("stop() clears the timers and awaits the in-flight tick", async () => {
-    const h = await harness({ subscriptions: [sub("s1")], start: true });
+    const h = await harness({ subscriptions: [sub("s1")] });
+    // Armed BEFORE start(), so the gate is deterministically ahead of start()'s
+    // own first tick rather than racing it by microtask count.
     const gate = h.db.pause("telemetry", "updateOne", heartbeatWrite as never);
-    const tick = h.tick();
+    void h.notifier.start();
     await gate.reached;
+    const tick = h.tick(); // joins the in-flight first tick
 
     let settled = false;
     const stopped = h.notifier.stop().then(() => {
@@ -898,6 +1026,29 @@ describe("init / start / stop", () => {
     expect(settled).toBe(true);
     expect(h.notifier.getSnapshot().started).toBe(false);
     expect(h.notifier.getSnapshot().stopping).toBe(true);
+  });
+
+  it("start() does not hold its caller for the first tick — boot is not blocked on a sweep", async () => {
+    // index.ts awaits start() ahead of the audit-channel wiring, the SMS/WS
+    // adapters, scheduler.start() and workerPool.start().
+    const h = await harness({ subscriptions: [sub("s1")] });
+    const gate = h.db.pause("telemetry", "updateOne", heartbeatWrite as never);
+    let resolved = false;
+    const started = h.notifier.start().then(() => {
+      resolved = true;
+    });
+    try {
+      await gate.reached; // the first tick is running, held at its heartbeat
+      await Promise.resolve();
+      expect(resolved).toBe(true);
+      expect(h.notifier.getSnapshot().started).toBe(true);
+    } finally {
+      gate.release();
+      await started;
+      await h.notifier.stop(); // start() armed two real intervals; drains the tick
+    }
+    // The fired tick still ran to completion.
+    expect((await h.heartbeat()).state).toBe("ok");
   });
 });
 
@@ -964,6 +1115,68 @@ describe("validateTarget at subscription-load time", () => {
     // Only the unjudged subscription minted a row.
     expect(await h.ledgerCount()).toBe(1);
     expect((await h.row("s-unjudged", e.dedupeKey)).subscriptionId).toBe("s-unjudged");
+  });
+});
+
+describe("a malformed subscription row costs THAT row, never the load (D6)", () => {
+  it("rows with no usable transport binding are dropped, counted and warned once — and the rest load at start()", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE: before the per-row guard, the first of these
+    // threw on `sub.transport.adapterId` inside the ONE try around the whole
+    // loop, and `reloadSubscriptions(true)` — start()'s first load, which the
+    // harness reproduces — rethrew: no subscriber loaded and the sweep never
+    // started.
+    const h = await harness({
+      subscriptions: [
+        sub("s-malformed-missing", { transport: undefined as never }),
+        sub("s-malformed-null", { transport: null as never }),
+        sub("s-malformed-no-adapter", { transport: { target: "C0000001" } as never }),
+        sub("s-malformed-number-adapter", { transport: { adapterId: 7, target: "C0000001" } as never }),
+        sub("s-good"),
+      ],
+    });
+
+    expect(h.snapshot().subscriptions).toBe(1);
+    expect(h.snapshot().subscriptionUnloaded).toBe(4);
+    expect(h.snapshot().subscriptionReloadFaults).toBe(0);
+    expect(warnLines("ops subscription row has no usable transport binding")).toHaveLength(4);
+
+    // Counted every load, warned once per process.
+    await h.notifier.reloadSubscriptions();
+    expect(h.snapshot().subscriptionUnloaded).toBe(8);
+    expect(warnLines("ops subscription row has no usable transport binding")).toHaveLength(4);
+
+    // The good subscription is fully live: it mints and delivers.
+    const e = await h.seedEvent({ matchedSubscriptionIds: ["s-good"] });
+    await h.tick();
+    expect(await h.ledgerCount()).toBe(1);
+    expect((await h.row("s-good", e.dedupeKey)).lastOutcome).toBe("accepted");
+  });
+
+  it("a malformed row arriving on a LATER reload does not freeze the map — new rows load and the kill switch works", async () => {
+    // The reload-side failure mode: a throw there RETAINED the previous map
+    // forever, so no new subscription ever loaded and `enabled: false` stopped
+    // taking effect.
+    const h = await harness({ subscriptions: [sub("s-reload-1")] });
+    expect(h.snapshot().subscriptions).toBe(1);
+
+    const subs = h.db.collection(OPS_SUBSCRIPTIONS_COLLECTION);
+    await subs.insertOne(sub("s-reload-bad", { transport: null as never }));
+    await subs.insertOne(sub("s-reload-2"));
+    await h.notifier.reloadSubscriptions();
+    expect(h.snapshot().subscriptions).toBe(2);
+    expect(h.snapshot().subscriptionReloadFaults).toBe(0);
+
+    await subs.updateOne({ _id: "s-reload-1" }, { $set: { enabled: false } });
+    await h.notifier.reloadSubscriptions();
+    expect(h.snapshot().subscriptions).toBe(1);
+  });
+
+  it("a row whose _id is not a string is dropped the same way", async () => {
+    const h = await harness({ subscriptions: [sub("s-id-good")] });
+    await h.db.collection(OPS_SUBSCRIPTIONS_COLLECTION).insertOne({ ...sub("ignored"), _id: new ObjectId() } as never);
+    await h.notifier.reloadSubscriptions();
+    expect(h.snapshot().subscriptions).toBe(1);
+    expect(h.snapshot().subscriptionUnloaded).toBe(1);
   });
 });
 

@@ -412,6 +412,48 @@ describe("transition legality", () => {
     expect(changedKeys(before, await rowById(h, id))).toEqual([]);
   });
 
+  it.each([
+    ["cleared — a clear attributed to a person", "cleared"],
+    ["pending — a working state with no nextNudgeAt", "pending"],
+    ["delivered — a working state with no nextNudgeAt", "delivered"],
+    ["an arbitrary string", "resolved"],
+    ["empty", ""],
+    ["missing", undefined],
+    ["a number", 7],
+  ] as Array<[string, unknown]>)(
+    "refuses an act outside D7's three (%s) as illegal-transition and records nothing",
+    async (_label, act) => {
+      const h = await harness();
+      const { id, handle } = await seedRow(h, { state: "delivered", nextNudgeAt: t(5) });
+      const before = await rowById(h, id);
+
+      await expect(h.notifier.accept({ ...ack(handle), act: act as OpsAcknowledgement["act"] })).resolves.toEqual({
+        state: "refused",
+        reason: "illegal-transition",
+      });
+      expect(changedKeys(before, await rowById(h, id))).toEqual([]);
+      expect(casWrites(h)).toHaveLength(0);
+    },
+  );
+
+  it("a malformed act is refused AHEAD of the replay, monotonicity and cleared checks", async () => {
+    // Each of those would otherwise answer a malformed call with a result that
+    // tells the edge it was fine: `superseded` or the benign `row-cleared`.
+    const h = await harness();
+
+    const acked = await seedRow(h, { lastAckAt: t(5), lastAckKey: "U9:seen:x" });
+    await expect(h.notifier.accept({ ...ack(acked.handle), act: "pending" as never, at: BASE })).resolves.toEqual({
+      state: "refused",
+      reason: "illegal-transition",
+    });
+
+    const cleared = await seedRow(h, { state: "cleared", expiresAt: t(60) });
+    await expect(h.notifier.accept({ ...ack(cleared.handle), act: "cleared" as never })).resolves.toEqual({
+      state: "refused",
+      reason: "illegal-transition",
+    });
+  });
+
   it("refuses an unknown handle without touching the ledger", async () => {
     const h = await harness();
     await seedRow(h);
@@ -905,7 +947,7 @@ describe("intake and delivery on one row", () => {
     expect(h.snapshot().deliveryRecordLost).toBe(0);
   });
 
-  it("a delivery whose snapshot intake invalidated LOSES its record CAS rather than blending", async () => {
+  it("a delivery whose scan copy intake invalidated does NOT post — the pre-post re-read declines it", async () => {
     const h = await harness({ subscriptions: [sub("s1")] });
     const { id, handle } = await seedRow(h, { state: "pending", attemptCount: 0, nextNudgeAt: BASE });
 
@@ -923,14 +965,50 @@ describe("intake and delivery on one row", () => {
     gate.release();
     await tick;
 
-    // The post HAPPENED — that is the honest cost — but the record is refused
-    // rather than written over the acknowledgement.
-    expect(h.transport.views).toHaveLength(1);
-    expect(h.snapshot().deliveryRecordLost).toBe(1);
+    // NOTHING was posted: the decision to post is made from a read taken
+    // inside the latch, and that read shows a row the human has already seen.
+    // (Before the re-read this case posted and then lost record()'s CAS.)
+    expect(h.transport.views).toHaveLength(0);
+    expect(h.snapshot().deliveryRecordLost).toBe(0);
+    expect(h.snapshot().deliveriesAccepted).toBe(0);
     const row = await rowById(h, id);
     expect(row.state).toBe("seen");
     expect(row.principal).toBe("U1");
     expect(row.attemptCount).toBe(0);
     expect(row.lastOutcome).toBeUndefined();
+    // Declined, not stalled: the decline writes nothing to a stopped row.
+    expect(hasKey(row, "stalledReason")).toBe(false);
+    expect(hasKey(row, "nextNudgeAt")).toBe(false);
+  });
+
+  it("an acknowledgement landing on row B DURING row A's post keeps B from being posted", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE for the pre-post re-read, in the shape the race
+    // actually takes in production: B's latch is FREE while A's post holds the
+    // phase (a real post can run ATTEMPT_SPACING_MS + SLACK_POST_TIMEOUT_MS), so
+    // the acknowledgement applies at once — and the arm's scan copy of B still
+    // says `pending`. Without the re-read, B is posted to a human who has
+    // already dismissed it.
+    const h = await harness({ subscriptions: [sub("s1")] });
+    const a = await seedRow(h, { state: "pending", attemptCount: 0, nextNudgeAt: t(-1) });
+    const b = await seedRow(h, { state: "pending", attemptCount: 0, nextNudgeAt: BASE });
+
+    let bAck: Promise<unknown> | undefined;
+    h.transport.onDeliver = async (view) => {
+      if (view.handle !== a.handle) return;
+      bAck = h.notifier.accept(ack(b.handle, { act: "dismissed" }));
+      await expect(bAck).resolves.toEqual({ state: "applied", rowState: "dismissed" });
+    };
+
+    await h.tick();
+
+    expect(bAck).toBeDefined();
+    expect(h.transport.views.map((v) => v.handle)).toEqual([a.handle]);
+    expect(h.snapshot().deliveriesAccepted).toBe(1);
+    expect(h.snapshot().deliveryRecordLost).toBe(0);
+    const rowB = await rowById(h, b.id);
+    expect(rowB.state).toBe("dismissed");
+    expect(rowB.attemptCount).toBe(0);
+    expect(rowB.lastOutcome).toBeUndefined();
+    expect((await rowById(h, a.id)).state).toBe("delivered");
   });
 });

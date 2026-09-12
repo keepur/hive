@@ -141,8 +141,16 @@ export class DeliveryPhase {
           // deliveryReference is written only on an accepted outcome and is
           // never unset, so it is the durable form of the same question.
           const next = row.deliveryReference !== undefined ? "delivered" : "pending";
+          // ⚠ `snoozedUntil: { $lte: now }` IN THE FILTER, not only in the scan.
+          // The scan's copy predates this latch, so a RE-SNOOZE (intake moves
+          // snoozedUntil and nothing else — D7) landing between the scan and
+          // here still satisfies `state: "snoozed"`. Filtered on state alone,
+          // this write then expired a pause intake had just answered `applied`
+          // with a later snoozedUntil for, and the row was re-delivered on this
+          // tick. A miss is a benign lost race — the newer pause stands — so it
+          // is not counted.
           await this.notifications.updateOne(
-            { _id: row._id, state: "snoozed" },
+            { _id: row._id, state: "snoozed", snoozedUntil: { $lte: now } },
             {
               $set: {
                 state: next,
@@ -186,7 +194,15 @@ export class DeliveryPhase {
    * convention a query planner could lose.
    */
   async run(now: Date, ctx: DeliveryContext): Promise<DeliveryResult> {
-    const budgetEnd = now.getTime() + DELIVERY_BUDGET_MS;
+    // ⚠ The budget clock starts HERE, at the top of the delivery phase, from a
+    // FRESH clock reading — NOT from the tick's `now`, which was captured
+    // before ingest and snooze expiry ran. Measured from `now`, a tick whose
+    // ingest alone took DELIVERY_BUDGET_MS (a warm restart draining a backlog,
+    // i.e. exactly the surge the budget exists for) would reach this phase
+    // with the budget already spent and starve every row, arm 1's guaranteed
+    // first delivery included. D5's budget is per PHASE. `now` itself stays
+    // the tick's instant for everything the rows record and for the due-scan.
+    const budgetEnd = ctx.clock().getTime() + DELIVERY_BUDGET_MS;
     const working = { $in: [...OPS_NUDGE_STATES] };
     const arms = [
       // Arm 1 — the guaranteed first delivery.
@@ -224,15 +240,15 @@ export class DeliveryPhase {
         if (seen.has(id)) continue;
         seen.add(id);
         try {
-          const madeAttempt = await ctx.lock(id, async () => {
+          const result = await ctx.lock(id, async () => {
             const wait = nextAttemptAt - ctx.clock().getTime();
-            const made = await this.attemptRow(row, now, ctx, wait);
-            return made;
+            return this.attemptRow(row, now, ctx, wait);
           });
-          if (madeAttempt) {
+          if (result !== "declined") {
             attempted += 1;
             nextAttemptAt = ctx.clock().getTime() + ATTEMPT_SPACING_MS;
           }
+          if (result === "attempted-unrecorded") ok = false;
         } catch (err) {
           ok = false;
           this.counters.sweepFaults += 1;
@@ -256,15 +272,23 @@ export class DeliveryPhase {
     return { ok, attempted, deferred };
   }
 
-  /** D5's five steps. Returns whether an ATTEMPT was made (a stall is not one). */
-  private async attemptRow(row: OpsNotification, now: Date, ctx: DeliveryContext, waitMs: number): Promise<boolean> {
+  /**
+   * D5's five steps, plus the pre-post re-read. `declined` covers a stall and
+   * a row that stopped being postable since the scan — neither is an attempt.
+   */
+  private async attemptRow(
+    row: OpsNotification,
+    now: Date,
+    ctx: DeliveryContext,
+    waitMs: number,
+  ): Promise<"declined" | "attempted" | "attempted-unrecorded"> {
     // 1. Resolve the subscription. Unresolved ⇒ stall. This is D11 lever 1 —
     //    ops_subscriptions.enabled: false — taking effect.
     const sub = ctx.subscriptions.get(row.subscriptionId);
     if (!sub) {
       this.counters.subscriptionUnresolved += 1;
       await this.stall(row, "subscription", now);
-      return false;
+      return "declined";
     }
 
     // 2. Resolve the cadence and apply the THREE-DISJUNCT attempt gate.
@@ -272,7 +296,7 @@ export class DeliveryPhase {
     if (!(row.attemptCount === 0 || row.forceDeliver === true || interval !== undefined)) {
       this.counters.cadenceUnresolved += 1;
       await this.stall(row, "cadence", now);
-      return false;
+      return "declined";
     }
 
     // 3. Resolve the adapter. Unbound ⇒ stall. This is the single, already
@@ -282,16 +306,46 @@ export class DeliveryPhase {
     if (!adapter) {
       this.counters.transportUnbound += 1;
       await this.stall(row, "transport", now);
-      return false;
+      return "declined";
     }
 
     if (waitMs > 0) await ctx.sleep(waitMs);
 
-    // 4. Build the view and deliver, bounded by THE ADAPTER'S OWN DEADLINE,
-    //    not by the sweep's patience (D12).
+    // 4. RE-READ THE ROW, immediately before the irreversible side effect, and
+    //    decline if the decision this attempt was admitted on no longer stands.
+    //
+    // ⚠ Not defensive. `row` is the copy the arm's scan read BEFORE its loop,
+    // and the per-row latch serializes WRITES, not that read: an
+    // acknowledgement on this row that landed while an EARLIER row's post held
+    // the phase (a post can take ATTEMPT_SPACING_MS + SLACK_POST_TIMEOUT_MS)
+    // took this row's latch uncontended and applied. Deciding from the stale
+    // copy then posted a row a human had already seen, dismissed or snoozed —
+    // and record()'s CAS below could only refuse the bookkeeping AFTER the post.
+    // The read is inside the latch, so no intake write can land between it and
+    // record(); it sits after the spacing sleep so that window is covered too.
+    //
+    // Postable = still in a working state, still due, and not attempted since
+    // the scan (an unchanged attemptCount is what record()'s CAS conditions on,
+    // so a row that passes here and then loses that CAS was moved by a writer
+    // outside this process's latch). Declining is not an attempt and writes
+    // nothing: a row that left the working states is not nudge-eligible, and a
+    // row that is no longer due is some other writer's schedule to keep.
+    const fresh = await this.notifications.findOne({ _id: row._id });
+    if (
+      !fresh ||
+      !(OPS_NUDGE_STATES as readonly string[]).includes(fresh.state) ||
+      !(fresh.nextNudgeAt instanceof Date) ||
+      fresh.nextNudgeAt.getTime() > now.getTime() ||
+      fresh.attemptCount !== row.attemptCount
+    ) {
+      return "declined";
+    }
+
+    // 5. Build the view FROM THE FRESH READ and deliver, bounded by THE
+    //    ADAPTER'S OWN DEADLINE, not by the sweep's patience (D12).
     let outcome: DeliveryOutcome;
     try {
-      outcome = await adapter.deliver(this.buildView(row, sub, ctx.reasons));
+      outcome = await adapter.deliver(this.buildView(fresh, sub, ctx.reasons));
     } catch (err) {
       // An adapter that THROWS rather than returning an outcome is contained
       // and recorded as unknown/transport-fault, counted, never escaping.
@@ -303,9 +357,30 @@ export class DeliveryPhase {
       outcome = { status: "unknown", reason: "transport-fault" };
     }
 
-    // 5. Record.
-    await this.record(row, outcome, interval, adapter.adapterId, now);
-    return true;
+    // 6. Record, against the fresh read — its (state, attemptCount) is the CAS
+    //    precondition, and its attempts[] ring is the one the append extends.
+    try {
+      await this.record(fresh, outcome, interval, adapter.adapterId, now);
+    } catch (err) {
+      // ⚠ COUNTED ON deliveryRecordLost, NOT sweepFaults. The side effect is
+      // spent: the message is posted and, for Slack, its ts registered as an
+      // echo. A record() that THROWS (a storage fault, not a lost CAS) leaves
+      // the row exactly as unrecorded as a lost CAS does — attemptCount and
+      // forceDeliver untouched, so the row is re-attempted on the next tick,
+      // a duplicate post — and the generic per-row fault counter would bury
+      // that one specific consequence among faults that spent nothing. It is
+      // still a phase fault, so the caller marks the phase not-ok and the
+      // heartbeat reads `degraded`; and it is still an attempt, so the spacing
+      // to the next row applies.
+      this.counters.deliveryRecordLost += 1;
+      log.warn("ops delivery record write failed after an external side effect — the attempt is unrecorded", {
+        adapterId: adapter.adapterId,
+        outcome: outcome.status,
+        error: String(err),
+      });
+      return "attempted-unrecorded";
+    }
+    return "attempted";
   }
 
   /**
@@ -346,9 +421,20 @@ export class DeliveryPhase {
    * POST WITH NO TRACE. Every other CAS in this ticket inspects matchedCount
    * (applyClearing → rowsCleared, both renewal arms, intake → LOST), because
    * D8's standard is that a lost race is DETECTED rather than blended — and
-   * blending it here is the one place with a side effect already spent. The
-   * in-process per-row latch makes it unreachable today; it is counted anyway
-   * precisely because the latch is the thing a future edit changes.
+   * blending it here is the one place with a side effect already spent.
+   *
+   * What keeps it from firing is TWO mechanisms together, and neither alone:
+   * the per-row latch serializes intake's write against this one, and
+   * attemptRow's pre-post re-read (step 4) makes the decision to post from a
+   * copy read INSIDE that latch. The latch alone was not enough — the arm's
+   * scan reads its rows before the loop, so an acknowledgement landing while
+   * an earlier row's post held the phase applied uncontended, and the stale
+   * copy was then posted and lost this CAS (a posted notification the human
+   * had already acknowledged). With both in place no in-process writer can
+   * move the row between the re-read and this write; a miss now means a
+   * writer outside this process's latch (a second engine, a hand edit). It is
+   * counted anyway, because the latch and the re-read are exactly the things
+   * a future edit changes.
    */
   private async record(
     row: OpsNotification,

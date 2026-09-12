@@ -17,6 +17,7 @@ import {
   HARD_SNOOZE_CEILING_MS,
   OPS_SYSTEM_PRINCIPAL,
   expiresAtFor,
+  type OpsAck,
   type OpsAcknowledgement,
   type OpsIntakeResult,
   type OpsNotification,
@@ -27,6 +28,9 @@ import { WRITE } from "./notification-store.js";
 
 /** D7's table: the four states an attributed act may transition FROM. */
 const LEGAL_FROM: readonly OpsNotificationState[] = ["pending", "delivered", "seen", "snoozed"];
+
+/** D7's `OpsAck`: the only three states an attributed act may transition TO. */
+const ACTS: readonly unknown[] = ["seen", "dismissed", "snoozed"] satisfies readonly OpsAck[];
 
 /** Signals a lost CAS to the one-retry loop. Never escapes this module. */
 const LOST = Symbol("cas-lost");
@@ -104,6 +108,22 @@ export class OpsIntake {
     ) {
       return { state: "refused", reason: "unattributed" };
     }
+
+    // ── 2b. The act must be one of D7's three. ──
+    // `act: OpsAck` is a compile-time claim, and D6 opens this seam to an agent
+    // tool call and an operator CLI, so it is checked like handle, actorId and
+    // `at` are — because step 8 writes it VERBATIM into `state`. Unchecked,
+    // `cleared` lands a clear attributed to a person (D7 rule 5, C9 — only a
+    // clearing fact clears); `pending`/`delivered` land a working state with
+    // nextNudgeAt unset, which no delivery arm ever reads again (a terminal
+    // state, C10); anything else stores a value outside D7's closed six.
+    //
+    // Refused as `illegal-transition` — no act outside the three is a legal
+    // transition from any state — and HERE, ahead of the replay check, rather
+    // than folded into step 6: a malformed act must never earn a `noop`
+    // (`superseded`) or the benign `row-cleared` from steps 3–4, both of which
+    // tell the edge its call was fine.
+    if (!ACTS.includes(input.act)) return { state: "refused", reason: "illegal-transition" };
 
     const now = this.clock();
     // ⚠ AN UNUSABLE `at` IS SUBSTITUTED WITH `now`, AND THE SUBSTITUTION IS

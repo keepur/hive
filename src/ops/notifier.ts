@@ -34,6 +34,29 @@ import { OpsIntake, parseHandle } from "./intake.js";
 const log = createLogger("ops-notifier");
 
 const unloadWarned = new Set<string>();
+/**
+ * Warn-once PER PROCESS for a row the shape guard drops, kept SEPARATE from
+ * `unloadWarned` so a row that is first malformed and then fixed into a target
+ * its adapter rejects still gets the second, different warning.
+ */
+const malformedWarned = new Set<string>();
+
+/**
+ * D6: the fields `reloadSubscriptions`, ingest and delivery key on or
+ * dereference. Read through `unknown` because the compile-time type is the
+ * very claim being tested.
+ */
+function isBindableSubscriptionRow(sub: unknown): sub is OpsSubscription {
+  if (sub === null || typeof sub !== "object") return false;
+  const row = sub as { _id?: unknown; transport?: unknown };
+  if (typeof row._id !== "string") return false;
+  const transport = row.transport;
+  return (
+    transport !== null &&
+    typeof transport === "object" &&
+    typeof (transport as { adapterId?: unknown }).adapterId === "string"
+  );
+}
 
 export class OpsNotifier {
   private readonly opsStore: OpsStore;
@@ -170,11 +193,21 @@ export class OpsNotifier {
       log.error("ops notifier first subscription load failed — sweep off, intake live", { error: String(err) });
       return;
     }
+    if (this.stopping || this.timer) return;
     this.started = true;
     this.reloadTimer = setInterval(() => void this.reloadSubscriptions(), SUBSCRIPTION_RELOAD_MS);
     this.reloadTimer.unref?.();
-    await this.sweepOnce();
-    if (this.stopping || this.timer) return;
+    // The first tick is FIRED, NOT AWAITED. index.ts awaits start() on the boot
+    // path, above the audit-channel wiring, the SMS/WebSocket adapters,
+    // scheduler.start() and workerPool.start(); an awaited first tick would hold
+    // all of them for a whole tick — an ingest drain plus a delivery phase
+    // whose in-flight post can outlast its budget by one adapter deadline,
+    // i.e. longest on exactly the warm restart with a backlog. Nothing after
+    // start() depends on that tick having run: sweepOnce() never rejects (it
+    // contains and counts its own faults), single-flight still holds, and
+    // stop() still drains it by awaiting `flight`. (KPR-456's sweeper awaits
+    // its first sweep; this is a deliberate divergence, not an oversight.)
+    void this.sweepOnce();
     this.timer = setInterval(() => void this.sweepOnce(), SWEEP_INTERVAL_MS);
     this.timer.unref?.();
   }
@@ -206,6 +239,39 @@ export class OpsNotifier {
       const rows = await this.opsStore.loadSubscriptions();
       const next = new Map<string, OpsSubscription>();
       for (const sub of rows) {
+        // ⚠ THE PER-ROW SHAPE GUARD, and it has to be INSIDE the loop. The
+        // rows are operator-written and `OpsSubscription` is a compile-time
+        // claim about them: KPR-454's loader is a bare find, and its
+        // admissibility predicate (which this component must not import —
+        // AC2) checks `filter` and `_id`, never `transport`. Without this, a
+        // row with no `transport` — or `transport: null` — throws on the
+        // `.adapterId` read below, and that throw lands in THIS method's one
+        // outer catch: at start() the notifier never starts for ANY
+        // subscriber, and on a reload the previous map is retained forever, so
+        // no new subscription ever loads and `enabled: false` stops working as
+        // a kill switch. One bad row must cost that row (D6).
+        //
+        // Checked: exactly what this component keys on or dereferences — the
+        // `_id` the stamped `matchedSubscriptionIds` resolve against, and the
+        // `transport` container with the `adapterId` string the binding needs.
+        // `target` stays opaque (its adapter judges it, below); `subscriberId`
+        // is a snapshot copied verbatim, not dereferenced, and is not this
+        // guard's to police any more than it is KPR-454's.
+        const raw: unknown = sub;
+        if (!isBindableSubscriptionRow(raw)) {
+          this.counters.subscriptionUnloaded += 1;
+          const id = raw !== null && typeof raw === "object" ? (raw as { _id?: unknown })._id : undefined;
+          const key = String(id);
+          if (!malformedWarned.has(key)) {
+            malformedWarned.add(key);
+            // Only a string id is logged: a hand-written row's `_id` can be
+            // anything, and this line must not carry an arbitrary value.
+            log.warn("ops subscription row has no usable transport binding — unloaded in memory", {
+              subscriptionId: typeof id === "string" ? id : undefined,
+            });
+          }
+          continue;
+        }
         const adapter = this.transports.get(sub.transport.adapterId);
         if (adapter) {
           let valid = false;

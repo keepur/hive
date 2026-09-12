@@ -241,13 +241,20 @@ export interface OpsNotifierCounters {
   deliveriesUnknown: number;
   transportFaults: number;
   /**
-   * D8: the record-CAS that lost. It counts the one write in this component
-   * that happens AFTER an irreversible external side effect (a posted Slack
-   * message, its ts already registered), so a miss loses the attempt's whole
-   * record and re-attempts the row next tick — a duplicate post with no trace.
-   * The in-process per-row latch makes it unreachable today, which is exactly
-   * why it is COUNTED rather than left silent: the latch is the thing a future
-   * edit changes.
+   * D8: the record write that did not land. It counts the one write in this
+   * component that happens AFTER an irreversible external side effect (a
+   * posted Slack message, its ts already registered), on BOTH of its failure
+   * shapes — a lost CAS, and a write that threw — so a miss loses the
+   * attempt's whole record, and a row still in a working state is re-attempted
+   * next tick: a duplicate post with no ledger trace.
+   *
+   * The lost-CAS shape is kept from firing by the per-row latch TOGETHER WITH
+   * the delivery phase's pre-post re-read (delivery.ts, attemptRow step 4) —
+   * the latch alone did not, because the arm's scan copy predates it. With
+   * both, no in-process writer can reach it; it is COUNTED rather than left
+   * silent because those two mechanisms are exactly what a future edit
+   * changes. The thrown shape is an ordinary storage fault and is reachable
+   * whenever Mongo is.
    */
   deliveryRecordLost: number;
   subscriptionUnresolved: number;

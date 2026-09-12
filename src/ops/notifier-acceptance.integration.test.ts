@@ -1120,8 +1120,12 @@ describe("AC9 — nothing in this diff publishes an ops_event, on success or on 
       (ctx) => (ctx.update?.$set as Record<string, unknown> | undefined)?.lastOutcome !== undefined,
     );
     await expect(delivery.tick()).resolves.toBeUndefined();
-    expect(delivery.snapshot().sweepFaults).toBe(1);
-    expect(warnLines("ops delivery fault")).toHaveLength(1);
+    // A record write that throws AFTER the post is counted on its own
+    // counter — the attempt is unrecorded and will be re-posted — not buried
+    // in sweepFaults; it still degrades the heartbeat.
+    expect(delivery.snapshot().deliveryRecordLost).toBe(1);
+    expect(delivery.snapshot().sweepFaults).toBe(0);
+    expect(warnLines("ops delivery record write failed")).toHaveLength(1);
     expect((await delivery.heartbeat()).state).toBe("degraded");
     expect(opsEventWrites(delivery, deliveryMark)).toEqual([]);
 
@@ -1639,13 +1643,33 @@ describe("AC13 — a tick contains its own faults (D8(b))", () => {
     await expect(delivery.tick()).resolves.toBeUndefined();
 
     expect(delivery.transport.views).toHaveLength(2); // the phase CONTINUED
-    expect(delivery.snapshot().sweepFaults).toBe(1);
+    // A thrown RECORD write follows a spent side effect, so it is counted on
+    // deliveryRecordLost rather than the generic per-row fault counter.
+    expect(delivery.snapshot().deliveryRecordLost).toBe(1);
+    expect(delivery.snapshot().sweepFaults).toBe(0);
     const first = await delivery.row("s1", e.dedupeKey);
     const second = await delivery.row("s2", e.dedupeKey);
     expect(first.lastOutcome).toBeUndefined();
     expect(first.attemptCount).toBe(0);
     expect(second.lastOutcome).toBe("accepted");
     expect(second.attemptCount).toBe(1);
+
+    // A per-row fault BEFORE any side effect — here the pre-post re-read — is
+    // the generic shape: counted on sweepFaults, nothing posted for that row,
+    // and the phase continues.
+    const reread = await harness({ subscriptions: [sub("s1"), sub("s2")], policy: policyWith() });
+    const e2 = await reread.seedEvent();
+    let reads = 0;
+    failOn(reread.db, OPS_NOTIFICATIONS_COLLECTION, "findOne", () => ++reads === 1);
+
+    await expect(reread.tick()).resolves.toBeUndefined();
+
+    expect(reread.transport.views).toHaveLength(1);
+    expect(reread.snapshot().sweepFaults).toBe(1);
+    expect(reread.snapshot().deliveryRecordLost).toBe(0);
+    expect((await reread.row("s1", e2.dedupeKey)).attemptCount).toBe(0);
+    expect((await reread.row("s2", e2.dedupeKey)).attemptCount).toBe(1);
+    expect((await reread.heartbeat()).state).toBe("degraded");
 
     // Snooze expiry, the same shape.
     const expiry = await harness({ subscriptions: [sub("s1")] });
@@ -1797,7 +1821,9 @@ describe("AC13 — a tick contains its own faults (D8(b))", () => {
   });
 
   it("a per-row latch serializes an intake write against a tick on the same row", async () => {
-    // The loser observes a CAS failure rather than a merged write.
+    // The acknowledgement wins outright: the tick's decision to post is made
+    // from a read taken INSIDE the latch, so it sees the acknowledged row and
+    // declines — no post, and no lost CAS to count.
     const h = await harness({ subscriptions: [sub("s1")] });
     const { id, handle } = await seedLedgerRow(h, { state: "pending", attemptCount: 0, nextNudgeAt: BASE });
 
@@ -1815,10 +1841,10 @@ describe("AC13 — a tick contains its own faults (D8(b))", () => {
     gate.release();
     await tick;
 
-    // The post HAPPENED — that is the honest cost — but the record is refused
-    // rather than written over the acknowledgement.
-    expect(h.transport.views).toHaveLength(1);
-    expect(h.snapshot().deliveryRecordLost).toBe(1);
+    // Nothing was posted to a human who had already seen the row, and nothing
+    // was written over the acknowledgement.
+    expect(h.transport.views).toHaveLength(0);
+    expect(h.snapshot().deliveryRecordLost).toBe(0);
     const row = await rowById(h, id);
     expect(row.state).toBe("seen");
     expect(row.principal).toBe("U1");
