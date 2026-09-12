@@ -152,8 +152,18 @@ export interface AuditRoutingControlDeps {
  * Dispatcher (wired-but-sweep-failed), which is a dispatcher change this
  * ticket does not make. The honest fix at this layer is to stop asserting the
  * cause and name where the answer is.
+ *
+ * ⚠ EXPORTED SO NOTHING MIRRORS IT (r2 CONSIDER 2, `MEETING_ACK_TEXT`
+ * precedent). This is the ONLY copy of these bytes in the repo: the control
+ * below returns it, and both test suites that assert on it — this module's own
+ * (`audit-routing.test.ts`, the contract) and the admin tool surface's
+ * (`admin-mcp-server.test.ts`, the passthrough) — import it rather than
+ * hand-typing it. A hand-typed copy went stale the moment this wording was
+ * rewritten and its suite stayed green, which is exactly the drift the
+ * precedent exists to prevent. Text and its assertions change in lockstep, or
+ * not at all.
  */
-const NOT_READY =
+export const AUDIT_ROUTING_NOT_READY =
   'Audit routing is not ready yet. Either the engine is still starting — retry in a moment — or the boot-time Slack channel sweep failed, in which case retrying will never help: check the engine log for "Failed to configure audit channel".';
 
 /**
@@ -181,7 +191,7 @@ export function createAuditRoutingControl(deps: AuditRoutingControlDeps): AuditR
     ready: () => dispatcher.auditRoutingReady(),
 
     describe: async () => {
-      if (!dispatcher.auditRoutingReady()) return NOT_READY;
+      if (!dispatcher.auditRoutingReady()) return AUDIT_ROUTING_NOT_READY;
       const name = dispatcher.getAuditChannelName();
       const lines = [
         `Audit channel: ${name ? `#${name}` : "(unset — the audit mirror is OFF)"}`,
@@ -209,7 +219,7 @@ export function createAuditRoutingControl(deps: AuditRoutingControlDeps): AuditR
     },
 
     set: async (name, actor) => {
-      if (!dispatcher.auditRoutingReady()) return { ok: false, message: NOT_READY };
+      if (!dispatcher.auditRoutingReady()) return { ok: false, message: AUDIT_ROUTING_NOT_READY };
 
       if (name === "") {
         await settings.deleteOne({ _id: AUDIT_ROUTING_DOC_ID });

@@ -1331,6 +1331,48 @@ describe("audit routing (KPR-452)", () => {
     expect(listChannels).toHaveBeenCalledTimes(2);
   });
 
+  // D2 rule 4's first half — "map hit, else one bounded refresh". Nothing
+  // pinned the short-circuit: the reviewer deleted `if (hit) return hit;` from
+  // `resolveAuditChannelId` (r2 CONSIDER 1 / M9) and all 238 dispatcher +
+  // conference cases stayed green, because every other row either misses the
+  // map (and so wants the refresh) or has no channel name at all. The blast
+  // radius of the missing pin is bounded by the 60 s floor — at most one
+  // spurious `conversations.list` per minute — which is why it is one row and
+  // not a redesign. `ops-audit` IS in `CHANNELS()`, so a hit must cost nothing.
+  it("AC10: a name already in the map resolves with no Slack call at all", async () => {
+    wire("ops-audit");
+    await dispatcher.dispatch(internalItem("team-1"));
+    expect(auditCall()[0].workItem.source.id).toBe("C-OPS");
+    expect(listChannels).not.toHaveBeenCalled();
+  });
+
+  // ⚠ THE 60 s FLOOR ON THE **FAILURE** PATH (r2 SHOULD-FIX A). The stamp is
+  // taken BEFORE the IIFE issues the call (dispatcher.ts), precisely so a slow
+  // or FAILING refresh cannot be retried at request rate — but every other
+  // AC10 row drives a RESOLVING `listChannels`, so moving the stamp inside the
+  // IIFE to fire only on success left all 238 cases green (M8).
+  //
+  // What that misses in production: an unresolvable audit channel (a typo'd
+  // `slack.auditChannel`, or the bot not yet invited — the state during this
+  // ticket's own deploy prerequisite) plus a Slack 429 episode. With a
+  // success-only stamp EVERY audit post re-issues `conversations.list` on the
+  // awaited dispatch path, each one subject to `@slack/web-api`'s 429
+  // retry/backoff, holding `recordTurnSuccess` and the fan-out `Promise.all`
+  // per post instead of once per minute. The floor must hold whether the
+  // refresh succeeded or not, so this row rejects and never resolves the name.
+  it("AC10: the 60s floor holds after a FAILED refresh, not just a successful one", async () => {
+    listChannels.mockRejectedValue(new Error("slack 429"));
+    wire("late-audit"); // absent from CHANNELS() ⇒ every post wants a refresh
+    await dispatcher.dispatch(internalItem("team-1"));
+    expect(listChannels).toHaveBeenCalledTimes(1);
+    expect(mockLogWarn.mock.calls.some((c: any[]) => c[0] === "Audit channel refresh failed")).toBe(true);
+
+    // Inside the window, still unresolved, still failing: no second attempt.
+    nowMs += 30_000;
+    await dispatcher.dispatch(internalItem("team-2"));
+    expect(listChannels).toHaveBeenCalledTimes(1);
+  });
+
   it("AC10: a concurrent fan-out of audit posts issues exactly one refresh", async () => {
     wire("late-audit");
     let release: (() => void) | undefined;
@@ -1506,6 +1548,14 @@ describe("audit routing (KPR-452)", () => {
   // `deliver`. A shared `"Audit post failed" || "Audit channel refresh failed"`
   // disjunction would pass on either row regardless of which fault the
   // arrangement actually produced.
+  //
+  // ⚠ THE ROWS ARE NOT INTERCHANGEABLE, and the deliver-reject row is the one
+  // that pins `postAuditLog`'s OWN try/catch: under a mutation that rethrows
+  // from that catch, only the deliver-reject row fails — the
+  // `conversations.list`-reject row is contained one layer down, by
+  // `refreshAuditChannelIds`' own internal catch (correct defence in depth),
+  // so it stays green. Do not delete the deliver-reject row believing the
+  // refresh row already covers the method-level frame.
   it.each([
     [
       "conversations.list rejects",

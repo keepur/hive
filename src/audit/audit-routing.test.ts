@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
 import {
   AUDIT_ROUTING_DOC_ID,
+  AUDIT_ROUTING_NOT_READY,
   auditCopyDecision,
   createAuditRoutingControl,
   getAuditRoutingControl,
@@ -193,13 +194,17 @@ describe("createAuditRoutingControl (KPR-452 D5)", () => {
     expect(describedOff).toContain("Resolves to a Slack channel id: no");
   });
 
+  // The message is asserted through the EXPORTED constant, never a hand-typed
+  // copy (r2 CONSIDER 2 — `MEETING_ACK_TEXT` precedent). `toBe` rather than
+  // `toContain`: this suite owns the contract, so it pins that both surfaces
+  // return exactly the one canonical string.
   it("reports not-ready during the boot window instead of a spurious not-found", async () => {
     const h = makeControlHarness({ ready: false, resolves: "C-OPS", configuredChannel: "cfg" });
     expect(h.control.ready()).toBe(false);
-    expect(await h.control.describe()).toContain("not ready yet");
+    expect(await h.control.describe()).toBe(AUDIT_ROUTING_NOT_READY);
     const res = await h.control.set("ops-audit", "cos");
     expect(res.ok).toBe(false);
-    expect(res.message).toContain("not ready yet");
+    expect(res.message).toBe(AUDIT_ROUTING_NOT_READY);
     expect(h.settings.replaceOne).not.toHaveBeenCalled();
     expect(h.dispatcher.resolveAuditChannelIdFully).not.toHaveBeenCalled();
   });

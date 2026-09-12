@@ -115,7 +115,7 @@ function makeFakeDb(): any {
 
 import { buildAdminTools } from "./admin-mcp-server.js";
 import { invalidateGeminiModelCache } from "./model-catalog-cache.js";
-import { setAuditRoutingControl, type AuditRoutingControl } from "../audit/audit-routing.js";
+import { AUDIT_ROUTING_NOT_READY, setAuditRoutingControl, type AuditRoutingControl } from "../audit/audit-routing.js";
 // Ensure the software-engineer archetype is registered in the registry.
 await import("../archetypes/software-engineer/index.js");
 
@@ -1795,19 +1795,24 @@ describe("admin-mcp-server — audit channel tools (KPR-452)", () => {
   // SURFACE the agent actually sees, i.e. that the tool layer neither
   // swallows the message nor reports success. Nothing here reads
   // `control.ready()` — see the interface note in the tool implementation.
+  //
+  // The message comes from the EXPORTED `AUDIT_ROUTING_NOT_READY`, never a
+  // hand-typed copy (r2 CONSIDER 2 — the `MEETING_ACK_TEXT` precedent). A
+  // mirrored literal here held the RETIRED wording and still passed, because a
+  // passthrough test stubs the control: the copy drifted invisibly the moment
+  // the real control's wording was rewritten. Asserting `toContain` of the
+  // import keeps the whole string in lockstep with its one definition.
   it("D5: reports the boot-window not-ready state at the tool surface", async () => {
-    const NOT_READY = "Audit routing is not ready yet — the engine is still starting. Retry in a moment.";
     control.ready = vi.fn(() => false);
-    control.describe = vi.fn(async () => NOT_READY);
-    control.set = vi.fn(async () => ({ ok: false, message: NOT_READY }));
+    control.describe = vi.fn(async () => AUDIT_ROUTING_NOT_READY);
+    control.set = vi.fn(async () => ({ ok: false, message: AUDIT_ROUTING_NOT_READY }));
 
     const got = await getHandler(makeTools(), "audit_channel_get")({});
-    expect(got.content[0].text).toContain("not ready yet");
+    expect(got.content[0].text).toContain(AUDIT_ROUTING_NOT_READY);
 
     const setRes = await getHandler(makeTools(), "audit_channel_set")({ channel_name: "ops-audit" });
     expect(setRes.isError).toBe(true);
-    expect(setRes.content[0].text).toContain("not ready yet");
-    expect(setRes.content[0].text).toContain("Retry in a moment");
+    expect(setRes.content[0].text).toContain(AUDIT_ROUTING_NOT_READY);
   });
 
   it("reports honestly when no control is installed (the stdio-fallback limit)", async () => {
