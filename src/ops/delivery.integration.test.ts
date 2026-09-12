@@ -543,17 +543,26 @@ describe("the arm passes — a blocked stall set cannot starve a servable row", 
     }
   };
 
-  it("a healthy subscriber's FIRST delivery is attempted ahead of two full pages of transport-stalled first deliveries", async () => {
+  it("a healthy subscriber's FIRST delivery is attempted ahead of five full pages of transport-stalled first deliveries", async () => {
     // ⚠ THE ABLE-TO-FAIL CASE. These rows have never been attempted, so they
     // keep attemptCount 0 and sat in arm 1's bucket forever, sorting OLDEST:
-    // two pages of them filled arm 1's page and then arm 3's, and the fresh
-    // row reached neither on this tick — nor on any later one, since the
-    // blocked set re-arrives every stall re-check.
+    // they filled every page ahead of the fresh row, which was reached neither
+    // on this tick nor on any later one, since the blocked set re-arrives
+    // every stall re-check.
+    //
+    // ⚠ FIVE pages, not two, and the count is what pins the MECHANISM. The
+    // phase reads at most five pages (four arm passes and arm 3), so a seed
+    // this size sorted ahead of the fresh row cannot be drained by ANY
+    // five-read arrangement over the unfiltered buckets. Two pages did not
+    // discriminate: with the `stalledReason` exclusion removed from all five
+    // passes, arm 1's two passes each took (and stalled) a page, arm 3 then
+    // served the fresh row, and the case passed without the exclusion it
+    // exists to test. Only pass (a)'s `$nin` reaches the fresh row first here.
     const h = await harness({
       subscriptions: [sub("healthy"), sub("blocked", { transport: { adapterId: "nowhere", target: "C0000009" } })],
       policy: policyWith(),
     });
-    await seedDue(h, 2 * DELIVERY_ARM_PAGE_SIZE, {
+    await seedDue(h, 5 * DELIVERY_ARM_PAGE_SIZE, {
       subscriptionId: "blocked",
       attemptCount: 0,
       stalledReason: "transport",
