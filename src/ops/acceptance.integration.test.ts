@@ -80,6 +80,36 @@ const opsSources = globSync("src/ops/**/*.ts", { cwd: root })
   .map((f) => readFileSync(`${root}${f}`, "utf8"));
 
 /**
+ * KPR-468 fix-forward: the fixed set of files THIS producer shipped with,
+ * before the ledger child existed. `opsSources` (above) globs the whole
+ * `src/ops/**` directory and is right for every OTHER scan below (AC7/AC15's
+ * forbidden-word checks are meant to cover future siblings too) — but the
+ * "no such collection name at all" check just below is narrower than its own
+ * comment ever claimed: it names this producer's diff ("this diff contains no
+ * such collection name"), not the whole directory for all time. KPR-468 (D2)
+ * legitimately declares `OPS_NOTIFICATIONS_COLLECTION = "ops_notifications"`
+ * in its own new files under `src/ops/`, which a directory-wide scan cannot
+ * distinguish from this producer regressing into writing the ledger itself.
+ * Pinning the fixed pre-KPR-468 file list (rather than trying to exclude each
+ * new ledger file by name as later chunks land) keeps the real property —
+ * this producer never mints `ops_notifications` — durable across the rest of
+ * this epic with no further edits here. The check this narrows is advisory
+ * only: the load-bearing half is assertion (a) below, the exact
+ * `fakeDb.collections.keys()` allow-list, which is untouched.
+ */
+const kpr454ProducerSources = [
+  "error-tokens.ts",
+  "ids.ts",
+  "match.ts",
+  "observe.ts",
+  "publisher-singleton.ts",
+  "publisher.ts",
+  "reasons.ts",
+  "store.ts",
+  "types.ts",
+].map((f) => readFileSync(`${root}src/ops/${f}`, "utf8"));
+
+/**
  * Slice one KPR-454 insertion out of a capture-point module. TWO literal
  * anchors: `agent-runner.ts` and `tool-bridge.ts` both legitimately mention
  * the forbidden words elsewhere, so a whole-module scan would fail against
@@ -427,8 +457,11 @@ describe("AC2 (C2, C3) — zero match is a stored, queryable fact and never a fa
     ]);
     // (b) a source scan proving this diff contains no such collection name at
     //     all. This is the durable half: it survives a refactor that stops
-    //     exercising a code path in this test.
-    for (const s of opsSources) expect(s).not.toContain("ops_notifications");
+    //     exercising a code path in this test. Scoped to THIS producer's own
+    //     fixed pre-KPR-468 file set (see `kpr454ProducerSources`) rather than
+    //     the whole `src/ops/**` directory: KPR-454's own files never mint the
+    //     ledger collection; KPR-468's files legitimately declare its name.
+    for (const s of kpr454ProducerSources) expect(s).not.toContain("ops_notifications");
     expect(await db.collection(OPS_SUBSCRIPTIONS_COLLECTION).countDocuments({})).toBe(0);
   });
 });
