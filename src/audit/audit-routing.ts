@@ -55,7 +55,7 @@ export interface AuditCopyDecision {
  *
  * Rule 3 — `policyFor`'s class. `skip` (cron) suppresses: a re-firing job
  * would be mirrored twice. `silent` and `notify` both POST. `silent` posting
- * is the honest consequence of the human ruling on KPR-452 — the ops stream
+ * is the honest consequence of the human ruling on KPR-452 — the audit-mirror stream
  * is RELOCATED, not deleted.
  *
  * `policyFor` carries a documented caveat (outage-notices.ts:14-19): ws/app
@@ -211,7 +211,7 @@ export function createAuditRoutingControl(deps: AuditRoutingControlDeps): AuditR
           .find((a) => a.homeBase === name);
         if (owner) {
           lines.push(
-            `Advisory: #${name} is ${owner.name}'s homeBase channel — the whole fleet's ops stream would land there. A dedicated audit channel is usually what you want.`,
+            `Advisory: #${name} is ${owner.name}'s homeBase channel — every mirrored turn in the fleet would land there. A dedicated audit channel is usually what you want.`,
           );
         }
       }

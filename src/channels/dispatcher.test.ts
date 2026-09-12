@@ -1132,7 +1132,7 @@ describe("audit routing (KPR-452)", () => {
     });
   }
 
-  // AC1 — the ops stream, single-dispatch site.
+  // AC1 — the audit-mirror stream, single-dispatch site.
   it.each([
     ["team- agent→agent DM", "team-abc"],
     ["event: bus delivery", "event:evt-1:production-support"],

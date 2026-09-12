@@ -22,8 +22,8 @@ function item(id: string, kind: ChannelKind, sourceId = "src-1"): WorkItem {
 }
 
 describe("auditCopyDecision (KPR-452 D2 rules 2-3)", () => {
-  // AC1 — the ops stream May asked to keep.
-  it("posts internal team- and event: items (the silent-class ops stream)", () => {
+  // AC1 — the audit-mirror stream May asked to keep.
+  it("posts internal team- and event: items (the silent-class audit-mirror stream)", () => {
     expect(auditCopyDecision(item("team-abc", "internal"), "slack")).toEqual({ post: true, reason: "post" });
     expect(auditCopyDecision(item("event:e1:jasper", "internal"), "slack")).toEqual({ post: true, reason: "post" });
   });
@@ -58,7 +58,7 @@ describe("auditCopyDecision (KPR-452 D2 rules 2-3)", () => {
     expect(auditCopyDecision(item("worker:claim-2", "sms"), "slack")).toEqual({ post: true, reason: "post" });
   });
 
-  // AC5 — notify-class non-Slack turns still appear in the ops stream.
+  // AC5 — notify-class non-Slack turns still appear in the audit mirror.
   it.each(["voice", "team", "app", "sms"] as const)("posts a notify-class %s turn", (kind) => {
     expect(auditCopyDecision(item("client-supplied-id", kind), "slack")).toEqual({ post: true, reason: "post" });
   });
