@@ -104,6 +104,15 @@ function unset(row: Row, path: string): void {
   delete target[parts.at(-1)!];
 }
 
+/**
+ * KPR-468: `$inc`, not previously supported (`updateOne` handled only `$set` /
+ * `$setOnInsert`) — `ingest.ts`'s renewal arms both increment `eventCount`.
+ * An absent field increments from 0, matching the real driver.
+ */
+function inc(row: Row, path: string, amount: number): void {
+  set(row, path, (get(row, path) ?? 0) + amount);
+}
+
 function same(a: unknown, b: unknown): boolean {
   if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime();
   if (a instanceof ObjectId || b instanceof ObjectId) return String(a) === String(b);
@@ -151,9 +160,15 @@ function compareOperand(actual: any, op: ComparisonOperator, expected: any): boo
 }
 
 /**
- * Equality, plus KPR-468's four comparison operators. Any OTHER operator-shaped
- * term throws rather than silently matching nothing, so a future test reaching
- * for one fails loudly instead of reporting coverage it lacks.
+ * Equality, KPR-468's four comparison operators, and $ne. Any OTHER
+ * operator-shaped term throws rather than silently matching nothing, so a
+ * future test reaching for one fails loudly instead of reporting coverage it
+ * lacks.
+ *
+ * $ne is NOT one of COMPARISON_OPERATORS (it is not order-based — it is
+ * `same()` inverted) but is admitted here for the same reason the other four
+ * are: ingest.ts's clearing/renewal filters (`state: { $ne: "cleared" }`)
+ * need it and nothing else does.
  */
 function predicate(actual: any, expected: any): boolean {
   if (
@@ -165,18 +180,38 @@ function predicate(actual: any, expected: any): boolean {
   ) {
     const operatorKeys = Object.keys(expected).filter((key) => key.startsWith("$"));
     if (operatorKeys.length > 0) {
-      const unsupported = operatorKeys.find((key) => !(COMPARISON_OPERATORS as readonly string[]).includes(key));
+      const unsupported = operatorKeys.find(
+        (key) => key !== "$ne" && !(COMPARISON_OPERATORS as readonly string[]).includes(key),
+      );
       if (unsupported !== undefined) throw new Error("unsupported_filter_" + unsupported);
       // A real filter may combine bounds (`{ $gt: x, $lte: y }`); `every` is
       // what makes that one conjunction rather than a special case.
-      return operatorKeys.every((key) => compareOperand(actual, key as ComparisonOperator, expected[key]));
+      return operatorKeys.every((key) =>
+        key === "$ne" ? !same(actual, expected[key]) : compareOperand(actual, key as ComparisonOperator, expected[key]),
+      );
     }
   }
   return same(actual, expected);
 }
 
+/**
+ * KPR-468: `$or` as a TOP-LEVEL filter key, alongside ordinary field keys —
+ * `ingest.ts`'s `strictlyAfter`/`newerThan` filters are exactly this shape
+ * (`{ _id: row._id, state: { $ne: "cleared" }, $or: [...] }`, `newerThan`
+ * spread into a sibling position). Each branch is itself a full sub-filter,
+ * matched by recursing into `matchesFilter` — nesting a second `$or` inside a
+ * branch therefore already works for free, though nothing in this ticket
+ * needs it. `$or` is intersected (AND-ed) with every sibling key exactly as
+ * real MongoDB does; it is not a special "only key allowed" case.
+ */
 export function matchesFilter(row: Row, filter: Row): boolean {
-  return Object.entries(filter).every(([key, value]) => predicate(get(row, key), value));
+  return Object.entries(filter).every(([key, value]) => {
+    if (key === "$or") {
+      if (!Array.isArray(value)) throw new Error("unsupported_filter_$or_shape");
+      return value.some((branch) => matchesFilter(row, branch as Row));
+    }
+    return predicate(get(row, key), value);
+  });
 }
 
 /**
@@ -449,6 +484,7 @@ export class FakeCollection {
       if (!old && this.uniqueConflict(row)) this.duplicateKeyError();
       if (!old && update.$setOnInsert) Object.assign(row, copy(update.$setOnInsert));
       for (const [key, value] of Object.entries(update.$set ?? {})) set(row, key, value);
+      for (const [key, amount] of Object.entries(update.$inc ?? {})) inc(row, key, amount as number);
       for (const key of Object.keys(update.$unset ?? {})) unset(row, key);
       if (!old) this.rows.push(row);
       return { acknowledged: true, matchedCount: old ? 1 : 0, modifiedCount: old ? 1 : 0, upsertedCount: old ? 0 : 1 };
