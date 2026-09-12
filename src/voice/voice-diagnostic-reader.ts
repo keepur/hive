@@ -287,6 +287,7 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
     "stopped",
     "bootToInitMs",
     "queueWaitMs",
+    "effort",
   ],
   engine_terminal: [
     "status",
@@ -313,6 +314,7 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
     "toolAckInjected",
     "bootToInitMs",
     "queueWaitMs",
+    "effort",
   ],
   diagnostic_gap: ["reason", "count"],
   teardown: ["result", "reason"],
@@ -1120,6 +1122,17 @@ function validatePayload(value: Record<string, unknown>, event: VoiceDiagnosticE
     "continuity" in value &&
     value.continuity !== undefined &&
     !["fresh", "warm", "resume", "full_transcript"].includes(String(value.continuity))
+  ) {
+    return false;
+  }
+  // KPR-465: delivered effort on the engine terminals. A literal list, not an
+  // import of AGENT_EFFORT_LEVELS — this reader is a pure offline module and
+  // must not pick up engine imports; a reader test pins the two in lockstep.
+  if (
+    "effort" in value &&
+    value.effort !== undefined &&
+    value.effort !== null &&
+    !["low", "medium", "high", "xhigh", "max"].includes(String(value.effort))
   ) {
     return false;
   }

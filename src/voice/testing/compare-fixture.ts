@@ -241,10 +241,9 @@ export function buildCall(callId: string, turns: FixtureTurn[]): string[] {
       initToFirstTokenMs: m(t.init),
       ...stage(t.boot, "bootToInitMs"),
       ...stage(t.queue, "queueWaitMs"),
-      // `effort` is emitted only when the turn sets it explicitly. Chunk B's
-      // defaults leave it ABSENT (the reader allowlist admits it only once
-      // chunk C's emitter lands); chunk C flips the cold/warm defaults below
-      // to `null` / `"medium"` and regenerates the fixtures in its own commit.
+      // `effort` is emitted only when the turn sets it explicitly. The cold/warm
+      // defaults below carry the delivered effort (`null` / `"medium"`, KPR-465
+      // chunk C); `"omit"` keeps the key absent (KPR-464-era shape, `call-old`).
       ...(t.effort !== undefined && t.effort !== "omit" ? { effort: t.effort } : {}),
       ...(t.toolCount !== undefined
         ? { toolCount: t.toolCount, toolMs: t.toolCount * 400, toolAckInjected: t.toolCount > 0 }
@@ -316,7 +315,8 @@ export function buildCompareFixture(): { jsonl: string; engineLog: string; bench
     engineFirstText: 1900 + 50 * index,
     eou: 520 + index,
     tts: 230 + index,
-    ...extra, // chunk C adds `effort: null`
+    effort: null,
+    ...extra,
   });
   const warm = (index: number, extra: Partial<FixtureTurn> = {}): FixtureTurn => ({
     index,
@@ -328,7 +328,8 @@ export function buildCompareFixture(): { jsonl: string; engineLog: string; bench
     engineFirstText: 1250 + 40 * index,
     eou: 515 + index,
     tts: 225 + index,
-    ...extra, // chunk C adds `effort: "medium"`
+    effort: "medium",
+    ...extra,
   });
   const lines = [
     ...buildCall("call-cold-a", [

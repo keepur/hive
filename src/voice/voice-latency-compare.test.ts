@@ -77,6 +77,8 @@ describe("KPR-465 comparison reader (R1)", () => {
     expect(warm.byStratum.first.stages.bootToInitMs.samples).toEqual([655]);
     expect(warm.byStratum.steady.stages.bootToInitMs).toMatchObject({ n: 0, missingByReason: { not_applicable: 3 } });
     expect(warm.byStratum.steady.stages.lockQueueMs.samples).toEqual([42, 43, 46]);
+    expect(warm.turns.every((t) => t.effort === "medium")).toBe(true);
+    expect(cold.turns.every((t) => t.effort === null)).toBe(true);
     expect(warm.turns.find((t) => t.turnId === "call-warm-a-t5")).toMatchObject({
       stratum: "retried",
       attempts: 2,

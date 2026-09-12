@@ -18,6 +18,7 @@ import {
 } from "./voice-diagnostic-reader.js";
 import { percentile as summaryPercentile } from "../voice-worker/telemetry.js";
 import { SpeechTrace } from "../voice-worker/speech-trace.js";
+import { AGENT_EFFORT_LEVELS } from "../agents/agent-effort.js";
 
 const COMPLETE_FIXTURE = readFileSync(
   fileURLToPath(new URL("../../docs/epics/kpr-462/fixtures/kpr-464-complete.jsonl", import.meta.url)),
@@ -192,6 +193,17 @@ describe("KPR-465 additive engine measures", () => {
     const report = reduceVoiceDiagnostics(COMPLETE_FIXTURE, "call-fixture");
     expect(report.complete).toBe(true);
     expect(report.engineAttempts).toBe(1);
+  });
+
+  it("KPR-465: effort on engine terminals accepts null and the five levels, rejects anything else", () => {
+    for (const e of [null, "low", "medium", "high", "xhigh", "max"])
+      expect(parseVoiceDiagnosticEvent({ ...base, effort: e })).not.toBeNull();
+    expect(parseVoiceDiagnosticEvent({ ...base, effort: "turbo" })).toBeNull();
+    expect(parseVoiceDiagnosticEvent({ ...base, effort: 3 })).toBeNull();
+  });
+
+  it("KPR-465: reader effort literal tracks AGENT_EFFORT_LEVELS", () => {
+    expect([...AGENT_EFFORT_LEVELS]).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 
   it("KPR-465: speech details expose the estimate components and the bound turnId", () => {
