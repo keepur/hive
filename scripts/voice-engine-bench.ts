@@ -10,7 +10,7 @@
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { realpathSync, appendFileSync, writeFileSync } from "node:fs";
-import { request as httpRequest } from "node:http";
+import { request as httpRequest, type IncomingMessage } from "node:http";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { performance } from "node:perf_hooks";
@@ -55,6 +55,19 @@ interface TurnOutcome {
   finish: "stop" | "error" | "closed" | "none";
 }
 
+/**
+ * Posts one turn and streams its SSE answer.
+ *
+ * Drill hooks (`onSent`, `onFirstText`) are awaited, not fired and forgotten: every
+ * response step (each chunk's events and `end`) runs on one promise chain, so while a
+ * hook is pending no later SSE event is processed, the turn does not settle, and the
+ * caller cannot post the next turn. The response stream is also paused for the hook's
+ * duration. What this cannot do is hold the engine: the server keeps running the turn
+ * (and may finish it) while the operator is at the prompt — whether a kill lands inside
+ * the engine turn is wall-clock on the live instance, not something the client controls.
+ * A transport failure (`req`/`res` error) still settles the turn immediately; a hook
+ * that rejects rejects the turn.
+ */
 export function postTurn(
   opts: BenchOptions,
   body: Record<string, unknown>,
@@ -68,7 +81,7 @@ export function postTurn(
   const url = new URL("/v1/chat/completions", opts.baseUrl);
   const payload = JSON.stringify(body);
   const startedAt = performance.now();
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let status: number | null = null;
     let firstTextMs: number | null = null;
     let text = "";
@@ -79,6 +92,52 @@ export function postTurn(
       if (settled) return;
       settled = true;
       resolve({ status, firstTextMs, totalMs: performance.now() - startedAt, text, finish });
+    };
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      req.destroy();
+      reject(error);
+    };
+    let chain: Promise<void> = Promise.resolve();
+    const step = (fn: () => void | Promise<void>) => {
+      chain = chain.then(fn).catch(fail);
+    };
+    let response: IncomingMessage | undefined;
+    let holding = false;
+    const hold = async (hook: () => Promise<void>) => {
+      holding = true;
+      response?.pause();
+      try {
+        await hook();
+      } finally {
+        holding = false;
+        response?.resume();
+      }
+    };
+    const handleChunk = async (chunk: string) => {
+      for (const ev of parser.push(chunk)) {
+        if (ev.type === "text") {
+          if (firstTextMs === null) {
+            firstTextMs = performance.now() - startedAt;
+            if (hooks.onFirstText) await hold(hooks.onFirstText);
+            if (hooks.closeAfterFirstTextMs !== undefined) {
+              setTimeout(() => {
+                // Same guard as closeAfterMs. A response that ended before the barge-in point already resolved
+                // with its honest "stop"; don't lean on Node treating a destroy() of a released keep-alive
+                // request (whose socket may now carry the next turn) as a no-op.
+                if (settled) return;
+                finish = "closed";
+                req.destroy();
+                done();
+              }, hooks.closeAfterFirstTextMs).unref?.();
+            }
+          }
+          text += ev.text;
+        } else if (ev.type === "done") {
+          finish = ev.finishReason === "error" ? "error" : "stop";
+        }
+      }
     };
     const req = httpRequest(
       {
@@ -93,33 +152,15 @@ export function postTurn(
         },
       },
       (res) => {
+        response = res;
+        // An `onSent` hook still pending when the response arrives keeps it paused; its `finally` resumes it.
+        // Pausing before the `data` listener is attached keeps the listener from switching the stream to flowing.
+        if (holding) res.pause();
         status = res.statusCode ?? null;
         res.setEncoding("utf8");
-        res.on("data", (chunk: string) => {
-          for (const ev of parser.push(chunk)) {
-            if (ev.type === "text") {
-              if (firstTextMs === null) {
-                firstTextMs = performance.now() - startedAt;
-                void hooks.onFirstText?.();
-                if (hooks.closeAfterFirstTextMs !== undefined) {
-                  setTimeout(() => {
-                    // Same guard as closeAfterMs. A response that ended before the barge-in point already resolved
-                    // with its honest "stop"; don't lean on Node treating a destroy() of a released keep-alive
-                    // request (whose socket may now carry the next turn) as a no-op.
-                    if (settled) return;
-                    finish = "closed";
-                    req.destroy();
-                    done();
-                  }, hooks.closeAfterFirstTextMs).unref?.();
-                }
-              }
-              text += ev.text;
-            } else if (ev.type === "done") {
-              finish = ev.finishReason === "error" ? "error" : "stop";
-            }
-          }
-        });
-        res.on("end", done);
+        res.on("data", (chunk: string) => step(() => handleChunk(chunk)));
+        // Chained: `end` can be emitted while the stream is paused, so it must wait behind any pending hook too.
+        res.on("end", () => step(done));
         res.on("error", done);
       },
     );
@@ -127,9 +168,16 @@ export function postTurn(
       if (finish === "none") finish = "closed";
       done();
     });
-    req.end(payload, () => {
-      void hooks.onSent?.();
-    });
+    const onSent = hooks.onSent;
+    if (onSent) {
+      let sent!: () => void;
+      const flushed = new Promise<void>((r) => (sent = r));
+      // First link of the chain: every response step waits for the body to flush and then for the hook.
+      step(() => flushed.then(() => hold(onSent)));
+      req.end(payload, () => sent());
+    } else {
+      req.end(payload);
+    }
     if (hooks.closeAfterMs !== undefined) {
       setTimeout(() => {
         if (settled) return;
@@ -205,6 +253,33 @@ export async function runBenchCall(
   return callId;
 }
 
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "localhost"]);
+
+/**
+ * The bench is loopback-only and every request carries the bridge bearer, so a base URL
+ * that is not plain `http:` to 127.0.0.1/localhost is refused. Returns an error message
+ * (never echoing the raw URL), or null when the URL is acceptable.
+ */
+export function loopbackBaseUrlError(raw: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return "--base-url is not a valid URL";
+  }
+  if (url.protocol !== "http:" || !LOOPBACK_HOSTS.has(url.hostname)) {
+    return `--base-url must be http://127.0.0.1:<port> or http://localhost:<port> (loopback only; the bridge bearer is sent on every request), got ${url.protocol}//${url.hostname}`;
+  }
+  return null;
+}
+
+/** `--calls`: a positive decimal integer, strictly (no `"8abc"`, no `"0"`, no `"1e3"`). Null when invalid. */
+export function parseCallCount(raw: string): number | null {
+  if (!/^[1-9]\d*$/.test(raw)) return null;
+  const n = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 /**
  * Line 1 of the `--out` file. Carries no turn and no `callId`; scripts/voice-latency-compare.ts
  * recognizes exactly this shape (`run: true`, no `callId`) and skips it.
@@ -238,7 +313,8 @@ async function operatorKillPrompt(phase: string, turn: BenchTurn): Promise<void>
   process.stderr.write(
     `\n[kill drill] phase=${phase} turn=${turn.index}. Identify the lease's CLI child NOW, e.g.\n` +
       `  pgrep -P <engine-pid> -nf claude-agent-sdk   # newest matching child of the engine\n` +
-      `and kill exactly that pid (kill -9 <pid>). Press Enter when done.\n`,
+      `and kill exactly that pid (kill -9 <pid>). Press Enter when done.\n` +
+      `The bench holds this turn until Enter, but the engine does not wait: the kill must land while the turn runs.\n`,
   );
   await new Promise<void>((r) => rl.question("", () => r()));
   rl.close();
@@ -271,6 +347,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     process.stderr.write(`unknown drill ${values.drill}\n`);
     return 2;
   }
+  const calls = parseCallCount(values.calls!);
+  if (calls === null) {
+    process.stderr.write(`--calls must be a positive integer, got "${values.calls}"\n`);
+    return 2;
+  }
   // Late import: config.ts loads hive.yaml/.env/Honeypot from HIVE_HOME; keep the module importable by tests without it.
   const { config } = await import("../src/config.js");
   const token = config.voice.bridgeToken;
@@ -279,6 +360,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     return 2;
   }
   const baseUrl = values["base-url"] ?? `http://127.0.0.1:${config.voice.port}`;
+  // Checked before anything is written or sent: the bearer never leaves the host.
+  const baseUrlError = loopbackBaseUrlError(baseUrl);
+  if (baseUrlError) {
+    process.stderr.write(`${baseUrlError}\n`);
+    return 2;
+  }
   const workerBootId = randomUUID();
   writeFileSync(
     values.out,
@@ -288,7 +375,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         agent: values.agent!,
         workerBootId,
         startedAt: new Date().toISOString(),
-        calls: Number(values.calls),
+        calls,
         drill: (values.drill as Drill | undefined) ?? null,
         warmup: values.warmup!,
       }),
@@ -329,8 +416,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     const ids = await Promise.all([1, 2, 3].map(() => runBenchCall({ ...opts, drill: undefined })));
     callIds.push(...ids);
   } else {
-    const n = Number.parseInt(values.calls!, 10);
-    for (let i = 0; i < n; i += 1) callIds.push(await runBenchCall(opts));
+    for (let i = 0; i < calls; i += 1) callIds.push(await runBenchCall(opts));
   }
   process.stderr.write(
     `bench complete: ${callIds.length} call(s)\n${callIds.map((id) => `  --call ${id}=${values.arm}`).join("\n")}\n`,

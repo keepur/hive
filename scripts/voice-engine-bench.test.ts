@@ -6,6 +6,11 @@
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { randomUUID } from "node:crypto";
+import { existsSync, mkdtempSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // Same file-level mocks as src/channels/voice/voice-adapter.integration.test.ts (logger, SDK, prompt-builder, config).
 const mockLog = vi.hoisted(() => ({
@@ -36,7 +41,7 @@ vi.mock("../src/agents/prompt-builder.js", () => ({
 const configRef = {
   current: {
     anthropic: { apiKey: "test-key" },
-    voice: { assistants: {} as Record<string, string> },
+    voice: { assistants: {} } as { assistants: Record<string, string>; bridgeToken?: string; port?: number },
   },
 };
 vi.mock("../src/config.js", () => ({
@@ -52,7 +57,14 @@ import {
   makeAdapter,
   startAdapter,
 } from "../src/channels/voice/testing/adapter-fixture.js";
-import { runBenchCall, type BenchOptions } from "./voice-engine-bench.js";
+import {
+  loopbackBaseUrlError,
+  main,
+  parseCallCount,
+  postTurn,
+  runBenchCall,
+  type BenchOptions,
+} from "./voice-engine-bench.js";
 import { BENCH_SCRIPT } from "../src/voice/voice-bench-script.js";
 import type { TurnContext, TurnResult } from "../src/agents/agent-manager.js";
 
@@ -74,6 +86,8 @@ const CONTEXT = "CONTEXT-SENTINEL-R6";
 const HOLD_CAP_MS = 5_000;
 /** Words of turn 5 streamed before the mid-answer stall the 300 ms barge-in lands in. */
 const LONG_TURN_WORDS_BEFORE_STALL = 5;
+/** How long the fake operator stays at the kill prompt after the engine has already finished the drilled turn. */
+const OPERATOR_HOLD_MS = 200;
 
 function turnIndexOf(ctx: TurnContext): number {
   const last = ctx.voicePrompt?.latestUserMessage ?? ctx.workItem.text;
@@ -232,14 +246,168 @@ describe("voice-engine-bench against the real adapter (R6)", () => {
     ["kill-b", "after-first-byte", 3],
     ["kill-c", "before-first-byte", 1],
   ] as const)(
-    "%s fires the kill hook exactly once at %s on turn %d and tags the row",
+    "%s fires the kill hook exactly once at %s on turn %d, tags the row, and holds the call until the hook resolves",
     async (drill, phase, turnIndex) => {
-      const kill = vi.fn<NonNullable<BenchOptions["kill"]>>(async () => {});
-      await runBenchCall({ ...opts, drill, kill }, `bench-${drill}`);
+      // Stands in for the operator prompt: resolves only when the test says the operator is done.
+      let operatorDone!: () => void;
+      const kill = vi.fn<NonNullable<BenchOptions["kill"]>>(() => new Promise<void>((r) => (operatorDone = r)));
+      const callId = `bench-${drill}`;
+      const call = runBenchCall({ ...opts, drill, kill }, callId);
+      await vi.waitFor(() => expect(kill).toHaveBeenCalledTimes(1), { timeout: 5_000 });
+      // Timing-independent: let the engine finish the drilled turn entirely (its terminal row is emitted only
+      // after the response is flushed) while the hook is still pending — the Tokyo turn's short reply included.
+      await vi.waitFor(
+        () => expect(engineRows("engine_terminal").filter((r) => r.callId === callId)).toHaveLength(turnIndex),
+        { timeout: 5_000 },
+      );
+      await delay(OPERATOR_HOLD_MS);
+      // A fired-and-forgotten hook would have let the bench record the drilled turn and post the next one by now.
+      expect(rows).toHaveLength(turnIndex - 1);
+      expect(engineRows("engine_received").filter((r) => r.callId === callId)).toHaveLength(turnIndex);
+      operatorDone();
+      await call;
       expect(kill).toHaveBeenCalledTimes(1);
       expect(kill.mock.calls[0]![0]).toBe(phase);
       expect(kill.mock.calls[0]![1].index).toBe(turnIndex);
       expect(rows.filter((r) => r.drill === drill).map((r) => r.turnIndex)).toEqual([turnIndex]);
+      expect(rows).toHaveLength(10);
+      // Nothing buffered during the hold was dropped: the whole answer (ending on its keyword) was processed after it.
+      const drilled = rows.find((r) => r.turnIndex === turnIndex)!;
+      expect(drilled).toMatchObject({ finish: "stop", status: 200 });
+      expect(drilled.textLength).toBe(`${CANNED[turnIndex]} `.length); // scriptedSpawn streams each word plus a space
+      if (turnIndex === 3) expect(drilled.keywordPass).toBe(true);
+      expect(drilled.clientTotalMs as number).toBeGreaterThanOrEqual(OPERATOR_HOLD_MS);
+    },
+  );
+});
+
+describe("postTurn awaits drill hooks against a single-write response", () => {
+  // The whole answer in ONE write, then end, with a server keep-alive shorter than the hold: the case where the
+  // rest of the first-text chunk is already parsed, `end` is emitted on the paused stream, and the server closes the
+  // socket while the operator is still at the prompt. None of it may be processed, dropped, or settle the turn early.
+  const frame = (choice: Record<string, unknown>) => `data: ${JSON.stringify({ choices: [choice] })}\n\n`;
+  const BODY =
+    frame({ delta: { content: "The capital " } }) +
+    frame({ delta: { content: "is Tokyo." } }) +
+    frame({ delta: {}, finish_reason: "stop" }) +
+    "data: [DONE]\n\n";
+  let server: Server;
+  let serverEnded = false;
+  let opts: BenchOptions;
+  beforeEach(async () => {
+    serverEnded = false;
+    server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.end(BODY, () => (serverEnded = true));
+      });
+    });
+    server.keepAliveTimeout = 20;
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    opts = {
+      baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      token: BRIDGE_TOKEN,
+      agentId: FIXTURE_AGENT_ID,
+      arm: "A1-warm",
+      goal: GOAL,
+      context: CONTEXT,
+      workerBootId: randomUUID(),
+      out: () => {},
+    };
+  });
+  afterEach(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it.each(["onSent", "onFirstText"] as const)(
+    "%s: nothing after the hold point is processed and the turn does not settle until the hook resolves",
+    async (hookName) => {
+      let turnSettled = false;
+      const duringHold: { serverEnded?: boolean; turnSettled?: boolean } = {};
+      const hook = async () => {
+        await vi.waitFor(() => expect(serverEnded).toBe(true));
+        await delay(OPERATOR_HOLD_MS);
+        duringHold.serverEnded = serverEnded;
+        duringHold.turnSettled = turnSettled;
+      };
+      const turn = postTurn(opts, {}, { [hookName]: hook });
+      void turn.then(() => (turnSettled = true));
+      const outcome = await turn;
+      expect(duringHold).toEqual({ serverEnded: true, turnSettled: false });
+      expect(outcome).toMatchObject({ status: 200, text: "The capital is Tokyo.", finish: "stop" });
+      expect(outcome.totalMs).toBeGreaterThanOrEqual(OPERATOR_HOLD_MS);
+    },
+  );
+
+  it("a hook that rejects rejects the turn instead of hanging it", async () => {
+    await expect(postTurn(opts, {}, { onFirstText: () => Promise.reject(new Error("prompt failed")) })).rejects.toThrow(
+      "prompt failed",
+    );
+  });
+});
+
+describe("voice-engine-bench argument validation", () => {
+  const originalConfig = configRef.current;
+  let stderr: string[];
+  let stderrSpy: { mockRestore: () => void };
+  let out: string;
+  beforeEach(() => {
+    stderr = [];
+    stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    out = join(mkdtempSync(join(tmpdir(), "kpr465-bench-")), "out.jsonl");
+    // A configured token, so a refusal below can only come from the validation under test.
+    configRef.current = {
+      ...originalConfig,
+      voice: { ...originalConfig.voice, bridgeToken: "tok-validation-sentinel", port: 3200 },
+    };
+  });
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    configRef.current = originalConfig;
+  });
+
+  it("parseCallCount accepts only a positive decimal integer", () => {
+    expect(parseCallCount("8")).toBe(8);
+    expect(parseCallCount("1")).toBe(1);
+    for (const bad of ["abc", "", "0", "-1", "8abc", "1e3", "1.5", " 8", "9007199254740993"]) {
+      expect(parseCallCount(bad)).toBeNull();
+    }
+  });
+
+  it("loopbackBaseUrlError accepts plain http to 127.0.0.1 or localhost only", () => {
+    expect(loopbackBaseUrlError("http://127.0.0.1:3200")).toBeNull();
+    expect(loopbackBaseUrlError("http://localhost:3200")).toBeNull();
+    for (const bad of [
+      "https://127.0.0.1:3200",
+      "https://localhost:3200",
+      "http://example.com:3200",
+      "http://10.0.0.5:3200",
+      "http://127.0.0.1.example.com:3200",
+      "not a url",
+    ]) {
+      expect(loopbackBaseUrlError(bad)).toMatch(/--base-url/);
+    }
+  });
+
+  it("main exits 2 on a non-numeric --calls before writing the result file", async () => {
+    expect(await main(["--arm", "A0-cold", "--out", out, "--calls", "abc"])).toBe(2);
+    expect(stderr.join("")).toMatch(/--calls must be a positive integer, got "abc"/);
+    expect(existsSync(out)).toBe(false);
+  });
+
+  it.each(["https://127.0.0.1:1", "http://bench.invalid:1"])(
+    "main exits 2 on --base-url %s before writing the result file or sending the bearer",
+    async (baseUrl) => {
+      expect(await main(["--arm", "A0-cold", "--out", out, "--calls", "1", "--base-url", baseUrl])).toBe(2);
+      const text = stderr.join("");
+      expect(text).toMatch(/--base-url must be http:\/\/127\.0\.0\.1:<port> or http:\/\/localhost:<port>/);
+      expect(text).not.toContain("tok-validation-sentinel");
+      expect(existsSync(out)).toBe(false);
     },
   );
 });
