@@ -97,6 +97,19 @@ export interface WarmTurnRequest {
   /** Per-request voice cancellation. Ephemeral and never serialized. */
   voiceRequestSignal?: AbortSignal;
   selectText?: (admission: WarmInputAdmission) => string;
+  /**
+   * KPR-465 §3.2: wall-clock (Date.now()) at spawnTurn's warm-branch entry.
+   * The queue stage is measured from here to consume start (turns ≥ 2, and a
+   * turn-1 survivor of a cancelled opener whose entry postdates the open
+   * call) or to the openVoiceStreamingSession call (the opener: turn 1 with
+   * enqueuedAt ≤ openCalledAt), so it folds in the pending-opening wait (V9)
+   * and the lease's turnChain wait, and never overlaps the boot stage. Raw
+   * delta — the adapter's measure() classifies a negative. Optional only for
+   * out-of-manager callers (tests); the manager always passes it, and without
+   * it the lease also reports no bootToInitMs (fail-closed: it cannot tell the
+   * opener from a survivor).
+   */
+  enqueuedAt?: number;
 }
 
 export interface WarmInputAdmission {
@@ -107,6 +120,22 @@ export interface WarmInputAdmission {
 
 export interface WarmRunResult extends RunResult {
   readonly voiceLifetimeSignal: AbortSignal;
+  /**
+   * KPR-465 §3.2: lock/queue stage for this warm turn (see WarmTurnRequest.
+   * enqueuedAt). Always a number when enqueuedAt was supplied — the RAW
+   * delta, possibly negative under clock skew, never clamped (canon R2; the
+   * adapter's measure() turns a negative into {value: null, reason}) —
+   * undefined when it was not (then the adapter reports not_observed).
+   */
+  queueWaitMs?: number;
+  // bootToInitMs (inherited from RunResult) is set on the OPENER turn only —
+  // turn 1 whose enqueuedAt ≤ the recorded openCalledAt: openVoiceStreamingSession
+  // call → the system/init message observed by this loop, raw delta. Turns
+  // ≥ 2 leave it undefined (the adapter reports not_applicable); a turn-1
+  // survivor of a cancelled opener that entered after the open call also
+  // leaves it undefined (the adapter reports not_observed on turn 1).
+  // initToFirstTokenMs on the opener is init → first delta; on every other
+  // turn it stays push → first delta (KPR-323 C2, unchanged).
 }
 
 export interface WarmVoiceSessionDeps {
@@ -155,6 +184,8 @@ export class WarmVoiceSession {
     this.markReady = resolve;
   });
   private resumedSessionId: string | undefined;
+  /** KPR-465: Date.now() immediately before the manager's openVoiceStreamingSession call. */
+  private openCalledAt: number | undefined;
   private inputPushed = false;
   private turnCount = 0;
   private turnInFlight = false;
@@ -192,7 +223,7 @@ export class WarmVoiceSession {
    * lifetime during provider initialization, this guard disposes the late
    * Query instead of binding it to an unreachable closed lease.
    */
-  start(query: Query, options: { resumedSessionId?: string } = {}): void {
+  start(query: Query, options: { resumedSessionId?: string; openCalledAt?: number } = {}): void {
     if (this.closed) {
       safeLog("warn", "Warm voice lease closed during session open — closing the late Query", {
         ...this.logCtx(),
@@ -210,6 +241,7 @@ export class WarmVoiceSession {
     }
     this.query = query;
     this.resumedSessionId = options.resumedSessionId;
+    this.openCalledAt = options.openCalledAt;
     this.markReady();
     this.lifetimeTimer = setTimeout(() => {
       // Bare-timer throw-safety (spec §4.2).
@@ -428,6 +460,30 @@ export class WarmVoiceSession {
     this.interruptRequested = false;
     this.turnCount += 1;
     const ownedTurn = this.turnCount;
+    // KPR-465 §3.2: queue stage. The OPENER is turn 1 whose request entered
+    // the manager no later than the open call (enqueuedAt ≤ openCalledAt):
+    // its queue stage ends at the open call, exactly where bootToInitMs
+    // begins (deliberate refinement of §3.2's "to consume start" — consume
+    // start is after boot on the opener, so the stages would overlap).
+    // A cancelled opener never increments turnCount (runTurn throws before
+    // consumeOneTurn — KPR-464 V4, test line 829), so a later survivor is
+    // ALSO ownedTurn === 1 with a stale openCalledAt; the ≤ gate fails for it
+    // (its entry postdates the open call) and it is measured as a joiner:
+    // entry → consume start, no boot stage. A survivor that queued before the
+    // open call passes the gate — it genuinely waited through boot. Missing
+    // enqueuedAt ⇒ no opener anchor either (fail-closed; tests only).
+    // Raw deltas, never clamped: voice-trace's measure() classifies a
+    // negative as {value: null, reason} (canon R2, never zero-coerced).
+    const consumeStartedAt = Date.now();
+    const openAnchor =
+      ownedTurn === 1 &&
+      req.enqueuedAt !== undefined &&
+      this.openCalledAt !== undefined &&
+      req.enqueuedAt <= this.openCalledAt
+        ? this.openCalledAt
+        : undefined;
+    const queueEndAt = openAnchor ?? consumeStartedAt;
+    const queueWaitMs = req.enqueuedAt === undefined ? undefined : queueEndAt - req.enqueuedAt;
     const detachRequest = bindVoiceRequest(req.voiceRequestSignal, () => {
       if (this.closed || !this.turnInFlight || this.turnCount !== ownedTurn) return;
       try {
@@ -463,6 +519,8 @@ export class WarmVoiceSession {
     let compactions = 0;
     let preCompactTokens: number | undefined;
     let initToFirstTokenMs: number | undefined;
+    let initAt: number | undefined;
+    let bootToInitMs: number | undefined;
     let timedOut = false;
     const toolCalls: { tool: string; startMs: number; endMs?: number }[] = [];
     let activeToolName: string | null = null;
@@ -516,6 +574,12 @@ export class WarmVoiceSession {
             const sub = (msg as { subtype?: string }).subtype;
             if (sub === "init") {
               sessionId = (msg as unknown as { session_id: string }).session_id;
+              // KPR-465 §3.2: opener turn only (openAnchor gate above) —
+              // open call → init observed here. Raw delta, never clamped.
+              if (openAnchor !== undefined && bootToInitMs === undefined) {
+                initAt = Date.now();
+                bootToInitMs = initAt - openAnchor;
+              }
             } else if (sub === "compact_boundary") {
               compactions++;
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -528,7 +592,9 @@ export class WarmVoiceSession {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const event = (msg as any).event;
             if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
-              if (initToFirstTokenMs === undefined) initToFirstTokenMs = Date.now() - pushedAt;
+              // KPR-465 §3.2: opener re-based to init → first delta once boot
+              // is measured separately; turns ≥ 2 stay push → first delta.
+              if (initToFirstTokenMs === undefined) initToFirstTokenMs = Date.now() - (initAt ?? pushedAt);
               streamed = true;
               streamedThisSegment = true; // KPR-324 §4.1: the model spoke in this segment
               try {
@@ -764,7 +830,9 @@ export class WarmVoiceSession {
       // the lease stays open (spec §6 precedence rule, timeout clause).
       aborted: this.interruptRequested || timedOut ? true : undefined,
       ...(timedOut ? { timedOut: true } : {}),
-      initToFirstTokenMs, // KPR-323 C1 field reuse: warm turns measure push → first delta
+      initToFirstTokenMs, // KPR-323 C1 field reuse: warm turns ≥ 2 measure push → first delta; opener init → first delta (KPR-465)
+      ...(bootToInitMs !== undefined ? { bootToInitMs } : {}),
+      ...(queueWaitMs !== undefined ? { queueWaitMs } : {}),
     };
   }
 }
