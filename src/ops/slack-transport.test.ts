@@ -141,6 +141,22 @@ describe("SlackOpsTransport.deliver (D6, C8, C14)", () => {
     expect((await thrown.deliver(view())).status).toBe("unknown");
   });
 
+  it.each(["constructor", "toString", "hasOwnProperty", "__proto__"])(
+    "an Object.prototype key (`%s`) as the Slack error code is unknown, never a nonacceptance",
+    async (code) => {
+      // ⚠ THE ABLE-TO-FAIL CASE for `in` versus hasOwnProperty: `in` walks the
+      // prototype chain, so these read as members of the closed set and map to
+      // `rejected` with a FUNCTION as the reason.
+      const t = new SlackOpsTransport(
+        "xoxb-test",
+        () => {},
+        () => new Date(0),
+        async () => slackResponse({ ok: false, error: code }),
+      );
+      expect(await t.deliver(view())).toEqual({ status: "unknown", reason: "transport-fault" });
+    },
+  );
+
   it("never registers an echo on any non-accepted outcome", async () => {
     const echo = vi.fn();
     const t = new SlackOpsTransport(

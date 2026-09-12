@@ -167,7 +167,16 @@ export class SlackOpsTransport implements OpsTransport {
             rawRefusalCode = undefined;
             try {
               const parsed = object(JSON.parse(raw));
-              if (parsed.ok === false && typeof parsed.error === "string" && parsed.error in NONACCEPTANCE) {
+              // hasOwnProperty, NEVER `in`: `in` also walks Object.prototype,
+              // so a body carrying `error: "constructor"` (or `toString`, …)
+              // would read as a member of the closed nonacceptance set and map
+              // to a FUNCTION as its "reason" — outside D6's closed set, and
+              // `rejected` for a response that proves nothing.
+              if (
+                parsed.ok === false &&
+                typeof parsed.error === "string" &&
+                Object.prototype.hasOwnProperty.call(NONACCEPTANCE, parsed.error)
+              ) {
                 rawRefusalCode = parsed.error;
               }
             } catch {
