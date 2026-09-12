@@ -1828,4 +1828,28 @@ describe("admin-mcp-server — audit channel tools (KPR-452)", () => {
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("audit_channel_get error");
   });
+
+  // The row above covers `audit_channel_get` only, via a throwing `describe()`.
+  // The Testing Contract requires the same of BOTH tools ("a missing control and
+  // a throwing control both become honest tool errors, never a throw"), and
+  // `audit_channel_set`'s own catch was reachable by no test: mutating it to
+  // `throw err;` left the whole file green. Two rows, because `set` has two
+  // distinct awaited control calls on either side of the normalization ladder —
+  // the clear leg (`""`) and the normal leg — and only the second is guarded by
+  // the row above's sibling. Mutation-proven in both directions.
+  it.each([
+    { label: "the normal leg", channel_name: "ops-audit" },
+    { label: "the clear leg", channel_name: "" },
+  ])("a throwing control on audit_channel_set's $label is a tool error, never a throw", async ({ channel_name }) => {
+    control.set = vi.fn(async () => {
+      throw new Error("mongo down");
+    });
+    const handler = getHandler(makeTools(), "audit_channel_set");
+    // The assertion is `resolves`, not `rejects`: the tool must absorb the
+    // fault. An unguarded catch rejects here and fails on the await itself.
+    const res = await handler({ channel_name });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("audit_channel_set error");
+    expect(res.content[0].text).toContain("mongo down");
+  });
 });
