@@ -205,6 +205,32 @@ export async function runBenchCall(
   return callId;
 }
 
+/**
+ * Line 1 of the `--out` file. Carries no turn and no `callId`; scripts/voice-latency-compare.ts
+ * recognizes exactly this shape (`run: true`, no `callId`) and skips it.
+ */
+export function benchRunHeader(input: {
+  arm: string;
+  agent: string;
+  workerBootId: string;
+  startedAt: string;
+  calls: number;
+  drill: Drill | null;
+  warmup: boolean;
+}): Record<string, unknown> {
+  return {
+    run: true,
+    script: BENCH_SCRIPT_VERSION,
+    arm: input.arm,
+    agent: input.agent,
+    workerBootId: input.workerBootId,
+    startedAt: input.startedAt,
+    calls: input.calls,
+    drill: input.drill,
+    warmup: input.warmup,
+  };
+}
+
 async function operatorKillPrompt(phase: string, turn: BenchTurn): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stderr });
   // Note: this kill-drill instruction assumes a quiet window (Task E3) — pgrep finding wrong process is a real risk
@@ -256,7 +282,17 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const workerBootId = randomUUID();
   writeFileSync(
     values.out,
-    `${JSON.stringify({ run: true, script: BENCH_SCRIPT_VERSION, arm: values.arm, agent: values.agent, workerBootId, startedAt: new Date().toISOString(), calls: Number(values.calls), drill: values.drill ?? null, warmup: values.warmup })}\n`,
+    `${JSON.stringify(
+      benchRunHeader({
+        arm: values.arm,
+        agent: values.agent!,
+        workerBootId,
+        startedAt: new Date().toISOString(),
+        calls: Number(values.calls),
+        drill: (values.drill as Drill | undefined) ?? null,
+        warmup: values.warmup!,
+      }),
+    )}\n`,
   );
   const opts: BenchOptions = {
     baseUrl,

@@ -10,7 +10,7 @@ import {
   mulberry32,
   parseEngineLog,
 } from "./voice-latency-compare.js";
-import { parseVoiceDiagnosticJsonl } from "./voice-diagnostic-reader.js";
+import { parseVoiceDiagnosticJsonl, VoiceDiagnosticInputError } from "./voice-diagnostic-reader.js";
 
 const FIX = "docs/epics/kpr-462/fixtures";
 const fixture = buildCompareFixture();
@@ -141,6 +141,41 @@ describe("KPR-465 comparison reader (R1)", () => {
     expect(report.failures).toEqual(["call call-cold-a (A0-cold) is incomplete"]);
     expect(report.arms.find((a) => a.arm === "A0-cold")!.calls[0]).toMatchObject({ complete: false, incomplete: 1 });
     expect(report.arms.find((a) => a.arm === "A1-warm")!.calls[0]!.complete).toBe(true);
+  });
+
+  it("a call id with no rows in the input (a mistyped --call) sets ok false and is not reported complete", () => {
+    const report = compareVoiceLatency({
+      calls: calls({ "call-cold-a": "A0-cold", "call-cold-typo": "A0-cold" }),
+    });
+    expect(report.ok).toBe(false);
+    expect(report.failures).toEqual(["call call-cold-typo (A0-cold) has no engine attempts — check the --call id"]);
+    const arm = report.arms[0]!;
+    expect(arm.calls.find((c) => c.callId === "call-cold-typo")).toMatchObject({ complete: false, engineAttempts: 0 });
+    expect(arm.calls.find((c) => c.callId === "call-cold-a")).toMatchObject({ complete: true });
+    expect(arm.calls.find((c) => c.callId === "call-cold-a")!.engineAttempts).toBeGreaterThan(0);
+    // The real call's data is untouched by the empty one.
+    expect(arm.byStratum.steady.turns).toBe(4);
+  });
+
+  it("a call id listed twice is rejected up front instead of pooling its turns twice", () => {
+    expect(() =>
+      compareVoiceLatency({
+        calls: [
+          { callId: "call-warm-a", arm: "A1-warm", jsonl: fixture.jsonl },
+          { callId: "call-cold-a", arm: "A0-cold", jsonl: fixture.jsonl },
+          { callId: "call-warm-a", arm: "A1-warm", jsonl: fixture.jsonl },
+        ],
+      }),
+    ).toThrow(VoiceDiagnosticInputError);
+    // Also across arms: one call cannot be evidence for two arms.
+    expect(() =>
+      compareVoiceLatency({
+        calls: [
+          { callId: "call-warm-a", arm: "A1-warm", jsonl: fixture.jsonl },
+          { callId: "call-warm-a", arm: "A2-warm-medium", jsonl: fixture.jsonl },
+        ],
+      }),
+    ).toThrow(/call id "call-warm-a" is listed more than once/);
   });
 
   it("fails the run on a warm-labelled arm with a cold steady turn and on a cold-labelled arm with a warm steady turn", () => {

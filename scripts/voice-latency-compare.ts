@@ -35,11 +35,21 @@ function splitPair(raw: string, flag: string): [string, string] {
   return [raw.slice(0, i), raw.slice(i + 1)];
 }
 
+/**
+ * The run header scripts/voice-engine-bench.ts writes as line 1 of its `--out` file
+ * (`{"run":true,"script":...,"arm":...,...}`). It carries no turn, so it is skipped —
+ * narrowly: any other line missing the row fields is still rejected.
+ */
+function isBenchHeaderRow(v: Record<string, unknown>): boolean {
+  return v.run === true && v.callId === undefined;
+}
+
 function parseBenchResults(text: string): BenchResultRow[] {
   const rows: BenchResultRow[] = [];
   for (const line of text.split(/\r?\n/)) {
     if (line.trim().length === 0) continue;
     const v = JSON.parse(line) as Record<string, unknown>;
+    if (isBenchHeaderRow(v)) continue;
     if (typeof v.callId !== "string" || typeof v.turnId !== "string" || typeof v.arm !== "string") {
       throw new VoiceDiagnosticInputError("bench result row missing callId/turnId/arm");
     }

@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildCompareFixture } from "../src/voice/testing/compare-fixture.js";
+import { benchRunHeader } from "./voice-engine-bench.js";
 
 const FIX = "docs/epics/kpr-462/fixtures";
 function run(args: string[]) {
@@ -42,6 +43,23 @@ describe("voice-latency-compare CLI", () => {
       run(["--input", `${FIX}/kpr-465-compare.jsonl`, "--call", "call-cold-a=A0-cold", "--pair", "nope"]).status,
     ).toBe(2);
   });
+  it("exits 2 on a duplicated --call and 1 on a --call id with no rows", () => {
+    const dup = run([
+      "--input",
+      `${FIX}/kpr-465-compare.jsonl`,
+      "--call",
+      "call-cold-a=A0-cold",
+      "--call",
+      "call-cold-a=A0-cold",
+    ]);
+    expect(dup.status).toBe(2);
+    expect(dup.stderr).toMatch(/call id "call-cold-a" is listed more than once/);
+    const typo = run(["--input", `${FIX}/kpr-465-compare.jsonl`, "--call", "call-cold-typo=A0-cold"]);
+    expect(typo.status).toBe(1);
+    expect(JSON.parse(typo.stdout).failures).toEqual([
+      "call call-cold-typo (A0-cold) has no engine attempts — check the --call id",
+    ]);
+  });
   it("accepts multiple --input files and a bench-results join", () => {
     const dir = mkdtempSync(join(tmpdir(), "kpr465-"));
     const f = buildCompareFixture();
@@ -60,5 +78,40 @@ describe("voice-latency-compare CLI", () => {
     ]);
     expect(r.status).toBe(0);
     expect(JSON.parse(r.stdout).benchAssertions.tool).toEqual({ pass: 1, fail: 0, unobserved: 0 });
+  });
+  it("consumes the bench CLI's own --out file: the run header line is skipped, other malformed lines still fail", () => {
+    const dir = mkdtempSync(join(tmpdir(), "kpr465-"));
+    const header = benchRunHeader({
+      arm: "A1-warm-bench",
+      agent: "mokie-bench",
+      workerBootId: "00000000-0000-4000-8000-000000000000",
+      startedAt: "2026-09-11T00:00:00.000Z",
+      calls: 1,
+      drill: null,
+      warmup: false,
+    });
+    const rows = readFileSync(`${FIX}/kpr-465-bench-results.jsonl`, "utf8");
+    const withHeader = join(dir, "bench-out.jsonl");
+    writeFileSync(withHeader, `${JSON.stringify(header)}\n${rows}`);
+    const args = ["--input", `${FIX}/kpr-465-compare.jsonl`, "--call", "call-bench-1=A1-warm-bench", "--bench-results"];
+    const ok = run([...args, withHeader]);
+    expect(ok.stderr).not.toMatch(/voice-latency-compare:/);
+    expect(ok.status).toBe(0);
+    const report = JSON.parse(ok.stdout);
+    expect(report.benchAssertions).toEqual({
+      rows: 4,
+      keyword: { pass: 3, fail: 0, notApplicable: 1 },
+      tool: { pass: 1, fail: 0, unobserved: 0 },
+    });
+    // Narrow: a non-header line missing the row fields is still rejected, header or not.
+    const malformed = join(dir, "bench-malformed.jsonl");
+    writeFileSync(malformed, `${JSON.stringify(header)}\n${rows}${JSON.stringify({ arm: "A1-warm-bench" })}\n`);
+    const bad = run([...args, malformed]);
+    expect(bad.status).toBe(2);
+    expect(bad.stderr).toMatch(/bench result row missing callId\/turnId\/arm/);
+    // A `run: true` line that also carries a callId is not the header shape — still validated as a row.
+    const runWithCall = join(dir, "bench-run-with-call.jsonl");
+    writeFileSync(runWithCall, `${JSON.stringify({ run: true, callId: "call-bench-1" })}\n${rows}`);
+    expect(run([...args, runWithCall]).status).toBe(2);
   });
 });

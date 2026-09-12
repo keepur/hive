@@ -113,7 +113,9 @@ export interface ArmReport {
   engineOnly: boolean;
   calls: Array<{
     callId: string;
+    /** The reader's own completeness, and false for a call with no engine attempts (nothing to compare). */
     complete: boolean;
+    engineAttempts: number;
     incomplete: number;
     unbound: number;
     gaps: number;
@@ -462,6 +464,14 @@ export function compareVoiceLatency(input: CompareInput): CompareReport {
     string,
     Array<{ callId: string; events: VoiceDiagnosticEvent[]; report: VoiceDiagnosticReport; malformedRows: number }>
   >();
+  // Structurally invalid input, like an unlabelled arm: a repeated call id would pool its turns twice.
+  const seenCallIds = new Set<string>();
+  for (const call of input.calls) {
+    if (seenCallIds.has(call.callId)) {
+      throw new VoiceDiagnosticInputError(`call id "${call.callId}" is listed more than once`);
+    }
+    seenCallIds.add(call.callId);
+  }
   for (const call of input.calls) {
     if (!armCalls.has(call.arm)) {
       armKindOf(call.arm); // throws on an unlabelled arm
@@ -474,6 +484,10 @@ export function compareVoiceLatency(input: CompareInput): CompareReport {
       .get(call.arm)!
       .push({ callId: call.callId, events: parsed.events, report, malformedRows: parsed.malformedRows });
     if (!report.complete) failures.push(`call ${call.callId} (${call.arm}) is incomplete`);
+    // Rows are filtered by call id, so a mistyped id reads back as an empty, reader-complete call.
+    if (report.engineAttempts === 0) {
+      failures.push(`call ${call.callId} (${call.arm}) has no engine attempts — check the --call id`);
+    }
   }
 
   const arms: ArmReport[] = [];
@@ -523,7 +537,8 @@ export function compareVoiceLatency(input: CompareInput): CompareReport {
       engineOnly,
       calls: calls.map((c) => ({
         callId: c.callId,
-        complete: c.report.complete,
+        complete: c.report.complete && c.report.engineAttempts > 0,
+        engineAttempts: c.report.engineAttempts,
         incomplete: c.report.incomplete.total,
         unbound: c.report.unbound.total,
         gaps: c.report.gaps.total,
