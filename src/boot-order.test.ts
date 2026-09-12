@@ -66,7 +66,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     // CONSIDER 2). The off-window is degraded-OFF rather than wrong-destination
     // (rule 4 misses, one warn per turn, no copy), which is why it is a pin and
     // not a redesign: a refactor that moved this below the Slack-dependent
-    // `dispatcher.setAuditChannel(...)` would leave all seven other anchors
+    // `dispatcher.setAuditChannel(...)` would leave all nine other anchors
     // green while the mirror silently stopped mirroring.
     offsetOf("dispatcher.setAuditChannelName(");
     // KPR-454: the ops publisher is a spawn-read surface (the first turn
