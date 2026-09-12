@@ -90,6 +90,7 @@ vi.mock("../../agents/agent-runner.js", () => ({
   }),
 }));
 
+import type { AgentEffort } from "../../agents/agent-effort.js";
 import { AgentManager, AgentStoppedError, type TurnResult } from "../../agents/agent-manager.js";
 import { AsyncPushQueue } from "../../agents/warm-voice-session.js";
 import { Dispatcher } from "../dispatcher.js";
@@ -132,8 +133,8 @@ function agentConfig(timeoutMs?: number) {
   };
 }
 
-function makeFixture(options: { timeoutMs?: number; taskLedger?: object } = {}) {
-  const config = agentConfig(options.timeoutMs);
+function makeFixture(options: { timeoutMs?: number; taskLedger?: object; effort?: AgentEffort } = {}) {
+  const config = { ...agentConfig(options.timeoutMs), ...(options.effort ? { effort: options.effort } : {}) };
   const registry = {
     get: vi.fn((id: string) => (id === "mokie" ? config : undefined)),
     getAll: vi.fn(() => [config]),
@@ -728,6 +729,25 @@ describe("VoiceAdapter real manager ownership", () => {
       expect(JSON.stringify(row)).not.toContain("SENTINEL");
     for (const row of rows("warm-465", "engine_terminal")) expect(JSON.stringify(row)).not.toContain("+1555");
     for (const [, data] of warmLogRows) expect(JSON.stringify(data)).not.toContain("SENTINEL"); // … and never the log row either
+  });
+
+  it("KPR-465: a warm lease delivers the pinned static effort and stamps it on the second turn's attempt terminal", async () => {
+    configRef.current.voice = { assistants: {}, warmPath: { enabled: true }, toolAck: { enabled: false } };
+    const fixture = makeFixture({ effort: "medium" });
+    runnerControl.openStream.mockImplementation(
+      async ({ input }: { input: AsyncIterable<{ message?: { content?: string } }> }) =>
+        successfulQuery(input, "warm-effort-text", "warm-effort-session", []),
+    );
+    const port = await start(fixture.adapter);
+    expect(await begin(port, body("warm-effort-465")).done).toContain("[DONE]");
+    expect(await begin(port, body("warm-effort-465")).done).toContain("[DONE]");
+    await vi.waitFor(() => expect(rows("warm-effort-465", "engine_terminal")).toHaveLength(2));
+    expect(runnerControl.openStream).toHaveBeenCalledTimes(1);
+    expect(runnerControl.openStream.mock.calls[0]![0]).toMatchObject({ effort: "medium" });
+    const attempts = rows("warm-effort-465", "engine_attempt_terminal");
+    expect(attempts).toHaveLength(2);
+    expect(attempts[1]).toMatchObject({ warm: true, effort: "medium" });
+    expect(rows("warm-effort-465", "engine_terminal")[1]).toMatchObject({ effort: "medium" });
   });
 
   it.each(["eof", "rejection"] as const)(

@@ -463,6 +463,33 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     expect(terminal.initToFirstTokenMs).toEqual({ value: 40, reason: null });
   });
 
+  it("KPR-465: attempt and request terminals carry the delivered effort from TurnResult, null when absent", async () => {
+    const withEffort = async (_ctx: TurnContext, onStream?: (c: string) => void): Promise<TurnResult> => {
+      onStream?.("hi");
+      return { ...echoTurnResult("hi"), effort: "medium" };
+    };
+    const effortSetup = makeAdapter({ spawn: withEffort, bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p1 } = await startAdapter(effortSetup);
+    await postChatCompletion(p1, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: workerShapedBody("effort-465"),
+    });
+    expect(engineRows("engine_attempt_terminal").find((r) => r.callId === "effort-465")!.effort).toBe("medium");
+    expect(engineRows("engine_terminal").find((r) => r.callId === "effort-465")!.effort).toBe("medium");
+    // Hand teardown back to afterEach for the second adapter.
+    effortSetup.adapter.stop();
+    adapter = undefined;
+
+    const noEffortSetup = makeAdapter({ spawn: echoSpawn(), bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p2 } = await startAdapter(noEffortSetup);
+    await postChatCompletion(p2, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: workerShapedBody("noeffort-465"),
+    });
+    expect(engineRows("engine_attempt_terminal").find((r) => r.callId === "noeffort-465")!.effort).toBeNull();
+    expect(engineRows("engine_terminal").find((r) => r.callId === "noeffort-465")!.effort).toBeNull();
+  });
+
   it("second turn (resume from session-store) — latest-user-message prompt", async () => {
     const setup = makeAdapter({
       storedSessionId: "stored-from-first-turn",
