@@ -10,7 +10,7 @@
  * Uses port: 0 (OS-assigned ephemeral) so parallel test runs never collide.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { request as httpRequest, type ClientRequest, type IncomingMessage } from "node:http";
+import { request as httpRequest, type ClientRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
 
@@ -51,14 +51,16 @@ vi.mock("../../config.js", () => ({
   },
 }));
 
-import { VoiceAdapter } from "./voice-adapter.js";
+import type { VoiceAdapter } from "./voice-adapter.js";
 import type { TurnContext, TurnResult } from "../../agents/agent-manager.js";
 import type { Dispatcher } from "../dispatcher.js";
-
-interface CapturedSpawn {
-  ctx: TurnContext;
-  onStream?: (chunk: string) => void;
-}
+import {
+  BRIDGE_TOKEN as E2_BRIDGE_TOKEN,
+  engineRows,
+  makeAdapter,
+  postChatCompletion,
+  startAdapter as startFixtureAdapter,
+} from "./testing/adapter-fixture.js";
 
 function echoSpawn(): (ctx: TurnContext, onStream?: (chunk: string) => void) => Promise<TurnResult> {
   return async (_ctx, onStream) => {
@@ -79,101 +81,6 @@ function echoSpawn(): (ctx: TurnContext, onStream?: (chunk: string) => void) => 
     };
   };
 }
-
-function makeAdapter(opts: {
-  /** Resolved by spawnTurn; behavior may include onStream chunks. */
-  spawn: (ctx: TurnContext, onStream?: (chunk: string) => void) => Promise<TurnResult>;
-  /** What the session-store returns on get(agentId, threadId). */
-  storedSessionId?: string;
-  /**
-   * KPR-223: optional dispatcher mock. When provided, the adapter is
-   * constructed with the dispatcher so voice turns route through
-   * `dispatcher.routeVoiceTurn` instead of directly through
-   * `agentManager.spawnTurn`. Omit to keep the legacy fallback wiring.
-   */
-  dispatcher?: Dispatcher;
-  /** KPR-322 E1: override VAPI_SERVER_SECRET (default "shared-secret"). */
-  serverSecret?: string;
-  /** KPR-322 E1: HIVE_VOICE_BRIDGE_TOKEN (default "" = LiveKit disabled). */
-  bridgeToken?: string;
-  /** KPR-322 E2: abort in-flight spawn for a thread. */
-  abortThread?: (agentId: string, threadId: string) => unknown;
-  /** KPR-322 E2: override session-store get (hanging pre-spawn gate). */
-  sessionStoreGet?: ReturnType<typeof vi.fn>;
-}) {
-  const captured: CapturedSpawn[] = [];
-  const sessionStoreGet =
-    opts.sessionStoreGet ??
-    vi
-      .fn()
-      .mockResolvedValue(opts.storedSessionId ? { sessionId: opts.storedSessionId, provider: "claude" } : undefined);
-  const sessionStoreSet = vi.fn().mockResolvedValue(undefined);
-
-  const spawnTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
-    captured.push({ ctx, onStream });
-    return await opts.spawn(ctx, onStream);
-  });
-
-  const abortThread = opts.abortThread ?? vi.fn().mockReturnValue(false);
-
-  const registry: any = {
-    get: vi.fn((id: string) =>
-      id === "mokie" ? { id: "mokie", name: "Mokie", model: "claude-sonnet-4-6" } : undefined,
-    ),
-  };
-  const memoryManager: any = {
-    read: vi.fn().mockResolvedValue(""),
-    getHotTierPrompt: vi.fn().mockResolvedValue(""),
-  };
-  const agentManager: any = {
-    spawnTurn,
-    abortThread,
-    getSessionStore: () => ({ get: sessionStoreGet, set: sessionStoreSet }),
-    providerFor: vi.fn().mockReturnValue("claude"),
-  };
-
-  const serverSecret = opts.serverSecret ?? "shared-secret";
-  const bridgeToken = opts.bridgeToken ?? "";
-  const adapter = opts.dispatcher
-    ? new VoiceAdapter(0, serverSecret, bridgeToken, registry, memoryManager, agentManager, opts.dispatcher)
-    : new VoiceAdapter(0, serverSecret, bridgeToken, registry, memoryManager, agentManager);
-  return { adapter, captured, sessionStoreGet, sessionStoreSet, spawnTurn };
-}
-
-function postChatCompletion(
-  port: number,
-  opts: { headers?: Record<string, string>; body: Record<string, unknown> },
-): Promise<{ status: number; headers: IncomingMessage["headers"]; chunks: string[] }> {
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(opts.body);
-    const req: ClientRequest = httpRequest(
-      {
-        host: "127.0.0.1",
-        port,
-        path: "/v1/chat/completions",
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-          // Vapi default — auth comes from assistant.metadata.hive_agent_id.
-          authorization: "Bearer no-credentials-provided",
-          ...opts.headers,
-        },
-      },
-      (res) => {
-        const chunks: string[] = [];
-        res.on("data", (c) => chunks.push(c.toString("utf-8")));
-        res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, chunks }));
-        res.on("error", reject);
-      },
-    );
-    req.on("error", reject);
-    req.write(payload);
-    req.end();
-  });
-}
-
-const E2_BRIDGE_TOKEN = "tok-1";
 
 function workerShapedBody(callId: string): Record<string, unknown> {
   return {
@@ -199,12 +106,6 @@ function echoTurnResult(text: string, aborted = false): TurnResult {
     errors: [],
     aborted,
   };
-}
-
-function engineRows(event?: string): Array<Record<string, unknown>> {
-  return mockLog.writeTracked.mock.calls
-    .map((call) => call[2] as Record<string, unknown>)
-    .filter((row) => row?.kind === "voice_diagnostic" && (!event || row.event === event));
 }
 
 function beginStreamingChat(
@@ -258,7 +159,6 @@ function beginStreamingChat(
 
 describe("VoiceAdapter integration (KPR-219)", () => {
   let adapter: VoiceAdapter | undefined;
-  let port: number = 0;
 
   afterEach(async () => {
     if (adapter) {
@@ -268,15 +168,10 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     vi.clearAllMocks();
   });
 
-  async function startAdapter(
-    setup: ReturnType<typeof makeAdapter>,
-  ): Promise<{ server: { address: () => AddressInfo | string | null }; port: number }> {
+  /** Records the adapter for afterEach teardown, then starts it on its ephemeral port. */
+  function startAdapter(setup: ReturnType<typeof makeAdapter>): ReturnType<typeof startFixtureAdapter> {
     adapter = setup.adapter;
-    await adapter.start();
-    const server = (adapter as any).httpServer as { address: () => AddressInfo };
-    const addr = server.address();
-    port = addr.port;
-    return { server, port };
+    return startFixtureAdapter(setup);
   }
 
   async function startAdapterWithHangingSpawn(opts: {
