@@ -406,8 +406,16 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
   let falseInterruption = 0;
   const callObservationEventIds = new Set<string>();
   const gapEventIds = new Set<string>();
+  const unresolvedIdentityEventIds = new Set<string>();
   const invalidatedBridgeBindings = new Set<string>();
   const invalidatedSynthesisBindings = new Set<string>();
+
+  const recordCorrelationMissing = (row: VoiceDiagnosticEvent) => {
+    if (unresolvedIdentityEventIds.has(row.eventId)) return;
+    unresolvedIdentityEventIds.add(row.eventId);
+    gaps.correlation_missing = (gaps.correlation_missing ?? 0) + 1;
+    gapTotal += 1;
+  };
 
   const observe = (kind: EntityKind, key: string, row: VoiceDiagnosticEvent, start: boolean, terminal: boolean) => {
     let state = maps[kind].get(key);
@@ -450,6 +458,28 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
         if (row.turnId) invalidatedBridgeBindings.add(workerKey(row.workerBootId, row.turnId));
         if (row.synthesisId) invalidatedSynthesisBindings.add(workerKey(row.workerBootId, row.synthesisId));
       }
+      continue;
+    }
+    // Attempt-bearing supplemental observations (a playout handle, or an ID-bearing LLM/TTS SDK
+    // metric) can carry a valid schema with an unresolved identity half — unlike primary lifecycle
+    // rows (speech_started/terminal, bridge_*, synthesis_*), parsing does not require their full
+    // correlation tuple. Left unchecked, such a row silently vanishes from the reduction (neither an
+    // entity nor a gap), so a call can read back `complete: true` with zero incomplete entities while
+    // a real attempt's evidence was dropped. Explicitly account it as a correlation gap instead of
+    // letting it disappear — this must not fire for legitimate call-level observations (output_playback
+    // / false_interruption with a null speechId, handled above) or for optional unbound associations
+    // (an SDK metric row that carries neither correlating id at all, e.g. not tied to any attempt).
+    if (row.event === "handle_playout_item" && (row.workerBootId === null || row.speechId === null)) {
+      recordCorrelationMissing(row);
+      continue;
+    }
+    if (
+      row.event === "sdk_metric" &&
+      row.source === "sdk_metrics_context" &&
+      row.workerBootId === null &&
+      ((row.metric === "llm" && row.turnId !== null) || (row.metric === "tts" && row.synthesisId !== null))
+    ) {
+      recordCorrelationMissing(row);
       continue;
     }
     if (isSpeechEvidence(row) && row.workerBootId && row.speechId) {

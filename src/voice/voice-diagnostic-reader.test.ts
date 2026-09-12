@@ -291,6 +291,149 @@ describe("voice diagnostic entity lifecycles", () => {
     expect(report.playoutObserved).toBe(0);
   });
 
+  it.each([
+    [
+      "handle_playout_item missing speechId",
+      () => ({
+        ...row(
+          "playout-missing-speech",
+          {
+            event: "handle_playout_item",
+            source: "sdk_handle",
+            metric: "playout",
+            textLength: 4,
+            interrupted: false,
+            startedSpeakingAt: { value: null, reason: "not_observed" },
+          },
+          {},
+        ),
+      }),
+    ],
+    [
+      "handle_playout_item missing workerBootId",
+      () => ({
+        ...row(
+          "playout-missing-worker",
+          {
+            event: "handle_playout_item",
+            source: "sdk_handle",
+            metric: "playout",
+            textLength: 4,
+            interrupted: false,
+            startedSpeakingAt: { value: null, reason: "not_observed" },
+          },
+          { speechId: "speech-missing-worker" },
+        ),
+        workerBootId: null,
+      }),
+    ],
+    [
+      "handle_playout_item missing both identity fields",
+      () => ({
+        ...row(
+          "playout-missing-both",
+          {
+            event: "handle_playout_item",
+            source: "sdk_handle",
+            metric: "playout",
+            textLength: 4,
+            interrupted: false,
+            startedSpeakingAt: { value: null, reason: "not_observed" },
+          },
+          {},
+        ),
+        workerBootId: null,
+      }),
+    ],
+    [
+      "ID-bearing LLM sdk_metric missing workerBootId",
+      () => ({
+        ...row(
+          "llm-metric-missing-worker",
+          { event: "sdk_metric", source: "sdk_metrics_context", metric: "llm" },
+          { turnId: "turn-missing-worker" },
+        ),
+        workerBootId: null,
+      }),
+    ],
+    [
+      "ID-bearing TTS sdk_metric missing workerBootId",
+      () => ({
+        ...row(
+          "tts-metric-missing-worker",
+          { event: "sdk_metric", source: "sdk_metrics_context", metric: "tts", ttfbMs: { value: 5, reason: null } },
+          { synthesisId: "synth-missing-worker" },
+        ),
+        workerBootId: null,
+      }),
+    ],
+  ] as const)("accounts an attempt-bearing supplemental observation with unresolved identity: %s", (_label, build) => {
+    const supplemental = build() as VoiceDiagnosticEvent;
+    const report = reduceVoiceDiagnostics(jsonl([supplemental]), "call-test");
+
+    expect(report.complete).toBe(false);
+    expect(report.malformedRows).toBe(0);
+    expect(report.gaps).toMatchObject({ total: 1, byReason: { correlation_missing: 1 } });
+    expect(report.speechAttempts).toBe(0);
+    expect(report.bridgeAttempts).toBe(0);
+    expect(report.synthesisAttempts).toBe(0);
+  });
+
+  it("does not double-count a repeated unresolved-identity supplemental row", () => {
+    const supplemental = {
+      ...row(
+        "playout-missing-worker-dup",
+        {
+          event: "handle_playout_item",
+          source: "sdk_handle",
+          metric: "playout",
+          textLength: 4,
+          interrupted: false,
+          startedSpeakingAt: { value: null, reason: "not_observed" },
+        },
+        { speechId: "speech-dup" },
+      ),
+      workerBootId: null,
+    } as VoiceDiagnosticEvent;
+
+    const report = reduceVoiceDiagnostics(jsonl([supplemental, supplemental]), "call-test");
+    expect(report.gaps).toMatchObject({ total: 1, byReason: { correlation_missing: 1 } });
+  });
+
+  it("does not flag an sdk_metric row that carries neither correlating id (an optional unbound association)", () => {
+    const anonymousLlmMetric = row("llm-metric-unbound", {
+      event: "sdk_metric",
+      source: "sdk_metrics_context",
+      metric: "llm",
+    });
+    const anonymousTtsMetric = row("tts-metric-unbound", {
+      event: "sdk_metric",
+      source: "sdk_metrics_context",
+      metric: "tts",
+      ttfbMs: { value: 5, reason: null },
+    });
+
+    const report = reduceVoiceDiagnostics(jsonl([anonymousLlmMetric, anonymousTtsMetric]), "call-test");
+    expect(report.gaps).toMatchObject({ total: 0 });
+    expect(report.malformedRows).toBe(0);
+  });
+
+  it("still rejects a primary lifecycle row with the same missing identity as malformed, never as a gap", () => {
+    const missingSpeechIdentity = {
+      ...row("speech-start-missing-identity", {
+        event: "speech_started",
+        origin: "sdk_response",
+        acceptedEpoch: 1,
+      }),
+      workerBootId: null,
+    } as VoiceDiagnosticEvent;
+
+    const report = reduceVoiceDiagnostics(jsonl([missingSpeechIdentity]), "call-test");
+    expect(report.malformedRows).toBe(1);
+    expect(report.gaps).toMatchObject({ total: 0 });
+    expect(report.speechAttempts).toBe(0);
+  });
+
   it("uses the summary's shared nearest-rank contract for an even sample set", () => {
     const rows: VoiceDiagnosticEvent[] = [];
     for (const [index, eouMs] of [90, 190].entries()) {
