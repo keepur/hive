@@ -139,6 +139,62 @@ describe("voice diagnostic reader fixtures", () => {
   });
 });
 
+describe("KPR-465 additive engine measures", () => {
+  const base = {
+    kind: "voice_diagnostic",
+    schemaVersion: 2,
+    eventId: "e1",
+    event: "engine_attempt_terminal",
+    ts: "2026-09-11T00:00:00.000Z",
+    component: "voice-engine",
+    clockId: "c",
+    monoMs: 1,
+    callId: "k",
+    workerBootId: "11111111-1111-4111-8111-111111111111",
+    speechId: null,
+    turnId: "t1",
+    synthesisId: null,
+    engineAttemptSeq: 1,
+    outcome: "completed",
+  };
+
+  it("accepts bootToInitMs/queueWaitMs measures on attempt and request terminals", () => {
+    expect(
+      parseVoiceDiagnosticEvent({
+        ...base,
+        bootToInitMs: { value: 650, reason: null },
+        queueWaitMs: { value: null, reason: "not_applicable" },
+      }),
+    ).not.toBeNull();
+    expect(
+      parseVoiceDiagnosticEvent({
+        ...base,
+        event: "engine_terminal",
+        engineAttemptSeq: null,
+        queueWaitMs: { value: 12, reason: null },
+      }),
+    ).not.toBeNull();
+  });
+
+  it("rejects malformed measures and unknown keys", () => {
+    expect(parseVoiceDiagnosticEvent({ ...base, bootToInitMs: 650 })).toBeNull();
+    expect(parseVoiceDiagnosticEvent({ ...base, bootToInitMs: { value: 0, reason: "not_observed" } })).toBeNull();
+    expect(parseVoiceDiagnosticEvent({ ...base, queueWaitMs: { value: -1, reason: null } })).toBeNull();
+    expect(parseVoiceDiagnosticEvent({ ...base, bootToInit: { value: 1, reason: null } })).toBeNull();
+  });
+
+  it("KPR-464-era rows without the keys still parse and the complete fixture still reduces to the same totals", () => {
+    // COMPLETE_FIXTURE is the file-level constant near the top of this file
+    // (import.meta.url-relative — never a cwd-relative readFileSync). The count
+    // is the literal the "reduces the complete fixture" test above pins; a
+    // drift here is a real change, not something to fix by editing this.
+    expect(parseVoiceDiagnosticEvent(base)).not.toBeNull();
+    const report = reduceVoiceDiagnostics(COMPLETE_FIXTURE, "call-fixture");
+    expect(report.complete).toBe(true);
+    expect(report.engineAttempts).toBe(1);
+  });
+});
+
 describe("voice diagnostic entity lifecycles", () => {
   it("requires a finite handle playout measurement before counting observed playout", () => {
     const speechId = "speech-playout-measurement";

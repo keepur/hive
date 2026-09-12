@@ -249,6 +249,14 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
   engine_attempt_started: ["continuity"],
   engine_first_text: ["textLength", "firstTextMs"],
   engine_client_closed: [],
+  // KPR-465 §3.2 delivery note (version decision): `bootToInitMs` and
+  // `queueWaitMs` on the two engine terminals are OPTIONAL additions under
+  // `schemaVersion: 2` — no version bump. No existing key changes meaning,
+  // KPR-464-era rows without them parse unchanged, and the comparison reader
+  // treats an absent key as `not_observed` for stage tables. A bump would
+  // force compare mode to refuse pooling across versions for rows that are
+  // semantically identical. Allowlisted (and measure-validated below) one
+  // commit before the adapter emits them, so no commit writes rejected rows.
   engine_attempt_terminal: [
     "continuity",
     "launchAdmission",
@@ -265,6 +273,8 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
     "initToFirstTokenMs",
     "firstTextMs",
     "stopped",
+    "bootToInitMs",
+    "queueWaitMs",
   ],
   engine_terminal: [
     "status",
@@ -289,6 +299,8 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
     "toolCount",
     "toolMs",
     "toolAckInjected",
+    "bootToInitMs",
+    "queueWaitMs",
   ],
   diagnostic_gap: ["reason", "count"],
   teardown: ["result", "reason"],
@@ -974,6 +986,8 @@ function validatePayload(value: Record<string, unknown>, event: VoiceDiagnosticE
     "spawnPrepMs",
     "initToFirstTokenMs",
     "responseCompleteMs",
+    "bootToInitMs",
+    "queueWaitMs",
   ]) {
     if (field in value && value[field] !== undefined && !validMeasure(value[field])) return false;
   }
