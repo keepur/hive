@@ -65,6 +65,18 @@ export interface VoiceDiagnosticEntityDetail {
     ts: string;
     monoMs: number;
   }>;
+  latency?: SpeechLatencyDetail;
+}
+
+/** KPR-465 §3.3: per-speech components of the v2 estimate, exposed for the comparison reader. */
+export interface SpeechLatencyDetail {
+  estimateMs: number | null;
+  exclusion: LatencyExclusionReason | null;
+  eouMs: number | null;
+  bridgeFirstTextMs: number | null;
+  ttsTtfbMs: number | null;
+  /** turnId of the single bound bridge, when exactly one bridge is bound; else null. */
+  boundTurnId: string | null;
 }
 
 export interface VoiceDiagnosticReport {
@@ -661,19 +673,33 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
 
   const exclusions = emptyLatencyExclusions();
   const samples: number[] = [];
+  const latencyBySpeechKey = new Map<string, SpeechLatencyDetail>();
   const bridgesBySpeech = groupBoundEntities(maps.bridge);
   const synthesesBySpeech = groupBoundEntities(maps.synthesis);
   for (const speech of maps.speech.values()) {
-    const reason = latencyExclusion(
-      speech,
-      bridgesBySpeech.get(speech.key) ?? [],
-      synthesesBySpeech.get(speech.key) ?? [],
-      effectiveStates,
-    );
+    const boundBridges = bridgesBySpeech.get(speech.key) ?? [];
+    const boundSyntheses = synthesesBySpeech.get(speech.key) ?? [];
+    const reason = latencyExclusion(speech, boundBridges, boundSyntheses, effectiveStates);
     if (typeof reason === "string") exclusions[reason] += 1;
     else samples.push(reason);
+    const eou = speech.eouMetrics.length === 1 ? speech.eouMetrics[0]! : null;
+    const bridge = boundBridges.length === 1 ? boundBridges[0]! : null;
+    const synthesis = boundSyntheses.length === 1 ? boundSyntheses[0]! : null;
+    const tts = synthesis && synthesis.ttsMetrics.length === 1 ? synthesis.ttsMetrics[0]! : null;
+    latencyBySpeechKey.set(speech.key, {
+      estimateMs: typeof reason === "number" ? reason : null,
+      exclusion: typeof reason === "string" ? reason : null,
+      eouMs: eou && eou.event === "sdk_metric" ? measureValue(eou.eouMs) : null,
+      bridgeFirstTextMs: bridge ? measureValue(bridge.bridgeFirstText) : null,
+      ttsTtfbMs: tts && tts.event === "sdk_metric" ? measureValue(tts.ttfbMs) : null,
+      boundTurnId: bridge?.turnId ?? null,
+    });
   }
   samples.sort((a, b) => a - b);
+  for (const detail of details.speech) {
+    const latency = latencyBySpeechKey.get(detail.key);
+    if (latency) detail.latency = latency;
+  }
 
   const generatedSpeech = new Set<string>();
   let synthesizedAudioObserved = 0;

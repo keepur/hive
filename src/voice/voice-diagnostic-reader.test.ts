@@ -193,6 +193,23 @@ describe("KPR-465 additive engine measures", () => {
     expect(report.complete).toBe(true);
     expect(report.engineAttempts).toBe(1);
   });
+
+  it("KPR-465: speech details expose the estimate components and the bound turnId", () => {
+    // COMPLETE_FIXTURE (import.meta.url-relative), not a cwd-relative readFileSync.
+    const report = reduceVoiceDiagnostics(COMPLETE_FIXTURE, "call-fixture");
+    const replacement = report.details.speech.find((s) => s.speechId === "speech-replacement")!;
+    expect(replacement.latency).toEqual({
+      estimateMs: 60,
+      exclusion: null,
+      eouMs: 10,
+      bridgeFirstTextMs: 20,
+      ttsTtfbMs: 30,
+      boundTurnId: "turn-replacement",
+    });
+    const opening = report.details.speech.find((s) => s.speechId === "speech-opening")!;
+    expect(opening.latency).toMatchObject({ estimateMs: null, exclusion: "not_applicable", boundTurnId: null });
+    expect(report.details.bridge[0]).not.toHaveProperty("latency");
+  });
 });
 
 describe("voice diagnostic entity lifecycles", () => {
