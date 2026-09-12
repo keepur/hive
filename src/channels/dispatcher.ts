@@ -38,6 +38,7 @@ import {
   deadlineTerminalNoticeFor,
   deadlineZeroProgressNoticeFor,
 } from "./deadline-continuation.js";
+import { auditCopyDecision } from "../audit/audit-routing.js";
 
 const log = createLogger("dispatcher");
 
@@ -192,7 +193,21 @@ export class Dispatcher {
   private recentMessageIds = new Map<string, number>(); // messageTs -> timestamp (dedup)
   private auditAdapter?: ChannelAdapter;
   private auditChannelIds?: Map<string, string>; // slack channel name → id
-  private fallbackAuditChannelId?: string;
+  /**
+   * KPR-452 D4: the configured audit channel NAME (`override ?? config
+   * .slack.auditChannel`), resolved to an id lazily. Empty string is treated
+   * as unset. `homeBase` is no longer an audit destination, and there is NO
+   * default recipient — unset means the mirror is off (KPR-456 canon).
+   */
+  private auditChannelName?: string;
+  /** Epoch ms of the last dispatch-path `conversations.list` ATTEMPT. */
+  private auditRefreshAt = 0;
+  /**
+   * Single-flight guard for the dispatch-path refresh. Always holds an
+   * already-terminated promise (the IIFE below catches internally), so every
+   * awaiter sees a resolution and no rejection escapes.
+   */
+  private auditRefreshInFlight?: Promise<void>;
   private taskLedger?: TaskLedger;
   private retryQueue?: RetryQueue;
   private outageStateProvider: OutageStateProvider = () => false;
@@ -225,6 +240,9 @@ export class Dispatcher {
   private meetingAckEnabled = false;
 
   private static readonly DEDUP_TTL_MS = 60_000; // 1 minute TTL for dedup entries
+
+  /** KPR-452 D4: dispatch-path channel-map refresh floor. */
+  private static readonly AUDIT_REFRESH_INTERVAL_MS = 60_000;
 
   constructor(
     registry: AgentRegistry,
@@ -265,10 +283,80 @@ export class Dispatcher {
     this.teamStore = store;
   }
 
-  setAuditChannel(adapter: ChannelAdapter, channelIdByName: Map<string, string>, fallbackChannelId?: string): void {
+  /**
+   * KPR-452 D4: Slack-dependent activation. Wired at index.ts's existing
+   * site, BELOW the spawn-capable boundary, because it needs the started
+   * Slack adapter. The routing CONTROL and `setAuditChannelName` are wired
+   * above the boundary — wiring above, activation below, the same
+   * disjoint-valid-range shape as `workerPool.start()`. A turn landing
+   * between the two sees `auditAdapter` unset and `postAuditLog` returns at
+   * D2 rule 1, exactly as today.
+   *
+   * The third parameter (`fallbackChannelId`) is GONE — the dispatcher no
+   * longer holds a fallback id, because there is no longer a primary
+   * (homeBase) destination for it to be a fallback to.
+   */
+  setAuditChannel(adapter: ChannelAdapter, channelIdByName: Map<string, string>): void {
     this.auditAdapter = adapter;
     this.auditChannelIds = channelIdByName;
-    this.fallbackAuditChannelId = fallbackChannelId;
+  }
+
+  /** KPR-452 D4: the effective audit channel name. Empty ⇒ unset ⇒ mirror off. */
+  setAuditChannelName(name: string | undefined): void {
+    const trimmed = name?.trim();
+    this.auditChannelName = trimmed ? trimmed : undefined;
+  }
+
+  getAuditChannelName(): string | undefined {
+    return this.auditChannelName;
+  }
+
+  /** Map-only lookup — NEVER issues a Slack call. For `audit_channel_get`. */
+  peekAuditChannelId(): string | undefined {
+    return this.auditChannelName ? this.auditChannelIds?.get(this.auditChannelName) : undefined;
+  }
+
+  /** True once both the audit adapter and the Slack client are wired. */
+  auditRoutingReady(): boolean {
+    return Boolean(this.auditAdapter && this.auditChannelIds && this.slackAdapter);
+  }
+
+  /**
+   * KPR-452 D5: the `audit_channel_set` validation path. NOT on any turn's
+   * critical path, so — deliberately unlike `refreshAuditChannelIds` below —
+   * it paginates FULLY and SEEDS every resolved name→id pair into
+   * `auditChannelIds`. The seeding is what makes the tool a working escape
+   * for a channel beyond page 1 of the dispatch-path refresh; without it the
+   * tool would report success while every subsequent audit post kept failing
+   * to resolve until the next boot.
+   *
+   * Throws on a Slack fault: the caller is the admin tool, which turns that
+   * into an honest tool error. No turn is ever on this path.
+   */
+  async resolveAuditChannelIdFully(name: string): Promise<string | undefined> {
+    const client = this.slackAdapter?.client;
+    const ids = this.auditChannelIds;
+    if (!client || !ids) return undefined;
+    // Declared WITHOUT the plan's initial `ids.get(name)` seed: the do-while
+    // body always runs and always reassigns `found` before the condition
+    // reads it, so that seed was dead (eslint no-useless-assignment) and
+    // removing it changes nothing — this method paginates at least one page
+    // by design, so a pre-existing map hit never short-circuits the sweep.
+    let found: string | undefined;
+    let cursor: string | undefined = undefined;
+    do {
+      const page = await client.conversations.list({
+        types: "public_channel,private_channel",
+        limit: 1000,
+        cursor,
+      });
+      for (const c of page.channels ?? []) {
+        if (c.name && c.id) ids.set(c.name, c.id);
+      }
+      cursor = page.response_metadata?.next_cursor || undefined;
+      found = ids.get(name);
+    } while (cursor && !found);
+    return found;
   }
 
   setSlackAdapter(adapter: SlackAdapter): void {
@@ -525,7 +613,17 @@ export class Dispatcher {
           );
         }
 
-        if (this.auditAdapter && item.source.kind !== this.auditAdapter.kind) {
+        // KPR-452 D1: the mirror decision now lives entirely inside
+        // postAuditLog (D2 rules 1-5). The `source.kind` predicate that used
+        // to sit here is GONE — do not re-add it.
+        //
+        // POSITION is load-bearing too. This stays inside the delivery `else`
+        // arm, after deliverAgentResult, because the sibling isNonResponse
+        // and killedReaction arms deliver nothing and post no audit copy
+        // today. Hoisting the call above them would newly mirror
+        // non-response-suppressed turns and killed round-1 reactions. "One
+        // decision point" means one PREDICATE, not a relocated call.
+        if (this.auditAdapter) {
           await this.postAuditLog(workResult);
         }
 
@@ -1297,7 +1395,7 @@ export class Dispatcher {
       );
     }
 
-    if (this.auditAdapter && ctx.workItem.source.kind !== this.auditAdapter.kind) {
+    if (this.auditAdapter) {
       const workResult: WorkResult = {
         text: result.finalMessage,
         agentId: ctx.agentId,
@@ -1306,6 +1404,9 @@ export class Dispatcher {
         durationMs: result.usage.durationMs,
         error: result.errors[0],
       };
+      // KPR-452: fire-and-forget shape preserved. postAuditLog is now
+      // contained (D4) and no longer rejects, so this .catch is
+      // belt-and-braces rather than the guard.
       this.postAuditLog(workResult).catch((err) => log.warn("Audit post failed (voice)", { error: String(err) }));
     }
 
@@ -1882,7 +1983,10 @@ export class Dispatcher {
             log.warn("Task ledger complete failed", { error: String(err) }),
           );
         }
-        if (this.auditAdapter && effectiveItem.source.kind !== this.auditAdapter.kind) {
+        // KPR-452 D1 — same reduction as the single-dispatch site.
+        // `workResult.workItem` IS `effectiveItem`, so the leaf sees the same
+        // item the old guard read.
+        if (this.auditAdapter) {
           await this.postAuditLog(workResult);
         }
         log.info("Fan-out dispatch complete", {
@@ -2455,54 +2559,169 @@ Meeting rules:
     await Promise.all(reactionDispatches);
   }
 
+  /** KPR-452 D2 rule 4. Map hit, else one bounded refresh, else undefined. */
+  private async resolveAuditChannelId(): Promise<string | undefined> {
+    const name = this.auditChannelName;
+    if (!name) return undefined;
+    const hit = this.auditChannelIds?.get(name);
+    if (hit) return hit;
+    await this.refreshAuditChannelIds();
+    return this.auditChannelIds?.get(name);
+  }
+
+  /**
+   * KPR-452 D4: bounded dispatch-path refresh so a channel created after boot
+   * is usable without a restart. Deliberately unlike boot's fully paginated
+   * sweep (index.ts): this runs on the AWAITED dispatch path, and a
+   * multi-page sweep would put Slack pagination latency inside a turn's
+   * completion. ONE page, cursor NOT followed.
+   *
+   * ⚠ THIS METHOD IS DELIBERATELY NOT `async`. Everything up to storing
+   * `auditRefreshInFlight` runs synchronously, so an N-agent fan-out firing N
+   * audit posts concurrently produces ONE refresh, not N. Making it `async`
+   * would introduce an await point before the flag is stored and break the
+   * single-flight guarantee (AC10).
+   *
+   * The 60 s stamp is taken BEFORE the call is issued, so a slow or failing
+   * refresh cannot be retried at request rate.
+   *
+   * ⚠ The in-flight promise is stored ALREADY-TERMINATED — the IIFE catches
+   * internally and clears itself in a language-level `finally`. Never clear
+   * with a bare `p.finally(...)` called for its side effect: `.finally()`
+   * returns a DERIVED promise that re-rejects, nothing awaits it, and the
+   * cleanup idiom would itself raise an unhandled rejection on the very fault
+   * containment exists to absorb.
+   *
+   * ⚠ `await Promise.resolve();` IS THE IIFE'S FIRST STATEMENT AND IS LOAD-
+   * BEARING — do not delete it as noise. Without it, a SYNCHRONOUS throw from
+   * `client.conversations.list` (a client misconfigured at construction, a
+   * throwing stub) runs the whole IIFE body — `catch`, `finally`, and all —
+   * BEFORE `this.auditRefreshInFlight = inFlight` executes. The `finally`'s
+   * clear then targets a field that was never set, the assignment lands
+   * afterwards, and the field permanently holds a RESOLVED promise: every
+   * later call returns at the `if (existing)` early-return and the refresh is
+   * dead for the life of the process — precisely the latch D4 forbids. The
+   * leading await pushes the body into a microtask, so the assignment always
+   * wins the race. Unreachable through the real `@slack/web-api` client and
+   * through the tests' `mockRejectedValue`, which is exactly why it must be
+   * closed here rather than left to a test to notice.
+   *
+   * ACCEPTED LIMIT: on a workspace with more than one page of channels a
+   * newly created channel outside page 1 will not resolve on this path until
+   * the next boot. The operator-facing escape is `audit_channel_set`, whose
+   * validation paginates fully and seeds the map.
+   */
+  private refreshAuditChannelIds(): Promise<void> {
+    const existing = this.auditRefreshInFlight;
+    if (existing) return existing;
+    const ids = this.auditChannelIds;
+    const client = this.slackAdapter?.client;
+    const name = this.auditChannelName;
+    if (!ids || !client || !name) return Promise.resolve();
+    const now = Date.now();
+    if (now - this.auditRefreshAt < Dispatcher.AUDIT_REFRESH_INTERVAL_MS) return Promise.resolve();
+    this.auditRefreshAt = now;
+    const inFlight = (async () => {
+      // Load-bearing — see the note above. Defers the body past the
+      // `this.auditRefreshInFlight = inFlight` assignment below, so a
+      // synchronous throw cannot latch the single-flight guard forever.
+      await Promise.resolve();
+      try {
+        const page = await client.conversations.list({ types: "public_channel,private_channel", limit: 1000 });
+        for (const c of page.channels ?? []) {
+          if (c.name && c.id) ids.set(c.name, c.id);
+        }
+      } catch (err) {
+        log.warn("Audit channel refresh failed", { error: String(err), auditChannel: name });
+      } finally {
+        this.auditRefreshInFlight = undefined;
+      }
+    })();
+    this.auditRefreshInFlight = inFlight;
+    return inFlight;
+  }
+
+  /**
+   * KPR-452: mirror one completed turn into the configured audit channel.
+   *
+   * ⚠ CONTAINMENT (D4 / AC13) — THIS METHOD NEVER THROWS INTO ITS CALLER.
+   * Two of its three call sites are AWAITED inside the `try` whose `catch` is
+   * `handleTurnFailure`, and by the time they run the turn's own delivery has
+   * ALREADY LANDED. An unguarded Slack 429 or transport reject would
+   * therefore convert an already-delivered turn into a "Something went wrong"
+   * failure notice plus a KPR-307 `outage_queue` enqueue — visibly worse than
+   * a missing audit copy. Every fault below — name resolution, the lazy
+   * `conversations.list`, and `auditAdapter.deliver` alike (the last of which
+   * was UNGUARDED pre-KPR-452 and could already fail a delivered turn) —
+   * degrades to skip-and-warn with this method resolving normally.
+   */
   private async postAuditLog(result: WorkResult): Promise<void> {
-    if (!this.auditAdapter || !this.auditChannelIds) return;
+    try {
+      // D2 rule 1 — no audit adapter. Also covers the boot window before
+      // index.ts's `setAuditChannel` runs, below the spawn-capable boundary.
+      const auditAdapter = this.auditAdapter;
+      if (!auditAdapter) return;
 
-    const agentConfig = this.registry.get(result.agentId);
-    const agentName = agentConfig?.name ?? result.agentId;
-    const homeBase = agentConfig?.homeBase;
-    const channelId = (homeBase ? this.auditChannelIds.get(homeBase) : undefined) ?? this.fallbackAuditChannelId;
-    if (!channelId) {
-      log.warn("No audit channel resolved for agent", {
-        agentId: result.agentId,
-        homeBase,
+      // D2 rules 2-3 — the SINGLE predicate (audit-routing.ts). Do not
+      // re-add a `source.kind` check at any call site.
+      if (!auditCopyDecision(result.workItem, auditAdapter.kind).post) return;
+
+      // D2 rule 4 — destination. `agentConfig.homeBase` is NO LONGER read
+      // here; the mirror has exactly one destination.
+      const channelId = await this.resolveAuditChannelId();
+      if (!channelId) {
+        log.warn("No audit channel resolved", {
+          agentId: result.agentId,
+          auditChannel: this.auditChannelName ?? null,
+        });
+        return;
+      }
+
+      // D2 rule 5 — cheap invariant guard, generalizing the old slack-kind-
+      // specific self-post check. UNREACHABLE BY CONSTRUCTION, not merely
+      // dead under rule 2: no namespace surviving rule 2 ever carries a Slack
+      // channel id in `source.id` — `event:` items carry a channel NAME
+      // (scheduler.ts), `team-` items a `team_channels` id, and
+      // voice/sms/imessage/ws items a call id, phone number or client id.
+      // Do not write a test that pretends it fires, and do not count on it to
+      // exclude anything.
+      if (result.workItem.source.id === channelId) return;
+
+      const agentConfig = this.registry.get(result.agentId);
+      const agentName = agentConfig?.name ?? result.agentId;
+      const icon =
+        result.workItem.source.kind === "sms"
+          ? ":phone:"
+          : result.workItem.source.kind === "imessage"
+            ? ":speech_balloon:"
+            : result.workItem.source.kind === "app"
+              ? ":iphone:"
+              : ":incoming_envelope:";
+      const senderDisplay = result.workItem.senderName ?? result.workItem.sender;
+      const summary = result.text.length > 300 ? result.text.slice(0, 300) + "..." : result.text;
+
+      const auditItem: WorkItem = {
+        id: `audit:${result.workItem.id}`,
+        text: `${icon} *${agentName}* handled ${result.workItem.source.kind} from ${senderDisplay}:\n> ${summary}\n_($${result.costUsd.toFixed(3)} \u00b7 ${(result.durationMs / 1000).toFixed(1)}s)_`,
+        source: { kind: "internal", id: channelId, label: "audit" },
+        sender: "system",
+        timestamp: new Date(),
+        // KPR-452 D3: NO `slackThreadTs` / `slackTs`. Under a fixed
+        // destination a thread timestamp from a DIFFERENT channel is
+        // meaningless — `SlackAdapter.deliver` would thread against a foreign
+        // ts. Audit copies post at top level. Everything else about the
+        // rendered copy is unchanged.
+      };
+
+      await auditAdapter.deliver({
+        text: auditItem.text,
+        agentId: "system",
+        workItem: auditItem,
+        costUsd: 0,
+        durationMs: 0,
       });
-      return;
+    } catch (err) {
+      log.warn("Audit post failed", { agentId: result.agentId, error: String(err) });
     }
-    // Skip if the audit would post back into the same channel the message came from.
-    if (result.workItem.source.kind === "slack" && result.workItem.source.id === channelId) {
-      return;
-    }
-    const icon =
-      result.workItem.source.kind === "sms"
-        ? ":phone:"
-        : result.workItem.source.kind === "imessage"
-          ? ":speech_balloon:"
-          : result.workItem.source.kind === "app"
-            ? ":iphone:"
-            : ":incoming_envelope:";
-    const senderDisplay = result.workItem.senderName ?? result.workItem.sender;
-    const summary = result.text.length > 300 ? result.text.slice(0, 300) + "..." : result.text;
-
-    const auditItem: WorkItem = {
-      id: `audit:${result.workItem.id}`,
-      text: `${icon} *${agentName}* handled ${result.workItem.source.kind} from ${senderDisplay}:\n> ${summary}\n_($${result.costUsd.toFixed(3)} \u00b7 ${(result.durationMs / 1000).toFixed(1)}s)_`,
-      source: { kind: "internal", id: channelId, label: "audit" },
-      sender: "system",
-      timestamp: new Date(),
-      // Preserve thread info from original message so audit logs are threaded
-      meta: {
-        slackThreadTs: result.workItem.meta?.slackThreadTs as string,
-        slackTs: result.workItem.meta?.slackTs as string,
-      },
-    };
-
-    await this.auditAdapter.deliver({
-      text: auditItem.text,
-      agentId: "system",
-      workItem: auditItem,
-      costUsd: 0,
-      durationMs: 0,
-    });
   }
 }

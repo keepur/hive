@@ -53,6 +53,13 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
     // scribeEnabled's own nesting lives (meeting-scribe.ts, not config.ts),
     // so this anchor is what closes the gap at the one live feed.
     offsetOf("dispatcher.setMeetingAckEnabled(config.meetingWorkers.ackEnabled)");
+    // KPR-452: the audit routing control is a spawn-read fact (the admin
+    // audit_channel_get/set tools read the module-global accessor per turn),
+    // so its wiring must precede every spawn-capable surface. Note that
+    // dispatcher.setAuditChannel(...) deliberately stays BELOW — it needs the
+    // started Slack adapter, the same disjoint-valid-range shape as
+    // workerPool.start().
+    offsetOf("setAuditRoutingControl(");
     // KPR-454: the ops publisher is a spawn-read surface (the first turn
     // after boot can fail a tool), so both anchors are order-pinned below.
     offsetOf("await opsPublisher.init()");
@@ -71,6 +78,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("await workerPool.ensureIndexes()"),
       offsetOf("dispatcher.setMeetingScribe("),
       offsetOf("dispatcher.setMeetingAckEnabled("),
+      offsetOf("setAuditRoutingControl("),
       offsetOf("await opsPublisher.init()"),
       offsetOf("setOpsPublisher("),
     ];
@@ -99,6 +107,7 @@ describe("boot order — spawn-capable boundary (KPR-414)", () => {
       offsetOf("await workerPool.ensureIndexes()"),
       offsetOf("dispatcher.setMeetingScribe("),
       offsetOf("dispatcher.setMeetingAckEnabled("),
+      offsetOf("setAuditRoutingControl("),
       offsetOf("await opsPublisher.init()"),
       offsetOf("setOpsPublisher("),
     );

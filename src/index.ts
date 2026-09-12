@@ -68,6 +68,12 @@ import { OutageEpisodeTracker } from "./outage/outage-notices.js";
 import { OutageReplayProcessor } from "./outage/outage-replay-processor.js";
 import { OpsPublisher } from "./ops/publisher.js";
 import { setOpsPublisher } from "./ops/publisher-singleton.js";
+import {
+  AUDIT_ROUTING_DOC_ID,
+  createAuditRoutingControl,
+  setAuditRoutingControl,
+  type AuditRoutingDoc,
+} from "./audit/audit-routing.js";
 const log = createLogger("index");
 
 function provisionAgentDirs(agentIds: string[]): void {
@@ -182,7 +188,16 @@ async function main(): Promise<void> {
   // eslint-disable-next-line prefer-const
   let scheduler: Scheduler;
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
-  let fallbackAuditId: string | undefined;
+  // KPR-452 D4/AC11: the boot-resolved `config.slack.auditChannel` id. It is
+  // NO LONGER the audit mirror's fallback — its one surviving consumer is
+  // RetentionSweeper.report, which posts the retention dry-run/deletion
+  // report here and falls back to a log line when it is undefined.
+  // ⚠ NAMED DIVERGENCE (spec D4): a runtime `audit_channel_set` moves the
+  // audit mirror and does NOT move this report, which keeps following
+  // config.slack.auditChannel plus a restart. Repointing it at the runtime
+  // resolver would change behavior on a shipped, unrelated surface (KPR-51)
+  // and is out of scope. Do not delete this variable.
+  let retentionReportChannelId: string | undefined;
 
   // KPR-295 — writes the roster-stats contract doc on every load outcome
   // (including blocked) via the guard-immune raw collection. Must use
@@ -473,6 +488,57 @@ async function main(): Promise<void> {
     scribeMaxConcurrent: config.meetingWorkers.scribeMaxConcurrent,
   });
 
+  // KPR-452 (D5/D6): audit-mirror routing control. The admin
+  // `audit_channel_get` / `audit_channel_set` tools read the module-global
+  // accessor PER SPAWN, so this wiring is a spawn-read fact and belongs ABOVE
+  // the spawn-capable boundary below — the same engine-wide rule as the
+  // worker pool, the scribe and the ack lever (KPR-414). Guarded by
+  // src/boot-order.test.ts, which carries this call as an anchor in all three
+  // of its lists.
+  //
+  // `dispatcher.setAuditChannel(...)` deliberately stays at its later,
+  // Slack-dependent site: wiring above, activation below — the same
+  // disjoint-valid-range shape as `workerPool.start()`. A turn landing
+  // between the two sees `auditAdapter` unset, so `postAuditLog` returns at
+  // D2 rule 1 and the tools report not-ready rather than a wrong answer.
+  const auditSettings = db.collection<AuditRoutingDoc>("instance_settings");
+  // ⚠ WRAPPED, and the wrapping is load-bearing. Today's audit block sits
+  // inside a boot try/catch that degrades to log.warn; this read sits ABOVE
+  // the boundary, where nothing catches for it and main().catch exits 1. An
+  // unwrapped findOne would let a transient Mongo fault abort startup over an
+  // audit-routing lookup. A failed or unreadable override warns once and
+  // falls back to config.slack.auditChannel — exactly D5's no-override
+  // precedence. Boot never fails on audit routing.
+  let auditOverride: AuditRoutingDoc | null = null;
+  try {
+    auditOverride = await auditSettings.findOne({ _id: AUDIT_ROUTING_DOC_ID });
+  } catch (err) {
+    log.warn("Audit routing override read failed — falling back to hive.yaml", { error: String(err) });
+  }
+  dispatcher.setAuditChannelName(auditOverride?.channelName || config.slack.auditChannel);
+  if (!dispatcher.getAuditChannelName()) {
+    // D5: NO DEFAULT RECIPIENT (KPR-456 canon). With no configured channel
+    // the mirror is simply off — never homeBase, never an operator, never any
+    // agent channel. The mirror being off is not repaired by falling back to
+    // a channel nobody chose.
+    log.warn("Audit mirror is OFF — no audit channel configured", {
+      hint: "set slack.auditChannel in hive.yaml (restart), or call the admin audit_channel_set tool",
+    });
+  }
+  setAuditRoutingControl(
+    createAuditRoutingControl({
+      dispatcher,
+      settings: auditSettings,
+      roster: () => registry,
+      configuredChannel: config.slack.auditChannel,
+      initialOverride: auditOverride,
+    }),
+  );
+  log.info("Audit routing wired (KPR-452)", {
+    auditChannel: dispatcher.getAuditChannelName() || null,
+    source: auditOverride?.channelName ? "runtime override" : config.slack.auditChannel ? "hive.yaml" : "unset",
+  });
+
   // KPR-454 (D10): the ops tool-failure publisher. Publishing is a SPAWN-READ
   // fact — the first turn after boot can fail a tool — so construction,
   // init() and singleton registration all sit ABOVE the spawn-capable
@@ -680,9 +746,11 @@ async function main(): Promise<void> {
   await obligations.start(config.slack.botToken, (channel, ts) => slack.registerOutboundTs(channel, ts));
   log.info("Slack adapter connected");
 
-  // Audit routing: every agent mirrors non-Slack conversations to their own
-  // homeBase channel. The global slack.auditChannel (if set) is the fallback
-  // for agents whose homeBase can't be resolved.
+  // KPR-452: resolve the Slack channel name→id map, then hand it plus the
+  // audit adapter to the dispatcher. `homeBase` is NO LONGER an audit
+  // destination — the mirror posts every surviving copy to the single
+  // configured audit channel, whose NAME was already wired above the
+  // spawn-capable boundary. This site is Slack-dependent activation only.
   const channelIdByName = new Map<string, string>();
   try {
     let cursor: string | undefined = undefined;
@@ -697,13 +765,16 @@ async function main(): Promise<void> {
       }
       cursor = page.response_metadata?.next_cursor || undefined;
     } while (cursor);
-    const fallbackName = config.slack.auditChannel;
-    fallbackAuditId = fallbackName ? channelIdByName.get(fallbackName) : undefined;
-    dispatcher.setAuditChannel(slackAdapter, channelIdByName, fallbackAuditId);
+    // AC11: RetentionSweeper.report's destination, resolved once at boot from
+    // config.slack.auditChannel. Deliberately NOT the runtime override.
+    retentionReportChannelId = config.slack.auditChannel ? channelIdByName.get(config.slack.auditChannel) : undefined;
+    dispatcher.setAuditChannel(slackAdapter, channelIdByName);
     log.info("Audit channel configured", {
       channels: channelIdByName.size,
-      fallback: fallbackName || null,
-      fallbackResolved: Boolean(fallbackAuditId),
+      auditChannel: dispatcher.getAuditChannelName() || null,
+      auditChannelResolved: Boolean(dispatcher.peekAuditChannelId()),
+      retentionReportChannel: config.slack.auditChannel || null,
+      retentionReportResolved: Boolean(retentionReportChannelId),
     });
   } catch (err) {
     log.warn("Failed to configure audit channel", { error: String(err) });
@@ -963,9 +1034,9 @@ async function main(): Promise<void> {
   const retentionSweeper = new RetentionSweeper(config.retention, {
     hiveHome,
     report: async (text) => {
-      if (fallbackAuditId) {
+      if (retentionReportChannelId) {
         await slack
-          .postMessage(fallbackAuditId, text)
+          .postMessage(retentionReportChannelId, text)
           .catch((err) => log.warn("Retention report: Slack post failed", { error: String(err) }));
       } else {
         log.info("Retention report (no audit channel configured)", { text });
