@@ -66,6 +66,8 @@ import { installKeepAliveDispatcher } from "./http/loopback-dispatcher.js";
 import { OutageQueueStore, type OutageQueueDoc } from "./outage/outage-queue-store.js";
 import { OutageEpisodeTracker } from "./outage/outage-notices.js";
 import { OutageReplayProcessor } from "./outage/outage-replay-processor.js";
+import { OpsPublisher } from "./ops/publisher.js";
+import { setOpsPublisher } from "./ops/publisher-singleton.js";
 const log = createLogger("index");
 
 function provisionAgentDirs(agentIds: string[]): void {
@@ -471,6 +473,40 @@ async function main(): Promise<void> {
     scribeMaxConcurrent: config.meetingWorkers.scribeMaxConcurrent,
   });
 
+  // KPR-454 (D10): the ops tool-failure publisher. Publishing is a SPAWN-READ
+  // fact — the first turn after boot can fail a tool — so construction,
+  // init() and singleton registration all sit ABOVE the spawn-capable
+  // boundary below, alongside the KPR-394/414/417 wiring. Guarded by
+  // src/boot-order.test.ts, which carries both anchors in all three of its
+  // lists.
+  //
+  // init() is NON-FATAL to boot, with a split posture (D10):
+  //  - index faults are contained INSIDE init() and keep the publisher wired
+  //    (the meeting-scribe precedent at :456, not the worker-pool's
+  //    boot-fatal one — none of these indexes carries a correctness role, and
+  //    a TTL conflict after a routine activity.retentionDays change must not
+  //    silently stop failure recording);
+  //  - a REGISTRY-UPSERT fault throws out of init() and leaves the publisher
+  //    UNSET, which is the honest degrade: with no registry rows C5 would
+  //    fail closed on every publish, so a wired-but-registryless publisher
+  //    would spend the rejection counter — the mis-integrated-producer signal
+  //    — on what is actually a Mongo outage. Unset ⇒ every observe call is a
+  //    no-op.
+  const opsPublisher = new OpsPublisher(db, config.activity.retentionDays);
+  try {
+    await opsPublisher.init();
+    setOpsPublisher(opsPublisher);
+    // No getSnapshot() argument. Chunk 3 documents that method as having "no
+    // caller in this diff, deliberately" (the KPR-220 spawn-coordinator
+    // precedent) and D10 invariant (a) agrees; a boot log would be that
+    // caller. It would also carry no information — every counter is zero at
+    // this instant, since nothing has published yet. init() already logs the
+    // three facts worth having (reasons, subscriptions, indexFailures).
+    log.info("Ops publisher wired (KPR-454)");
+  } catch (err) {
+    log.error("Ops publisher init failed — tool-failure publishing is OFF this boot", { error: String(err) });
+  }
+
   // ── Spawn-capable boundary (KPR-394, restated by KPR-414) ──────────────
   // Everything BELOW this line can dispatch a turn: bgTaskManager /
   // codeTaskManager orphan-completion callbacks, meetingMonitor, every
@@ -575,6 +611,11 @@ async function main(): Promise<void> {
   process.on("SIGUSR1", () => {
     prefixCache.invalidateAll("sigusr1");
     safeReload();
+    // KPR-454 D9: refresh the loaded ops-subscription set. This handler sits
+    // BELOW the spawn-capable boundary, correctly and without exception — a
+    // signal handler is not a per-spawn read, and the publisher's own wiring
+    // (the thing a turn reads) is above the marker.
+    void opsPublisher.reloadSubscriptions();
   });
   log.info("Hot-reload enabled", { signal: "SIGUSR1" });
 
@@ -941,6 +982,14 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     log.info("Shutdown signal received", { signal });
     await obligations.stop();
+    // KPR-454 D10: clear the reload timer and stop accepting first, then
+    // drain within SHUTDOWN_DRAIN_MS. Before slackAdapter.stop() and
+    // mongoClient.close() — the queue's inserts need a live client. Safe on a
+    // publisher whose init() threw: the local const exists either way, and
+    // stop() touches only `stopping`, the (possibly undefined) reload timer
+    // and an empty queue (an unset singleton means no observe call ever
+    // enqueued).
+    await opsPublisher.stop();
     sweeper.stop();
     retentionSweeper.stop();
     adminApi?.stop();

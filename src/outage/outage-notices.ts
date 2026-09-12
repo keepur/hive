@@ -6,23 +6,112 @@
 import type { WorkItem, ChannelKind } from "../types/work-item.js";
 
 // ---------------------------------------------------------------------------
-// Source policy (§5-3a). Prefix-detected on engine-synthesized ids — formats
-// are fixed in scheduler.ts (sched:/callback:/event:/team-). Known caveat
-// (spec Finding 7 r1, ⚠ §10): ws/app ids are client-supplied; a client id
-// that collides with a reserved prefix would misclassify. Accepted at spec
-// time; the meta.outagePolicy variant remains the documented alternative.
+// Source policy (§5-3a), and — since KPR-454 (D7) — the ONE reserved-prefix
+// table in the repository.
+//
+// Prefix-detected on engine-synthesized ids; the formats are fixed in
+// scheduler.ts (sched:/callback:/event:/team-) and meeting-worker-pool.ts
+// (worker:). Known caveat (KPR-307 spec Finding 7 r1, ⚠ §10): ws/app ids are
+// client-supplied, so a client id colliding with a reserved prefix
+// misclassifies. Accepted at spec time; the blast radius is one outage
+// notice's policy and — post-KPR-454 — one event's `waiting`, hence one
+// mis-selected subscription. The meta.outagePolicy variant remains the
+// documented alternative.
+//
+// KPR-454 D7 / contract C6: `sourceOfId` is the ONLY function in this
+// repository that tests a reserved WorkItem.id prefix, and both public
+// answers are TOTAL maps from its bucket. That is what keeps them from
+// drifting: adding a row to SOURCE_PREFIXES is a COMPILE ERROR until both
+// projections classify the new source. A second startsWith chain anywhere
+// else is a contract violation, guarded by
+// src/ops/single-prefix-predicate.test.ts.
 // ---------------------------------------------------------------------------
+
+import type { Waiting } from "../ops/types.js";
 
 export type OutageSourcePolicy = "notify" | "silent" | "skip";
 
+/** The bucket a reserved WorkItem.id prefix names. Fallthrough is "human". */
+export type WorkItemSource = "cron" | "callback" | "event" | "agent" | "worker" | "human";
+
+/**
+ * THE prefix table. Ordered: the first matching prefix wins, so a longer
+ * prefix that shares a head with a shorter one must precede it. None do
+ * today — the five are mutually non-prefixing — so this ordering rule is
+ * currently UNEXERCISED by any test, and it is stated as contract for the
+ * prefix someone adds later rather than as a verified property. (It is NOT
+ * what keeps `scheduled:` out of the `sched:` bucket: `"scheduled:"` fails
+ * `startsWith("sched:")` outright, at index 5.) Per-arm rationale lives on
+ * the row it explains.
+ */
+const SOURCE_PREFIXES: ReadonlyArray<readonly [string, WorkItemSource]> = [
+  ["sched:", "cron"], // cron re-fires at the next match — queueing would double-run
+  ["callback:", "callback"], // one-shot, marked fired pre-dispatch — queue preserves it
+  ["event:", "event"], // one-shot event delivery — queue preserves it
+  ["team-", "agent"], // agent-to-agent traffic: another agent is blocked on it
+  ["worker:", "worker"], // KPR-390: one-shot boss re-entry, claim already terminal
+] as const;
+
+/** THE reserved-prefix predicate (C6). Nothing else in the repo may test one. */
+export function sourceOfId(id: string): WorkItemSource {
+  for (const [prefix, source] of SOURCE_PREFIXES) {
+    if (id.startsWith(prefix)) return source;
+  }
+  // Human channels: slack, sms, imessage, app/ws. NOT "team DM" — a `team-`
+  // id returns "agent" above and can never reach here. (The pre-KPR-454
+  // comment claimed otherwise; an implementer who trusted it mapped
+  // agent-to-agent traffic to a human waiter, which is the misrouting the
+  // KPR-451 epic exists to remove.)
+  return "human";
+}
+
+const POLICY_BY_SOURCE: Record<WorkItemSource, OutageSourcePolicy> = {
+  cron: "skip",
+  callback: "silent",
+  event: "silent",
+  agent: "silent",
+  worker: "silent",
+  human: "notify",
+};
+
+const WAITING_BY_SOURCE: Record<WorkItemSource, Waiting> = {
+  cron: "nobody",
+  callback: "nobody",
+  event: "nobody",
+  agent: "agent",
+  worker: "nobody",
+  human: "human-now",
+};
+
+export function policyForId(id: string): OutageSourcePolicy {
+  return POLICY_BY_SOURCE[sourceOfId(id)];
+}
+
+/** Unchanged behaviour, signature, return type and callers (dispatcher.ts:872, :1103). */
 export function policyFor(item: WorkItem): OutageSourcePolicy {
-  const id = item.id;
-  if (id.startsWith("sched:")) return "skip"; // cron re-fires at the next match — queueing would double-run
-  if (id.startsWith("callback:")) return "silent"; // one-shot, marked fired pre-dispatch — queue preserves it
-  if (id.startsWith("event:")) return "silent";
-  if (id.startsWith("team-")) return "silent";
-  if (id.startsWith("worker:")) return "silent"; // KPR-390: one-shot boss re-entry, claim already terminal — queue preserves it
-  return "notify"; // human channels: slack, sms, imessage, app/ws, team DM
+  return policyForId(item.id);
+}
+
+/**
+ * KPR-454 D7 / contract C6: the `waiting` attribute of an ops event, derived
+ * from the SAME table as the outage policy — never a second predicate.
+ *
+ * An absent id ⇒ "nobody", fail-closed to the quietest value and TRUE rather
+ * than a fudge: a detached worker or scribe execution has no WorkItem because
+ * nobody is directly waiting on it (KPR-453 canon).
+ *
+ * `waiting: "obligation"` is NEVER derived here — D3 reserves it for KPR-456's
+ * sweep, the only component that knows a deadline exists.
+ *
+ * D6's admissibility bound deliberately does NOT cascade into this function:
+ * that bound governs STORAGE of an id, while `waiting` is derived from
+ * whatever id the runtime holds, admissible or not. Re-classifying an honest
+ * id whose only defect is an unstorable character would buy nothing (a hostile
+ * `team-…` id passes the charset anyway).
+ */
+export function waitingFor(id?: string): Waiting {
+  if (id === undefined) return "nobody";
+  return WAITING_BY_SOURCE[sourceOfId(id)];
 }
 
 export function adapterKeyFor(item: WorkItem): string {

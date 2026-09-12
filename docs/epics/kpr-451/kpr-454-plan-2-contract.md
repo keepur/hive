@@ -1,5 +1,16 @@
 # KPR-454 plan — chunk 2: the contract module
 
+> ## ⚠ POST-REVIEW AMENDMENTS — the shipped source is authoritative
+>
+> **Read this before re-running any fence below.** Same amendment as [chunk 3](kpr-454-plan-3-publisher.md) and for the same reason (`kpr-454-design.md:242` — "chunks get re-dispatched and re-executed"): two pre-PR review rounds, **`81d7c05`** and **`b438558`**, changed the two files this chunk generates, and the fences were not re-edited hunk by hunk. **Where a fence below differs from the shipped `src/ops/ids.ts` or `src/ops/error-tokens.ts`, the shipped file wins.** The fences predate:
+>
+> - `OPS_CLEARS_MAX_LENGTH` — the bound on a `clears` key, the one stored-and-indexed string none of the other bounds reached;
+> - `OPS_LOG_VALUE_MAX` and `clipForLog` — the C13 bound on an operator- or foreign-producer-authored value written into a log line;
+> - `CLASSIFIER_TEXT_MAX` and the `classifierText` helper in `error-tokens.ts` — the bound on the text the rules run over, plus the totality guard that keeps the bound from introducing a throw edge on a path whose containment would drop the whole failure record;
+> - the `ids.ts` header no longer counting the bounds (the count rotted once; it groups them by breach behaviour instead).
+>
+> Everything else in this chunk still stands as written.
+
 Implements design **D1**, **D4**, **D5**, **D6** (types, registry rows, error tokens, id bound). One task, one commit; its unit coverage is [chunk 2b](kpr-454-plan-2b-contract-tests.md) (Task 3), split out at the Task 2 | Task 3 seam to keep each half inside the 1,000-line review bound. Everything here is pure: no Mongo, no I/O, no singleton. That is deliberate — the enable gate and the classifier must be unit-testable without a database, and the publisher (chunk 3) consumes this module rather than re-declaring any of it.
 
 ---
@@ -49,7 +60,7 @@ export interface OpsSubject {
   id: string;
 }
 
-/** D2: references only — no text, no URLs. This producer's whole `kind` vocabulary is "workItem". */
+/** D2: references only — no text, no URLs. This producer's whole `kind` vocabulary is "work-item". */
 export interface OpsEvidence {
   kind: string;
   id: string;
