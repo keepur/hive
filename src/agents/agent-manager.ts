@@ -245,6 +245,14 @@ export interface TurnResult {
   /** KPR-323 C2: 1-based turn sequence within the warm lease. */
   warmTurnSeq?: number;
   /**
+   * KPR-465 §3.2/§4.1: the static effort actually delivered to the SDK on a
+   * VOICE turn (cold: prepareSpawn's carve-out; warm: the lease's pinned
+   * opening value). undefined on every other channel and whenever nothing was
+   * delivered. The voice adapter stamps engine_attempt_terminal.effort from
+   * this field and never re-derives it.
+   */
+  effort?: AgentEffort;
+  /**
    * KPR-388: true iff the FINALIZED attempt was launched with a session
    * handle (options.resume / previous_response_id / previous_interaction_id).
    * False when the finalized attempt ran fresh — first turn, KPR-313
@@ -374,6 +382,7 @@ type WarmVoiceLease = WarmVoiceSession & {
     readonly route: ProviderModelRoute;
     readonly timeoutMs: number;
     readonly resumeSessionId?: string;
+    readonly effort?: AgentEffort;
   };
 };
 
@@ -457,7 +466,8 @@ interface SpawnShaping {
    * for pilots. KPR-346: ALSO set by prepareSpawn's Lane A branch (clamped
    * static :effort suffix — §D6). KPR-430: ALSO set by the static agent
    * `effort` field (claude lane, every non-voice, non-round-1 path; Lane A
-   * through the clamp) — precedence pin > static > router.
+   * through the clamp) — precedence pin > static > router. KPR-465: ALSO
+   * set by the voice carve-out from the static field (claude route only).
    */
   effortOverride: TurnEffort | undefined;
   /**
@@ -1723,6 +1733,7 @@ export class AgentManager {
           bootToInitMs: finalResult.bootToInitMs,
           initToFirstTokenMs: finalResult.initToFirstTokenMs,
         };
+        if (isAgentEffort(shaping.effortOverride)) turnResult.effort = shaping.effortOverride;
       }
       this.recordSpawnObservability(effectiveCtx, shaping, finalResult, !!finalAttemptSessionId, voiceAdmission?.config?.model);
 
@@ -1947,6 +1958,10 @@ export class AgentManager {
 
       definition = this.registry.get(ctx.agentId)!;
       const openingRoute = resolveProviderModel(definition.model);
+      // KPR-465 §4.1: resolve the static field ONCE and pin it for the call
+      // like the model and prompt (definition reloads apply to the next lease).
+      // Claude by construction here (isWarmPathEligible), so no route gate.
+      const openingEffort = this.resolveStaticClaudeEffort(definition, modelToTier(definition.model), ctx.agentId);
       if (ctx.sessionProvider && ctx.sessionProvider !== openingRoute.provider) {
         ctx = { ...ctx, sessionId: undefined, sessionProvider: undefined };
       }
@@ -1957,6 +1972,7 @@ export class AgentManager {
           route: openingRoute,
           timeoutMs: definition.timeoutMs ?? 300_000,
           resumeSessionId: openingCtx.sessionId,
+          ...(openingEffort ? { effort: openingEffort } : {}),
         },
       });
 
@@ -2010,6 +2026,7 @@ export class AgentManager {
         // when ctx.systemPromptOverride is falsy (final round, issue 1), so
         // the `?? ""` here is a type narrowing, not a silent-empty fallback.
         systemPromptOverride: ctx.systemPromptOverride ?? "",
+        effort: pinnedLease.opening.effort,
       });
       lease.start(q, { resumedSessionId: openingCtx.sessionId, openCalledAt });
       checkOpeningLifetime();
@@ -2124,10 +2141,14 @@ export class AgentManager {
     // approximation of "was this call warm" (that's warmPath/warmTurnSeq).
     const resumedSession = selected.continuity === "resume";
     const warmTurnSeq = selected.turnSeq;
+    // KPR-465 §4.1: the lease's pinned opening effort — shared by the
+    // TurnResult stamp and the observability shaping literal below.
+    const pinnedEffort = lease.opening.effort;
     const turnResult = this.finalizeSpawnResult(ctx, runResult, route, resumedSession);
     turnResult.voiceLifetimeSignal = runResult.voiceLifetimeSignal;
     turnResult.warmPath = true;
     turnResult.warmTurnSeq = warmTurnSeq;
+    if (pinnedEffort) turnResult.effort = pinnedEffort;
     // C1 on warm turns (plan review r1 adv. 3): lock/spawn stages do not
     // exist (zeros by definition); KPR-465 adds the queue stage and, on the
     // opener only, the boot stage. initToFirstTokenMs is the lease's
@@ -2142,15 +2163,18 @@ export class AgentManager {
       initToFirstTokenMs: runResult.initToFirstTokenMs,
     };
     // The warm lane's shaping is exactly what prepareSpawn's voice carve-out
-    // returns (raw text + the static route, no router, no resource limits) —
-    // constructed inline because prepareSpawn is not re-entered on a warm
-    // turn. Same `route` object the breaker permit was keyed on.
+    // returns (raw text + the static route, no router, no resource limits,
+    // KPR-465: the pinned static effort) — constructed inline because
+    // prepareSpawn is not re-entered on a warm turn. Same `route` object the
+    // breaker permit was keyed on. The effort here MUST be the lease's pinned
+    // value or warm A2 turns get no effort/effortSource in agent_turn_telemetry.
     this.recordSpawnObservability(ctx, {
       prompt: ctx.workItem.text,
       route,
       resourceLimits: undefined,
       routerCostUsd: 0,
-      effortOverride: undefined,
+      effortOverride: pinnedEffort,
+      ...(pinnedEffort ? { effortSource: "static" as const } : {}),
     }, runResult, resumedSession, model);
     lease.lastTurn = { ctx, result: turnResult };
 
@@ -2694,6 +2718,8 @@ export class AgentManager {
    * dropped — clampLaneAEffort's pattern. Called exactly once per turn,
    * immediately before the router gate (after the voice / round-1 / Lane A /
    * Lane B returns), so Lane B agents never see a spurious off-catalog warn.
+   * KPR-465 §4.1: ALSO called from the voice carve-out (claude route only)
+   * and once per warm voice lease at opening (pinned for the call).
    * Tolerates a vanished agentConfig (KPR-306 wedged-permit hazard) and makes
    * NO registry call when the field is unset (non-adopters byte-identical).
    */
@@ -2847,8 +2873,22 @@ export class AgentManager {
     // Voice carve-out: KPR-219 supplies its own systemPromptOverride and
     // explicitly bypasses prepending + model router. Pin via this branch so
     // future prepareSpawn edits cannot accidentally re-shape voice prompts.
+    // KPR-465 §4.1 (KPR-430 ⚠ 1's sanctioned one-line change): the static
+    // agent-definition `effort` field IS delivered on voice — claude route
+    // only, so Lane A/B voice stays byte-identical and never sees the
+    // off-catalog warn. No per-channel value, no hive.yaml key (KPR-430 §3).
     if (ctx.channel === "voice") {
-      return { prompt: item.text, route: staticRoute, resourceLimits: undefined, routerCostUsd: 0, effortOverride: undefined, ...(voiceAdmission ? { voiceAdmission } : {}) };
+      const staticEffort =
+        staticRoute.provider === "claude" ? this.resolveStaticClaudeEffort(agentConfig, staticTier, ctx.agentId) : undefined;
+      return {
+        prompt: item.text,
+        route: staticRoute,
+        resourceLimits: undefined,
+        routerCostUsd: 0,
+        effortOverride: staticEffort,
+        ...(staticEffort ? { effortSource: "static" as const } : {}),
+        ...(voiceAdmission ? { voiceAdmission } : {}),
+      };
     }
 
     const senderLabel = item.senderName ?? item.sender;

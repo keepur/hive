@@ -2792,16 +2792,20 @@ export class AgentRunner {
     sessionId: string | undefined;
     context: WorkItemContext;
     systemPromptOverride: string;
+    /** KPR-465 §4.1: the lease's pinned static effort; delivered by buildQueryEnvelope exactly as on send(). */
+    effort?: AgentEffort;
   }): Promise<Query> {
     log.info("Opening warm voice streaming session", {
       agent: this.agentConfig.id,
       resumeSession: params.sessionId ?? "new",
+      ...(params.effort ? { effort: params.effort } : {}),
     });
 
     const options = await this.buildQueryEnvelope({
       sessionId: params.sessionId,
       context: params.context,
       systemPromptOverride: params.systemPromptOverride,
+      effort: params.effort,
       streaming: true,
     });
 
