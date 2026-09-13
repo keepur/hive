@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
+import type { AgentEffort } from "../agents/agent-effort.js";
 import { createLogger, type Level, type LogWriteResult } from "../logging/logger.js";
 
 export const VOICE_TRACE_VERSION = 2 as const;
@@ -264,6 +265,12 @@ export type EnginePayload = {
   lockWaitMs?: Measure;
   spawnPrepMs?: Measure;
   initToFirstTokenMs?: Measure;
+  /** KPR-465 §3.2: cold every attempt; warm opener only; warm turns ≥ 2 not_applicable; any outcome other than `completed` (failed, cancelled, incomplete) not_observed. */
+  bootToInitMs?: Measure;
+  /** KPR-465 §3.2: warm turns only (entry → consume start; opener → open call); cold not_applicable; any outcome other than `completed` (failed, cancelled, incomplete) not_observed. */
+  queueWaitMs?: Measure;
+  /** KPR-465 §3.2: static effort the envelope actually carried (voice); null when nothing was delivered. */
+  effort?: AgentEffort | null;
   responseCompleteMs?: Measure;
   clientGone?: boolean;
   correlation?: ParsedTrace["correlation"];

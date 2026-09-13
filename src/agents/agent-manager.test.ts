@@ -836,6 +836,13 @@ describe("AgentManager", () => {
       expect(result.stageTimings!.initToFirstTokenMs).toBeUndefined();
     });
 
+    it("KPR-465: cold stageTimings carry no queueWaitMs key (byte-identical cold shape)", async () => {
+      mockConversationIndex.mockResolvedValue(undefined);
+      mockRunnerSend.mockResolvedValueOnce(makeRunResult({ bootToInitMs: 741, initToFirstTokenMs: 1263 }));
+      const result = await manager.spawnTurn(makeVoiceCtx({ agentId: "agent-a" }));
+      expect(Object.keys(result.stageTimings!).sort()).toEqual(["bootToInitMs", "initToFirstTokenMs", "lockWaitMs", "spawnPrepMs"]);
+    });
+
     it("leaves stageTimings undefined for an SMS ctx", async () => {
       mockConversationIndex.mockResolvedValue(undefined);
       const result = await manager.spawnTurn(makeSmsCtx({ agentId: "agent-a" }));
@@ -5702,7 +5709,7 @@ describe("AgentManager", () => {
           expect(mockRunnerSend.mock.calls[1]![6]).toBeUndefined();
         });
 
-        it("voice path delivers no effort (carve-out — router never runs)", async () => {
+        it("voice path with no static field delivers no effort (carve-out — router never runs)", async () => {
           (appConfig as any).modelRouter.enabled = true;
           vi.mocked(routeModel).mockResolvedValue(makeRouterResult({ effort: "high" }));
           // Mirror the existing voice carve-out test's ctx/item construction (rule 1).
@@ -6556,15 +6563,50 @@ describe("AgentManager", () => {
       expect(turnTelemetryStore.record.mock.calls[1]![0]).toMatchObject({ effort: "xhigh", effortSource: "static" });
     });
 
-    it("T4: voice path delivers nothing even with the field set (carve-out)", async () => {
+    it("T4 (KPR-465): voice path delivers the static field (carve-out still skips the router)", async () => {
       (appConfig as any).modelRouter.enabled = true;
-      const id = setFable("max");
+      const id = setFable("medium");
       const item = makeWorkItem({ text: "voice turn", source: { kind: "ws", id: "voice-1", label: "voice" } });
-      await manager.spawnTurn({ ...makeSmsCtx({ agentId: id, threadId: "voice:1", workItem: item }), channel: "voice" as const });
+      const result = await manager.spawnTurn({ ...makeSmsCtx({ agentId: id, threadId: "voice:1", workItem: item }), channel: "voice" as const });
       expect(routeModel).not.toHaveBeenCalled();
-      expect(mockRunnerSend.mock.calls[0]![4]).toBeUndefined();
+      expect(mockRunnerSend.mock.calls[0]![4]).toBeUndefined(); // resourceLimits still pinned undefined
+      expect(mockRunnerSend.mock.calls[0]![6]).toBe("medium");
+      expect(result.effort).toBe("medium");
+      expect(turnTelemetryStore.record.mock.calls[0]![0]).toMatchObject({ effort: "medium", effortSource: "static" });
+      expect(staticWarns()).toHaveLength(0);
+    });
+
+    it("T4b (KPR-465): voice haiku agent with the field — nothing delivered, one warn, no TurnResult.effort", async () => {
+      registry._agents.set("agent-hv", makeAgentConfig({ id: "agent-hv", name: "Hv", model: "claude-haiku-4-5", effort: "max" }));
+      const item = makeWorkItem({ text: "v", source: { kind: "ws", id: "voice-1", label: "voice" } });
+      const r1 = await manager.spawnTurn({ ...makeSmsCtx({ agentId: "agent-hv", threadId: "voice:h1", workItem: item }), channel: "voice" as const });
+      await manager.spawnTurn({ ...makeSmsCtx({ agentId: "agent-hv", threadId: "voice:h2", workItem: item }), channel: "voice" as const });
+      expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
+      expect(r1.effort).toBeUndefined();
+      expect(staticWarns()).toHaveLength(1);
+      expect(turnTelemetryStore.record.mock.calls[0]![0]).not.toHaveProperty("effortSource");
+    });
+
+    it("T4c (KPR-465): Lane A voice agent with the field — unchanged: nothing delivered and ZERO static warns (route gate)", async () => {
+      // Env is the only live Lane A credential source (Keychain leg stubbed) —
+      // mirrors the warm block's (6b) kimi voice row so the turn reaches send().
+      process.env.KIMI_API_KEY = "test-kimi-key";
+      registry._agents.set("agent-kv", makeAgentConfig({ id: "agent-kv", name: "Kv", model: "kimi/kimi-k3", effort: "high" }));
+      const item = makeWorkItem({ text: "v", source: { kind: "ws", id: "voice-1", label: "voice" } });
+      try {
+        await manager.spawnTurn({ ...makeSmsCtx({ agentId: "agent-kv", threadId: "voice:k1", workItem: item }), channel: "voice" as const });
+      } finally {
+        delete process.env.KIMI_API_KEY;
+      }
       expect(mockRunnerSend.mock.calls[0]![6]).toBeUndefined();
       expect(staticWarns()).toHaveLength(0);
+    });
+
+    it("T4d (KPR-465): reflection turn on a voice thread delivers the field like any other reflection", async () => {
+      const id = setFable("low");
+      const item = makeWorkItem({ text: "reflect", source: { kind: "ws", id: "voice-1", label: "voice" } });
+      await manager.spawnTurn({ ...makeSmsCtx({ agentId: id, threadId: "voice:r1", workItem: item }), channel: "voice" as const, kind: "reflection" as const });
+      expect(mockRunnerSend.mock.calls[0]![6]).toBe("low");
     });
 
     it("T5a: haiku agent with the field — nothing delivered, exactly one warn across two turns, envelope unchanged", async () => {
@@ -7601,7 +7643,13 @@ describe("AgentManager", () => {
       expect(turnTelemetryStore.record).toHaveBeenCalledTimes(1);
       const telDoc1 = turnTelemetryStore.record.mock.calls[0]![0];
       expect(telDoc1.resumedSession).toBe(true);
-      expect(r1.stageTimings).toEqual({ lockWaitMs: 0, spawnPrepMs: 0, initToFirstTokenMs: expect.any(Number) });
+      expect(r1.stageTimings).toEqual({
+        lockWaitMs: 0,
+        spawnPrepMs: 0,
+        queueWaitMs: expect.any(Number),
+        bootToInitMs: expect.any(Number), // KPR-465: opener carries the boot stage
+        initToFirstTokenMs: expect.any(Number),
+      });
       // Ticket outlives the turn — the lease holds lock + one budget slot.
       const snap1 = manager.getSnapshot().perAgent["agent-a"]!;
       expect(snap1.activeSpawns).toBe(1);
@@ -7617,6 +7665,7 @@ describe("AgentManager", () => {
       // Turn 2 rides the already-open streaming query() — no fresh resume,
       // so resumedSession must be false even though ctx.sessionId is set.
       expect(r2.resumedSession).toBe(false);
+      expect(r2.stageTimings).toEqual({ lockWaitMs: 0, spawnPrepMs: 0, queueWaitMs: expect.any(Number), initToFirstTokenMs: expect.any(Number) });
       expect(turnTelemetryStore.record).toHaveBeenCalledTimes(2);
       const telDoc2 = turnTelemetryStore.record.mock.calls[1]![0];
       expect(telDoc2.resumedSession).toBe(false);
@@ -7631,6 +7680,40 @@ describe("AgentManager", () => {
       expect(sessionStore.set).toHaveBeenCalledTimes(2);
       expect(sessionStore.set).toHaveBeenCalledWith("agent-a", "voice:call-1", "sess-warm-1", "claude", expect.anything(), undefined);
       expect(sessionStore.set).toHaveBeenCalledWith("agent-a", "voice:call-1", "sess-warm-2", "claude", expect.anything(), null);
+    });
+
+    it("KPR-465: a request queued behind a pending opening reports queueWaitMs spanning its FIRST warm-branch entry", async () => {
+      let now = 10_000;
+      const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+      try {
+        let openGateResolve!: () => void;
+        const openGate = new Promise<void>((r) => (openGateResolve = r));
+        installEchoStreamingRunner({ openGate });
+        // Back-to-back, synchronously: t2 must observe the pending opening
+        // (registered before openWarmLease's first await) to take the
+        // recursion path. Do NOT drain between these two lines.
+        const t1 = manager.spawnTurn(makeVoiceCtx({ sessionId: undefined }));
+        const t2 = manager.spawnTurn(makeVoiceCtx({ sessionId: undefined })); // joiner, first entry at 10_000
+        void t1.catch(() => {});
+        void t2.catch(() => {});
+        expect(pendingWarmOpenings(manager).size).toBe(1);
+        now = 10_300; // publication + t2's re-entry + the open call all land here
+        await vi.waitFor(() => expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1));
+        expect(pendingWarmOpenings(manager).size).toBe(0);
+        now = 10_700; // the opening was held 400 ms past the open call
+        openGateResolve();
+        const r1 = await t1;
+        const r2 = await t2;
+        expect(r1.warmTurnSeq).toBe(1);
+        expect(r2.warmTurnSeq).toBe(2);
+        // Opener: entry 10_000 → open call 10_300 (queue), open call → init at 10_700 (boot), init → delta both at 10_700.
+        expect(r1.stageTimings).toEqual({ lockWaitMs: 0, spawnPrepMs: 0, queueWaitMs: 300, bootToInitMs: 400, initToFirstTokenMs: 0 });
+        // Joiner: FIRST entry 10_000 → consume start 10_700. An un-threaded
+        // anchor (re-entry at 10_300) measures 400 and fails here.
+        expect(r2.stageTimings).toEqual({ lockWaitMs: 0, spawnPrepMs: 0, queueWaitMs: 700, initToFirstTokenMs: 0 });
+      } finally {
+        nowSpy.mockRestore();
+      }
     });
 
     it("(2b) a first-turn ctx with no stored session opens with resume undefined — never a store re-read", async () => {
@@ -7655,6 +7738,46 @@ describe("AgentManager", () => {
       // 2nd positional arg to AgentRunner's constructor (index 10, matching
       // the cold-path laneAPassthrough pin at (6b) above).
       expect(vi.mocked(AgentRunner).mock.calls.at(-1)![10]).toEqual({ workerPool: pool });
+    });
+
+    // KPR-465 §4.1: agent-a's fixture model is haiku, whose tier drops the
+    // static field — these rows move it to a non-haiku claude model so the
+    // field is actually deliverable (the haiku drop is pinned by T4b).
+    it("KPR-465: a static effort field is pinned on the lease, forwarded to openVoiceStreamingSession, and stamped on every warm turn", async () => {
+      registry._agents.set("agent-a", makeAgentConfig({ ...registry._agents.get("agent-a")!, model: "claude-sonnet-4-6", effort: "medium" }));
+      installEchoStreamingRunner();
+      const r1 = await manager.spawnTurn(makeVoiceCtx({ sessionId: undefined }));
+      const r2 = await manager.spawnTurn(makeVoiceCtx({ sessionId: "sess-warm-1" }));
+      expect(mockRunnerOpenStream).toHaveBeenCalledTimes(1);
+      expect(mockRunnerOpenStream.mock.calls[0]![0].effort).toBe("medium");
+      expect(r1.effort).toBe("medium");
+      expect(r2.effort).toBe("medium");
+      expect(turnTelemetryStore.record.mock.calls[0]![0]).toMatchObject({ effort: "medium", effortSource: "static" });
+      expect(turnTelemetryStore.record.mock.calls[1]![0]).toMatchObject({ effort: "medium", effortSource: "static" });
+      expect(mockRunnerSend).not.toHaveBeenCalled();
+    });
+
+    it("KPR-465: no field ⇒ the lease opens without effort and telemetry carries no effortSource (today)", async () => {
+      registry._agents.set("agent-a", makeAgentConfig({ ...registry._agents.get("agent-a")!, model: "claude-sonnet-4-6" }));
+      installEchoStreamingRunner();
+      const r1 = await manager.spawnTurn(makeVoiceCtx({ sessionId: undefined }));
+      // The opener threads `effort: pinnedLease.opening.effort` unconditionally
+      // (plan C1 Step 4), so the key is present with an undefined value —
+      // pin the value, which is what the runner's envelope reads.
+      expect(mockRunnerOpenStream.mock.calls[0]![0].effort).toBeUndefined();
+      expect(r1.effort).toBeUndefined();
+      expect(turnTelemetryStore.record.mock.calls[0]![0]).not.toHaveProperty("effort");
+      expect(turnTelemetryStore.record.mock.calls[0]![0]).not.toHaveProperty("effortSource");
+    });
+
+    it("KPR-465: a definition reload mid-call does not change the pinned effort until the next lease", async () => {
+      registry._agents.set("agent-a", makeAgentConfig({ ...registry._agents.get("agent-a")!, model: "claude-sonnet-4-6", effort: "medium" }));
+      installEchoStreamingRunner();
+      const r1 = await manager.spawnTurn(makeVoiceCtx({ sessionId: undefined }));
+      registry._agents.set("agent-a", makeAgentConfig({ ...registry._agents.get("agent-a")!, effort: "low" }));
+      const r2 = await manager.spawnTurn(makeVoiceCtx({ sessionId: "sess-warm-1" }));
+      expect(r1.effort).toBe("medium");
+      expect(r2.effort).toBe("medium");
     });
 
     describe("KPR-467 call-pinned reload routing", () => {

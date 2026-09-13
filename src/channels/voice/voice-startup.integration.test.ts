@@ -90,6 +90,7 @@ vi.mock("../../agents/agent-runner.js", () => ({
   }),
 }));
 
+import type { AgentEffort } from "../../agents/agent-effort.js";
 import { AgentManager, AgentStoppedError, type TurnResult } from "../../agents/agent-manager.js";
 import { AsyncPushQueue } from "../../agents/warm-voice-session.js";
 import { Dispatcher } from "../dispatcher.js";
@@ -132,8 +133,8 @@ function agentConfig(timeoutMs?: number) {
   };
 }
 
-function makeFixture(options: { timeoutMs?: number; taskLedger?: object } = {}) {
-  const config = agentConfig(options.timeoutMs);
+function makeFixture(options: { timeoutMs?: number; taskLedger?: object; effort?: AgentEffort } = {}) {
+  const config = { ...agentConfig(options.timeoutMs), ...(options.effort ? { effort: options.effort } : {}) };
   const registry = {
     get: vi.fn((id: string) => (id === "mokie" ? config : undefined)),
     getAll: vi.fn(() => [config]),
@@ -674,6 +675,79 @@ describe("VoiceAdapter real manager ownership", () => {
         expect.objectContaining({ outcome: "completed", errorClass: null }),
       ]),
     );
+  });
+
+  it("KPR-465: warm attempt terminals carry the boot stage on the opener only and the queue stage on every turn", async () => {
+    configRef.current.voice = { assistants: {}, warmPath: { enabled: true }, toolAck: { enabled: false } };
+    const fixture = makeFixture();
+    const pushed: string[] = [];
+    runnerControl.openStream.mockImplementation(
+      async ({ input }: { input: AsyncIterable<{ message?: { content?: string } }> }) =>
+        successfulQuery(input, "warm-465-text", "warm-465-session", pushed),
+    );
+    const port = await start(fixture.adapter);
+    // body(callId) uses the callId itself as the user content, which
+    // legitimately appears on every row as `callId` — so the R7 sentinel is an
+    // explicit transcript line, not the callId.
+    const TRANSCRIPT_SENTINEL = "SENTINEL-TRANSCRIPT-465 +15555550100";
+    const withSentinel = () => ({ ...body("warm-465"), messages: [{ role: "user", content: TRANSCRIPT_SENTINEL }] });
+    const a = begin(port, withSentinel());
+    expect(await a.done).toContain("[DONE]");
+    const b = begin(port, withSentinel());
+    expect(await b.done).toContain("[DONE]");
+    await vi.waitFor(() => expect(rows("warm-465", "engine_terminal")).toHaveLength(2));
+    expect(runnerControl.openStream).toHaveBeenCalledTimes(1);
+
+    const attempts = rows("warm-465", "engine_attempt_terminal").filter(
+      (r) => r.outcome === "completed" && r.warm === true,
+    );
+    expect(attempts).toHaveLength(2);
+    const opener = attempts.find((r) => r.selectedContinuity === "fresh")!;
+    const second = attempts.find((r) => r.selectedContinuity === "warm")!;
+    expect(opener).toMatchObject({
+      bootToInitMs: { value: expect.any(Number), reason: null },
+      queueWaitMs: { value: expect.any(Number), reason: null },
+    });
+    expect(second).toMatchObject({
+      bootToInitMs: { value: null, reason: "not_applicable" },
+      queueWaitMs: { value: expect.any(Number), reason: null },
+    });
+    const requestTerminals = rows("warm-465", "engine_terminal");
+    expect(requestTerminals.map((r) => r.queueWaitMs)).toEqual([
+      { value: expect.any(Number), reason: null },
+      { value: expect.any(Number), reason: null },
+    ]);
+    // Spec §3.2 bullet 1 names the "Voice turn complete" row: a warm row carries queueWaitMs (the cold row's absence is pinned in the adapter suite).
+    const warmLogRows = traceLog.info.mock.calls.filter(
+      (c) => c[0] === "Voice turn complete" && (c[1] as Record<string, unknown>).callId === "warm-465",
+    );
+    expect(warmLogRows).toHaveLength(2);
+    for (const [, data] of warmLogRows) expect(typeof (data as Record<string, unknown>).queueWaitMs).toBe("number");
+    // R7 at runtime: the request transcript never rides any engine row.
+    expect(pushed.join("\n")).toContain("SENTINEL-TRANSCRIPT-465"); // the sentinel really reached the provider input …
+    for (const row of rows("warm-465", "engine_attempt_terminal"))
+      expect(JSON.stringify(row)).not.toContain("SENTINEL");
+    for (const row of rows("warm-465", "engine_terminal")) expect(JSON.stringify(row)).not.toContain("+1555");
+    for (const [, data] of warmLogRows) expect(JSON.stringify(data)).not.toContain("SENTINEL"); // … and never the log row either
+  });
+
+  it("KPR-465: a warm lease delivers the pinned static effort and stamps it on the second turn's attempt terminal", async () => {
+    configRef.current.voice = { assistants: {}, warmPath: { enabled: true }, toolAck: { enabled: false } };
+    const fixture = makeFixture({ effort: "medium" });
+    runnerControl.openStream.mockImplementation(
+      async ({ input }: { input: AsyncIterable<{ message?: { content?: string } }> }) =>
+        successfulQuery(input, "warm-effort-text", "warm-effort-session", []),
+    );
+    const port = await start(fixture.adapter);
+    expect(await begin(port, body("warm-effort-465")).done).toContain("[DONE]");
+    expect(await begin(port, body("warm-effort-465")).done).toContain("[DONE]");
+    await vi.waitFor(() => expect(rows("warm-effort-465", "engine_terminal")).toHaveLength(2));
+    expect(runnerControl.openStream).toHaveBeenCalledTimes(1);
+    expect(runnerControl.openStream.mock.calls[0]![0]).toMatchObject({ effort: "medium" });
+    const attempts = rows("warm-effort-465", "engine_attempt_terminal");
+    expect(attempts).toHaveLength(2);
+    expect(attempts[1]).toMatchObject({ warm: true, effort: "medium" });
+    expect(rows("warm-effort-465", "engine_terminal")[1]).toMatchObject({ effort: "medium" });
   });
 
   it.each(["eof", "rejection"] as const)(

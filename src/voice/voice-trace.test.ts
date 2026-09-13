@@ -7,6 +7,8 @@ import {
   measure,
   parseVoiceTrace,
   voiceDiagnosticEvent,
+  type EnginePayload,
+  type Measure,
   type TrackedVoiceLogger,
   type VoiceDiagnosticEvent,
 } from "./voice-trace.js";
@@ -67,6 +69,35 @@ describe("voice trace metadata", () => {
       ]),
     );
     expect(JSON.stringify(row)).not.toMatch(/transcript|phone|audioBytes|toolArguments|metadata/);
+  });
+
+  it("keeps the KPR-465 boot and queue stage measures content-free on an engine attempt terminal", () => {
+    // Typed as an intersection so the check stays honest whether or not
+    // EnginePayload itself declares the two keys yet.
+    const payload: EnginePayload & { bootToInitMs: Measure; queueWaitMs: Measure } = {
+      event: "engine_attempt_terminal",
+      outcome: "completed",
+      bootToInitMs: measure(650, "not_observed"),
+      queueWaitMs: measure(undefined, "not_applicable"),
+    };
+    const row = voiceDiagnosticEvent(
+      {
+        component: "voice-engine",
+        callId: "call",
+        workerBootId: randomUUID(),
+        turnId: randomUUID(),
+        engineAttemptSeq: 1,
+      },
+      payload,
+    ) as VoiceDiagnosticEvent & { bootToInitMs: Measure; queueWaitMs: Measure };
+    const serialized = JSON.stringify(row);
+
+    expect(serialized).not.toMatch(/transcript|phone|audioBytes|toolArguments|metadata/);
+    for (const forbidden of ["SENTINEL", "+1555", "Bearer "]) expect(serialized).not.toContain(forbidden);
+    expect(typeof row.bootToInitMs.value).toBe("number");
+    expect(row.bootToInitMs).toEqual({ value: 650, reason: null });
+    expect(row.queueWaitMs.value).toBeNull();
+    expect(row.queueWaitMs).toEqual({ value: null, reason: "not_applicable" });
   });
 });
 

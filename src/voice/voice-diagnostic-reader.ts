@@ -65,6 +65,18 @@ export interface VoiceDiagnosticEntityDetail {
     ts: string;
     monoMs: number;
   }>;
+  latency?: SpeechLatencyDetail;
+}
+
+/** KPR-465 §3.3: per-speech components of the v2 estimate, exposed for the comparison reader. */
+export interface SpeechLatencyDetail {
+  estimateMs: number | null;
+  exclusion: LatencyExclusionReason | null;
+  eouMs: number | null;
+  bridgeFirstTextMs: number | null;
+  ttsTtfbMs: number | null;
+  /** turnId of the single bound bridge, when exactly one bridge is bound; else null. */
+  boundTurnId: string | null;
 }
 
 export interface VoiceDiagnosticReport {
@@ -249,6 +261,14 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
   engine_attempt_started: ["continuity"],
   engine_first_text: ["textLength", "firstTextMs"],
   engine_client_closed: [],
+  // KPR-465 §3.2 delivery note (version decision): `bootToInitMs` and
+  // `queueWaitMs` on the two engine terminals are OPTIONAL additions under
+  // `schemaVersion: 2` — no version bump. No existing key changes meaning,
+  // KPR-464-era rows without them parse unchanged, and the comparison reader
+  // treats an absent key as `not_observed` for stage tables. A bump would
+  // force compare mode to refuse pooling across versions for rows that are
+  // semantically identical. Allowlisted (and measure-validated below) one
+  // commit before the adapter emits them, so no commit writes rejected rows.
   engine_attempt_terminal: [
     "continuity",
     "launchAdmission",
@@ -265,6 +285,9 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
     "initToFirstTokenMs",
     "firstTextMs",
     "stopped",
+    "bootToInitMs",
+    "queueWaitMs",
+    "effort",
   ],
   engine_terminal: [
     "status",
@@ -289,6 +312,9 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
     "toolCount",
     "toolMs",
     "toolAckInjected",
+    "bootToInitMs",
+    "queueWaitMs",
+    "effort",
   ],
   diagnostic_gap: ["reason", "count"],
   teardown: ["result", "reason"],
@@ -649,19 +675,33 @@ export function reduceVoiceDiagnostics(input: string | ParsedRows, callId: strin
 
   const exclusions = emptyLatencyExclusions();
   const samples: number[] = [];
+  const latencyBySpeechKey = new Map<string, SpeechLatencyDetail>();
   const bridgesBySpeech = groupBoundEntities(maps.bridge);
   const synthesesBySpeech = groupBoundEntities(maps.synthesis);
   for (const speech of maps.speech.values()) {
-    const reason = latencyExclusion(
-      speech,
-      bridgesBySpeech.get(speech.key) ?? [],
-      synthesesBySpeech.get(speech.key) ?? [],
-      effectiveStates,
-    );
+    const boundBridges = bridgesBySpeech.get(speech.key) ?? [];
+    const boundSyntheses = synthesesBySpeech.get(speech.key) ?? [];
+    const reason = latencyExclusion(speech, boundBridges, boundSyntheses, effectiveStates);
     if (typeof reason === "string") exclusions[reason] += 1;
     else samples.push(reason);
+    const eou = speech.eouMetrics.length === 1 ? speech.eouMetrics[0]! : null;
+    const bridge = boundBridges.length === 1 ? boundBridges[0]! : null;
+    const synthesis = boundSyntheses.length === 1 ? boundSyntheses[0]! : null;
+    const tts = synthesis && synthesis.ttsMetrics.length === 1 ? synthesis.ttsMetrics[0]! : null;
+    latencyBySpeechKey.set(speech.key, {
+      estimateMs: typeof reason === "number" ? reason : null,
+      exclusion: typeof reason === "string" ? reason : null,
+      eouMs: eou && eou.event === "sdk_metric" ? measureValue(eou.eouMs) : null,
+      bridgeFirstTextMs: bridge ? measureValue(bridge.bridgeFirstText) : null,
+      ttsTtfbMs: tts && tts.event === "sdk_metric" ? measureValue(tts.ttfbMs) : null,
+      boundTurnId: bridge?.turnId ?? null,
+    });
   }
   samples.sort((a, b) => a - b);
+  for (const detail of details.speech) {
+    const latency = latencyBySpeechKey.get(detail.key);
+    if (latency) detail.latency = latency;
+  }
 
   const generatedSpeech = new Set<string>();
   let synthesizedAudioObserved = 0;
@@ -974,6 +1014,8 @@ function validatePayload(value: Record<string, unknown>, event: VoiceDiagnosticE
     "spawnPrepMs",
     "initToFirstTokenMs",
     "responseCompleteMs",
+    "bootToInitMs",
+    "queueWaitMs",
   ]) {
     if (field in value && value[field] !== undefined && !validMeasure(value[field])) return false;
   }
@@ -1080,6 +1122,17 @@ function validatePayload(value: Record<string, unknown>, event: VoiceDiagnosticE
     "continuity" in value &&
     value.continuity !== undefined &&
     !["fresh", "warm", "resume", "full_transcript"].includes(String(value.continuity))
+  ) {
+    return false;
+  }
+  // KPR-465: delivered effort on the engine terminals. A literal list, not an
+  // import of AGENT_EFFORT_LEVELS — this reader is a pure offline module and
+  // must not pick up engine imports; a reader test pins the two in lockstep.
+  if (
+    "effort" in value &&
+    value.effort !== undefined &&
+    value.effort !== null &&
+    !["low", "medium", "high", "xhigh", "max"].includes(String(value.effort))
   ) {
     return false;
   }
