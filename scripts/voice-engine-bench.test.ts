@@ -504,4 +504,17 @@ describe("voice-engine-bench main call loop (KPR-465 review round 2)", () => {
       expect(sleep.mock.calls.map(([ms]) => ms)).toEqual(Array<number>(2 * BENCH_SCRIPT.length).fill(THINK_MS));
     }
   });
+
+  it("concurrent-3 records calls: 3 in the header whatever --calls resolves to, and ignores --call-gap-ms", async () => {
+    for (const extra of [[], ["--calls", "5"]]) {
+      const sleep = vi.fn(async (_ms: number) => {});
+      const args = ["--arm", "A1-warm", "--out", out, "--drill", "concurrent-3", "--base-url", baseUrl];
+      expect(await main([...args, "--call-gap-ms", String(GAP_MS), ...extra], { sleep })).toBe(0);
+      const rows = readOut();
+      expect(rows[0]).toMatchObject({ run: true, calls: 3, drill: "concurrent-3" });
+      expect(new Set(rows.slice(1).map((r) => r.callId)).size).toBe(3);
+      expect(rows).toHaveLength(1 + 3 * BENCH_SCRIPT.length);
+      expect(sleep.mock.calls.every(([ms]) => ms === THINK_MS)).toBe(true);
+    }
+  });
 });

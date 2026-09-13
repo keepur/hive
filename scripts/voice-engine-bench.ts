@@ -27,6 +27,8 @@ import {
 
 export type Drill = "double-request" | "concurrent-3" | "kill-a" | "kill-b" | "kill-c";
 export const DRILLS: readonly Drill[] = ["double-request", "concurrent-3", "kill-a", "kill-b", "kill-c"];
+/** `--drill concurrent-3` always runs exactly this many parallel calls; `--calls` does not apply to it. */
+export const CONCURRENT_DRILL_CALLS = 3;
 export const BARGE_IN_AFTER_FIRST_TEXT_MS = 300;
 export const BARGE_IN_DURING_TOOL_WAIT_MS = 1_500;
 
@@ -408,7 +410,7 @@ export async function main(
         agent: values.agent!,
         workerBootId,
         startedAt: new Date().toISOString(),
-        calls,
+        calls: values.drill === "concurrent-3" ? CONCURRENT_DRILL_CALLS : calls,
         drill: (values.drill as Drill | undefined) ?? null,
         warmup: values.warmup!,
       }),
@@ -447,7 +449,9 @@ export async function main(
     process.stderr.write(`warm-up call ${warmId} discarded\n`);
   }
   if (values.drill === "concurrent-3") {
-    const ids = await Promise.all([1, 2, 3].map(() => runBenchCall({ ...opts, drill: undefined })));
+    const ids = await Promise.all(
+      Array.from({ length: CONCURRENT_DRILL_CALLS }, () => runBenchCall({ ...opts, drill: undefined })),
+    );
     callIds.push(...ids);
   } else {
     // Each warm call holds one of the agent's `spawnBudget` slots (5 on the mokie-bench clone) for the whole call and
