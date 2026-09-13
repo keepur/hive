@@ -274,6 +274,43 @@ describe("AC1 — with no subscriptions nothing is minted, nothing is delivered 
     expect(ops.length).toBeGreaterThan(0);
     expect(ops.map((o) => o.operation).filter((op) => op !== "find")).toEqual([]);
   });
+
+  it("only ever READS ops_reasons, and never calls ensureIndexes()/upsertReasons() on KPR-454's collections", async () => {
+    // notifier.ts:131-133's own comment ("the notifier constructs its OWN
+    // OpsStore and never calls ensureIndexes() or upsertReasons() on it")
+    // stated as a checked property rather than left to a code comment. Raw
+    // construction, not `harness()`: `loadReasons()` runs exactly once, inside
+    // `init()`, and `harness()` has already called `init()` by the time it
+    // returns — a mark taken after it would see zero further ops_reasons
+    // operations and the "no write" assertion below would pass vacuously.
+    const db = new FakeDb();
+    await db.collection(OPS_REASONS_COLLECTION).insertOne(reason("r1"));
+    // Everything from here on is the notifier's, not the fixture's own seed.
+    const mark = db.operations.length;
+    const notifier = new OpsNotifier(
+      db.db,
+      90,
+      () => true,
+      () => BASE,
+      async () => {},
+    );
+
+    await notifier.init();
+
+    const reasonOps = db.operations.slice(mark).filter((o) => o.collection === OPS_REASONS_COLLECTION);
+    expect(reasonOps.length).toBeGreaterThan(0);
+    expect(reasonOps.map((o) => o.operation).filter((op) => op !== "find")).toEqual([]);
+
+    // KPR-454 owns index creation on ops_events, ops_subscriptions and
+    // ops_reasons; this child's own ensureIndexes() only ever touches
+    // ops_notifications (D12, integration point 1).
+    const foreignIndexCreation = db.operations.filter(
+      (o) =>
+        o.operation === "createIndex" &&
+        [OPS_EVENTS_COLLECTION, OPS_SUBSCRIPTIONS_COLLECTION, OPS_REASONS_COLLECTION].includes(o.collection),
+    );
+    expect(foreignIndexCreation).toEqual([]);
+  });
 });
 
 // ───────────────────────────────────────────────────────────────────────────

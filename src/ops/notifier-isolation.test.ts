@@ -80,4 +80,22 @@ describe("AC15 — activity_log is not a failure oracle here (C12)", () => {
       expect(source, file).not.toMatch(/activity_log|costUsd|agent_events|EVENT_SCHEMAS|checkEvents/);
     }
   });
+
+  // The regression-surface bullet this AC is tied to also names the
+  // `subscribe:` agent-definition field, delivery routing, the retry queue
+  // and the outage queue — none of which the assertion above's regex
+  // touches. Widened here rather than folded into the regex above: the
+  // `subscribe:` token needs its own care (`OpsSubscription`/`subscriptionId`
+  // are legitimate and pervasive in these files; only the literal
+  // colon-terminated field key is checked) and the queue/routing modules are
+  // checked by import path, which also catches a re-implemented parallel
+  // queue that never spells either module's name.
+  it("imports nothing from the dispatcher, the retry queue or the outage queue, and never names the subscribe: field", () => {
+    for (const file of NOTIFIER_FILES) {
+      const source = readFileSync(file, "utf8");
+      expect(source, file).not.toMatch(/from\s+"[^"]*\/(channels|sweeper|outage)\//);
+      expect(source, file).not.toMatch(/outage_queue|outageQueue|retryQueue|retry-queue|retry_queue/);
+      expect(source, file).not.toMatch(/subscribe:/);
+    }
+  });
 });

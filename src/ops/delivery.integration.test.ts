@@ -25,7 +25,7 @@ import { WriteGuard } from "../db/write-guard.js";
 import { DeliveryPhase, __resetCadenceWarningsForTests, resolveCadence } from "./delivery.js";
 import { OPS_LOG_VALUE_MAX } from "./ids.js";
 import { OpsNotifier } from "./notifier.js";
-import { NOTIFIER_STATS_KIND, OpsNotificationStore } from "./notification-store.js";
+import { NOTIFIER_STATS_KIND, OpsNotificationStore, SWEEP_CURSOR_KIND } from "./notification-store.js";
 import {
   ATTEMPTS_RING_CAP,
   DELIVERY_ARM_PAGE_SIZE,
@@ -1218,6 +1218,26 @@ describe("the heartbeat", () => {
     await h.seedEvent();
     // The ingest page `find` — outside every per-event try by design.
     failOn(h.db, OPS_EVENTS_COLLECTION, "find", () => true);
+
+    await expect(h.tick()).resolves.toBeUndefined();
+    expect((await h.heartbeat()).state).toBe("degraded");
+    expect(h.snapshot().sweepFaults).toBe(1);
+  });
+
+  it("reports `degraded` when the SWEEP CURSOR read throws — outside every inner try, same as the other two", async () => {
+    const h = await harness({ subscriptions: [sub("s1")] });
+    await h.seedEvent();
+    // Predicated on the cursor's own filter shape (`{ kind: SWEEP_CURSOR_KIND }`)
+    // rather than a blanket `telemetry`/`findOne` fault: the heartbeat this
+    // test itself reads back afterward is ALSO a `telemetry` `findOne`
+    // (`{ kind: NOTIFIER_STATS_KIND }`), so an unpredicated fault would take
+    // out the test's own assertion, not just the cursor read it targets.
+    failOn(
+      h.db,
+      "telemetry",
+      "findOne",
+      (ctx) => (ctx.filter as { kind?: string } | undefined)?.kind === SWEEP_CURSOR_KIND,
+    );
 
     await expect(h.tick()).resolves.toBeUndefined();
     expect((await h.heartbeat()).state).toBe("degraded");
