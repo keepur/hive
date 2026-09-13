@@ -887,12 +887,14 @@ Then, when all checks pass: `agent_delete mokie-bench confirm=true` → `kill -U
 
 - [ ] **Step 4: Accepted residuals (record, do not fix):** `memory`/`memory_versions`/`agent_memory` rows keyed `mokie-bench` have no TTL and remain; `sessions` rows expire under the 7-day TTL; one fleet-wide team-summary prefix invalidation on create and one on delete (KPR-432/434 cost class) — both inside the quiet window. A clone found by any later session is deleted, never reused.
 
-- [ ] **Step 5: Bench invocation (from the instance dir so `config.ts` finds `hive.yaml`/`.env`/Honeypot):**
+- [ ] **Step 5: Bench invocation (from the instance dir so `config.ts` finds `hive.yaml`/`.env`/Honeypot).** **Warm-arm spacing (pre-PR review round 2 finding):** each warm bench call holds one of the clone's `spawnBudget` (5) slots for the call plus the engine's `WARM_IDLE_TIMEOUT_MS` (120 s) after its last turn; running `--calls` sequential warm calls with no gap can exhaust the budget before earlier leases idle out (503s misread as a real finding, and a live kill drill's `pgrep` picking up a still-open prior call's process instead of the drilled one). Use `--call-gap-ms` on any **warm** multi-call invocation — at least `130000` (120 s + margin) is the safe default absent a faster empirical read from the session's own block timing; **not needed on the cold arm** (no warm lease, no budget held between calls) or on `double-request`/`concurrent-3` (bounded call counts well under the budget):
 
 ```bash
 cd ~/services/hive/dodi
 npx tsx ~/github/hive/scripts/voice-engine-bench.ts --arm A0-cold --out /tmp/kpr465/A0-cold.jsonl --calls 8 --warmup
-# drills, one invocation each (kill drills prompt for the pid):
+# warm block: --call-gap-ms spaces sequential calls past the 120s warm-lease idle timeout
+npx tsx ~/github/hive/scripts/voice-engine-bench.ts --arm A1-warm --out /tmp/kpr465/A1-warm.jsonl --calls 8 --call-gap-ms 130000
+# drills, one invocation each (kill drills default to --calls 1 and prompt for the pid):
 npx tsx ~/github/hive/scripts/voice-engine-bench.ts --arm A1-warm --out /tmp/kpr465/A1-warm-dbl.jsonl --drill double-request
 npx tsx ~/github/hive/scripts/voice-engine-bench.ts --arm A1-warm --out /tmp/kpr465/A1-warm-c3.jsonl --drill concurrent-3
 npx tsx ~/github/hive/scripts/voice-engine-bench.ts --arm A1-warm --out /tmp/kpr465/A1-warm-kill-a.jsonl --drill kill-a
