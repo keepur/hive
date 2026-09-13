@@ -6,7 +6,7 @@
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -61,6 +61,7 @@ import {
   loopbackBaseUrlError,
   main,
   parseCallCount,
+  parseCallGapMs,
   postTurn,
   resolveCallsCount,
   runBenchCall,
@@ -413,6 +414,23 @@ describe("voice-engine-bench argument validation", () => {
     expect(existsSync(out)).toBe(false);
   });
 
+  it("parseCallGapMs (KPR-465 review round 2) accepts only a non-negative decimal integer", () => {
+    expect(parseCallGapMs("0")).toBe(0);
+    expect(parseCallGapMs("1500")).toBe(1500);
+    for (const bad of ["abc", "", "-1", "05", "1.5", "1e3", " 5", "5ms", "9007199254740993"]) {
+      expect(parseCallGapMs(bad)).toBeNull();
+    }
+  });
+
+  it.each(["--call-gap-ms=-5", "--call-gap-ms=abc"])(
+    "main exits 2 on %s before writing the result file",
+    async (flag) => {
+      expect(await main(["--arm", "A1-warm", "--out", out, "--calls", "2", flag])).toBe(2);
+      expect(stderr.join("")).toMatch(/--call-gap-ms must be a non-negative integer, got "(-5|abc)"/);
+      expect(existsSync(out)).toBe(false);
+    },
+  );
+
   it.each(["https://127.0.0.1:1", "http://bench.invalid:1"])(
     "main exits 2 on --base-url %s before writing the result file or sending the bearer",
     async (baseUrl) => {
@@ -423,4 +441,67 @@ describe("voice-engine-bench argument validation", () => {
       expect(existsSync(out)).toBe(false);
     },
   );
+});
+
+describe("voice-engine-bench main call loop (KPR-465 review round 2)", () => {
+  // A stub bridge answering every turn at once, so a whole multi-call run takes milliseconds.
+  const frame = (choice: Record<string, unknown>) => `data: ${JSON.stringify({ choices: [choice] })}\n\n`;
+  const BODY = frame({ delta: { content: "ok" } }) + frame({ delta: {}, finish_reason: "stop" }) + "data: [DONE]\n\n";
+  const THINK_MS = 250; // runBenchCall's per-turn caller think-time
+  const GAP_MS = 7_000;
+  const originalConfig = configRef.current;
+  let server: Server;
+  let baseUrl: string;
+  let out: string;
+  let stderrSpy: { mockRestore: () => void };
+  beforeEach(async () => {
+    server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.end(BODY);
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    out = join(mkdtempSync(join(tmpdir(), "kpr465-bench-loop-")), "out.jsonl");
+    stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    configRef.current = {
+      ...originalConfig,
+      voice: { ...originalConfig.voice, bridgeToken: BRIDGE_TOKEN, port: 3200 },
+    };
+  });
+  afterEach(async () => {
+    stderrSpy.mockRestore();
+    configRef.current = originalConfig;
+    server.closeAllConnections();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  const readOut = () =>
+    readFileSync(out, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+
+  it("--call-gap-ms sleeps between sequential calls only — not before the first or after the last", async () => {
+    const sleep = vi.fn(async (_ms: number) => {});
+    const args = ["--arm", "A1-warm", "--out", out, "--calls", "3", "--base-url", baseUrl];
+    expect(await main([...args, "--call-gap-ms", String(GAP_MS)], { sleep })).toBe(0);
+    const think = Array<number>(BENCH_SCRIPT.length).fill(THINK_MS);
+    expect(sleep.mock.calls.map(([ms]) => ms)).toEqual([...think, GAP_MS, ...think, GAP_MS, ...think]);
+    const rows = readOut();
+    expect(rows[0]).toMatchObject({ run: true, calls: 3, drill: null });
+    expect(new Set(rows.slice(1).map((r) => r.callId)).size).toBe(3);
+    expect(rows).toHaveLength(1 + 3 * BENCH_SCRIPT.length);
+  });
+
+  it("without --call-gap-ms (or with 0) sequential calls run back to back, exactly as before", async () => {
+    const args = ["--arm", "A1-warm", "--out", out, "--calls", "2", "--base-url", baseUrl];
+    for (const extra of [[], ["--call-gap-ms", "0"]]) {
+      const sleep = vi.fn(async (_ms: number) => {});
+      expect(await main([...args, ...extra], { sleep })).toBe(0);
+      expect(sleep.mock.calls.map(([ms]) => ms)).toEqual(Array<number>(2 * BENCH_SCRIPT.length).fill(THINK_MS));
+    }
+  });
 });

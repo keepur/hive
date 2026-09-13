@@ -281,6 +281,16 @@ export function parseCallCount(raw: string): number | null {
 }
 
 /**
+ * `--call-gap-ms`: a non-negative decimal integer, strictly (no `"-1"`, no `"05"`, no `"1.5"`, no `"1e3"`).
+ * Null when invalid.
+ */
+export function parseCallGapMs(raw: string): number | null {
+  if (!/^(0|[1-9]\d*)$/.test(raw)) return null;
+  const n = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+/**
  * KPR-465 review round 1: resolve the effective `--calls` count. A kill-*
  * drill is a single scripted scenario (one kill, one operator prompt) — the
  * general default of 8 would repeat the drill's kill point once per call and
@@ -333,7 +343,11 @@ async function operatorKillPrompt(phase: string, turn: BenchTurn): Promise<void>
   rl.close();
 }
 
-export async function main(argv = process.argv.slice(2)): Promise<number> {
+/** `sleep` stands in for every wait `main` makes (per-turn think-time and `--call-gap-ms`); tests inject a spy. */
+export async function main(
+  argv = process.argv.slice(2),
+  deps: { sleep?: (ms: number) => Promise<void> } = {},
+): Promise<number> {
   const { values } = parseArgs({
     args: argv,
     strict: true,
@@ -342,6 +356,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       arm: { type: "string" },
       agent: { type: "string", default: "mokie-bench" },
       calls: { type: "string" },
+      "call-gap-ms": { type: "string" },
       out: { type: "string" },
       "base-url": { type: "string" },
       drill: { type: "string" },
@@ -352,7 +367,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   });
   if (!values.arm || !values.out) {
     process.stderr.write(
-      "usage: voice-engine-bench --arm <label> --out <jsonl> [--agent mokie-bench] [--calls 8, or 1 for a kill-* drill] [--base-url http://127.0.0.1:<port>] [--drill double-request|concurrent-3|kill-a|kill-b|kill-c] [--warmup]\n",
+      "usage: voice-engine-bench --arm <label> --out <jsonl> [--agent mokie-bench] [--calls 8, or 1 for a kill-* drill] [--call-gap-ms <ms between sequential calls, default 0>] [--base-url http://127.0.0.1:<port>] [--drill double-request|concurrent-3|kill-a|kill-b|kill-c] [--warmup]\n",
     );
     return 2;
   }
@@ -363,6 +378,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const calls = resolveCallsCount(values.calls, values.drill);
   if (calls === null) {
     process.stderr.write(`--calls must be a positive integer, got "${values.calls}"\n`);
+    return 2;
+  }
+  const callGapMs = values["call-gap-ms"] === undefined ? 0 : parseCallGapMs(values["call-gap-ms"]);
+  if (callGapMs === null) {
+    process.stderr.write(`--call-gap-ms must be a non-negative integer, got "${values["call-gap-ms"]}"\n`);
     return 2;
   }
   // Late import: config.ts loads hive.yaml/.env/Honeypot from HIVE_HOME; keep the module importable by tests without it.
@@ -405,6 +425,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     out: (row) => appendFileSync(values.out!, `${JSON.stringify(row)}\n`),
     drill: values.drill as Drill | undefined,
     kill: operatorKillPrompt,
+    sleep: deps.sleep,
   };
   const callIds: string[] = [];
   if (values.warmup) {
@@ -429,7 +450,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     const ids = await Promise.all([1, 2, 3].map(() => runBenchCall({ ...opts, drill: undefined })));
     callIds.push(...ids);
   } else {
-    for (let i = 0; i < calls; i += 1) callIds.push(await runBenchCall(opts));
+    // Each warm call holds one of the agent's `spawnBudget` slots (5 on the mokie-bench clone) for the whole call and
+    // for WARM_IDLE_TIMEOUT_MS (120 s) after its last turn, so back-to-back calls beyond `spawnBudget` can be rejected
+    // with 503s before earlier leases idle out (and a kill prompt can find a still-open earlier lease's CLI child).
+    // `--call-gap-ms` is the operator's lever here; raising the clone's `spawnBudget` is the other, set on the instance.
+    const sleep = opts.sleep ?? defaultSleep;
+    for (let i = 0; i < calls; i += 1) {
+      if (i > 0 && callGapMs > 0) await sleep(callGapMs);
+      callIds.push(await runBenchCall(opts));
+    }
   }
   process.stderr.write(
     `bench complete: ${callIds.length} call(s)\n${callIds.map((id) => `  --call ${id}=${values.arm}`).join("\n")}\n`,
