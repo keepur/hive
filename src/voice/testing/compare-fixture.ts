@@ -424,19 +424,36 @@ export function buildCompareFixture(): { jsonl: string; engineLog: string; bench
     }), // DISAGREES: jsonl says 1230
     JSON.stringify({ ts: ts(11), level: "info", component: "other", msg: "unrelated row", callId: "call-warm-a" }),
   ];
-  const benchResults = [1, 2, 3, 4].map((i) =>
+  const benchResults = [
+    ...[1, 2, 3, 4].map((i) =>
+      JSON.stringify({
+        callId: "call-bench-1",
+        arm: "A1-warm-bench",
+        turnIndex: i,
+        turnId: `call-bench-1-t${i}`,
+        expectsTool: i === 4,
+        keywordPass: i === 4 ? null : true,
+        clientFirstTextMs: 1300 + i,
+        textLength: 8,
+        status: 200,
+      }),
+    ),
+    // A mid-sentence barge-in row (the §6.1 script's turn 5): the answer was cut off before any keyword
+    // arrived, so `keywordPass` is false, and the comparison must count it not-applicable, never a fail.
+    // It expects no tool, so it needs no engine turn to join.
     JSON.stringify({
       callId: "call-bench-1",
       arm: "A1-warm-bench",
-      turnIndex: i,
-      turnId: `call-bench-1-t${i}`,
-      expectsTool: i === 4,
-      keywordPass: i === 4 ? null : true,
-      clientFirstTextMs: 1300 + i,
+      turnIndex: 5,
+      turnId: "call-bench-1-t5",
+      expectsTool: false,
+      keywordPass: false,
+      clientFirstTextMs: 1305,
       textLength: 8,
       status: 200,
+      bargeIn: true,
     }),
-  );
+  ];
   return {
     jsonl: `${lines.join("\n")}\n`,
     engineLog: `${engineLog.join("\n")}\n`,

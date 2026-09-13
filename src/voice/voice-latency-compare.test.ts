@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { buildCompareFixture } from "./testing/compare-fixture.js";
+import { buildCall, buildCompareFixture, type FixtureTurn } from "./testing/compare-fixture.js";
 import {
   armKindOf,
   bootstrapMedianDifference,
@@ -323,10 +323,65 @@ describe("KPR-465 comparison reader (R1)", () => {
       .split("\n")
       .map((l) => JSON.parse(l));
     const report = compareVoiceLatency({ calls: calls({ "call-bench-1": "A1-warm-bench" }), benchResults: rows });
+    // notApplicable 2: t4 carries no keyword check, and t5 is the barge-in row whose truncated answer missed its keyword.
     expect(report.benchAssertions).toEqual({
-      rows: 4,
-      keyword: { pass: 3, fail: 0, notApplicable: 1 },
+      rows: 5,
+      keyword: { pass: 3, fail: 0, notApplicable: 2 },
       tool: { pass: 1, fail: 0, unobserved: 0 },
+    });
+  });
+
+  it("barge-in bench rows count as neither a keyword nor a tool pass/fail, whatever the truncated turn showed", () => {
+    const turn = (index: number, extra: Partial<FixtureTurn>): FixtureTurn => ({
+      index,
+      warm: true,
+      selected: index === 1 ? "fresh" : "warm",
+      boot: index === 1 ? 655 : "na",
+      queue: 40 + index,
+      init: 1150 + 40 * index,
+      engineFirstText: 1250 + 40 * index,
+      effort: "medium",
+      engineOnly: true,
+      ...extra,
+    });
+    // Two lookups the caller barged in on during the tool wait (script turn 7's shape), both cancelled: t2's tool
+    // had not finished (toolCount 0, answer missed its keyword); t3's had (toolCount 1, answer hit its keyword).
+    const jsonl = `${buildCall("call-barge", [
+      turn(1, {}),
+      turn(2, { interrupted: true, toolCount: 0 }),
+      turn(3, { interrupted: true, toolCount: 1 }),
+    ]).join("\n")}\n`;
+    const benchRow = (index: number, keywordPass: boolean) => ({
+      callId: "call-barge",
+      arm: "A1-warm-bench",
+      turnIndex: index,
+      turnId: `call-barge-t${index}`,
+      expectsTool: true,
+      keywordPass,
+      clientFirstTextMs: null,
+      textLength: 0,
+      status: 200,
+    });
+    const assertionsWith = (flag: { bargeIn?: boolean }) =>
+      compareVoiceLatency({
+        calls: [{ callId: "call-barge", arm: "A1-warm-bench", jsonl }],
+        benchResults: [
+          { ...benchRow(2, false), ...flag },
+          { ...benchRow(3, true), ...flag },
+        ],
+      }).benchAssertions;
+    // Control: the same rows without the flag (absent, as in older result files, or false) are scored as usual.
+    for (const flag of [{}, { bargeIn: false }]) {
+      expect(assertionsWith(flag)).toEqual({
+        rows: 2,
+        keyword: { pass: 1, fail: 1, notApplicable: 0 },
+        tool: { pass: 1, fail: 1, unobserved: 0 },
+      });
+    }
+    expect(assertionsWith({ bargeIn: true })).toEqual({
+      rows: 2,
+      keyword: { pass: 0, fail: 0, notApplicable: 2 },
+      tool: { pass: 0, fail: 0, unobserved: 2 },
     });
   });
 

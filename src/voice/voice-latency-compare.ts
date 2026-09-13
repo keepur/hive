@@ -72,6 +72,12 @@ export interface BenchResultRow {
   clientFirstTextMs: number | null;
   textLength: number;
   status: number | null;
+  /**
+   * The bench closed this turn on purpose (script turns 5 and 7). How much of the answer arrived before the
+   * close depends on arm speed, not correctness, so its keyword and tool checks count as neither pass nor fail.
+   * Optional: result files written before the field existed still parse.
+   */
+  bargeIn?: boolean;
 }
 
 export interface TurnRow {
@@ -604,12 +610,14 @@ export function compareVoiceLatency(input: CompareInput): CompareReport {
       tool: { pass: 0, fail: 0, unobserved: 0 },
     };
     for (const r of input.benchResults) {
-      if (r.keywordPass === null) benchAssertions.keyword.notApplicable += 1;
+      // A barge-in answer was truncated deliberately: whatever it showed is latency, not correctness.
+      const bargeIn = r.bargeIn === true;
+      if (bargeIn || r.keywordPass === null) benchAssertions.keyword.notApplicable += 1;
       else if (r.keywordPass) benchAssertions.keyword.pass += 1;
       else benchAssertions.keyword.fail += 1;
       if (!r.expectsTool) continue;
       const turn = byKey.get(`${r.callId} ${r.turnId}`);
-      if (!turn || turn.toolCount === null) benchAssertions.tool.unobserved += 1;
+      if (bargeIn || !turn || turn.toolCount === null) benchAssertions.tool.unobserved += 1;
       else if (turn.toolCount >= 1) benchAssertions.tool.pass += 1;
       else benchAssertions.tool.fail += 1;
     }

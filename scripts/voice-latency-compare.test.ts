@@ -98,9 +98,10 @@ describe("voice-latency-compare CLI", () => {
     expect(ok.stderr).not.toMatch(/voice-latency-compare:/);
     expect(ok.status).toBe(0);
     const report = JSON.parse(ok.stdout);
+    // The fixture's barge-in row (t5, keywordPass false) lands in notApplicable, not fail: the CLI passes bargeIn through.
     expect(report.benchAssertions).toEqual({
-      rows: 4,
-      keyword: { pass: 3, fail: 0, notApplicable: 1 },
+      rows: 5,
+      keyword: { pass: 3, fail: 0, notApplicable: 2 },
       tool: { pass: 1, fail: 0, unobserved: 0 },
     });
     // Narrow: a non-header line missing the row fields is still rejected, header or not.

@@ -63,6 +63,7 @@ function parseBenchResults(text: string): BenchResultRow[] {
       clientFirstTextMs: typeof v.clientFirstTextMs === "number" ? v.clientFirstTextMs : null,
       textLength: typeof v.textLength === "number" ? v.textLength : 0,
       status: typeof v.status === "number" ? v.status : null,
+      ...(typeof v.bargeIn === "boolean" ? { bargeIn: v.bargeIn } : {}),
     });
   }
   return rows;
