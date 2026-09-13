@@ -281,6 +281,19 @@ export function parseCallCount(raw: string): number | null {
 }
 
 /**
+ * KPR-465 review round 1: resolve the effective `--calls` count. A kill-*
+ * drill is a single scripted scenario (one kill, one operator prompt) — the
+ * general default of 8 would repeat the drill's kill point once per call and
+ * prompt the operator 8 times. Default a kill-* drill to 1 unless the
+ * operator explicitly passes `--calls` (e.g. to gather several kill samples
+ * in one invocation). `raw` is `undefined` when `--calls` was not passed.
+ */
+export function resolveCallsCount(raw: string | undefined, drill: string | undefined): number | null {
+  if (raw !== undefined) return parseCallCount(raw);
+  return drill?.startsWith("kill-") ? 1 : 8;
+}
+
+/**
  * Line 1 of the `--out` file. Carries no turn and no `callId`; scripts/voice-latency-compare.ts
  * recognizes exactly this shape (`run: true`, no `callId`) and skips it.
  */
@@ -328,7 +341,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     options: {
       arm: { type: "string" },
       agent: { type: "string", default: "mokie-bench" },
-      calls: { type: "string", default: "8" },
+      calls: { type: "string" },
       out: { type: "string" },
       "base-url": { type: "string" },
       drill: { type: "string" },
@@ -339,7 +352,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   });
   if (!values.arm || !values.out) {
     process.stderr.write(
-      "usage: voice-engine-bench --arm <label> --out <jsonl> [--agent mokie-bench] [--calls 8] [--base-url http://127.0.0.1:<port>] [--drill double-request|concurrent-3|kill-a|kill-b|kill-c] [--warmup]\n",
+      "usage: voice-engine-bench --arm <label> --out <jsonl> [--agent mokie-bench] [--calls 8, or 1 for a kill-* drill] [--base-url http://127.0.0.1:<port>] [--drill double-request|concurrent-3|kill-a|kill-b|kill-c] [--warmup]\n",
     );
     return 2;
   }
@@ -347,7 +360,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     process.stderr.write(`unknown drill ${values.drill}\n`);
     return 2;
   }
-  const calls = parseCallCount(values.calls!);
+  const calls = resolveCallsCount(values.calls, values.drill);
   if (calls === null) {
     process.stderr.write(`--calls must be a positive integer, got "${values.calls}"\n`);
     return 2;

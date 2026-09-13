@@ -62,6 +62,7 @@ import {
   main,
   parseCallCount,
   postTurn,
+  resolveCallsCount,
   runBenchCall,
   type BenchOptions,
 } from "./voice-engine-bench.js";
@@ -377,6 +378,18 @@ describe("voice-engine-bench argument validation", () => {
     for (const bad of ["abc", "", "0", "-1", "8abc", "1e3", "1.5", " 8", "9007199254740993"]) {
       expect(parseCallCount(bad)).toBeNull();
     }
+  });
+
+  it("resolveCallsCount (KPR-465 review round 1): a kill-* drill defaults to 1 call, everything else defaults to 8, an explicit --calls always wins", () => {
+    expect(resolveCallsCount(undefined, undefined)).toBe(8);
+    expect(resolveCallsCount(undefined, "double-request")).toBe(8);
+    expect(resolveCallsCount(undefined, "concurrent-3")).toBe(8);
+    expect(resolveCallsCount(undefined, "kill-a")).toBe(1);
+    expect(resolveCallsCount(undefined, "kill-b")).toBe(1);
+    expect(resolveCallsCount(undefined, "kill-c")).toBe(1);
+    expect(resolveCallsCount("3", "kill-a")).toBe(3); // explicit override still honored for a kill drill
+    expect(resolveCallsCount("3", undefined)).toBe(3);
+    expect(resolveCallsCount("abc", "kill-a")).toBeNull(); // still validated
   });
 
   it("loopbackBaseUrlError accepts plain http to 127.0.0.1 or localhost only", () => {
