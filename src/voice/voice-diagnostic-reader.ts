@@ -263,12 +263,16 @@ const PAYLOAD_FIELDS: Record<VoiceDiagnosticEventName, readonly string[]> = {
   engine_client_closed: [],
   // KPR-465 §3.2 delivery note (version decision): `bootToInitMs` and
   // `queueWaitMs` on the two engine terminals are OPTIONAL additions under
-  // `schemaVersion: 2` — no version bump. No existing key changes meaning,
-  // KPR-464-era rows without them parse unchanged, and the comparison reader
-  // treats an absent key as `not_observed` for stage tables. A bump would
-  // force compare mode to refuse pooling across versions for rows that are
-  // semantically identical. Allowlisted (and measure-validated below) one
-  // commit before the adapter emits them, so no commit writes rejected rows.
+  // `schemaVersion: 2` — no version bump. KPR-464-era rows without them parse
+  // unchanged, and the comparison reader treats an absent key as
+  // `not_observed` for stage tables. Parsing is compatible, but one existing
+  // key's timing is not: the warm opener's (turn 1) `initToFirstTokenMs` now
+  // runs init → first text and excludes boot (reported as `bootToInitMs`),
+  // where pre-KPR-465 warm-opener rows ran push → first text including boot.
+  // Never pool warm-opener `initToFirstTokenMs` across the KPR-465 boundary;
+  // KPR-465's own arms are same-build. Allowlisted (and measure-validated
+  // below) one commit before the adapter emits them, so no commit writes
+  // rejected rows.
   engine_attempt_terminal: [
     "continuity",
     "launchAdmission",

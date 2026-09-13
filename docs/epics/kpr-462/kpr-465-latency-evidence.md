@@ -6,6 +6,8 @@
 **Running identities (read back at session start):** pending
 **Schema decision:** additive keys under `voice_diagnostic` schemaVersion 2 (`bootToInitMs`, `queueWaitMs`, `effort` on engine terminals; endpointing on `session_started`); no version bump (chunk A Task A3 Step 2 rationale: no existing key changes meaning, KPR-464-era rows parse unchanged, and a bump would stop the compare mode from pooling semantically identical rows). The keys on this build are `bootToInitMs` and `queueWaitMs` (chunk A) and `effort` (chunk C). The endpointing keys on `session_started` belong to chunk D Task D4, which has not been built, so no endpointing key is emitted or allowlisted.
 
+**Correction (2026-09-13, post-merge coherence review):** the rationale above is wrong on one point. An existing key did change meaning: the warm opener's (turn 1) `initToFirstTokenMs` is now init → first text and excludes boot, which is reported separately as `bootToInitMs` (measurement note (i) below). Before KPR-465, a warm-opener row measured push → first text including boot. Rows still parse across the boundary, but warm-opener `initToFirstTokenMs` values from before and after KPR-465 are not comparable and must not be pooled. KPR-465's own comparisons are unaffected because every arm runs on the same build. Warm turns ≥ 2 and cold turns are unchanged. Canon: KPR-462 register R8, corrected.
+
 Authored 2026-09-12 (offline only). No instance, database, log, or call was touched to write this record.
 
 ## 1. Offline verification (chunks A–D)
