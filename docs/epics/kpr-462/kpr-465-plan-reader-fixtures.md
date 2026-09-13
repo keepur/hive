@@ -18,7 +18,7 @@ The Testing Contract below is reproduced from part 1 verbatim so this file stand
   - Scope: CLI end-to-end over the checked-in fixtures (`spawnSync` of `npx tsx scripts/voice-latency-compare.ts`), asserting exit codes 0/1/2 and that stdout JSON equals the module's output for the same inputs.
   - Reason: the operator runs the CLI, not the module; exit codes are the run gate.
   - Harness: `existing` (`scripts/voice-latency-baseline.test.ts` shows the `spawnSync` + tmpdir pattern).
-  - Minimum assertions: fixture run exits 0 with `ok: true`; mislabel fixture run exits 1; missing `--call` exits 2; unknown-key file exits 0 but reports `malformedRows ≥ 1` for that call.
+  - Minimum assertions: fixture run exits 0 with `ok: true`; mislabel fixture run exits 1; missing `--call` exits 2; unknown-key file exits **1** (not 0 — corrected at `create-tests`, post pre-PR review round 5: the reader already marks a call with malformed rows incomplete, and R1 minimum assertion (12) turns an incomplete call into `ok: false`, which the CLI reports as exit 1) with `malformedRows ≥ 1` for that call.
 - E2E: `not-required` (the reader consumes bench/live artifacts produced by chunks D/E).
 
 ### Critical Flows

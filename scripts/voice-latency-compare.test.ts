@@ -115,4 +115,30 @@ describe("voice-latency-compare CLI", () => {
     writeFileSync(runWithCall, `${JSON.stringify({ run: true, callId: "call-bench-1" })}\n${rows}`);
     expect(run([...args, runWithCall]).status).toBe(2);
   });
+
+  // create-tests audit (post pre-PR review round 5): closes a genuine gap — no
+  // test exercised an unknown-key input file through the CLI. The chunk B
+  // plan's own draft text said this case "exits 0 ... reports malformedRows
+  // >= 1", but that's wrong by design: the reader already marks a call with
+  // malformed rows incomplete (voice-diagnostic-reader.ts), and R1 minimum
+  // assertion (12) turns an incomplete call into ok:false, which exits 1 —
+  // never 0. This test pins the real, correct behavior.
+  it("an unknown key in the input file surfaces as a malformed row, marks the call incomplete, and exits 1 (not 0)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "kpr465-"));
+    const jsonl = readFileSync(`${FIX}/kpr-465-compare.jsonl`, "utf8");
+    const withUnknownKey = jsonl.replace(
+      '"event":"engine_received","correlation":"worker"',
+      '"event":"engine_received","correlation":"worker","transcript":"secret"',
+    );
+    const path = join(dir, "unknown-key.jsonl");
+    writeFileSync(path, withUnknownKey);
+    const r = run(["--input", path, "--call", "call-cold-a=A0-cold"]);
+    expect(r.status).toBe(1);
+    const report = JSON.parse(r.stdout);
+    expect(report.ok).toBe(false);
+    expect(report.failures).toEqual(["call call-cold-a (A0-cold) is incomplete"]);
+    expect(report.arms[0]!.calls[0]!.malformedRows).toBeGreaterThanOrEqual(1);
+    expect(report.arms[0]!.calls[0]!.complete).toBe(false);
+    expect(r.stdout).not.toContain("secret");
+  });
 });
