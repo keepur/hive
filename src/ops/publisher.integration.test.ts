@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ObjectId } from "mongodb";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // `store.ts`, `publisher.ts` and `observe.ts` each call `createLogger` at
 // module load; the mock must hand back the SAME object every call so the
@@ -1074,6 +1077,33 @@ describe("overlapping subscription reloads commit by start order, not completion
     await reloadA;
     expect(publisher.getSnapshot().subscriptions).toBe(1);
     expect(debugsMatching(SUPERSEDED_DEBUG)).toBe(0);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// AC8 (KPR-507) — documentation
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("AC8 (KPR-507) — CLAUDE.md documents the ordered-commit rule, adjacent to the reload-cadence clause", () => {
+  const claude = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "CLAUDE.md"), "utf8");
+
+  it("the Ops tool-failure publishing bullet states the ordered-commit rule next to the 60s/SIGUSR1 clause", () => {
+    const anchor = "the subscription set, by contrast, reloads every 60 s and on SIGUSR1";
+    const anchorIndex = claude.indexOf(anchor);
+    expect(anchorIndex).toBeGreaterThan(-1);
+    // "Adjacent to" the anchor clause, not merely present anywhere in the file.
+    const nearby = claude.slice(anchorIndex, anchorIndex + 600);
+    expect(nearby).toMatch(/ordered by start/);
+    expect(nearby.toLowerCase()).toContain("supersedes nothing");
+  });
+
+  it("does not claim the notifier fix repaired the publisher, and does not mirror the sentence onto the Ops notifier bullet", () => {
+    expect(claude).not.toMatch(/notifier.{0,80}repair(?:ed|s)?.{0,80}publisher/is);
+    const notifierBulletStart = claude.indexOf("Ops notifier — the acknowledgement ledger");
+    expect(notifierBulletStart).toBeGreaterThan(-1);
+    const notifierBulletEnd = claude.indexOf("\n- **", notifierBulletStart + 1);
+    const notifierBullet = claude.slice(notifierBulletStart, notifierBulletEnd === -1 ? undefined : notifierBulletEnd);
+    expect(notifierBullet).not.toMatch(/ordered by start/);
   });
 });
 
