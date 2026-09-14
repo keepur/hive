@@ -29,6 +29,7 @@ import {
   initialBootstrapWork,
   reconcileBootstrap,
   runBootstrap,
+  runHostPreparationJanitor,
   type BootstrapDeps,
 } from "./bootstrap.js";
 import {
@@ -308,6 +309,7 @@ async function bootstrapDeps(env: NodeJS.ProcessEnv): Promise<BootstrapDeps> {
     npmCliPath: await hostNpmCli(env),
     pathEnv: env.PATH,
     invokingHome: env.HOME,
+    isProcessLive: (owner) => processIsLive(nodeReconcileHostIO, owner),
   };
 }
 
@@ -339,6 +341,10 @@ async function runFrozenBootstrap(operation: AcquiredOperation, env: NodeJS.Proc
     if (disposal && disposal.failures.length > 0) {
       operation.record.staging.sweepFailures.push(...disposal.failures);
       await persistOperation(operation).catch(() => {});
+    }
+    // Only after the terminal bootstrap record is durable; failures are reported, never fatal.
+    if (!retainLock && operation.record.bootstrap?.outcome) {
+      await runHostPreparationJanitor(operation).catch(() => []);
     }
     if (!retainLock && operation.record.resolution) await finishOperationLock(operation);
   }
@@ -584,6 +590,7 @@ async function runReconcileMode(args: DeploymentArguments, env: NodeJS.ProcessEn
           isProcessLive: (owner) => processIsLive(nodeReconcileHostIO, owner),
         });
         await writeOperationJson(resolve(acquired.paths.operationDirectory, "reconciliation.json"), outcome);
+        await runHostPreparationJanitor(acquired).catch(() => []);
         await finishOperationLock(acquired, { reconcileClaimId: claimId });
         return outcome;
       },

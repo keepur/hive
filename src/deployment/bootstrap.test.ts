@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -211,6 +211,52 @@ describe("durable tooling bootstrap", { timeout: 120_000 }, () => {
     const record = await readRegisteredRecord<BootstrapRecord>(result.recordPath, { instance, kind: "bootstrap" });
     expect(record.payload.packageRoot.path).toBe(final);
     expect(record.payload.archive.sha256).toBe(f.archiveSha);
+  });
+
+  it("a host-prepared helper without a validated receipt aborts before any self-test, job or install", async () => {
+    const f = fixture();
+    const hooks: JobHooks = { calls: [] };
+    let selfTests = 0;
+    const operation = await acquireOperation({
+      instanceHome: f.home,
+      instanceId: "dodi",
+      mode: "bootstrap",
+      workKind: "bootstrap",
+      bootstrap: initialBootstrapWork({
+        artifact: f.archive,
+        sha256: f.archiveSha,
+        revision: REVISION,
+        sourceHelper: resolve(
+          f.home,
+          ".hive-state",
+          "bootstrap",
+          `.prepare-${randomUUID()}`,
+          "package",
+          "pkg",
+          "deploy.min.js",
+        ),
+      }),
+      toolSha256: f.helperSha,
+      ownerStartTime: "start",
+    });
+    const d = deps(f, hooks);
+    await expect(
+      runBootstrap(
+        operation,
+        { configPath: configPath(f) },
+        {
+          ...d,
+          selfTest: async (options) => {
+            selfTests += 1;
+            return d.selfTest!(options);
+          },
+        },
+      ),
+    ).rejects.toThrow("PREPARATION_ORPHAN_RETAINED");
+    expect(selfTests).toBe(0);
+    expect(hooks.calls).toEqual([]);
+    expect(operation.record.bootstrap?.adoption).toBeNull();
+    await releaseLock(operation).catch(() => {});
   });
 
   it("sweeps staging siblings at start and reuses a final-name entry without reinstalling", async () => {

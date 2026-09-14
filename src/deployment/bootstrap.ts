@@ -67,6 +67,12 @@ import {
   type TreeSeal,
 } from "./pilot-records.js";
 import { readRelease, type Release } from "./release.js";
+import {
+  adoptHostPreparation,
+  disposeHostPreparation,
+  PreparationAdoptionError,
+  type HostAdoption,
+} from "./host-preparation.js";
 
 const log = createLogger("deployment-bootstrap");
 
@@ -115,6 +121,10 @@ export interface BootstrapWork {
   finalEntry: TreeSeal | null;
   reused: boolean;
   registration: RecordRef | null;
+  /** Immutable retained copy of the adopted host preparation's validated receipt. */
+  hostPreparation: FileSeal | null;
+  /** Journaled receipt adoption and its separately fenced janitor state. */
+  adoption: HostAdoption | null;
   outcome: "validated" | "aborted" | null;
 }
 
@@ -143,6 +153,8 @@ export function initialBootstrapWork(input: {
     finalEntry: null,
     reused: false,
     registration: null,
+    hostPreparation: null,
+    adoption: null,
     outcome: null,
   };
 }
@@ -190,6 +202,47 @@ export interface BootstrapDeps {
   runnerOptions?: Pick<ConfinedJobRunnerOptions, "io">;
   promotionIO?: ArtifactStagingContext["promotionIO"];
   selectMethod?: typeof selectPromotionMethod;
+  /** OS liveness of a host preparer; required to adopt a host-prepared helper. */
+  isProcessLive?(owner: { pid: number; startTime: string }): Promise<boolean>;
+}
+
+/**
+ * Adopt a host-prepared source helper's receipt before any install (chunk 5
+ * Step 5). Validation failures abort with a fixed code; an interrupted journal
+ * that no longer matches the exact validated or adopted bytes is unresolved.
+ */
+async function adoptPreparation(operation: AcquiredOperation, configPath: string, deps: BootstrapDeps): Promise<void> {
+  const state = work(operation);
+  try {
+    await adoptHostPreparation(operation, state, {
+      configPath,
+      isProcessLive:
+        deps.isProcessLive ??
+        (async () => {
+          throw new PreparationAdoptionError("PREPARATION_OWNER_UNVERIFIED");
+        }),
+    });
+  } catch (error) {
+    if (error instanceof PreparationAdoptionError) throw new BootstrapAbortedError(error.code);
+    throw error;
+  }
+}
+
+/**
+ * Operation-owned janitor after the terminal bootstrap record is durable:
+ * disposes only the adopted preparation directory and receipt by identity.
+ * Failures are reported with the sweep failures, never fatal.
+ */
+export async function runHostPreparationJanitor(operation: AcquiredOperation): Promise<string[]> {
+  const state = work(operation);
+  const failures = await disposeHostPreparation(operation, state);
+  if (failures.length > 0) {
+    operation.record.staging.sweepFailures.push(
+      ...failures.map((message) => ({ path: state.adoption?.directory.path ?? state.sourceHelper, message })),
+    );
+    await persistOperation(operation);
+  }
+  return failures;
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -556,6 +609,8 @@ export async function runBootstrap(
   const home = operation.record.canonicalHome;
   const instance = instanceOf(operation, options.configPath);
   const paths = bootstrapPaths(home, state.reviewedSha256, operation.record.id);
+  // Receipt adoption is journaled and retained before any self-test, job or install.
+  await adoptPreparation(operation, options.configPath, deps);
   const { runner, context } = await stagingContext(operation, deps);
 
   // Unconditional sweep: only staging siblings, never a final-name entry.
@@ -711,6 +766,18 @@ export async function reconcileBootstrap(
   const instance = instanceOf(operation, deps.configPath);
   const paths = bootstrapPaths(home, state.reviewedSha256, operation.record.id);
   if (operation.record.signalsBegun !== false) throw new BootstrapUnresolvedError("bootstrap work cannot signal");
+  if (state.adoption?.state === "intended") {
+    // Finish only against the exact prior validated or predicted adopted receipt bytes.
+    try {
+      await adoptHostPreparation(operation, state, {
+        configPath: deps.configPath,
+        isProcessLive: deps.isProcessLive,
+      });
+    } catch (error) {
+      const code = error instanceof PreparationAdoptionError ? error.code : "PREPARATION_ADOPTION_UNRESOLVED";
+      throw new BootstrapUnresolvedError(code, { cause: error });
+    }
+  }
   const promotion = operation.record.staging.promotion;
   if (promotion && (promotion.state === "intended" || promotion.state === "copying") && promotion.copyPid !== null) {
     if (promotion.copyStartTime === null) throw new BootstrapUnresolvedError("promotion copy identity unknown");
