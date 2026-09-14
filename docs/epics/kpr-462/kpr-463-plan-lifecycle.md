@@ -127,7 +127,7 @@ Add `resolveDotenvPath` cases for absent/default, relative `hive-personal.yaml`,
 
 ## Task 8: Serialize, stage and recover the paired transaction
 
-**Files:** Create `src/deployment/operation.ts`, `artifact.ts`, `transaction.ts`, `main.ts`, `confined-job.ts`, `clone-promotion.ts`, `transaction.test.ts`, `confined-job.test.ts`, `clone-promotion.test.ts`, `lifecycle.integration.test.ts`, `adoption.integration.test.ts`, `confinement.integration.test.ts`; modify `src/cli/prereqs.ts`, `src/cli/update-preflight.ts`, `service/deploy.sh`, `service/deploy-check.sh`, `service/deploy.test.sh`.
+**Files:** Create `src/deployment/operation.ts`, `artifact.ts`, `transaction.ts`, `main.ts`, `confined-job.ts`, `clone-promotion.ts`, `transaction.test.ts`, `confined-job.test.ts`, `clone-promotion.test.ts`, `lifecycle.integration.test.ts`, `adoption.integration.test.ts`, `confinement.integration.test.ts`; modify `src/cli/prereqs.ts` (init/resume self-test; the update/first-adoption self-test lives in the frozen helper's locked preflight), `service/deploy.sh`, `service/deploy-check.sh`, `service/deploy.test.sh`.
 
 **Schedule:** S7 implements Steps 1–5 and Step 6's injected transaction unit matrix, then finishes Task 7 daemon/install and Task 9 CLI/wrapper/bootstrap routing in that same source checkpoint. All release/ports/services/health/diagnostic imports already exist. S9 adds and runs the complete `lifecycle.integration.test.ts` and Task 9 `adoption.integration.test.ts`, including actual frozen-helper execution, packed preflight and Task 6 closed-gate propagation. S7 unit tests inject the existing filesystem/process/probe boundaries; they cannot certify the future S8 bundle. Keep each deferred integration assertion pending until S9.
 
