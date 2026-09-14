@@ -36,19 +36,33 @@
  * - Inbound called-number: LiveKit SIP attribute `sip.trunkPhoneNumber`
  *   (protocol AttrSIPTrunkNumber). No JS constant in agents 1.6.4 / rtc-node.
  */
-import { voice, type ErrorEvent, type JobContext } from "@livekit/agents";
+import {
+  voice,
+  type ConversationItemAddedEvent,
+  type ErrorEvent,
+  type JobContext,
+  type MetricsCollectedEvent,
+  type SpeechCreatedEvent,
+  type UserInputTranscribedEvent,
+  type UserStateChangedEvent,
+} from "@livekit/agents";
 import * as cartesia from "@livekit/agents-plugin-cartesia";
 import * as deepgram from "@livekit/agents-plugin-deepgram";
 import * as elevenlabs from "@livekit/agents-plugin-elevenlabs";
 import * as silero from "@livekit/agents-plugin-silero";
 import { SipClient } from "livekit-server-sdk";
+import { RoomEvent, type RemoteParticipant } from "@livekit/rtc-node";
 import { ReadableStream, TransformStream } from "node:stream/web";
 import { createLogger } from "../logging/logger.js";
 import type { VendorCell } from "./cells.js";
 import type { DispatchMetadata } from "./dispatch-meta.js";
 import { FAILURE_BEHAVIOR, FALLBACK_LINES, resolveFailureAction } from "./error-map.js";
 import { BridgeError, HiveLLM } from "./hive-llm.js";
-import { CallStats, TurnMetrics, type VoiceWorkerHeartbeat } from "./telemetry.js";
+import { SpeechTrace, type CallDiagnosticCounts } from "./speech-trace.js";
+import { StartupActionOwnership, StartupArbiter, type RecoveryChain, type StartupEvent } from "./startup-arbiter.js";
+import { CallStats, type VoiceWorkerHeartbeat } from "./telemetry.js";
+import { TracedAgent } from "./traced-agent.js";
+import { VOICE_PROCESS_ID } from "../voice/voice-trace.js";
 import { normalizeForTTS } from "./tts-normalize.js";
 import type { WorkerConfig } from "./worker-config.js";
 
@@ -110,12 +124,27 @@ export function resolveInboundAgent(
 /** Ordered job teardown so noteCallEnded hits a live Mongo client (KPR-322). */
 export async function runJobShutdown(hooks: {
   releaseCall: () => Promise<void>;
-  flush: () => Promise<void>;
+  closeTrace?: () => void;
+  settleTrace?: () => Promise<unknown>;
+  snapshotTrace?: () => CallDiagnosticCounts;
+  flush: (diagnostics?: CallDiagnosticCounts) => Promise<unknown>;
   closeMongo: () => Promise<void>;
 }): Promise<void> {
-  await hooks.releaseCall();
-  await hooks.flush();
-  await hooks.closeMongo();
+  try {
+    hooks.closeTrace?.();
+  } catch {
+    // Continue teardown: later persistence and resource release are independent.
+  }
+  await hooks.settleTrace?.().catch(() => {});
+  let diagnostics: CallDiagnosticCounts | undefined;
+  try {
+    diagnostics = hooks.snapshotTrace?.();
+  } catch {
+    // A missing snapshot must not strand heartbeat or Mongo cleanup.
+  }
+  await hooks.releaseCall().catch(() => {});
+  await hooks.flush(diagnostics).catch(() => {});
+  await hooks.closeMongo().catch(() => {});
 }
 
 export async function runCallSession(
@@ -126,9 +155,9 @@ export async function runCallSession(
   heartbeat?: VoiceWorkerHeartbeat,
   closeMongo?: () => Promise<void>,
 ): Promise<void> {
-  const shutdownHooks = {
+  const shutdownHooks: Parameters<typeof runJobShutdown>[0] = {
     releaseCall: async () => {},
-    flush: async () => {},
+    flush: async (_diagnostics?: CallDiagnosticCounts) => {},
     closeMongo: closeMongo ?? (async () => {}),
   };
   ctx.addShutdownCallback(() => runJobShutdown(shutdownHooks));
@@ -157,6 +186,8 @@ export async function runCallSession(
     ({ agentId: hiveAgentId, goal, context } = resolved);
   }
 
+  const speechTrace = new SpeechTrace({ callId, workerBootId: VOICE_PROCESS_ID });
+  const callAbort = new AbortController();
   const hiveLLM = new HiveLLM({
     bridgeUrl: wc.bridgeUrl,
     bridgeToken: wc.bridgeToken,
@@ -164,28 +195,86 @@ export async function runCallSession(
     callId,
     goal,
     context,
+    trace: speechTrace,
+    callSignal: callAbort.signal,
   });
 
+  const ttsProvider = buildTts(cell, wc, hiveAgentId);
   const vad = await silero.VAD.load();
   const session = new voice.AgentSession({
     stt: buildStt(cell, wc.deepgramApiKey),
-    tts: buildTts(cell, wc, hiveAgentId),
+    tts: ttsProvider,
     vad,
     llm: hiveLLM,
     turnHandling: { turnDetection: cell.stt === "deepgram/flux-general-en" ? "stt" : "vad" },
     ttsTextTransforms: ["filter_markdown", "filter_emoji", hiveTtsNormalize],
   });
 
-  const stats = new CallStats(wc, {
+  const stats = new CallStats(
+    wc,
+    {
+      callId,
+      agentId: hiveAgentId,
+      cell,
+      direction: outbound ? "outbound" : "inbound",
+    },
+    (status, reason) => speechTrace.summaryPersistence(status, reason),
+  );
+  const intendedIdentity = outbound ? `sip-${callId}` : undefined;
+  const inputOptions: { audioEnabled: boolean; participantIdentity?: string } = {
+    audioEnabled: true,
+    ...(intendedIdentity ? { participantIdentity: intendedIdentity } : {}),
+  };
+  const outputOptions = { audioEnabled: true };
+
+  let closeCall: (cause: "call_close" | "setup_failed") => Promise<void> = async () => {};
+  // Assigned immediately after the arbiter; its request callback closes over this exact call-local owner.
+  // eslint-disable-next-line prefer-const
+  let ownership!: StartupActionOwnership<BridgeError>;
+  const arbiter = new StartupArbiter({
+    requestOpening: () => {
+      try {
+        return ownership.scheduleOwned("opening", () => session.generateReply());
+      } catch (error) {
+        void closeCall("setup_failed");
+        throw error;
+      }
+    },
+    observe: (event) => observeStartup(speechTrace, event),
+  });
+
+  ownership = new StartupActionOwnership<BridgeError>({
+    arbiter,
+    trace: speechTrace,
+    recover: async (chain, failure, actions) => {
+      await performOwnedRecovery(chain, failure, actions, { session, stats, ctx, heartbeat });
+    },
+  });
+
+  const agent = new TracedAgent({
+    // §5.3: intentionally unused — the ENGINE owns the prompt
+    // (buildVoiceSystemPrompt via TurnContext.systemPromptOverride).
+    instructions: "Placeholder — hive owns the prompt server-side.",
+    tts: ttsProvider,
     callId,
-    agentId: hiveAgentId,
-    cell,
-    direction: outbound ? "outbound" : "inbound",
+    workerBootId: VOICE_PROCESS_ID,
+    callSignal: callAbort.signal,
+    trace: speechTrace,
+    onAcceptedUserTurn: () => {
+      if (callAbort.signal.aborted) return;
+      const acceptedEpoch = ownership.acceptCallerTurn();
+      speechTrace.call({ event: "caller_turn_accepted", acceptedEpoch });
+    },
   });
-  const metrics = new TurnMetrics(callId, cell, hiveLLM, outbound ? "outbound" : "inbound", (line) => {
-    if (line.totalToFirstAudioMs >= 0) stats.recordTurnLatency(line.totalToFirstAudioMs);
-  });
-  metrics.attach(session);
+
+  let traceClosed = false;
+  const closeTrace = (cause: "call_closed" | "setup_failed") => {
+    if (traceClosed) return;
+    traceClosed = true;
+    if (!callAbort.signal.aborted) callAbort.abort();
+    agent.dispose();
+    speechTrace.close(cause);
+  };
 
   if (heartbeat) void heartbeat.noteCallStarted();
   let callReleased = false;
@@ -196,41 +285,235 @@ export async function runCallSession(
     await heartbeat.noteCallEnded();
   };
   shutdownHooks.releaseCall = releaseCall;
-  shutdownHooks.flush = () => stats.flush("completed");
+  shutdownHooks.closeTrace = () => closeTrace("call_closed");
+  shutdownHooks.settleTrace = () => speechTrace.settleWrites();
+  shutdownHooks.snapshotTrace = () => speechTrace.snapshot();
+  shutdownHooks.flush = (diagnostics) => stats.flush("completed", diagnostics);
 
-  session.on(voice.AgentSessionEventTypes.ConversationItemAdded, (ev) => {
+  const onSpeechCreated = (ev: SpeechCreatedEvent) => {
+    const scope = ownership.generationScope;
+    speechTrace.speechCreated(ev.speechHandle, scope?.origin ?? "sdk_response", scope?.epoch ?? arbiter.epoch);
+    ownership.registerSpeech(ev.speechHandle);
+  };
+  const onMetrics = (ev: MetricsCollectedEvent) => {
+    speechTrace.metrics(ev);
+    if (ev.metrics.type === "eou_metrics" && ev.metrics.speechId) ownership.admitEou(ev.metrics.speechId);
+  };
+  const onUserInput = (ev: UserInputTranscribedEvent) => {
+    const hasNonemptyFinal = ev.isFinal && !!ev.transcript.trim();
+    if (hasNonemptyFinal) speechTrace.call({ event: "caller_final_input", hasFinalInput: true });
+    arbiter.finalInput(hasNonemptyFinal);
+  };
+  const onUserState = (ev: UserStateChangedEvent) => {
+    speechTrace.call({ event: "caller_state", state: ev.newState });
+    if (outbound) arbiter.callerState(ev.newState);
+  };
+  const onConversationItem = (ev: ConversationItemAddedEvent) => {
     const item = ev.item;
     if (item.type === "message" && item.role === "assistant" && item.interrupted) {
       hiveLLM.interruptedSpokenText = item.textContent ?? "";
-      stats.recordInterruption();
     }
-  });
+  };
+  const onSessionError = (ev: ErrorEvent) => {
+    const failure = bridgeFailure(ev);
+    if (!failure) {
+      if (ev.error.type === "llm_error") {
+        speechTrace.unboundProviderFailure("llm", "llm_provider_failed");
+      } else if (ev.error.type === "tts_error") {
+        speechTrace.unboundProviderFailure("tts", "tts_provider_failed");
+      }
+      log.error("Session error (non-bridge)", { callId, error: "provider_error" });
+      return;
+    }
+    if (ownership.captureError(failure)) {
+      stats.recordFailure(FAILURE_BEHAVIOR[failure.failureClass].telemetryOutcome);
+    }
+  };
+  const onSessionClose = () => {
+    void closeCall("call_close");
+  };
+  const onFalseInterruption = () => {
+    speechTrace.falseInterruption();
+  };
+  const onOutputPlaybackStarted = () => {
+    speechTrace.outputPlayback();
+  };
+  const onOutputPlaybackFinished = (event: { playbackPosition: number; interrupted: boolean }) => {
+    const durationMs = Number.isFinite(event.playbackPosition)
+      ? Math.max(0, event.playbackPosition * 1_000)
+      : undefined;
+    speechTrace.outputPlayback(durationMs, event.interrupted);
+  };
+  const onParticipantConnected = (participant: RemoteParticipant) => {
+    if (participant.identity === intendedIdentity) {
+      speechTrace.call({ event: "participant_available", intendedParticipant: true });
+    }
+  };
+  const onParticipantDisconnected = (participant: RemoteParticipant) => {
+    if (intendedIdentity && participant.identity === intendedIdentity) void closeCall("call_close");
+  };
+  const onRoomDisconnected = () => {
+    void closeCall("call_close");
+  };
 
-  session.on(voice.AgentSessionEventTypes.Error, (ev) => {
-    void handleSessionError(ev, { session, stats, ctx, callId, heartbeat, releaseCall });
-  });
+  session.on(voice.AgentSessionEventTypes.SpeechCreated, onSpeechCreated);
+  session.on(voice.AgentSessionEventTypes.MetricsCollected, onMetrics);
+  session.on(voice.AgentSessionEventTypes.UserInputTranscribed, onUserInput);
+  session.on(voice.AgentSessionEventTypes.UserStateChanged, onUserState);
+  session.on(voice.AgentSessionEventTypes.ConversationItemAdded, onConversationItem);
+  session.on(voice.AgentSessionEventTypes.Error, onSessionError);
+  session.on(voice.AgentSessionEventTypes.Close, onSessionClose);
+  session.on(voice.AgentSessionEventTypes.AgentFalseInterruption, onFalseInterruption);
+  ctx.room.on(RoomEvent.ParticipantConnected, onParticipantConnected);
+  ctx.room.on(RoomEvent.ParticipantDisconnected, onParticipantDisconnected);
+  ctx.room.on(RoomEvent.Disconnected, onRoomDisconnected);
 
-  const agent = new voice.Agent({
-    // §5.3: intentionally unused — the ENGINE owns the prompt
-    // (buildVoiceSystemPrompt via TurnContext.systemPromptOverride). Do not
-    // "fix" agent behavior here.
-    instructions: "Placeholder — hive owns the prompt server-side.",
+  let callClosedResolve!: () => void;
+  const callClosed = new Promise<void>((resolve) => {
+    callClosedResolve = resolve;
   });
+  let startSettled = false;
+  let preStartCloseInFlight: Promise<void> | null = null;
+  let postStartCloseInFlight: Promise<void> | null = null;
+  let attachedAudioOutput: voice.AudioOutput | null = null;
+  let cleanupPromise: Promise<void> | null = null;
+
+  const detachOutputListeners = () => {
+    attachedAudioOutput?.off(voice.AudioOutput.EVENT_PLAYBACK_STARTED, onOutputPlaybackStarted);
+    attachedAudioOutput?.off(voice.AudioOutput.EVENT_PLAYBACK_FINISHED, onOutputPlaybackFinished);
+    attachedAudioOutput = null;
+  };
+  const attachOutputListeners = () => {
+    const output = session.output.audio;
+    if (!output || output === attachedAudioOutput) return;
+    detachOutputListeners();
+    attachedAudioOutput = output;
+    output.on(voice.AudioOutput.EVENT_PLAYBACK_STARTED, onOutputPlaybackStarted);
+    output.on(voice.AudioOutput.EVENT_PLAYBACK_FINISHED, onOutputPlaybackFinished);
+  };
+
+  const detachListeners = () => {
+    session.off(voice.AgentSessionEventTypes.SpeechCreated, onSpeechCreated);
+    session.off(voice.AgentSessionEventTypes.MetricsCollected, onMetrics);
+    session.off(voice.AgentSessionEventTypes.UserInputTranscribed, onUserInput);
+    session.off(voice.AgentSessionEventTypes.UserStateChanged, onUserState);
+    session.off(voice.AgentSessionEventTypes.ConversationItemAdded, onConversationItem);
+    session.off(voice.AgentSessionEventTypes.Error, onSessionError);
+    session.off(voice.AgentSessionEventTypes.Close, onSessionClose);
+    session.off(voice.AgentSessionEventTypes.AgentFalseInterruption, onFalseInterruption);
+    detachOutputListeners();
+    ctx.room.off(RoomEvent.ParticipantConnected, onParticipantConnected);
+    ctx.room.off(RoomEvent.ParticipantDisconnected, onParticipantDisconnected);
+    ctx.room.off(RoomEvent.Disconnected, onRoomDisconnected);
+  };
+  const disableMedia = () => {
+    inputOptions.audioEnabled = false;
+    outputOptions.audioEnabled = false;
+    try {
+      session.input.setAudioEnabled(false);
+    } catch {}
+    try {
+      session.output.setAudioEnabled(false);
+      session.output.audio?.clearBuffer();
+    } catch {}
+  };
+  const closeSdkAgain = (): Promise<void> => {
+    const postStart = startSettled;
+    const previous = postStart ? postStartCloseInFlight : preStartCloseInFlight;
+    if (previous) return previous;
+    const task = Promise.resolve().then(() => session.close());
+    if (postStart) postStartCloseInFlight = task;
+    else preStartCloseInFlight = task;
+    void task
+      .finally(() => {
+        if (postStartCloseInFlight === task) postStartCloseInFlight = null;
+        if (preStartCloseInFlight === task) preStartCloseInFlight = null;
+      })
+      .catch(() => {});
+    return task;
+  };
+  const closeSdkBounded = async (reason: "call_close" | "late_start" | "late_start_failed") => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        closeSdkAgain().then(
+          () => "closed" as const,
+          () => "failed" as const,
+        ),
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), 2_000);
+        }),
+      ]);
+      speechTrace.teardown(result, reason);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  closeCall = (cause) => {
+    if (!arbiter.closed) {
+      if (!startSettled) speechTrace.startupPending();
+      arbiter.close();
+      ownership.close();
+      disableMedia();
+      if (!callAbort.signal.aborted) callAbort.abort();
+      callClosedResolve();
+      speechTrace.call({ event: "call_closed", reason: cause });
+      closeTrace(cause === "setup_failed" ? "setup_failed" : "call_closed");
+      detachListeners();
+    }
+    cleanupPromise ??= closeSdkBounded("call_close");
+    return cleanupPromise;
+  };
+  shutdownHooks.closeTrace = () => {
+    void closeCall("call_close");
+  };
+  shutdownHooks.settleTrace = async () => {
+    await closeCall("call_close").catch(() => {});
+    return speechTrace.settleWrites();
+  };
+
+  speechTrace.call({ event: "call_started", direction: outbound ? "outbound" : "inbound" });
+
   try {
-    await session.start({ agent, room: ctx.room });
+    const startTask = session.start({ agent, room: ctx.room, inputOptions, outputOptions });
+    const observedStart = startTask.then(
+      async () => {
+        startSettled = true;
+        if (arbiter.closed) await closeSdkBounded("late_start");
+      },
+      async (error) => {
+        startSettled = true;
+        if (arbiter.closed) await closeSdkBounded("late_start_failed");
+        throw error;
+      },
+    );
+    void observedStart.catch(() => {});
+    await Promise.race([observedStart, callClosed]);
+    if (arbiter.closed) return;
+    await observedStart;
+    attachOutputListeners();
+    speechTrace.call({ event: "session_started" });
 
     if (dest) {
+      if (arbiter.closed) return;
       const sip = new SipClient(wc.livekitUrl, wc.livekitApiKey, wc.livekitApiSecret);
       await sip.createSipParticipant(wc.sipTrunkId, dest, callId, {
-        participantIdentity: `sip-${callId}`,
+        participantIdentity: intendedIdentity!,
         waitUntilAnswered: true,
       });
-      session.generateReply();
+      if (arbiter.closed) return;
+      speechTrace.call({ event: "sip_answered", intendedParticipant: true });
+      arbiter.answer();
     }
   } catch (err) {
     // callId only — LiveKit/SIP errors can embed the destination.
     log.error("Call setup failed", { callId });
-    await recordSetupFailure(stats, heartbeat);
+    stats.recordFailure("setup_failed");
+    stats.recordTerminalOutcome("failed");
+    await closeCall("setup_failed");
+    await speechTrace.settleWrites().catch(() => {});
+    if (heartbeat) await heartbeat.noteError("setup_failed");
+    await stats.flush("failed", speechTrace.snapshot());
     throw err;
   }
 }
@@ -239,54 +522,70 @@ export async function runCallSession(
 export async function recordSetupFailure(
   stats: Pick<CallStats, "recordFailure" | "flush">,
   heartbeat?: Pick<VoiceWorkerHeartbeat, "noteError">,
+  diagnostics?: CallDiagnosticCounts,
 ): Promise<void> {
   stats.recordFailure("setup_failed");
   if (heartbeat) await heartbeat.noteError("setup_failed");
-  await stats.flush("failed");
+  await stats.flush("failed", diagnostics);
 }
 
-async function handleSessionError(
-  ev: ErrorEvent,
+function bridgeFailure(ev: ErrorEvent): BridgeError | null {
+  const inner = ev.error;
+  return inner.type === "llm_error" && inner.error instanceof BridgeError ? inner.error : null;
+}
+
+function observeStartup(trace: SpeechTrace, event: StartupEvent): void {
+  if (event.kind === "decision") {
+    trace.call({ event: "opening_decision", decision: event.decision, reason: event.reason });
+  } else if (event.kind === "cancel") {
+    trace.markCancellation(event.speechId, event.reason);
+  }
+}
+
+async function performOwnedRecovery(
+  chain: RecoveryChain<BridgeError>,
+  failure: BridgeError,
+  actions: StartupActionOwnership<BridgeError>,
   args: {
     session: voice.AgentSession;
     stats: CallStats;
     ctx: JobContext;
-    callId: string;
     heartbeat?: VoiceWorkerHeartbeat;
-    releaseCall: () => Promise<void>;
   },
 ): Promise<void> {
-  const { session, stats, ctx, callId, heartbeat, releaseCall } = args;
-  const inner = ev.error;
-  const failure = inner.type === "llm_error" && inner.error instanceof BridgeError ? inner.error : null;
-  if (!failure) {
-    log.error("Session error (non-bridge)", { callId, error: String("error" in inner ? inner.error : inner) });
-    return;
-  }
+  const { session, stats, ctx, heartbeat } = args;
+  if (!actions.chainOwns(chain)) return;
   const behavior = FAILURE_BEHAVIOR[failure.failureClass];
-  stats.recordFailure(behavior.telemetryOutcome);
   const retrySpent = behavior.retryOnce ? stats.retryConsumed(failure.failureClass) : true;
   const action = resolveFailureAction(failure.failureClass, retrySpent);
   if (action.kind === "retry") {
-    if (action.sayFirst) await speakAndWait(session, FALLBACK_LINES[action.sayFirst]);
-    if (action.delayMs > 0) await new Promise((r) => setTimeout(r, action.delayMs));
-    session.generateReply();
+    if (action.sayFirst) {
+      if (!actions.chainOwns(chain)) return;
+      const fallback = actions.scheduleOwned("fallback", () => session.say(FALLBACK_LINES[action.sayFirst!]), chain);
+      try {
+        await actions.waitOwned(chain, () => fallback.waitForPlayout());
+      } catch {
+        // Best-effort fallback failure never authorizes an additional retry.
+      }
+    }
+    if (!actions.chainOwns(chain)) return;
+    if (action.delayMs > 0 && !(await actions.delayOwned(chain, action.delayMs))) return;
+    if (!actions.chainOwns(chain)) return;
+    actions.scheduleOwned("retry", () => session.generateReply(), chain);
     return;
   }
   if (action.kind === "continue") return;
-  await speakAndWait(session, FALLBACK_LINES[action.say]);
-  if (heartbeat) void heartbeat.noteError(behavior.telemetryOutcome);
-  await stats.flush("failed");
-  await releaseCall();
-  ctx.shutdown();
-}
-
-async function speakAndWait(session: voice.AgentSession, text: string): Promise<void> {
+  if (!actions.chainOwns(chain)) return;
+  stats.recordTerminalOutcome("failed");
+  const fallback = actions.scheduleOwned("fallback", () => session.say(FALLBACK_LINES[action.say]), chain);
   try {
-    await session.say(text).waitForPlayout();
+    await actions.waitOwned(chain, () => fallback.waitForPlayout());
   } catch {
-    // Fallback TTS is best-effort; still proceed with retry/shutdown.
+    // Terminal fallback is best effort; shutdown still requires current ownership.
   }
+  if (!actions.chainOwns(chain)) return;
+  if (heartbeat) void heartbeat.noteError(behavior.telemetryOutcome);
+  ctx.shutdown();
 }
 
 function inboundCalledNumber(ctx: JobContext): string | undefined {

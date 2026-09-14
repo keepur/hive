@@ -8,6 +8,8 @@ import {
   WARM_INTERRUPT_GRACE_MS,
 } from "./warm-voice-session.js";
 import { VOICE_TOOL_ACK_PHRASES, VOICE_TOOL_ACK_SEPARATOR } from "./voice-tool-ack.js";
+import { VoiceRequestCancelledError } from "./voice-request-cancellation.js";
+import { measure } from "../voice/voice-trace.js";
 
 vi.mock("../logging/logger.js", () => ({
   createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
@@ -26,13 +28,17 @@ vi.mock("../config.js", () => ({
  * must never be needed (the lease's manual next() loop is what keeps the
  * long-lived generator open across turns — assertion 3).
  */
-function makeFakeQuery(opts: { closeThrows?: boolean; interruptRejects?: Error } = {}) {
+function makeFakeQuery(
+  opts: { closeThrows?: boolean; interruptRejects?: Error; interruptPromise?: Promise<unknown> } = {},
+) {
   const out = new AsyncPushQueue<SDKMessage>();
   const it = out[Symbol.asyncIterator]();
   const returnSpy = vi.fn();
-  const interrupt = opts.interruptRejects
-    ? vi.fn().mockRejectedValue(opts.interruptRejects)
-    : vi.fn().mockResolvedValue(undefined);
+  const interrupt = opts.interruptPromise
+    ? vi.fn(() => opts.interruptPromise)
+    : opts.interruptRejects
+      ? vi.fn().mockRejectedValue(opts.interruptRejects)
+      : vi.fn().mockResolvedValue(undefined);
   const close = opts.closeThrows
     ? vi.fn(() => {
         out.end();
@@ -522,6 +528,64 @@ describe("WarmVoiceSession", () => {
     }
   });
 
+  it("ignores a predecessor interrupt rejection after its successor owns the turn", async () => {
+    let rejectInterrupt!: (error: Error) => void;
+    const interruptPromise = new Promise<never>((_resolve, reject) => {
+      rejectInterrupt = reject;
+    });
+    const { q, emit } = makeFakeQuery({ interruptPromise });
+    const { lease, onClosed } = makeLease();
+    lease.start(q);
+    const a = lease.runTurn({ text: "A", timeoutMs: 60_000 });
+    await microFlush();
+    lease.requestInterrupt("A-disconnected");
+    const b = lease.runTurn({ text: "B", timeoutMs: 60_000 });
+    emit(resultMsg({ result: "A done", session_id: "s1" }));
+    await a;
+    await microFlush();
+    expect(lease.turns).toBe(2);
+    expect(lease.hasTurnInFlight).toBe(true);
+
+    rejectInterrupt(new Error("late A rejection"));
+    await microFlush();
+    expect(lease.isClosed).toBe(false);
+    expect(onClosed).not.toHaveBeenCalled();
+    emit(resultMsg({ result: "B done", session_id: "s2" }));
+    await expect(b).resolves.toMatchObject({ text: "B done" });
+    lease.close("test-cleanup");
+  });
+
+  it("invalidates an idle interrupt owner as soon as a successor queues", async () => {
+    let rejectInterrupt!: (error: Error) => void;
+    const interruptPromise = new Promise<never>((_resolve, reject) => {
+      rejectInterrupt = reject;
+    });
+    const { q, emit } = makeFakeQuery({ interruptPromise });
+    const { lease, onClosed } = makeLease();
+    lease.start(q);
+    lease.requestInterrupt("idle-owner");
+    rejectInterrupt(new Error("idle rejection"));
+    const b = lease.runTurn({ text: "B", timeoutMs: 60_000 });
+    expect(lease.turns).toBe(0);
+    expect(lease.hasTurnInFlight).toBe(false);
+    await microFlush();
+    expect(lease.isClosed).toBe(false);
+    expect(onClosed).not.toHaveBeenCalled();
+    emit(resultMsg({ result: "B done", session_id: "s1" }));
+    await expect(b).resolves.toMatchObject({ text: "B done" });
+    lease.close("test-cleanup");
+  });
+
+  it("still closes when an idle interrupt rejection retains ownership", async () => {
+    const { q } = makeFakeQuery({ interruptRejects: new Error("idle rejection") });
+    const { lease, onClosed } = makeLease();
+    lease.start(q);
+    lease.requestInterrupt("idle-owner");
+    await microFlush();
+    expect(lease.isClosed).toBe(true);
+    expect(onClosed).toHaveBeenCalledWith({ reason: "interrupt-failed:idle-owner", turns: 0 });
+  });
+
   // ------------------------------------------------------ 10: stream death
   it("returns an error result (never hangs) when the output stream ends mid-turn — with wall-clock duration fallback and accumulated usage (KPR-401 parity, round-2 finding A.1)", async () => {
     const { q, emit, endOutput } = makeFakeQuery();
@@ -745,17 +809,187 @@ describe("WarmVoiceSession", () => {
   });
 
   // ------------------------------- review round 1, issue 4: started vs closed
-  it("reports an unstarted lease as 'not started yet', and a closed one as closed", async () => {
+  it("queues an unstarted lease until readiness and reports the retained close reason", async () => {
     const { lease } = makeLease();
-    // Published-but-unstarted (the manager's narrow open window).
-    await expect(lease.runTurn({ text: "u1", timeoutMs: 1_000 })).rejects.toThrow(/not started yet/);
+    const pending = lease.runTurn({ text: "u1", timeoutMs: 1_000 });
+    let settled = false;
+    void pending.finally(() => {
+      settled = true;
+    }).catch(() => {});
+    await microFlush();
+    expect(settled).toBe(false);
     expect(lease.isClosed).toBe(false);
 
-    // Once genuinely closed, the message names the close reason.
     lease.close("idle-timeout");
-    await expect(lease.runTurn({ text: "u1", timeoutMs: 1_000 })).rejects.toThrow(
+    await expect(pending).rejects.toThrow(/Warm voice lease closed \(idle-timeout\)/);
+    await expect(lease.runTurn({ text: "u2", timeoutMs: 1_000 })).rejects.toThrow(
       /Warm voice lease closed \(idle-timeout\)/,
     );
+  });
+
+  it("skips a cancelled reserved opener and lets the first survivor select fresh input", async () => {
+    const { q, emit } = makeFakeQuery();
+    const { lease } = makeLease();
+    const pushed = drainInput(lease);
+    const first = new AbortController();
+    const admissions: string[] = [];
+    const a = lease.runTurn({
+      text: "obsolete opener",
+      timeoutMs: 5_000,
+      voiceRequestSignal: first.signal,
+      selectText: (admission) => {
+        admissions.push(`A:${admission.continuity}`);
+        return "obsolete opener";
+      },
+    });
+    const b = lease.runTurn({
+      text: "fallback",
+      timeoutMs: 5_000,
+      selectText: (admission) => {
+        admissions.push(`B:${admission.continuity}`);
+        return "earlier caller sentinel; current caller sentinel";
+      },
+    });
+
+    first.abort();
+    lease.start(q);
+    await expect(a).rejects.toBeInstanceOf(VoiceRequestCancelledError);
+    await microFlush();
+    expect(admissions).toEqual(["B:fresh"]);
+    expect(pushed).toEqual([
+      expect.stringMatching(/^earlier caller sentinel; current caller sentinel\n\n\*\*Current date\/time\*\*: /),
+    ]);
+    emit(resultMsg({ result: "survived", session_id: "fresh-session" }));
+    await expect(b).resolves.toMatchObject({ text: "survived" });
+    lease.close("test-cleanup");
+  });
+
+  it("uses launch resume continuity until the first successful push, then warm continuity", async () => {
+    const { q, emit } = makeFakeQuery();
+    const { lease } = makeLease();
+    const admissions: Array<{ continuity: string; launchSessionId?: string; turnSeq: number }> = [];
+    lease.start(q, { resumedSessionId: "stored-session" });
+
+    const first = lease.runTurn({
+      text: "latest one",
+      timeoutMs: 5_000,
+      selectText: (admission) => {
+        admissions.push(admission);
+        return "latest one";
+      },
+    });
+    emit(resultMsg({ result: "one", session_id: "stored-session" }));
+    await first;
+
+    const second = lease.runTurn({
+      text: "latest two",
+      timeoutMs: 5_000,
+      selectText: (admission) => {
+        admissions.push(admission);
+        return "latest two";
+      },
+    });
+    emit(resultMsg({ result: "two", session_id: "stored-session" }));
+    await second;
+
+    expect(admissions).toEqual([
+      { continuity: "resume", launchSessionId: "stored-session", turnSeq: 1 },
+      { continuity: "warm", launchSessionId: "stored-session", turnSeq: 2 },
+    ]);
+    lease.close("test-cleanup");
+  });
+
+  it("retains one typed lifetime cause for active and queued requests", async () => {
+    class StoppedForTest extends Error {}
+    const stopped = new StoppedForTest("stopped lifetime");
+    const { q, emit } = makeFakeQuery();
+    const { lease } = makeLease();
+    lease.start(q, { resumedSessionId: "stored-session" });
+
+    const a = lease.runTurn({ text: "A", timeoutMs: 60_000 });
+    const b = lease.runTurn({ text: "B", timeoutMs: 60_000 });
+    const c = lease.runTurn({ text: "C", timeoutMs: 60_000 });
+    await microFlush();
+    emit({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        id: "usage-before-stop",
+        content: [{ type: "text", text: "partial" }],
+        usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 2, cache_creation_input_tokens: 1 },
+      },
+      session_id: "stored-session",
+    });
+    await microFlush();
+    lease.close("ticket-abort", stopped);
+
+    const active = await a;
+    expect(active.error).toContain("ticket-abort");
+    expect(active.inputTokens).toBe(7);
+    expect(active.outputTokens).toBe(3);
+    expect(active.voiceLifetimeSignal).toBe(lease.voiceLifetimeSignal);
+    expect(active.voiceLifetimeSignal.aborted).toBe(true);
+    expect(active.voiceLifetimeSignal.reason).toBe(stopped);
+    await expect(b).rejects.toBe(stopped);
+    await expect(c).rejects.toBe(stopped);
+    lease.close("later", new Error("replacement"));
+    expect(lease.voiceLifetimeSignal.reason).toBe(stopped);
+  });
+
+  it("cancels a queued request without interrupting its predecessor or blocking a successor", async () => {
+    const { q, emit, interrupt } = makeFakeQuery();
+    const { lease } = makeLease();
+    const pushed = drainInput(lease);
+    lease.start(q);
+    const a = lease.runTurn({ text: "A", timeoutMs: 60_000 });
+    await microFlush();
+    const cancelled = new AbortController();
+    const b = lease.runTurn({ text: "B", timeoutMs: 60_000, voiceRequestSignal: cancelled.signal });
+    const c = lease.runTurn({ text: "C", timeoutMs: 60_000 });
+    cancelled.abort();
+    expect(interrupt).not.toHaveBeenCalled();
+
+    emit(resultMsg({ result: "A done", session_id: "s1" }));
+    await a;
+    await expect(b).rejects.toBeInstanceOf(VoiceRequestCancelledError);
+    await microFlush();
+    expect(pushed).toHaveLength(2);
+    expect(pushed[1]).toMatch(/^C\n\n\*\*Current date\/time\*\*: /);
+    emit(resultMsg({ result: "C done", session_id: "s2" }));
+    await expect(c).resolves.toMatchObject({ text: "C done" });
+    expect(interrupt).not.toHaveBeenCalled();
+    lease.close("test-cleanup");
+  });
+
+  it("detaches a completed request and suppresses post-cancel streaming for the active owner", async () => {
+    const { q, emit, interrupt } = makeFakeQuery();
+    const { lease } = makeLease();
+    lease.start(q);
+    const firstSignal = new AbortController();
+    const first = lease.runTurn({ text: "A", timeoutMs: 60_000, voiceRequestSignal: firstSignal.signal });
+    emit(resultMsg({ result: "A done", session_id: "s1" }));
+    await first;
+
+    const secondSignal = new AbortController();
+    const streamed: string[] = [];
+    const second = lease.runTurn({
+      text: "B",
+      timeoutMs: 60_000,
+      voiceRequestSignal: secondSignal.signal,
+      onStream: (text) => streamed.push(text),
+    });
+    await microFlush();
+    firstSignal.abort();
+    expect(interrupt).not.toHaveBeenCalled();
+    secondSignal.abort();
+    expect(interrupt).toHaveBeenCalledTimes(1);
+    emit(delta("late bytes"));
+    emit(resultMsg({ result: "", session_id: "s2" }));
+    const result = await second;
+    expect(result.aborted).toBe(true);
+    expect(streamed).toEqual([]);
+    expect(lease.isClosed).toBe(false);
+    lease.close("test-cleanup");
   });
 
   it("STILL sets `error` when a non-interrupted turn's result carries a non-success subtype", async () => {
@@ -1062,5 +1296,209 @@ describe("WarmVoiceSession", () => {
 
       lease.close("test-cleanup");
     });
+  });
+});
+
+describe("KPR-465 stage anchors", () => {
+  afterEach(() => vi.useRealTimers());
+
+  function openLease(opts: { openCalledAt?: number } = {}) {
+    const fq = makeFakeQuery();
+    const lease = new WarmVoiceSession({ agentId: "a", threadKey: "a:t", onClosed: () => {} });
+    lease.start(fq.q, { resumedSessionId: undefined, ...opts });
+    return { fq, lease };
+  }
+
+  it("opener: queueWaitMs ends at the open call, bootToInitMs spans open → init, initToFirstTokenMs spans init → first delta", async () => {
+    // Sequencing IS the assertion here: consume start must land strictly
+    // AFTER the open call, otherwise "queue ends at the open call" (the
+    // refinement) and "queue ends at consume start" (the spec-literal
+    // reading) give the same number and the case discriminates nothing.
+    // runTurn chains consumeOneTurn behind `await this.ready` as microtasks,
+    // so nothing runs between the synchronous statements below — consume
+    // start reads Date.now() at the first await after start().
+    vi.useFakeTimers({ now: 1_000 });
+    const fq = makeFakeQuery();
+    const lease = new WarmVoiceSession({ agentId: "a", threadKey: "a:t", onClosed: () => {} });
+    const turn = lease.runTurn({ text: "t1", timeoutMs: 5_000, enqueuedAt: 1_000 }); // entered the manager at 1_000, before the open call
+    vi.setSystemTime(1_300); // 300 ms of pre-open wait (runner build, shaping)
+    lease.start(fq.q, { openCalledAt: 1_300 });
+    vi.setSystemTime(1_400); // the ready → consume hop: consume start lands here, one step AFTER the open call
+    await microFlush(); // consume start at 1_400
+    vi.setSystemTime(1_950); // CLI boot: 650 ms after the open call
+    fq.emit(initMsg("s1"));
+    await microFlush();
+    vi.setSystemTime(3_250); // model: 1 300 ms after init
+    fq.emit(delta("hi"));
+    fq.emit(resultMsg({ result: "hi", session_id: "s1" }));
+    const r = await turn;
+    expect(r.queueWaitMs).toBe(300); // entry 1_000 → open call 1_300 — NOT → consume start 1_400 (400, the un-refined reading)
+    expect(r.bootToInitMs).toBe(650);
+    expect(r.initToFirstTokenMs).toBe(1_300);
+    lease.close("test-cleanup");
+  });
+
+  it("turn ≥ 2 queued behind an in-flight turn: queueWaitMs spans entry → consume start; bootToInitMs undefined; initToFirstTokenMs is push → delta", async () => {
+    vi.useFakeTimers({ now: 0 });
+    const { fq, lease } = openLease({ openCalledAt: 0 });
+    fq.emit(initMsg("s1"));
+    const t1 = lease.runTurn({ text: "t1", timeoutMs: 5_000, enqueuedAt: 0 });
+    await microFlush();
+    vi.setSystemTime(100);
+    const t2 = lease.runTurn({ text: "t2", timeoutMs: 5_000, enqueuedAt: 100 }); // queued behind t1
+    vi.setSystemTime(900);
+    fq.emit(delta("a"));
+    fq.emit(resultMsg({ result: "a", session_id: "s1" }));
+    await t1;
+    await microFlush(); // t2 consume start at 900
+    vi.setSystemTime(1_400);
+    fq.emit(delta("b"));
+    fq.emit(resultMsg({ result: "b", session_id: "s1" }));
+    const r2 = await t2;
+    expect(r2.queueWaitMs).toBe(800);
+    expect(r2.bootToInitMs).toBeUndefined();
+    expect(r2.initToFirstTokenMs).toBe(500);
+    lease.close("test-cleanup");
+  });
+
+  it("opener without an open anchor: bootToInitMs undefined, initToFirstTokenMs falls back to push → delta, queueWaitMs still measured to consume start", async () => {
+    vi.useFakeTimers({ now: 0 });
+    const { fq, lease } = openLease();
+    const t1 = lease.runTurn({ text: "t1", timeoutMs: 5_000, enqueuedAt: 0 });
+    await microFlush();
+    vi.setSystemTime(50);
+    fq.emit(initMsg("s1"));
+    await microFlush();
+    vi.setSystemTime(250);
+    fq.emit(delta("x"));
+    fq.emit(resultMsg({ result: "x", session_id: "s1" }));
+    const r = await t1;
+    expect(r.bootToInitMs).toBeUndefined();
+    expect(r.initToFirstTokenMs).toBe(250);
+    expect(r.queueWaitMs).toBe(0);
+    lease.close("test-cleanup");
+  });
+
+  it("no enqueuedAt ⇒ queueWaitMs AND bootToInitMs undefined (fail-closed: an out-of-manager caller gives the lease no way to tell the opener from a survivor)", async () => {
+    const { fq, lease } = openLease({ openCalledAt: Date.now() });
+    fq.emit(initMsg("s1"));
+    const t = lease.runTurn({ text: "t", timeoutMs: 5_000 });
+    fq.emit(delta("x"));
+    fq.emit(resultMsg({ result: "x", session_id: "s1" }));
+    const r = await t;
+    expect(r.queueWaitMs).toBeUndefined();
+    expect(r.bootToInitMs).toBeUndefined();
+    expect(typeof r.initToFirstTokenMs).toBe("number"); // push → delta fallback, unchanged
+    lease.close("test-cleanup");
+  });
+
+  it("failed turn (output ends before result) still reports queueWaitMs and leaves bootToInitMs undefined on turn ≥ 2", async () => {
+    const { fq, lease } = openLease({ openCalledAt: Date.now() });
+    fq.emit(initMsg("s1"));
+    const t1 = lease.runTurn({ text: "t1", timeoutMs: 5_000, enqueuedAt: Date.now() });
+    fq.emit(resultMsg({ result: "ok", session_id: "s1" }));
+    await t1;
+    const t2 = lease.runTurn({ text: "t2", timeoutMs: 5_000, enqueuedAt: Date.now() });
+    fq.endOutput();
+    const r2 = await t2;
+    expect(r2.error).toMatch(/output ended before turn result/);
+    expect(typeof r2.queueWaitMs).toBe("number");
+    expect(r2.bootToInitMs).toBeUndefined();
+    lease.close("test-cleanup");
+  });
+
+  // R2 row 7 — the KPR-464 V4 shape (this file, line 829): a cancelled opener
+  // rejects in runTurn before consumeOneTurn ever increments turnCount, so the
+  // survivor is ALSO ownedTurn === 1 with openCalledAt already recorded.
+  it("cancelled-opener survivor that entered AFTER the open call is measured as a joiner: queueWaitMs = entry → consume start, no bootToInitMs", async () => {
+    vi.useFakeTimers({ now: 0 });
+    const fq = makeFakeQuery();
+    const lease = new WarmVoiceSession({ agentId: "a", threadKey: "a:t", onClosed: () => {} });
+    const opener = new AbortController();
+    const a = lease.runTurn({ text: "dead opener", timeoutMs: 5_000, voiceRequestSignal: opener.signal, enqueuedAt: 0 });
+    void a.catch(() => {});
+    vi.setSystemTime(100);
+    lease.start(fq.q, { openCalledAt: 100 }); // the manager's open call at 100
+    opener.abort();
+    await expect(a).rejects.toBeInstanceOf(VoiceRequestCancelledError);
+    expect(lease.turns).toBe(0); // premise: the cancelled opener never consumed
+    vi.setSystemTime(2_000); // lease sat idle 1.9 s
+    const b = lease.runTurn({ text: "survivor", timeoutMs: 5_000, enqueuedAt: 2_000 });
+    await microFlush(); // survivor consume start at 2_000
+    vi.setSystemTime(2_050);
+    fq.emit(initMsg("s1")); // init still unconsumed on the stream — observed by the survivor, but NOT measured
+    await microFlush();
+    vi.setSystemTime(2_400);
+    fq.emit(delta("ok"));
+    fq.emit(resultMsg({ result: "ok", session_id: "s1" }));
+    const r = await b;
+    expect(lease.turns).toBe(1); // survivor IS ownedTurn === 1
+    expect(r.queueWaitMs).toBe(0); // entry 2_000 → consume start 2_000, NOT 2_000 − 100 = 1_900 (clamped-to-open-call fabrication)
+    expect(r.bootToInitMs).toBeUndefined(); // not open(100) → init(2_050) = 1_950 (idle time, not boot)
+    expect(r.initToFirstTokenMs).toBe(400); // push → delta fallback
+    lease.close("test-cleanup");
+  });
+
+  it("cancelled-opener survivor that queued BEFORE the open call honestly measures as the opener", async () => {
+    vi.useFakeTimers({ now: 0 });
+    const fq = makeFakeQuery();
+    const lease = new WarmVoiceSession({ agentId: "a", threadKey: "a:t", onClosed: () => {} });
+    const opener = new AbortController();
+    const a = lease.runTurn({ text: "dead opener", timeoutMs: 5_000, voiceRequestSignal: opener.signal, enqueuedAt: 0 });
+    void a.catch(() => {});
+    vi.setSystemTime(50);
+    const b = lease.runTurn({ text: "early joiner", timeoutMs: 5_000, enqueuedAt: 50 }); // queued while the opening is pending
+    vi.setSystemTime(300);
+    lease.start(fq.q, { openCalledAt: 300 });
+    opener.abort();
+    // Same sequencing discipline as the opener case: b's consume start must
+    // land AFTER the open call so the two queue-end readings diverge
+    // (250 vs 350). The advance goes BEFORE the `rejects` await — that await
+    // is the drain in which a rejects and b's consumeOneTurn starts.
+    vi.setSystemTime(400);
+    await expect(a).rejects.toBeInstanceOf(VoiceRequestCancelledError);
+    await microFlush(); // b consume start (after ready) at 400
+    expect(lease.turns).toBe(1); // b consumed; the cancelled opener never did
+    vi.setSystemTime(900);
+    fq.emit(initMsg("s1"));
+    await microFlush();
+    vi.setSystemTime(1_000);
+    fq.emit(delta("ok"));
+    fq.emit(resultMsg({ result: "ok", session_id: "s1" }));
+    const r = await b;
+    expect(r.queueWaitMs).toBe(250); // entry 50 → open call 300 — NOT → consume start 400 (350, the un-refined reading)
+    expect(r.bootToInitMs).toBe(600); // open 300 → init 900: it really waited through boot
+    expect(r.initToFirstTokenMs).toBe(100);
+    lease.close("test-cleanup");
+  });
+
+  // R2 row 8 — canon "never zero-coerced": a negative delta is returned raw;
+  // voice-trace's measure() (line 55) classifies it as {value: null, reason}.
+  it("reports a negative queue delta raw (clock skew), never clamped to 0", async () => {
+    vi.useFakeTimers({ now: 0 });
+    const { fq, lease } = openLease({ openCalledAt: 0 });
+    fq.emit(initMsg("s1"));
+    const t = lease.runTurn({ text: "t", timeoutMs: 5_000, enqueuedAt: 5_000 }); // "entered" 5 s in the future
+    fq.emit(delta("x"));
+    fq.emit(resultMsg({ result: "x", session_id: "s1" }));
+    const r = await t;
+    expect(r.queueWaitMs).toBe(-5_000);
+    expect(measure(r.queueWaitMs, "not_observed")).toEqual({ value: null, reason: "not_observed" });
+    lease.close("test-cleanup");
+  });
+
+  // R7 at runtime: the request transcript never rides the stage-carrying
+  // result. (Type-level R7 — `Measure.value: number | null` on `EnginePayload` — lands in Task A4 Step 1; this is the observed property.)
+  it("the stage fields never carry request bytes", async () => {
+    const { fq, lease } = openLease({ openCalledAt: Date.now() });
+    fq.emit(initMsg("s1"));
+    const t = lease.runTurn({ text: "SENTINEL-TRANSCRIPT-465 +15555550100", timeoutMs: 5_000, enqueuedAt: Date.now() });
+    fq.emit(delta("x"));
+    fq.emit(resultMsg({ result: "x", session_id: "s1" }));
+    const r = await t;
+    const stages = JSON.stringify({ q: r.queueWaitMs, b: r.bootToInitMs, i: r.initToFirstTokenMs });
+    expect(stages).not.toContain("SENTINEL");
+    expect(stages).not.toContain("+1555");
+    lease.close("test-cleanup");
   });
 });

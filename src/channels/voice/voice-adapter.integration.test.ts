@@ -10,17 +10,22 @@
  * Uses port: 0 (OS-assigned ephemeral) so parallel test runs never collide.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { request as httpRequest, type ClientRequest, type IncomingMessage } from "node:http";
+import { request as httpRequest, type ClientRequest } from "node:http";
 import type { AddressInfo } from "node:net";
+import { randomUUID } from "node:crypto";
 
-vi.mock("../../logging/logger.js", () => ({
-  createLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }),
+const mockLog = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+  writeTracked: vi.fn(
+    (_level: string, _msg: string, _data: Record<string, unknown> | undefined, callback: (result: string) => void) =>
+      callback("acknowledged"),
+  ),
+  trackedSinkSnapshot: vi.fn(() => ({ sinkErrors: 0 })),
 }));
+vi.mock("../../logging/logger.js", () => ({ createLogger: () => mockLog }));
 
 // Stub the SDK — the per-turn-via-AgentManager path doesn't reach `query()`,
 // but the import at the top of voice-adapter.ts does.
@@ -46,14 +51,16 @@ vi.mock("../../config.js", () => ({
   },
 }));
 
-import { VoiceAdapter } from "./voice-adapter.js";
+import type { VoiceAdapter } from "./voice-adapter.js";
 import type { TurnContext, TurnResult } from "../../agents/agent-manager.js";
 import type { Dispatcher } from "../dispatcher.js";
-
-interface CapturedSpawn {
-  ctx: TurnContext;
-  onStream?: (chunk: string) => void;
-}
+import {
+  BRIDGE_TOKEN as E2_BRIDGE_TOKEN,
+  engineRows,
+  makeAdapter,
+  postChatCompletion,
+  startAdapter as startFixtureAdapter,
+} from "./testing/adapter-fixture.js";
 
 function echoSpawn(): (ctx: TurnContext, onStream?: (chunk: string) => void) => Promise<TurnResult> {
   return async (_ctx, onStream) => {
@@ -74,101 +81,6 @@ function echoSpawn(): (ctx: TurnContext, onStream?: (chunk: string) => void) => 
     };
   };
 }
-
-function makeAdapter(opts: {
-  /** Resolved by spawnTurn; behavior may include onStream chunks. */
-  spawn: (ctx: TurnContext, onStream?: (chunk: string) => void) => Promise<TurnResult>;
-  /** What the session-store returns on get(agentId, threadId). */
-  storedSessionId?: string;
-  /**
-   * KPR-223: optional dispatcher mock. When provided, the adapter is
-   * constructed with the dispatcher so voice turns route through
-   * `dispatcher.routeVoiceTurn` instead of directly through
-   * `agentManager.spawnTurn`. Omit to keep the legacy fallback wiring.
-   */
-  dispatcher?: Dispatcher;
-  /** KPR-322 E1: override VAPI_SERVER_SECRET (default "shared-secret"). */
-  serverSecret?: string;
-  /** KPR-322 E1: HIVE_VOICE_BRIDGE_TOKEN (default "" = LiveKit disabled). */
-  bridgeToken?: string;
-  /** KPR-322 E2: abort in-flight spawn for a thread. */
-  abortThread?: (agentId: string, threadId: string) => unknown;
-  /** KPR-322 E2: override session-store get (hanging pre-spawn gate). */
-  sessionStoreGet?: ReturnType<typeof vi.fn>;
-}) {
-  const captured: CapturedSpawn[] = [];
-  const sessionStoreGet =
-    opts.sessionStoreGet ??
-    vi
-      .fn()
-      .mockResolvedValue(opts.storedSessionId ? { sessionId: opts.storedSessionId, provider: "claude" } : undefined);
-  const sessionStoreSet = vi.fn().mockResolvedValue(undefined);
-
-  const spawnTurn = vi.fn(async (ctx: TurnContext, onStream?: (chunk: string) => void) => {
-    captured.push({ ctx, onStream });
-    return await opts.spawn(ctx, onStream);
-  });
-
-  const abortThread = opts.abortThread ?? vi.fn().mockReturnValue(false);
-
-  const registry: any = {
-    get: vi.fn((id: string) =>
-      id === "mokie" ? { id: "mokie", name: "Mokie", model: "claude-sonnet-4-6" } : undefined,
-    ),
-  };
-  const memoryManager: any = {
-    read: vi.fn().mockResolvedValue(""),
-    getHotTierPrompt: vi.fn().mockResolvedValue(""),
-  };
-  const agentManager: any = {
-    spawnTurn,
-    abortThread,
-    getSessionStore: () => ({ get: sessionStoreGet, set: sessionStoreSet }),
-    providerFor: vi.fn().mockReturnValue("claude"),
-  };
-
-  const serverSecret = opts.serverSecret ?? "shared-secret";
-  const bridgeToken = opts.bridgeToken ?? "";
-  const adapter = opts.dispatcher
-    ? new VoiceAdapter(0, serverSecret, bridgeToken, registry, memoryManager, agentManager, opts.dispatcher)
-    : new VoiceAdapter(0, serverSecret, bridgeToken, registry, memoryManager, agentManager);
-  return { adapter, captured, sessionStoreGet, sessionStoreSet, spawnTurn };
-}
-
-function postChatCompletion(
-  port: number,
-  opts: { headers?: Record<string, string>; body: Record<string, unknown> },
-): Promise<{ status: number; headers: IncomingMessage["headers"]; chunks: string[] }> {
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(opts.body);
-    const req: ClientRequest = httpRequest(
-      {
-        host: "127.0.0.1",
-        port,
-        path: "/v1/chat/completions",
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-          // Vapi default — auth comes from assistant.metadata.hive_agent_id.
-          authorization: "Bearer no-credentials-provided",
-          ...opts.headers,
-        },
-      },
-      (res) => {
-        const chunks: string[] = [];
-        res.on("data", (c) => chunks.push(c.toString("utf-8")));
-        res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, chunks }));
-        res.on("error", reject);
-      },
-    );
-    req.on("error", reject);
-    req.write(payload);
-    req.end();
-  });
-}
-
-const E2_BRIDGE_TOKEN = "tok-1";
 
 function workerShapedBody(callId: string): Record<string, unknown> {
   return {
@@ -247,7 +159,6 @@ function beginStreamingChat(
 
 describe("VoiceAdapter integration (KPR-219)", () => {
   let adapter: VoiceAdapter | undefined;
-  let port: number = 0;
 
   afterEach(async () => {
     if (adapter) {
@@ -257,21 +168,16 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     vi.clearAllMocks();
   });
 
-  async function startAdapter(
-    setup: ReturnType<typeof makeAdapter>,
-  ): Promise<{ server: { address: () => AddressInfo | string | null }; port: number }> {
+  /** Records the adapter for afterEach teardown, then starts it on its ephemeral port. */
+  function startAdapter(setup: ReturnType<typeof makeAdapter>): ReturnType<typeof startFixtureAdapter> {
     adapter = setup.adapter;
-    await adapter.start();
-    const server = (adapter as any).httpServer as { address: () => AddressInfo };
-    const addr = server.address();
-    port = addr.port;
-    return { server, port };
+    return startFixtureAdapter(setup);
   }
 
   async function startAdapterWithHangingSpawn(opts: {
     abortThread: (agentId: string, threadId: string) => unknown;
     resolveSpawnOnDestroy?: boolean;
-  }): Promise<{ port: number; spawnFinished: Promise<void> }> {
+  }): Promise<{ port: number; spawnFinished: Promise<void>; requestAborted: Promise<void> }> {
     let releaseHang!: () => void;
     const hang = new Promise<void>((r) => {
       releaseHang = r;
@@ -280,20 +186,20 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     const spawnFinished = new Promise<void>((r) => {
       spawnFinishedResolve = r;
     });
-
-    const abortThread = (agentId: string, threadId: string): boolean => {
-      try {
-        return Boolean(opts.abortThread(agentId, threadId));
-      } finally {
-        // Unblock the hanging spawn after abort is attempted (including
-        // when abortThread throws — clientGone is already true).
-        releaseHang();
-      }
-    };
+    let requestAbortedResolve!: () => void;
+    const requestAborted = new Promise<void>((r) => {
+      requestAbortedResolve = r;
+    });
 
     const setup = makeAdapter({
-      spawn: async (_ctx, onStream) => {
+      spawn: async (ctx, onStream) => {
         onStream?.("first ");
+        const cancelled = () => {
+          requestAbortedResolve();
+          releaseHang();
+        };
+        ctx.voiceRequestSignal?.addEventListener("abort", cancelled, { once: true });
+        if (ctx.voiceRequestSignal?.aborted) cancelled();
         try {
           await hang;
           return echoTurnResult("first ", true);
@@ -301,7 +207,7 @@ describe("VoiceAdapter integration (KPR-219)", () => {
           setImmediate(spawnFinishedResolve);
         }
       },
-      abortThread,
+      abortThread: opts.abortThread,
       bridgeToken: E2_BRIDGE_TOKEN,
     });
 
@@ -313,7 +219,7 @@ describe("VoiceAdapter integration (KPR-219)", () => {
         sock.on("close", () => releaseHang());
       });
     }
-    return { port: p, spawnFinished };
+    return { port: p, spawnFinished, requestAborted };
   }
 
   async function startAdapterWithHangingSessionStore(opts: {
@@ -400,6 +306,188 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     expect(ctx.systemPromptOverride).toBe("voice-prompt:say hi:");
     expect(ctx.threadId).toBe("voice:call-int-1");
     expect(ctx.channel).toBe("voice");
+  });
+
+  it("validates trace metadata, preserves the worker turn id, and never copies metadata into prompts or work items", async () => {
+    const workerBootId = randomUUID();
+    const turnId = randomUUID();
+    const secretSentinel = "TRACE-SECRET-MUST-NOT-LEAK";
+    const setup = makeAdapter({ spawn: echoSpawn(), bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p } = await startAdapter(setup);
+
+    const res = await postChatCompletion(p, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: {
+        ...workerShapedBody("call-trace-valid"),
+        metadata: { voiceTrace: { schemaVersion: 2, workerBootId, turnId } },
+        ignoredTraceField: secretSentinel,
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.chunks.join("")).toContain(`chatcmpl-${turnId}`);
+    const ctx = setup.captured[0]!.ctx;
+    expect(JSON.stringify({ prompt: ctx.systemPromptOverride, item: ctx.workItem })).not.toContain(secretSentinel);
+    const received = engineRows("engine_received");
+    const terminal = engineRows("engine_terminal");
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({ workerBootId, turnId, correlation: "worker" });
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]).toMatchObject({ workerBootId, turnId, outcome: "completed", engineAttemptSeq: 1 });
+  });
+
+  it.each([
+    ["missing", undefined, "legacy"],
+    ["malformed", { voiceTrace: { schemaVersion: 2, workerBootId: "bad", turnId: "also-bad" } }, "invalid"],
+    [
+      "oversized",
+      { voiceTrace: { schemaVersion: 2, workerBootId: randomUUID(), turnId: randomUUID(), raw: "x".repeat(10_000) } },
+      "invalid",
+    ],
+  ])("uses a fresh bounded trace for %s metadata", async (_label, metadata, correlation) => {
+    const setup = makeAdapter({ spawn: echoSpawn(), bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p } = await startAdapter(setup);
+    const res = await postChatCompletion(p, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: { ...workerShapedBody(`call-trace-${correlation}`), ...(metadata ? { metadata } : {}) },
+    });
+    expect(res.status).toBe(200);
+    expect(engineRows("engine_received")).toHaveLength(1);
+    expect(engineRows("engine_received")[0]).toMatchObject({ correlation, workerBootId: null });
+    expect(String(engineRows())).not.toContain("x".repeat(100));
+    expect(engineRows("engine_terminal")).toHaveLength(1);
+    if (correlation === "invalid") expect(engineRows("diagnostic_gap")).toHaveLength(1);
+  });
+
+  it("emits two attempt terminals and one request terminal for the real adapter outer retry", async () => {
+    let calls = 0;
+    const setup = makeAdapter({
+      storedSessionId: "resume-me",
+      bridgeToken: E2_BRIDGE_TOKEN,
+      spawn: async (ctx, onStream) => {
+        calls += 1;
+        ctx.onVoiceLaunchAdmission?.(calls === 1 ? "resume" : "fresh");
+        if (calls === 1) return { ...echoTurnResult(""), errors: ["resumed initialization failed"] };
+        ctx.onVoiceAdmission?.("fresh");
+        onStream?.("replacement");
+        return echoTurnResult("replacement");
+      },
+    });
+    const { port: p } = await startAdapter(setup);
+    const res = await postChatCompletion(p, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: workerShapedBody("call-outer-retry"),
+    });
+    expect(res.status).toBe(200);
+    expect(res.chunks.join("")).toContain("replacement");
+    expect(setup.captured).toHaveLength(2);
+    expect(setup.captured[1]!.ctx.sessionId).toBeUndefined();
+    const attempts = engineRows("engine_attempt_terminal");
+    expect(attempts).toHaveLength(2);
+    expect(attempts.map((row) => row.engineAttemptSeq)).toEqual([1, 2]);
+    expect(attempts[0]).toMatchObject({ launchAdmission: "resume", selectedContinuity: null, outcome: "failed" });
+    expect(attempts[1]).toMatchObject({ launchAdmission: "fresh", selectedContinuity: "fresh", outcome: "completed" });
+    expect(new Set(attempts.map((row) => row.turnId)).size).toBe(1);
+    expect(engineRows("engine_terminal")).toHaveLength(1);
+  });
+
+  it("KPR-465: cold attempt terminal carries bootToInitMs equal to the log row's and queueWaitMs not_applicable", async () => {
+    const spawn = async (_ctx: TurnContext, onStream?: (c: string) => void): Promise<TurnResult> => {
+      onStream?.("hi");
+      return {
+        ...echoTurnResult("hi"),
+        stageTimings: { lockWaitMs: 1, spawnPrepMs: 2, bootToInitMs: 741, initToFirstTokenMs: 1263 },
+      };
+    };
+    const setup = makeAdapter({ spawn, bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p } = await startAdapter(setup);
+    const res = await postChatCompletion(p, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: workerShapedBody("cold-465"),
+    });
+    expect(res.status).toBe(200);
+    const terminal = engineRows("engine_attempt_terminal").find((r) => r.callId === "cold-465")!;
+    expect(terminal.outcome).toBe("completed");
+    expect(terminal.bootToInitMs).toEqual({ value: 741, reason: null });
+    expect(terminal.queueWaitMs).toEqual({ value: null, reason: "not_applicable" });
+    const requestTerminal = engineRows("engine_terminal").find((r) => r.callId === "cold-465")!;
+    expect(requestTerminal.bootToInitMs).toEqual({ value: 741, reason: null });
+    expect(requestTerminal.queueWaitMs).toEqual({ value: null, reason: "not_applicable" });
+    const logRow = mockLog.info.mock.calls.find((c) => c[0] === "Voice turn complete")![1] as Record<string, unknown>;
+    expect(logRow.bootToInitMs).toBe(741);
+    expect(logRow).not.toHaveProperty("queueWaitMs");
+  });
+
+  it("KPR-465: a failed attempt reports not_observed for both new stages", async () => {
+    const spawn = async (): Promise<TurnResult> => ({
+      ...echoTurnResult(""),
+      errors: ["boom"],
+      stageTimings: { lockWaitMs: 0, spawnPrepMs: 0, bootToInitMs: 500 },
+    });
+    const setup = makeAdapter({ spawn, bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p } = await startAdapter(setup);
+    await postChatCompletion(p, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: workerShapedBody("failed-465"),
+    });
+    const terminal = engineRows("engine_attempt_terminal").find((r) => r.callId === "failed-465")!;
+    expect(terminal.outcome).toBe("failed");
+    expect(terminal.bootToInitMs).toEqual({ value: null, reason: "not_observed" });
+    expect(terminal.queueWaitMs).toEqual({ value: null, reason: "not_observed" });
+  });
+
+  // The adapter encodes barge-in/disconnect as `cancelled` (aborted result →
+  // "cancelled"), never "interrupted"; spec §3.2 bullet 2 wants not_observed
+  // for it too — a cancelled warm turn 1 must not contribute a boot sample.
+  it("KPR-465: a cancelled (aborted-result) attempt reports not_observed for both new stages even when the stages were measured", async () => {
+    const spawn = async (_ctx: TurnContext, onStream?: (c: string) => void): Promise<TurnResult> => {
+      onStream?.("partial");
+      return {
+        ...echoTurnResult("partial", true),
+        warmPath: true,
+        warmTurnSeq: 1,
+        stageTimings: { lockWaitMs: 0, spawnPrepMs: 0, queueWaitMs: 12, bootToInitMs: 500, initToFirstTokenMs: 40 },
+      };
+    };
+    const setup = makeAdapter({ spawn, bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p } = await startAdapter(setup);
+    await postChatCompletion(p, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: workerShapedBody("cancelled-465"),
+    });
+    const terminal = engineRows("engine_attempt_terminal").find((r) => r.callId === "cancelled-465")!;
+    expect(terminal.outcome).toBe("cancelled");
+    expect(terminal.bootToInitMs).toEqual({ value: null, reason: "not_observed" });
+    expect(terminal.queueWaitMs).toEqual({ value: null, reason: "not_observed" });
+    // Pre-existing stages stay outcome-blind (unchanged behavior, pinned so a "harmonizing" edit is caught).
+    expect(terminal.initToFirstTokenMs).toEqual({ value: 40, reason: null });
+  });
+
+  it("KPR-465: attempt and request terminals carry the delivered effort from TurnResult, null when absent", async () => {
+    const withEffort = async (_ctx: TurnContext, onStream?: (c: string) => void): Promise<TurnResult> => {
+      onStream?.("hi");
+      return { ...echoTurnResult("hi"), effort: "medium" };
+    };
+    const effortSetup = makeAdapter({ spawn: withEffort, bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p1 } = await startAdapter(effortSetup);
+    await postChatCompletion(p1, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: workerShapedBody("effort-465"),
+    });
+    expect(engineRows("engine_attempt_terminal").find((r) => r.callId === "effort-465")!.effort).toBe("medium");
+    expect(engineRows("engine_terminal").find((r) => r.callId === "effort-465")!.effort).toBe("medium");
+    // Hand teardown back to afterEach for the second adapter.
+    effortSetup.adapter.stop();
+    adapter = undefined;
+
+    const noEffortSetup = makeAdapter({ spawn: echoSpawn(), bridgeToken: E2_BRIDGE_TOKEN });
+    const { port: p2 } = await startAdapter(noEffortSetup);
+    await postChatCompletion(p2, {
+      headers: { authorization: `Bearer ${E2_BRIDGE_TOKEN}` },
+      body: workerShapedBody("noeffort-465"),
+    });
+    expect(engineRows("engine_attempt_terminal").find((r) => r.callId === "noeffort-465")!.effort).toBeNull();
+    expect(engineRows("engine_terminal").find((r) => r.callId === "noeffort-465")!.effort).toBeNull();
   });
 
   it("second turn (resume from session-store) — latest-user-message prompt", async () => {
@@ -590,24 +678,17 @@ describe("VoiceAdapter integration (KPR-219)", () => {
   });
 
   it("aborts the in-flight spawn and suppresses writes when the client disconnects mid-stream (KPR-322 E2)", async () => {
-    let sawAbort!: () => void;
-    const abortSignal = new Promise<void>((r) => {
-      sawAbort = r;
-    });
-    const abortThread = vi.fn((_agentId: string, _threadId: string) => {
-      sawAbort();
-      return true;
-    });
-    const { port: p, spawnFinished } = await startAdapterWithHangingSpawn({ abortThread });
+    const abortThread = vi.fn();
+    const { port: p, spawnFinished, requestAborted } = await startAdapterWithHangingSpawn({ abortThread });
 
     const req = beginStreamingChat(p, workerShapedBody("call-e2"));
     await req.firstChunk();
     const disconnectAt = Date.now();
     req.destroySocket();
 
-    await abortSignal;
+    await requestAborted;
     expect(Date.now() - disconnectAt).toBeLessThanOrEqual(100);
-    expect(abortThread).toHaveBeenCalledWith("mokie", "voice:call-e2");
+    expect(abortThread).not.toHaveBeenCalled();
     await spawnFinished;
   });
 
@@ -636,7 +717,7 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
-  it("close listener is throw-safe when abortThread throws (KPR-322 review B2)", async () => {
+  it("does not reach the legacy thread-wide abort callback when a request closes", async () => {
     const abortThread = vi.fn(() => {
       throw new Error("boom");
     });
@@ -648,6 +729,6 @@ describe("VoiceAdapter integration (KPR-219)", () => {
     await req.firstChunk();
     req.destroySocket();
     await spawnFinished;
-    expect(abortThread).toHaveBeenCalled();
+    expect(abortThread).not.toHaveBeenCalled();
   });
 });
