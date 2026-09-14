@@ -277,6 +277,27 @@ switch (command) {
     process.exit(code);
     break;
   }
+  case "deployment-tooling": {
+    // Validate-only tooling check (KPR-463 spec §3.2): reports this package's own
+    // pkg/release.json identity. Parses no instance configuration, loads no
+    // secrets and binds no socket; exit 0 alone is never a pass.
+    if (positionals[1] !== "validate-only" || positionals.length !== 2 || process.argv.length !== 4) {
+      console.error("Usage: hive deployment-tooling validate-only");
+      process.exit(2);
+    }
+    const { readRelease } = await import("./deployment/release.js");
+    const release = readRelease(PKG_ROOT);
+    process.stdout.write(
+      `TOOLING_VALIDATE_OK ${JSON.stringify({
+        manifest: {
+          packageVersion: release.packageVersion,
+          sourceRevision: release.sourceRevision,
+          dependencyLockSha256: release.dependencyLockSha256,
+        },
+      })}\n`,
+    );
+    break;
+  }
   default:
     console.error(`Unknown command: ${command}`);
     console.error('Run "hive --help" for usage.');

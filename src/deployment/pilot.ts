@@ -20,3 +20,17 @@ export interface RegistryWork {
   };
   outcome: "record-committed" | "assessment-complete" | "migration-pending" | "aborted" | null;
 }
+
+export function initialRegistryWork(command: RegistryWork["command"]): RegistryWork {
+  return {
+    command,
+    phase: "reading",
+    selectedSnapshot: null,
+    selectedHold: null,
+    bootstrap: null,
+    capture: null,
+    result: null,
+    barrier: null,
+    outcome: null,
+  };
+}

@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { constants, existsSync } from "node:fs";
 import { chmod, copyFile, lstat, readFile, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { sha256 } from "./release.js";
@@ -10,12 +10,27 @@ import {
   decodeOperationRecord,
   finishOperationLock,
   OPERATION_SCHEMA_VERSION,
+  OperationUnresolvedError,
+  writeOperationJson,
   operationPaths,
   persistOperation,
   transferOwnershipToFrozen,
+  workKindForMode,
   type AcquiredOperation,
+  type LifecycleMode,
+  type NonLifecycleMode,
   type OperationRecord,
 } from "./operation.js";
+import { isRegistrySelector } from "./pilot-records.js";
+import { disposeOperationJobs } from "./clone-promotion.js";
+import {
+  abortBootstrap,
+  BootstrapUnresolvedError,
+  initialBootstrapWork,
+  reconcileBootstrap,
+  runBootstrap,
+  type BootstrapDeps,
+} from "./bootstrap.js";
 import {
   resolveLifecycleContext,
   runNodeLifecycle,
@@ -25,8 +40,10 @@ import {
   type LifecycleCommand,
 } from "./lifecycle.js";
 import { SANDBOX_EXEC } from "./confined-job.js";
+import { initialRegistryWork, type RegistryWork } from "./pilot.js";
 import {
   inspectOrReconcile,
+  processIsLive,
   nodeReconcileHostIO,
   PREVIOUS_OPERATION_RECONCILED,
   runReconcileOperation,
@@ -35,8 +52,18 @@ import {
 import { MigrationPendingError } from "./pilot-lifecycle.js";
 import { planBetaPluginCompatibility } from "./plugin-compat.js";
 
-export interface DeploymentArguments extends LifecycleCommand {
+export interface DeploymentArguments extends Omit<LifecycleCommand, "mode"> {
+  mode: LifecycleMode | NonLifecycleMode;
   dryRun: boolean;
+  /** Internal runbook modes (chunk 4 Task 9 Step 4b.1); never normal rollback fallback. */
+  sha256?: string;
+  revision?: string;
+  bootstrapRecord?: string;
+  pilotSdkPort?: number;
+  inventoryPilot?: string;
+  prepareLegacyHold?: string;
+  verifyLegacyHold?: string;
+  releaseLegacyHold?: string;
   instance?: string;
   operationRecord?: string;
   /** Internal: original frozen helper reconciling an interrupted operation. */
@@ -59,12 +86,37 @@ function value(arg: string, name: string): string | undefined {
 }
 
 export function parseDeploymentArguments(argv: readonly string[]): DeploymentArguments {
-  const mode: LifecycleCommand["mode"] = "update";
+  const mode: DeploymentArguments["mode"] = "update";
   const result: DeploymentArguments = { mode, dryRun: false };
-  const explicitModes = new Set<LifecycleCommand["mode"]>();
+  const explicitModes = new Set<DeploymentArguments["mode"]>();
+  const seen = new Set<string>();
   for (const arg of argv) {
+    const name = arg.replace(/=.*$/, "");
+    if (seen.has(name)) throw new Error(`duplicate deployment argument: ${name}`);
+    seen.add(name);
     if (arg === "--dry-run") result.dryRun = true;
-    else if (arg === "--rollback") explicitModes.add((result.mode = "rollback"));
+    else if (arg === "--bootstrap") explicitModes.add((result.mode = "bootstrap"));
+    else if (arg === "--capture-pilot") explicitModes.add((result.mode = "capture-pilot"));
+    else if (value(arg, "sha256") !== undefined) result.sha256 = value(arg, "sha256");
+    else if (value(arg, "revision") !== undefined) result.revision = value(arg, "revision");
+    else if (value(arg, "bootstrap-record") !== undefined) result.bootstrapRecord = value(arg, "bootstrap-record");
+    else if (value(arg, "pilot-sdk-port") !== undefined) {
+      const port = value(arg, "pilot-sdk-port")!;
+      if (!/^[1-9][0-9]{0,4}$/.test(port) || Number(port) > 65535) throw new Error("--pilot-sdk-port must be a port");
+      result.pilotSdkPort = Number(port);
+    } else if (value(arg, "inventory-pilot") !== undefined) {
+      result.inventoryPilot = value(arg, "inventory-pilot");
+      explicitModes.add((result.mode = "inventory-pilot"));
+    } else if (value(arg, "prepare-legacy-hold") !== undefined) {
+      result.prepareLegacyHold = value(arg, "prepare-legacy-hold");
+      explicitModes.add((result.mode = "prepare-legacy-hold"));
+    } else if (value(arg, "verify-legacy-hold") !== undefined) {
+      result.verifyLegacyHold = value(arg, "verify-legacy-hold");
+      explicitModes.add((result.mode = "verify-legacy-hold"));
+    } else if (value(arg, "release-legacy-hold") !== undefined) {
+      result.releaseLegacyHold = value(arg, "release-legacy-hold");
+      explicitModes.add((result.mode = "release-legacy-hold"));
+    } else if (arg === "--rollback") explicitModes.add((result.mode = "rollback"));
     else if (arg === "--start") explicitModes.add((result.mode = "start"));
     else if (arg === "--stop") explicitModes.add((result.mode = "stop"));
     else if (arg === "--restart") explicitModes.add((result.mode = "restart"));
@@ -95,6 +147,31 @@ export function parseDeploymentArguments(argv: readonly string[]): DeploymentArg
     throw new Error("--artifact and --tag are mutually exclusive");
   }
   if (explicitModes.size > 1) throw new Error("lifecycle mode options are mutually exclusive");
+  const nonLifecycle = workKindForMode(result.mode) !== "lifecycle";
+  if (result.mode === "bootstrap") {
+    if (result.artifact === undefined || result.sha256 === undefined || result.revision === undefined) {
+      throw new Error("--bootstrap requires --artifact, --sha256 and --revision");
+    }
+    if (!/^[a-f0-9]{64}$/.test(result.sha256)) throw new Error("--sha256 must be a reviewed 64-hex digest");
+    if (!/^[a-f0-9]{40}$/.test(result.revision)) throw new Error("--revision must be a reviewed 40-hex revision");
+  } else if (result.sha256 !== undefined || result.revision !== undefined) {
+    throw new Error("--sha256 and --revision are valid only with --bootstrap");
+  }
+  if ((result.mode === "capture-pilot") !== (result.bootstrapRecord !== undefined)) {
+    throw new Error("--capture-pilot requires exactly one --bootstrap-record");
+  }
+  if (result.pilotSdkPort !== undefined && result.mode !== "capture-pilot") {
+    throw new Error("--pilot-sdk-port is valid only with --capture-pilot");
+  }
+  if (
+    nonLifecycle &&
+    (result.tag !== undefined ||
+      result.legacyHold !== undefined ||
+      result.pilotRecovery !== undefined ||
+      (result.mode !== "bootstrap" && result.artifact !== undefined))
+  ) {
+    throw new Error("runbook helper modes do not accept lifecycle selectors");
+  }
   if (result.mode === "pilot-rollback" && (result.artifact !== undefined || result.tag !== undefined)) {
     throw new Error("pilot recovery cannot select a candidate artifact");
   }
@@ -107,6 +184,11 @@ export function parseDeploymentArguments(argv: readonly string[]): DeploymentArg
   for (const [name, path] of [
     ["pilot recovery snapshot", result.pilotRecovery],
     ["legacy hold record", result.legacyHold],
+    ["bootstrap record", result.bootstrapRecord],
+    ["inventory snapshot", result.inventoryPilot],
+    ["prepare snapshot", result.prepareLegacyHold],
+    ["verify hold record", result.verifyLegacyHold],
+    ["release hold record", result.releaseLegacyHold],
   ] as const) {
     if (path !== undefined && !isAbsolute(path)) throw new Error(`${name} must be absolute`);
   }
@@ -141,18 +223,6 @@ async function selectInstance(args: DeploymentArguments, env: NodeJS.ProcessEnv)
   return { home, configPath, instanceId, voiceEnabled: document?.voice?.livekit?.enabled === true };
 }
 
-async function requireRegisteredRunbookPath(path: string | undefined, selected: SelectedInstance): Promise<void> {
-  if (path === undefined) return;
-  const canonical = await realpath(path);
-  const state = await realpath(resolve(selected.home, ".hive-state"));
-  const rel = relative(state, canonical);
-  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-    throw new Error("runbook evidence must be registered beneath instance state");
-  }
-  const info = await lstat(canonical);
-  if (!info.isFile() || info.isSymbolicLink()) throw new Error("runbook evidence must be a regular file");
-}
-
 export async function deploymentDryRun(
   args: DeploymentArguments,
   env: NodeJS.ProcessEnv = process.env,
@@ -164,6 +234,7 @@ export async function deploymentDryRun(
     status: "DRY_RUN",
     target: selected.instanceId,
     mode: args.mode,
+    workKind: workKindForMode(args.mode),
     selectors: { hiveHome: selected.home, configPath: selected.configPath },
     voiceEnabled: selected.voiceEnabled,
     releaseSelector: args.artifact ? { artifact: args.artifact } : { tag: args.tag ?? "latest" },
@@ -171,7 +242,7 @@ export async function deploymentDryRun(
     recoveryProfile: args.pilotRecovery ? "registered-pilot" : "to-be-validated-under-lock",
     unknownEvidence: ["runtime process identity", "maintenance ledger", "candidate native imports", "paired health"],
     // Read-only plan; no directory is created, journaled or moved.
-    pluginCompatibility: stagingRequired(args.mode)
+    pluginCompatibility: isLifecycleStaging(args.mode)
       ? await planBetaPluginCompatibility(selected.home).then(
           (plan) => ({
             relocate: plan.relocate.map((item) => item.name),
@@ -181,10 +252,77 @@ export async function deploymentDryRun(
         )
       : "not-required",
     // Presence only: dry-run runs no self-test, promotion probe or artifact job.
-    stagingPrerequisites: stagingRequired(args.mode)
-      ? { sandboxExecPresent: existsSync(SANDBOX_EXEC), selfTest: "unverified", promotionMethod: "unverified" }
-      : "not-required",
+    stagingPrerequisites:
+      isLifecycleStaging(args.mode) || args.mode === "bootstrap"
+        ? { sandboxExecPresent: existsSync(SANDBOX_EXEC), selfTest: "unverified", promotionMethod: "unverified" }
+        : "not-required",
   };
+}
+
+function isLifecycleStaging(mode: DeploymentArguments["mode"]): boolean {
+  return workKindForMode(mode) === "lifecycle" && stagingRequired(mode as LifecycleMode);
+}
+
+/** Registered selectors must literally be registry payload paths of the selected instance. */
+function requireRegistrySelector(path: string | undefined, selected: SelectedInstance): void {
+  if (path === undefined) return;
+  if (!isRegistrySelector(selected.home, path)) {
+    throw new Error("runbook evidence selector must be a registered payload path of the selected instance");
+  }
+}
+
+async function hostNpmCli(env: NodeJS.ProcessEnv): Promise<string> {
+  if (!env.PATH) throw new Error("explicit PATH is required to resolve npm");
+  const found = execFileSync("/usr/bin/which", ["npm"], { encoding: "utf8", env: { PATH: env.PATH } }).trim();
+  const npmCli = await realpath(found);
+  const info = await lstat(npmCli);
+  if (!info.isFile() || info.isSymbolicLink() || !npmCli.endsWith("/bin/npm-cli.js")) {
+    throw new Error("host npm prerequisite must resolve to its real npm-cli.js");
+  }
+  return npmCli;
+}
+
+async function bootstrapDeps(env: NodeJS.ProcessEnv): Promise<BootstrapDeps> {
+  if (!env.HOME || !isAbsolute(env.HOME) || !env.PATH) throw new Error("explicit HOME and PATH are required");
+  return {
+    nodePath: await realpath(process.execPath),
+    npmCliPath: await hostNpmCli(env),
+    pathEnv: env.PATH,
+    invokingHome: env.HOME,
+  };
+}
+
+async function runFrozenBootstrap(operation: AcquiredOperation, env: NodeJS.ProcessEnv): Promise<void> {
+  const configPath = env.HIVE_CONFIG;
+  if (!configPath || !isAbsolute(configPath)) throw new Error("explicit absolute HIVE_CONFIG is required");
+  let retainLock = false;
+  try {
+    const result = await runBootstrap(operation, { configPath }, await bootstrapDeps(env));
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  } catch (error) {
+    if (error instanceof OperationUnresolvedError || error instanceof BootstrapUnresolvedError) {
+      retainLock = true;
+      operation.record.phase = "unresolved";
+      await persistOperation(operation).catch(() => {});
+      throw error;
+    }
+    await abortBootstrap(operation);
+    throw new DeploymentExit(1, {
+      status: "BOOTSTRAP_ABORTED",
+      operationId: operation.record.id,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    const disposal = await disposeOperationJobs({
+      canonicalInstanceHome: operation.record.canonicalHome,
+      operationId: operation.record.id,
+    }).catch(() => null);
+    if (disposal && disposal.failures.length > 0) {
+      operation.record.staging.sweepFailures.push(...disposal.failures);
+      await persistOperation(operation).catch(() => {});
+    }
+    if (!retainLock && operation.record.resolution) await finishOperationLock(operation);
+  }
 }
 
 async function ownerStartTime(): Promise<string> {
@@ -233,9 +371,17 @@ async function runFrozen(args: DeploymentArguments, env: NodeJS.ProcessEnv): Pro
     { pid: process.pid, startTime: await processStartTime(process.pid) },
     { pid: process.ppid, startTime: await processStartTime(process.ppid) },
   );
+  if (operation.record.workKind === "bootstrap") {
+    if (args.mode !== "bootstrap") throw new Error("frozen invocation mode does not match bootstrap work");
+    await runFrozenBootstrap(operation, env);
+    return;
+  }
+  if (operation.record.workKind !== "lifecycle" || workKindForMode(args.mode) !== "lifecycle") {
+    throw new Error("REGISTRY_HELPER_MODE_NOT_WIRED");
+  }
   let resolved = false;
   try {
-    await runNodeLifecycle(operation, args, env);
+    await runNodeLifecycle(operation, args as LifecycleCommand, env);
     resolved = Boolean(operation.record.resolution);
   } catch (error) {
     resolved = Boolean(operation.record.resolution) && operation.record.phase !== "unresolved";
@@ -278,6 +424,21 @@ async function runReconcileMode(args: DeploymentArguments, env: NodeJS.ProcessEn
     selfPath: self,
     selfSha256: sha256(await readFile(self)),
     lifecycle: lifecycleReconcileDepsFactory(env),
+    nonLifecycle: {
+      bootstrap: async (record, claimId) => {
+        const acquired: AcquiredOperation = { paths: operationPaths(record.canonicalHome, record.id), record };
+        const configPath = env.HIVE_CONFIG;
+        if (!configPath || !isAbsolute(configPath)) throw new Error("explicit absolute HIVE_CONFIG is required");
+        const outcome = await reconcileBootstrap(acquired, {
+          ...(await bootstrapDeps(env)),
+          configPath,
+          isProcessLive: (owner) => processIsLive(nodeReconcileHostIO, owner),
+        });
+        await writeOperationJson(resolve(acquired.paths.operationDirectory, "reconciliation.json"), outcome);
+        await finishOperationLock(acquired, { reconcileClaimId: claimId });
+        return outcome;
+      },
+    },
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
@@ -302,16 +463,38 @@ async function freezeAndInvoke(
       outcome: stale.outcome,
     });
   }
-  await requireRegisteredRunbookPath(args.pilotRecovery, selected);
-  await requireRegisteredRunbookPath(args.legacyHold, selected);
+  for (const selector of [
+    args.pilotRecovery,
+    args.legacyHold,
+    args.bootstrapRecord,
+    args.inventoryPilot,
+    args.prepareLegacyHold,
+    args.verifyLegacyHold,
+    args.releaseLegacyHold,
+  ]) {
+    requireRegistrySelector(selector, selected);
+  }
   const source = await realpath(process.argv[1]);
   const sourceInfo = await lstat(source);
   if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) throw new Error("deployment helper must be a regular file");
   const toolSha256 = sha256(await readFile(source));
+  const workKind = workKindForMode(args.mode);
   const operation = await acquireOperation({
     instanceHome: selected.home,
     instanceId: selected.instanceId,
     mode: args.mode,
+    workKind,
+    ...(workKind === "bootstrap"
+      ? {
+          bootstrap: initialBootstrapWork({
+            artifact: args.artifact!,
+            sha256: args.sha256!,
+            revision: args.revision!,
+            sourceHelper: source,
+          }),
+        }
+      : {}),
+    ...(workKind === "registry" ? { registry: initialRegistryWork(args.mode as RegistryWork["command"]) } : {}),
     toolSha256,
     ownerStartTime: await ownerStartTime(),
     priorProfile: args.pilotRecovery ? "pilot" : "stopped",
