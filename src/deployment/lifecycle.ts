@@ -44,6 +44,7 @@ import {
   quiesce,
   UnresolvedMaintenance,
   type IdleEvidence,
+  type QuiescenceIO,
   type TransactionIO,
 } from "./transaction.js";
 import { capturePrior, restorePrior } from "./prior.js";
@@ -68,6 +69,7 @@ import {
 } from "./pilot-lifecycle.js";
 import { pilotRecovered } from "./health.js";
 import type { StopProofClock } from "./stop-proof.js";
+import { InstalledWorkerMaintenance, processSealOf, stopInstalledWorkerUnderProof } from "./worker-maintenance.js";
 
 export {
   capturePrior,
@@ -421,35 +423,87 @@ export async function runNodeLifecycle(
 
   const controller = () => context.controller;
   const observeWorker = () => observeWorkerIdentity(context);
-  const inspectIdle = async (_deadline: number): Promise<IdleEvidence> => {
-    const result = parseWorkerProbe(
-      await probeJson(context.currentProbePath, "worker", runningWorkerEnvironment ?? probeEnvironment),
-    );
-    const observed = await observeWorker();
-    if (observed.pid !== result.supervisor.pid || observed.bootId !== result.supervisor.bootId) {
-      throw new Error("worker probe and process identity disagree");
-    }
-    if (result.healthPort !== undefined) {
-      if (!Number.isSafeInteger(result.healthPort) || result.healthPort < 1 || result.healthPort > 65535) {
-        throw new Error("worker probe reported an invalid health listener port");
-      }
-      recordedWorkerHealthPort = result.healthPort;
-    }
-    return {
-      supervisor: result.supervisor,
-      registered: result.classification === "worker-registered" && result.sdk.rootStatus === 200,
-      ownedSocket: result.socketOwned,
-      sdkActiveJobs: result.sdk.activeJobs,
-      telemetryActiveCalls: result.heartbeat.activeCalls,
-    };
+  // Private installed-worker `worker-maintenance` observer bound to THIS
+  // acquired operation (chunk 5 Step 2b). Baseline until this operation's own
+  // close acknowledgement; closed afterwards. Never inferred from a response.
+  let workerObserver: InstalledWorkerMaintenance | null = null;
+  let workerSeal: ReturnType<typeof processSealOf> | null = null;
+  let installedStopDeferred = false;
+  const installedObserver = (): InstalledWorkerMaintenance => {
+    workerObserver ??= new InstalledWorkerMaintenance({
+      operation,
+      instance: context.pilotInstance,
+      workerDefinition: definitions.worker,
+      serviceEnvironment: runningWorkerEnvironment ?? probeEnvironment,
+      nodePath: operation.record.hostNodePath ?? process.execPath,
+      configPath: context.configReal,
+      onHealthPort: (port) => {
+        recordedWorkerHealthPort = port;
+      },
+      controller: context.controller,
+      clock,
+    });
+    return workerObserver;
   };
-  const maintenance = maintenanceQuiescenceIO({
+  const inspectIdle = async (deadline: number): Promise<IdleEvidence> => {
+    const observer = installedObserver();
+    // The original 30-second quiescence deadline is recorded once and never extended.
+    observer.bindDeadline(deadline);
+    return (await observer.observe()).idle;
+  };
+  const baseMaintenance = maintenanceQuiescenceIO({
     operation,
     instanceHome: home,
     instanceId: summary.instanceId,
     inspect: inspectIdle,
     corroborateSupervisor: async () => observeWorker(),
   });
+  const maintenance: QuiescenceIO = {
+    ...baseMaintenance,
+    async close(operationId, deadline) {
+      await baseMaintenance.close(operationId, deadline);
+      installedObserver().markClosed();
+    },
+    async release(operationId, deadline) {
+      await baseMaintenance.release(operationId, deadline);
+      workerObserver?.clear();
+    },
+  };
+  /** Fresh final installed observation, proof consumed at the actual worker bootout dispatch. */
+  const stopInstalledWorker = async () => {
+    if (!workerSeal || !operation.record.supervisor) throw new Error("installed worker identity was not captured");
+    return stopInstalledWorkerUnderProof({
+      observer: installedObserver(),
+      operationId: operation.record.id,
+      worker: workerSeal,
+      bootId: operation.record.supervisor.bootId,
+      clock,
+      supplementary: () =>
+        proveBarrierBeforeStop({
+          operation,
+          instanceHome: home,
+          instanceId: summary.instanceId,
+          supervisor: operation.record.supervisor!,
+          corroborateSupervisor: async () => observeWorker(),
+        }),
+      persistSignalsBegun: async () => {
+        operation.record.signalsBegun = true;
+        await persistOperation(operation);
+      },
+      controller: controller(),
+      workerDefinition: definitions.worker,
+      healthListenerPort: () => recordedWorkerHealthPort ?? summary.workerHealthPort,
+      release: () => maintenance.release(operation.record.id, Date.now() + 2_000),
+    });
+  };
+  const recordVerifiedDeferredStop = async (reason: string): Promise<never> => {
+    // Verified: no signal issued and the same owner released admission.
+    installedStopDeferred = true;
+    barrierEstablished = false;
+    operation.record.signalsBegun = false;
+    await persistOperation(operation);
+    throw new DeferredMaintenance(`installed worker stop deferred: ${reason}`);
+  };
 
   const verifyCurrentPair = (minimumStartedAt = activationStartedAt) =>
     verifyPackagedPair(context, {
@@ -703,12 +757,14 @@ export async function runNodeLifecycle(
       }
       const worker = await controller().inspect(definitions.worker.label);
       if (worker.process) {
+        workerSeal = processSealOf(worker);
         await recordSupervisorProcess(
           worker.process.pid,
           worker.process.startTime,
           recordedWorkerHealthPort ?? summary.workerHealthPort,
         );
       }
+      await installedObserver().prepare();
       await quiesce(maintenance, operation.record.id);
       barrierEstablished = true;
     },
@@ -720,15 +776,8 @@ export async function runNodeLifecycle(
     async markSignalsBegun() {
       if (noOpHealthyStart || noOpReleaseCheck) return;
       if (holdSession) return; // Persisted by the proof-fenced stop itself, immediately before dispatch.
-      if (barrierEstablished && operation.record.supervisor) {
-        await proveBarrierBeforeStop({
-          operation,
-          instanceHome: home,
-          instanceId: summary.instanceId,
-          supervisor: operation.record.supervisor,
-          corroborateSupervisor: async () => observeWorker(),
-        });
-      }
+      // A barrier stop persists signalsBegun inside the proof fence, after the final fresh read.
+      if (barrierEstablished && operation.record.supervisor && workerWasRunning) return;
       operation.record.signalsBegun = true;
       await persistOperation(operation);
     },
@@ -757,6 +806,11 @@ export async function runNodeLifecycle(
           await persistOperation(operation);
           throw new DeferredMaintenance(`legacy hold stop deferred: ${outcome.reason}`);
         }
+        return;
+      }
+      if (barrierEstablished && operation.record.supervisor && workerWasRunning) {
+        const outcome = await stopInstalledWorker();
+        if (outcome.kind === "deferred") await recordVerifiedDeferredStop(outcome.reason);
         return;
       }
       if (workerWasRunning) {
@@ -849,6 +903,13 @@ export async function runNodeLifecycle(
         await finishDeferredPrePromotion();
         return;
       }
+      if (installedStopDeferred) {
+        await verifyUnsignaledPair();
+        operation.record.resolution = "deferred";
+        await persistOperation(operation);
+        await finishDeferredPrePromotion();
+        return;
+      }
       const worker = await controller().inspect(definitions.worker.label);
       if (worker.loaded) {
         await controller().bootout(definitions.worker, {
@@ -916,6 +977,21 @@ export async function runNodeLifecycle(
     },
     retainUnresolved,
   };
+
+  /** After a verified deferred stop no signal was issued: the captured generation must still run. */
+  async function verifyUnsignaledPair(): Promise<void> {
+    if (!serviceSnapshot) throw new Error("prior service snapshot missing");
+    for (const item of serviceSnapshot.services) {
+      if (!item.inspection.process) continue;
+      const live = await controller().inspect(item.definition.label);
+      if (
+        live.process?.pid !== item.inspection.process.pid ||
+        live.process?.startTime !== item.inspection.process.startTime
+      ) {
+        throw new Error("service generation changed although no stop signal was issued");
+      }
+    }
+  }
 
   async function finishDeferredPrePromotion(): Promise<void> {
     if (rotation) {
@@ -1014,31 +1090,31 @@ export async function runNodeLifecycle(
           phase,
           async quiesceCandidate() {
             if (worker.process) {
+              workerSeal = processSealOf(worker);
               await recordSupervisorProcess(worker.process.pid, worker.process.startTime, summary.workerHealthPort);
             }
+            await installedObserver().prepare();
             await quiesce(maintenance, operation.record.id);
+            barrierEstablished = true;
             return true;
           },
           releaseCandidate: () => maintenance.release(operation.record.id, Date.now() + 2_000),
           async markSignalsBegun() {
-            if (operation.record.supervisor) {
-              await proveBarrierBeforeStop({
-                operation,
-                instanceHome: home,
-                instanceId: summary.instanceId,
-                supervisor: operation.record.supervisor,
-                corroborateSupervisor: async () => observeWorker(),
-              });
-            }
+            // The candidate stop persists signalsBegun inside its proof fence.
+            if (operation.record.supervisor) return;
             operation.record.signalsBegun = true;
             await persistOperation(operation);
           },
           async stopCandidateWorker() {
-            await controller().bootout(definitions.worker, {
-              markIrreversible: async () => {},
-              healthListenerPort: recordedWorkerHealthPort ?? summary.workerHealthPort,
-            });
+            const outcome = await stopInstalledWorker();
+            if (outcome.kind === "deferred") {
+              barrierEstablished = false;
+              operation.record.signalsBegun = false;
+              await persistOperation(operation);
+            }
+            return outcome;
           },
+          verifyCandidateUnsignaled: () => verifyUnsignaledPair(),
           async verifyCandidatePacked() {
             engineLogOffset = 0;
             await verifyCurrentPair();
@@ -1069,7 +1145,7 @@ export async function runNodeLifecycle(
       },
       recoverPriorPair: async () => {
         await pilotIO!.recoverPriorPair();
-        operation.record.resolution = "recovered";
+        operation.record.resolution = operation.record.signalsBegun ? "recovered" : "deferred";
         await persistOperation(operation);
       },
       finishResolved: async () => (pilotIO ? pilotIO.finishResolved() : finish("deferred")),

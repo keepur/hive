@@ -1,13 +1,24 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
 import { parseBootIdentity } from "./health.js";
 import { buildServiceEnvironment, servicePortKeys, ServiceController } from "./services.js";
 import { requestMaintenance, type MaintenanceReply } from "../voice-worker/maintenance-ipc.js";
+import { canonical } from "./canonical.js";
+import { ProbeFailure } from "./pilot-probe.js";
+import { readRelease } from "./release.js";
+import {
+  readOwnLoaderTelemetry,
+  runWorkerMaintenanceProbe,
+  workerMaintenanceFailure,
+  type WorkerMaintenanceProbeDeps,
+} from "./worker-maintenance-probe.js";
 
-export type RuntimeProbeMode = "config" | "bridge" | "worker" | "outbound";
+export { readOwnLoaderTelemetry } from "./worker-maintenance-probe.js";
+
+export type RuntimeProbeMode = "config" | "bridge" | "worker" | "outbound" | "worker-maintenance";
 
 export interface BridgeProbeResult {
   authenticated: boolean;
@@ -375,9 +386,17 @@ async function outboundMode() {
   );
 }
 
-export async function runRuntimeProbe(mode: string): Promise<Record<string, unknown>> {
+export async function runRuntimeProbe(mode: string, inputPath?: string): Promise<Record<string, unknown>> {
+  if (mode === "worker-maintenance") {
+    if (inputPath === undefined || !isAbsolute(inputPath)) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+    return (await runWorkerMaintenanceProbe(inputPath, installedWorkerMaintenanceDeps())) as unknown as Record<
+      string,
+      unknown
+    >;
+  }
+  if (inputPath !== undefined) throw new Error("runtime probe mode accepts no private input path");
   if (mode !== "config" && mode !== "bridge" && mode !== "worker" && mode !== "outbound") {
-    throw new Error("runtime probe mode must be config, bridge, worker, or outbound");
+    throw new Error("runtime probe mode must be config, bridge, worker, outbound, or worker-maintenance");
   }
   switch (mode) {
     case "config":
@@ -391,23 +410,85 @@ export async function runRuntimeProbe(mode: string): Promise<Record<string, unkn
   }
 }
 
+/** Concrete in-process boundaries for the installed `worker-maintenance` mode. */
+function installedWorkerMaintenanceDeps(): WorkerMaintenanceProbeDeps {
+  const controllerFor = (operationDirectory: string, instanceId: string, hiveHome: string) =>
+    new ServiceController({ instanceId, hiveHome, home: process.env.HOME!, operationDir: operationDirectory });
+  // `<home>/.hive-state/deployment/operations/<id>`; association was validated first.
+  const instanceOf = (operationDirectory: string) => resolve(operationDirectory, "..", "..", "..", "..");
+  let loaded: Awaited<ReturnType<WorkerMaintenanceProbeDeps["loadWorkerConfig"]>> | null = null;
+  return {
+    now: Date.now,
+    uid: () => process.getuid!(),
+    selfPath: fileURLToPath(import.meta.url),
+    execPath: process.execPath,
+    env: process.env,
+    serviceEnvironment: (env) => assertRuntimeProbeEnvironment(env),
+    readRelease: (root) => readRelease(root),
+    async loadWorkerConfig() {
+      const { loadWorkerConfig } = await import("../voice-worker/worker-config.js");
+      const wc = loadWorkerConfig();
+      loaded = {
+        instanceHome: wc.instanceHome,
+        instanceId: wc.instanceId,
+        healthPort: wc.healthPort,
+        mongoUri: wc.mongoUri,
+        mongoDbName: wc.mongoDbName,
+      };
+      return loaded;
+    },
+    async inspectWorker(label, operationDirectory) {
+      if (!loaded) throw new ProbeFailure("PILOT_LOADER_UNAVAILABLE");
+      return (await controllerFor(operationDirectory, loaded.instanceId, instanceOf(operationDirectory)).inspect(label))
+        .process;
+    },
+    async processStartTime(pid, operationDirectory) {
+      if (!loaded) throw new ProbeFailure("PILOT_LOADER_UNAVAILABLE");
+      const identity = await controllerFor(
+        operationDirectory,
+        loaded.instanceId,
+        instanceOf(operationDirectory),
+      ).process(pid);
+      return identity?.startTime ?? null;
+    },
+    async listenerPid(port, supervisorPid, operationDirectory) {
+      if (!loaded) throw new ProbeFailure("PILOT_LOADER_UNAVAILABLE");
+      return (
+        await controllerFor(operationDirectory, loaded.instanceId, instanceOf(operationDirectory)).listener(
+          port,
+          supervisorPid,
+        )
+      ).pid;
+    },
+    probeWorkerHttp: (port) => probeWorkerHttp(port),
+    readTelemetry: (wc, request) => readOwnLoaderTelemetry(wc, request),
+    requestMaintenance: (options) => requestMaintenance(options),
+  };
+}
+
 async function main(): Promise<void> {
   const stdoutWrite = process.stdout.write;
   const stderrWrite = process.stderr.write;
   process.stdout.write = (() => true) as typeof process.stdout.write;
   process.stderr.write = (() => true) as typeof process.stderr.write;
+  const mode = process.argv[2] ?? "";
+  const privateMode = mode === "worker-maintenance";
+  const inputPath = process.argv[3];
   let output: Record<string, unknown>;
   try {
-    output = await runRuntimeProbe(process.argv[2] ?? "");
+    if (privateMode ? process.argv.length !== 4 : process.argv.length !== 3) {
+      throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+    }
+    output = await runRuntimeProbe(mode, privateMode ? inputPath : undefined);
     if (output.ok === false) process.exitCode = 1;
   } catch (error) {
-    output = runtimeProbeErrorResult(error);
+    output = privateMode ? await workerMaintenanceFailure(inputPath, error) : runtimeProbeErrorResult(error);
     process.exitCode = 1;
   } finally {
     process.stdout.write = stdoutWrite;
     process.stderr.write = stderrWrite;
   }
-  stdoutWrite.call(process.stdout, `${JSON.stringify(output)}\n`);
+  stdoutWrite.call(process.stdout, `${privateMode ? canonical(output) : JSON.stringify(output)}\n`);
 }
 
 const invokedPath = process.argv[1] ? realpathSync(process.argv[1]) : "";

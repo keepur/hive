@@ -401,7 +401,9 @@ describe("pilot recovery evidence", () => {
 });
 
 describe("pilot rollback transaction", () => {
-  function rollbackHarness(options: { verifyPilotFails?: boolean; quiesceDefers?: boolean } = {}) {
+  function rollbackHarness(
+    options: { verifyPilotFails?: boolean; quiesceDefers?: boolean; stopDefers?: boolean } = {},
+  ) {
     const calls: string[] = [];
     const candidate: ServiceSnapshot = { services: [] };
     const pilot = registered();
@@ -469,7 +471,14 @@ describe("pilot rollback transaction", () => {
       },
       releaseCandidate: async () => void calls.push("release-candidate"),
       markSignalsBegun: async () => void calls.push("signals"),
-      stopCandidateWorker: async () => void calls.push("bootout:worker"),
+      stopCandidateWorker: async () => {
+        if (options.stopDefers) {
+          calls.push("stop-deferred+released");
+          return { kind: "deferred" as const, reason: "fresh proof expired" };
+        }
+        calls.push("bootout:worker");
+      },
+      verifyCandidateUnsignaled: async () => void calls.push("verify-unsignaled"),
       verifyCandidatePacked: async () => void calls.push("verify-packaged"),
       captureFences: () => ({
         engineLog: { path: "/l", dev: 1, ino: 1, offset: 0 },
@@ -516,6 +525,16 @@ describe("pilot rollback transaction", () => {
       ]),
     );
     expect(tail.indexOf("start:candidate:engine")).toBeLessThan(tail.indexOf("start:candidate:worker"));
+  });
+
+  it("a verified deferred candidate stop signals nothing, restores nothing and resolves deferred", async () => {
+    const { io, calls } = rollbackHarness({ stopDefers: true });
+    await expect(activate(io)).rejects.toThrow("prior pair restored and verified");
+    expect(
+      calls.some((call) => call.startsWith("bootout") || call.startsWith("files") || call.startsWith("start")),
+    ).toBe(false);
+    expect(calls).toContain("verify-unsignaled");
+    expect(calls).toContain("resolved:deferred");
   });
 
   it("a candidate that cannot quiesce is deferred with no signal and no restore", async () => {

@@ -1,0 +1,534 @@
+/**
+ * Secret-free wire types, strict decoders and pure projections shared by the
+ * installed-worker `worker-maintenance` probe and the historical pilot probe
+ * ABI (KPR-463 plan chunk 5 Task 9 Step 4b.2a Steps 1–3).
+ *
+ * Builtin-only: the frozen helper decodes probe output with these functions;
+ * SDK/Mongo/loader imports stay lazily inside the installed `runtime-probe.ts`.
+ * Nothing here accepts a telemetry value, admission expectation or operation ID
+ * independently of a sealed request; decoded output is compared against the
+ * request that produced it and against independent OS evidence by the caller.
+ */
+import { createHash } from "node:crypto";
+import { canonical } from "./canonical.js";
+import { parseBootIdentity } from "./health.js";
+import {
+  array,
+  decodePilotSubject,
+  digest,
+  fileSeal,
+  instanceKey,
+  int,
+  literal,
+  object,
+  path,
+  processSeal,
+  release,
+  str,
+  uuid,
+  type Digest,
+  type FileSeal,
+  type InstanceKey,
+  type PilotSubject,
+  type ProcessSeal,
+} from "./pilot-records.js";
+import { parseMaintenanceReply, type MaintenanceReply } from "../voice-worker/maintenance-ipc.js";
+import type { BootIdentity, Release } from "./release.js";
+
+export const WORKER_MAINTENANCE_ABI = "hive-worker-maintenance/1";
+export const HISTORICAL_PROBE_ABI = "hive-pilot-probe/1";
+export const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
+export const DECISIVE_PROBE_BUDGET_MS = 2_000;
+export const TELEMETRY_MAX_AGE_MS = 60_000;
+export const MAX_PROBE_OUTPUT_BYTES = 256 * 1024;
+
+export const probeClassifications = [
+  "PILOT_PROBE_ABI_UNSUPPORTED",
+  "PILOT_PROBE_INPUT_INVALID",
+  "PILOT_LOADER_UNAVAILABLE",
+  "PILOT_CONFIGURATION_MISMATCH",
+  "PILOT_BRIDGE_FAILED",
+  "PILOT_DEPENDENCY_MISMATCH",
+  "PILOT_INVENTORY_INCOMPLETE",
+  "PILOT_PROBE_DEADLINE",
+  "PILOT_ADMISSION_MISMATCH",
+  "PILOT_TELEMETRY_MISSING",
+  "PILOT_TELEMETRY_INVALID",
+  "PILOT_TELEMETRY_STALE",
+  "PILOT_TELEMETRY_WRONG_BOOT",
+  "PILOT_TELEMETRY_QUERY_FAILED",
+] as const;
+export type ProbeClassification = (typeof probeClassifications)[number];
+
+/** A probe failure that carries only a fixed classification, never raw data. */
+export class ProbeFailure extends Error {
+  constructor(
+    readonly classification: ProbeClassification,
+    options?: ErrorOptions,
+  ) {
+    super(classification, options);
+  }
+}
+
+export function classificationOf(error: unknown): ProbeClassification {
+  if (error instanceof ProbeFailure) return error.classification;
+  const message = error instanceof Error ? error.message : "";
+  return (probeClassifications as readonly string[]).includes(message)
+    ? (message as ProbeClassification)
+    : "PILOT_PROBE_INPUT_INVALID";
+}
+
+export type OwnedDirectory = { path: string; identity: { dev: number; ino: number; uid: number } };
+
+export type HistoricalIdleRequest = {
+  expectedAdmission: "open" | "closed";
+  expectedSupervisor: BootIdentity;
+  statusRequestId: string;
+};
+
+export type HistoricalTelemetry = {
+  queryStartedAt: number;
+  queryFinishedAt: number;
+  supervisorIdentity: BootIdentity;
+  supervisorUpdatedAt: number;
+  activeCalls: number;
+};
+
+export type HistoricalIdle = {
+  status: { requestedAt: number; finishedAt: number; reply: MaintenanceReply };
+  telemetry: HistoricalTelemetry;
+};
+
+export type SdkObservation = {
+  host: "127.0.0.1";
+  port: number;
+  rootStatus: number;
+  agentName: string;
+  activeJobs: number;
+};
+
+export type WorkerMaintenancePhase = "baseline" | "post-close" | "final";
+
+export type WorkerMaintenanceRequest = {
+  schemaVersion: 1;
+  abi: typeof WORKER_MAINTENANCE_ABI;
+  action: "observe";
+  requestId: string;
+  operationId: string;
+  jobId: string;
+  instance: InstanceKey;
+  phase: WorkerMaintenancePhase;
+  requestedAt: number;
+  deadline: number;
+  maintenanceDeadline: number;
+  runtime: {
+    root: OwnedDirectory;
+    node: FileSeal;
+    probe: FileSeal;
+    config: FileSeal;
+    environmentSha256: Digest;
+  };
+  expectedRelease: Release;
+  expectedWorker: ProcessSeal;
+  idle: HistoricalIdleRequest;
+};
+
+export type WorkerMaintenanceObservation = {
+  schemaVersion: 1;
+  abi: typeof WORKER_MAINTENANCE_ABI;
+  action: "observe";
+  requestId: string;
+  operationId: string;
+  jobId: string;
+  instance: InstanceKey;
+  phase: WorkerMaintenancePhase;
+  requestSha256: Digest;
+  startedAt: number;
+  finishedAt: number;
+  release: Release;
+  sdk: SdkObservation;
+  idle: HistoricalIdle;
+};
+
+export type ProbeFailureEnvelope = {
+  schemaVersion: 1;
+  abi: string;
+  requestId: string;
+  classification: ProbeClassification;
+};
+
+const TIME_MAX = 8_640_000_000_000_000;
+const time = (value: unknown) => int(value, 0, TIME_MAX);
+
+export function sha256Canonical(value: unknown): Digest {
+  return createHash("sha256").update(canonical(value)).digest("hex");
+}
+
+export function bootIdentity(value: unknown): BootIdentity {
+  try {
+    return parseBootIdentity(value);
+  } catch (error) {
+    throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID", { cause: error });
+  }
+}
+
+function ownedDirectory(value: unknown): OwnedDirectory {
+  const o = object(value, ["path", "identity"]);
+  const i = object(o.identity, ["dev", "ino", "uid"]);
+  return { path: path(o.path), identity: { dev: int(i.dev), ino: int(i.ino), uid: int(i.uid, 0, 0x7fffffff) } };
+}
+
+export function historicalIdleRequest(value: unknown): HistoricalIdleRequest {
+  const o = object(value, ["expectedAdmission", "expectedSupervisor", "statusRequestId"]);
+  const supervisor = bootIdentity(o.expectedSupervisor);
+  if (supervisor.component !== "voice-worker") throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  return {
+    expectedAdmission: literal(o.expectedAdmission, ["open", "closed"]),
+    expectedSupervisor: supervisor,
+    statusRequestId: uuid(o.statusRequestId),
+  };
+}
+
+export function decodeWorkerMaintenanceRequest(value: unknown): WorkerMaintenanceRequest {
+  const o = object(value, [
+    "schemaVersion",
+    "abi",
+    "action",
+    "requestId",
+    "operationId",
+    "jobId",
+    "instance",
+    "phase",
+    "requestedAt",
+    "deadline",
+    "maintenanceDeadline",
+    "runtime",
+    "expectedRelease",
+    "expectedWorker",
+    "idle",
+  ]);
+  if (o.schemaVersion !== 1) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  const runtime = object(o.runtime, ["root", "node", "probe", "config", "environmentSha256"]);
+  const request: WorkerMaintenanceRequest = {
+    schemaVersion: 1,
+    abi: literal(o.abi, [WORKER_MAINTENANCE_ABI]),
+    action: literal(o.action, ["observe"]),
+    requestId: uuid(o.requestId),
+    operationId: uuid(o.operationId),
+    jobId: uuid(o.jobId),
+    instance: instanceKey(o.instance),
+    phase: literal(o.phase, ["baseline", "post-close", "final"]),
+    requestedAt: time(o.requestedAt),
+    deadline: time(o.deadline),
+    maintenanceDeadline: time(o.maintenanceDeadline),
+    runtime: {
+      root: ownedDirectory(runtime.root),
+      node: fileSeal(runtime.node),
+      probe: fileSeal(runtime.probe),
+      config: fileSeal(runtime.config),
+      environmentSha256: digest(runtime.environmentSha256),
+    },
+    expectedRelease: release(o.expectedRelease),
+    expectedWorker: processSeal(o.expectedWorker),
+    idle: historicalIdleRequest(o.idle),
+  };
+  const ids = [request.requestId, request.operationId, request.jobId, request.idle.statusRequestId];
+  if (new Set(ids).size !== ids.length) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  if (
+    request.deadline <= request.requestedAt ||
+    request.deadline > request.requestedAt + DECISIVE_PROBE_BUDGET_MS ||
+    request.deadline > request.maintenanceDeadline
+  ) {
+    throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  }
+  const expectedAdmission = request.phase === "baseline" ? "open" : "closed";
+  if (request.idle.expectedAdmission !== expectedAdmission) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  if (request.runtime.probe.realpath !== `${request.runtime.root.path}/pkg/runtime-probe.min.js`) {
+    throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  }
+  if (
+    request.idle.expectedSupervisor.pid !== request.expectedWorker.pid ||
+    canonical(request.idle.expectedSupervisor.release) !== canonical(request.expectedRelease)
+  ) {
+    throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  }
+  return request;
+}
+
+function sdkObservation(value: unknown): SdkObservation {
+  const o = object(value, ["host", "port", "rootStatus", "agentName", "activeJobs"]);
+  return {
+    host: literal(o.host, ["127.0.0.1"]),
+    port: int(o.port, 1, 65535),
+    rootStatus: int(o.rootStatus, 100, 599),
+    agentName: str(o.agentName, 128),
+    activeJobs: int(o.activeJobs, 0, 1_000_000),
+  };
+}
+
+export function historicalTelemetry(value: unknown): HistoricalTelemetry {
+  const o = object(value, [
+    "queryStartedAt",
+    "queryFinishedAt",
+    "supervisorIdentity",
+    "supervisorUpdatedAt",
+    "activeCalls",
+  ]);
+  return {
+    queryStartedAt: time(o.queryStartedAt),
+    queryFinishedAt: time(o.queryFinishedAt),
+    supervisorIdentity: bootIdentity(o.supervisorIdentity),
+    supervisorUpdatedAt: time(o.supervisorUpdatedAt),
+    activeCalls: int(o.activeCalls, 0, 1_000_000),
+  };
+}
+
+export function historicalIdle(value: unknown): HistoricalIdle {
+  const o = object(value, ["status", "telemetry"]);
+  const status = object(o.status, ["requestedAt", "finishedAt", "reply"]);
+  let reply: MaintenanceReply;
+  try {
+    reply = parseMaintenanceReply(status.reply);
+  } catch (error) {
+    throw new ProbeFailure("PILOT_ADMISSION_MISMATCH", { cause: error });
+  }
+  return {
+    status: { requestedAt: time(status.requestedAt), finishedAt: time(status.finishedAt), reply },
+    telemetry: historicalTelemetry(o.telemetry),
+  };
+}
+
+export function decodeWorkerMaintenanceObservation(value: unknown): WorkerMaintenanceObservation {
+  const o = object(value, [
+    "schemaVersion",
+    "abi",
+    "action",
+    "requestId",
+    "operationId",
+    "jobId",
+    "instance",
+    "phase",
+    "requestSha256",
+    "startedAt",
+    "finishedAt",
+    "release",
+    "sdk",
+    "idle",
+  ]);
+  if (o.schemaVersion !== 1) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  if (o.idle === null) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  return {
+    schemaVersion: 1,
+    abi: literal(o.abi, [WORKER_MAINTENANCE_ABI]),
+    action: literal(o.action, ["observe"]),
+    requestId: uuid(o.requestId),
+    operationId: uuid(o.operationId),
+    jobId: uuid(o.jobId),
+    instance: instanceKey(o.instance),
+    phase: literal(o.phase, ["baseline", "post-close", "final"]),
+    requestSha256: digest(o.requestSha256),
+    startedAt: time(o.startedAt),
+    finishedAt: time(o.finishedAt),
+    release: release(o.release),
+    sdk: sdkObservation(o.sdk),
+    idle: historicalIdle(o.idle),
+  };
+}
+
+export function decodeProbeFailure(value: unknown, abi: string): ProbeFailureEnvelope {
+  const o = object(value, ["schemaVersion", "abi", "requestId", "classification"]);
+  if (o.schemaVersion !== 1 || o.abi !== abi) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  return {
+    schemaVersion: 1,
+    abi,
+    requestId: str(o.requestId, 36),
+    classification: literal(o.classification, probeClassifications),
+  };
+}
+
+/**
+ * Correlate one decoded installed-worker observation with the exact request
+ * that produced it: identities, sealed request digest, release, phase and the
+ * ordered timestamps `requestedAt <= startedAt <= status/query <= finishedAt
+ * <= deadline`, plus the strict telemetry boot/heartbeat rules. Returns the
+ * fixed classification of the first failure or null.
+ */
+export function workerObservationFault(
+  observation: WorkerMaintenanceObservation,
+  request: WorkerMaintenanceRequest,
+  requestBytesSha256: Digest,
+  now: number,
+): ProbeClassification | null {
+  if (
+    observation.requestId !== request.requestId ||
+    observation.operationId !== request.operationId ||
+    observation.jobId !== request.jobId ||
+    observation.phase !== request.phase ||
+    observation.requestSha256 !== requestBytesSha256 ||
+    canonical(observation.instance) !== canonical(request.instance)
+  ) {
+    return "PILOT_PROBE_INPUT_INVALID";
+  }
+  if (canonical(observation.release) !== canonical(request.expectedRelease)) return "PILOT_DEPENDENCY_MISMATCH";
+  const { status, telemetry } = observation.idle;
+  const ordered = [request.requestedAt, observation.startedAt, Math.min(status.requestedAt, telemetry.queryStartedAt)];
+  const ends = [status.finishedAt, telemetry.queryFinishedAt];
+  if (
+    ordered.some((value, index) => index > 0 && value < ordered[index - 1]) ||
+    status.requestedAt > status.finishedAt ||
+    telemetry.queryStartedAt > telemetry.queryFinishedAt ||
+    ends.some((value) => value > observation.finishedAt) ||
+    observation.finishedAt > request.deadline ||
+    request.deadline > request.requestedAt + DECISIVE_PROBE_BUDGET_MS ||
+    observation.finishedAt > now
+  ) {
+    return "PILOT_PROBE_DEADLINE";
+  }
+  const reply = status.reply;
+  if (
+    reply.requestId !== request.idle.statusRequestId ||
+    reply.operationId !== request.operationId ||
+    reply.writtenAt < status.requestedAt ||
+    reply.writtenAt > status.finishedAt ||
+    reply.supervisor.pid !== request.idle.expectedSupervisor.pid ||
+    reply.supervisor.bootId !== request.idle.expectedSupervisor.bootId ||
+    reply.snapshot.admission !== request.idle.expectedAdmission ||
+    (request.idle.expectedAdmission === "open" && reply.snapshot.operationId !== null) ||
+    (request.idle.expectedAdmission === "closed" && reply.snapshot.operationId !== request.operationId)
+  ) {
+    return "PILOT_ADMISSION_MISMATCH";
+  }
+  if (
+    telemetry.supervisorIdentity.component !== "voice-worker" ||
+    canonical(telemetry.supervisorIdentity) !== canonical(request.idle.expectedSupervisor) ||
+    canonical(telemetry.supervisorIdentity.release) !== canonical(request.expectedRelease)
+  ) {
+    return "PILOT_TELEMETRY_WRONG_BOOT";
+  }
+  const bootStartedAt = Date.parse(telemetry.supervisorIdentity.startedAt);
+  if (!Number.isFinite(bootStartedAt) || telemetry.supervisorUpdatedAt < bootStartedAt)
+    return "PILOT_TELEMETRY_INVALID";
+  if (
+    telemetry.supervisorUpdatedAt > telemetry.queryFinishedAt ||
+    telemetry.queryFinishedAt - telemetry.supervisorUpdatedAt > TELEMETRY_MAX_AGE_MS
+  ) {
+    return "PILOT_TELEMETRY_STALE";
+  }
+  return null;
+}
+
+// ── historical ABI helpers (chunk 5 Step 2/3) ─────────────────────────────
+
+export type PilotConfigLoaderShape = {
+  instanceHome: string;
+  instanceId: string;
+  mongoDbName: string;
+  sipTrunkId: string;
+  inboundAgents: Record<string, string>;
+  agentVoices: Record<string, string>;
+  defaultStt: string;
+  defaultTts: string;
+  bridgeUrl: string;
+};
+
+/** Versioned configuration identity projection; excludes credentials and credential-bearing URLs. */
+export function pilotConfigProjection(wc: PilotConfigLoaderShape, instance: InstanceKey, sdkPort: number): object {
+  let bridge: URL;
+  try {
+    bridge = new URL(wc.bridgeUrl);
+  } catch {
+    throw new ProbeFailure("PILOT_CONFIGURATION_MISMATCH");
+  }
+  if (
+    bridge.protocol !== "http:" ||
+    bridge.hostname !== "127.0.0.1" ||
+    bridge.username ||
+    bridge.password ||
+    bridge.search ||
+    bridge.hash ||
+    bridge.pathname !== "/v1/chat/completions"
+  ) {
+    throw new ProbeFailure("PILOT_CONFIGURATION_MISMATCH");
+  }
+  if (wc.instanceHome !== instance.canonicalHome || wc.instanceId !== instance.instanceId) {
+    throw new ProbeFailure("PILOT_CONFIGURATION_MISMATCH");
+  }
+  return {
+    projection: 1,
+    instance,
+    databaseName: wc.mongoDbName,
+    ports: { bridge: Number(bridge.port || "80"), worker: sdkPort },
+    routing: { sipTrunkId: wc.sipTrunkId, inboundAgents: wc.inboundAgents, agentVoices: wc.agentVoices },
+    voice: { defaultStt: wc.defaultStt, defaultTts: wc.defaultTts },
+  };
+}
+
+export function pilotConfigIdentity(wc: PilotConfigLoaderShape, instance: InstanceKey, sdkPort: number): Digest {
+  return sha256Canonical(pilotConfigProjection(wc, instance, sdkPort));
+}
+
+/** Pinned LiveKit server SDK 2.14.1 SIP pagination: `{limit, afterId}`, bounded, non-repeating. */
+export async function allSipPages<T>(
+  read: (page: { limit: number; afterId: string }) => Promise<T[]>,
+  idOf: (row: T) => string,
+): Promise<T[]> {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  let afterId = "";
+  for (let page = 0; page < 100; page++) {
+    const rows = await read({ limit: 100, afterId });
+    if (!Array.isArray(rows) || rows.length > 100) throw new ProbeFailure("PILOT_INVENTORY_INCOMPLETE");
+    for (const row of rows) {
+      const id = idOf(row);
+      if (typeof id !== "string" || !id || id.length > 4096 || /[\0\r\n]/.test(id) || seen.has(id)) {
+        throw new ProbeFailure("PILOT_INVENTORY_INCOMPLETE");
+      }
+      seen.add(id);
+      result.push(row);
+    }
+    if (rows.length < 100) return result;
+    const next = idOf(rows[rows.length - 1]);
+    if (next === afterId) throw new ProbeFailure("PILOT_INVENTORY_INCOMPLETE");
+    afterId = next;
+  }
+  throw new ProbeFailure("PILOT_INVENTORY_INCOMPLETE");
+}
+
+export type InventoryItem = {
+  kind: "room" | "participant" | "dispatch" | "sip-rule" | "inbound-trunk";
+  id: string;
+  parent: string | null;
+  agentName: string | null;
+};
+
+export function inventoryDigest(operationId: string, resourceKind: InventoryItem["kind"], rawId: string): Digest {
+  if (typeof rawId !== "string" || !rawId || rawId.length > 4096 || /[\0\r\n]/.test(rawId)) {
+    throw new ProbeFailure("PILOT_INVENTORY_INCOMPLETE");
+  }
+  return createHash("sha256").update(`${operationId}\0${resourceKind}\0${rawId}`).digest("hex");
+}
+
+export function sortInventory(items: InventoryItem[]): InventoryItem[] {
+  return [...items].sort((left, right) =>
+    canonical([left.kind, left.id, left.parent, left.agentName]).localeCompare(
+      canonical([right.kind, right.id, right.parent, right.agentName]),
+    ),
+  );
+}
+
+export function inventoryItem(value: unknown): InventoryItem {
+  const o = object(value, ["kind", "id", "parent", "agentName"]);
+  return {
+    kind: literal(o.kind, ["room", "participant", "dispatch", "sip-rule", "inbound-trunk"]),
+    id: digest(o.id),
+    parent: o.parent === null ? null : digest(o.parent),
+    agentName: o.agentName === null ? null : str(o.agentName, 128),
+  };
+}
+
+export function inventoryItems(value: unknown): InventoryItem[] {
+  return array(value, inventoryItem, 0, 10_000);
+}
+
+export { decodePilotSubject };
+export type { PilotSubject };

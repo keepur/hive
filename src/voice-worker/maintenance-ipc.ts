@@ -460,6 +460,14 @@ function isAdmissionSnapshot(value: unknown): value is AdmissionSnapshot {
   );
 }
 
+/**
+ * The shared strict reply decoder, exported unchanged for historical-wire reuse
+ * by deployment probes (KPR-463 chunk 5 Step 2a). No protocol or gate change.
+ */
+export function parseMaintenanceReply(value: unknown): MaintenanceReply {
+  return parseReply(value);
+}
+
 function parseReply(value: unknown): MaintenanceReply {
   if (!value || typeof value !== "object") throw new Error("invalid maintenance reply");
   const reply = value as Partial<MaintenanceReply>;

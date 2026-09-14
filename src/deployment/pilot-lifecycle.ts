@@ -452,8 +452,13 @@ export interface PilotRollbackIO {
   quiesceCandidate(): Promise<boolean>;
   releaseCandidate(): Promise<void>;
   markSignalsBegun(): Promise<void>;
-  /** Stop the candidate worker under the final fresh proof fence. */
-  stopCandidateWorker(): Promise<void>;
+  /**
+   * Stop the candidate worker under the final fresh proof fence. A `deferred`
+   * outcome means no signal was issued and the same owner released admission.
+   */
+  stopCandidateWorker(): Promise<VerifiedStopOutcome | void>;
+  /** After a verified deferred stop: the candidate pair is still the captured generation. */
+  verifyCandidateUnsignaled?(): Promise<void>;
   verifyCandidatePacked(): Promise<void>;
   captureFences(): ActivationFences;
   finishResolved(resolution: "healthy" | "recovered" | "deferred"): Promise<void>;
@@ -469,6 +474,7 @@ export interface PilotRollbackIO {
  */
 export function pilotRollbackTransaction(io: PilotRollbackIO): TransactionIO {
   let barrierEstablished = false;
+  let stopDeferred = false;
   let fences: ActivationFences | null = null;
   let resolution: "healthy" | "recovered" | "deferred" = "deferred";
   const labels = {
@@ -488,7 +494,13 @@ export function pilotRollbackTransaction(io: PilotRollbackIO): TransactionIO {
     },
     markSignalsBegun: () => io.markSignalsBegun(),
     async stopWorkerAndChildren() {
-      await io.stopCandidateWorker();
+      const outcome = await io.stopCandidateWorker();
+      if (outcome && outcome.kind === "deferred") {
+        // Verified: no signal was issued and admission was released by the proof path.
+        stopDeferred = true;
+        barrierEstablished = false;
+        throw new DeferredMaintenance(`candidate stop deferred: ${outcome.reason}`);
+      }
     },
     async stopEngine() {
       await io.controller.bootout(io.candidateDefinitions.engine, { markIrreversible: async () => {} });
@@ -518,6 +530,12 @@ export function pilotRollbackTransaction(io: PilotRollbackIO): TransactionIO {
       resolution = "healthy";
     },
     async recoverPriorPair() {
+      if (stopDeferred) {
+        if (!io.verifyCandidateUnsignaled) throw new Error("deferred candidate stop cannot be verified");
+        await io.verifyCandidateUnsignaled();
+        resolution = "deferred";
+        return;
+      }
       const worker = await io.controller.inspect(labels.worker);
       if (worker.loaded) {
         const pilotWorker = io.pilot.services.services.find((item) => item.definition.label === labels.worker);
