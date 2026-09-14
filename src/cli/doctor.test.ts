@@ -11,6 +11,7 @@ import {
   renderPromptCacheSection,
   renderSpawnCoordinatorSection,
   renderVoiceWorkerSection,
+  renderPilotRegistrySection,
   renderResourceEnvelopesSection,
   resolveRequiredEnvVars,
 } from "./doctor.js";
@@ -486,6 +487,7 @@ describe("renderVoiceWorkerSection (KPR-322)", () => {
         health: "healthy",
         registration: "registered",
         maintenanceClassification: "worker-registered",
+        supervisor: { pid: 7001, bootId: "11111111-1111-4111-8111-111111111111" },
         unresolved: [{ jobId: "job-a", acceptedAt: 0, phase: "accepted-awaiting-entry" }],
       },
     );
@@ -496,6 +498,133 @@ describe("renderVoiceWorkerSection (KPR-322)", () => {
     expect(output).toContain("registration=registered health=healthy maintenance=worker-registered");
     expect(output).toContain("unresolved job=job-a phase=accepted-awaiting-entry");
     expect(output).not.toContain("must-not-leak");
+  });
+
+  // KPR-463 plan Task 4 Step 4: unresolved-entry diagnostics.
+  it("names the supervisor, phase, age and child PID of every unresolved admission", () => {
+    const lines: string[] = [];
+    const now = Date.now();
+    renderVoiceWorkerSection(fullRow, (line) => lines.push(line), "keepur", undefined, undefined, {
+      health: "unhealthy",
+      registration: "registered",
+      maintenanceClassification: "worker-registered",
+      supervisor: { pid: 7001, bootId: "22222222-2222-4222-8222-222222222222" },
+      unresolved: [
+        { jobId: "job-a", acceptedAt: now - 90_000, phase: "accepted-awaiting-entry" },
+        { jobId: "job-b", acceptedAt: now - 5_000, phase: "entered-awaiting-completion", childPid: 8123 },
+      ],
+    });
+    const output = lines.join("\n");
+    expect(output).toContain(
+      "unresolved admissions: 2 (supervisor pid=7001 boot=22222222-2222-4222-8222-222222222222)",
+    );
+    expect(output).toMatch(/unresolved job=job-a phase=accepted-awaiting-entry .*age=90s child=unassigned/);
+    expect(output).toMatch(/unresolved job=job-b phase=entered-awaiting-completion .*age=5s child=8123/);
+    // The standing rule: nothing but the genuine completion path clears these.
+    expect(output).toContain("only the genuine completion path clears these");
+    expect(output).toContain("never do, and no flag clears them");
+  });
+
+  it("reports an unreported supervisor rather than inventing one", () => {
+    const lines: string[] = [];
+    renderVoiceWorkerSection(fullRow, (line) => lines.push(line), "keepur", undefined, undefined, {
+      health: "unhealthy",
+      registration: "unregistered",
+      maintenanceClassification: "probe-response-invalid",
+      supervisor: null,
+      unresolved: [{ jobId: "job-c", acceptedAt: Date.now(), phase: "accepted-awaiting-entry" }],
+    });
+    expect(lines.join("\n")).toContain("supervisor unreported");
+  });
+
+  it("prints no unresolved block when the ledger is clean", () => {
+    const lines: string[] = [];
+    renderVoiceWorkerSection(fullRow, (line) => lines.push(line), "keepur", undefined, undefined, {
+      health: "healthy",
+      registration: "registered",
+      maintenanceClassification: "worker-registered",
+      supervisor: { pid: 1, bootId: "b" },
+      unresolved: [],
+    });
+    expect(lines.join("\n")).not.toContain("unresolved");
+  });
+});
+
+describe("renderPilotRegistrySection (KPR-463)", () => {
+  function render(outcome: Parameters<typeof renderPilotRegistrySection>[0]): string {
+    const lines: string[] = [];
+    renderPilotRegistrySection(outcome, (line) => lines.push(line));
+    return lines.join("\n");
+  }
+
+  it("reports when no registry command has ever run", () => {
+    expect(render(null)).toContain("no registry command has been recorded");
+  });
+
+  it("renders a registered pilot snapshot with its selector", () => {
+    const output = render({
+      operationId: "op-1",
+      recordedAt: "2026-09-14T00:00:00.000Z",
+      result: {
+        status: "PILOT_SNAPSHOT_REGISTERED",
+        snapshot: "snap-7",
+        loader: "packaged",
+        admission: "closed",
+      },
+    });
+    expect(output).toContain("PILOT_SNAPSHOT_REGISTERED (snapshot=snap-7 loader=packaged admission=closed)");
+    expect(output).toContain("captured and registered");
+    expect(output).toContain("operation op-1");
+  });
+
+  it("renders an available native hold and keeps the fresh-assessment caveat", () => {
+    const output = render({
+      operationId: "op-2",
+      recordedAt: "2026-09-14T00:00:00.000Z",
+      result: {
+        status: "NATIVE_HOLD_AVAILABLE",
+        snapshot: "snap-7",
+        holdRecord: "hold-3",
+        establishment: "requires-new-operation-close",
+      },
+    });
+    expect(output).toContain(
+      "NATIVE_HOLD_AVAILABLE (snapshot=snap-7 hold=hold-3 establishment=requires-new-operation-close)",
+    );
+    expect(output).toContain("must still acquire its own close");
+    expect(output).toContain("history, not a live hold");
+  });
+
+  it("renders an exercised-and-released legacy hold", () => {
+    const output = render({
+      operationId: "op-3",
+      recordedAt: "2026-09-14T00:00:00.000Z",
+      result: { status: "LEGACY_HOLD_EXERCISED_AND_RELEASED", snapshot: "snap-7", holdRecord: "hold-3" },
+    });
+    expect(output).toContain("LEGACY_HOLD_EXERCISED_AND_RELEASED (snapshot=snap-7 hold=hold-3)");
+    expect(output).toContain("exercised and then released");
+  });
+
+  it("renders a blocked capture with its reason", () => {
+    const output = render({
+      operationId: "op-4",
+      recordedAt: "2026-09-14T00:00:00.000Z",
+      result: { status: "PILOT_CAPTURE_BLOCKED", reason: "voice-worker is not running" },
+    });
+    expect(output).toContain("PILOT_CAPTURE_BLOCKED (reason=voice-worker is not running)");
+    expect(output).toContain("refused before observing anything");
+  });
+
+  it("lists migration gaps and survives an unreadable result", () => {
+    const gaps = render({
+      operationId: "op-5",
+      recordedAt: "2026-09-14T00:00:00.000Z",
+      result: { status: "MIGRATION_PENDING", snapshot: "snap-7", gaps: ["native procedure unavailable"] },
+    });
+    expect(gaps).toContain("gap: native procedure unavailable");
+    expect(render({ operationId: "op-6", recordedAt: "2026-09-14T00:00:00.000Z", result: null })).toContain(
+      "unreadable registry result",
+    );
   });
 });
 

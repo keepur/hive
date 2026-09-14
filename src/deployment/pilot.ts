@@ -1152,6 +1152,50 @@ export function registry(operation: AcquiredOperation): RegistryWork {
 
 export const REGISTRY_RESULT_FILE = "registry-result.json";
 
+/**
+ * Human-readable rendering of one recorded registry-command outcome. The
+ * frozen helper's stdout stays machine-readable JSON; this is the operator's
+ * reading of the same bytes, so the hold family's four statuses are legible
+ * without parsing them by hand.
+ *
+ * It reports what a command recorded, never a live held state — a registered
+ * record is a selector only, and `--verify-legacy-hold` re-derives its verdict
+ * from a fresh assessment every time.
+ */
+export function describeRegistryResult(value: unknown): string[] {
+  if (!value || typeof value !== "object") return ["unreadable registry result"];
+  const record = value as Record<string, unknown>;
+  const text = (key: string): string | null => (typeof record[key] === "string" ? (record[key] as string) : null);
+  const status = text("status") ?? "UNKNOWN";
+  const detail: string[] = [];
+  const add = (label: string, key: string) => {
+    const found = text(key);
+    if (found) detail.push(`${label}=${found}`);
+  };
+  add("snapshot", "snapshot");
+  add("hold", "holdRecord");
+  add("loader", "loader");
+  add("admission", "admission");
+  add("establishment", "establishment");
+  add("command", "command");
+  add("reason", "reason");
+  add("operation", "operationId");
+  const gaps = Array.isArray(record.gaps) ? record.gaps.filter((gap) => typeof gap === "string") : [];
+  const meaning: Record<string, string> = {
+    PILOT_SNAPSHOT_REGISTERED: "a pilot snapshot was captured and registered",
+    NATIVE_HOLD_AVAILABLE:
+      "this assessment found the recorded hold natively establishable; a lifecycle update or reapply must still acquire its own close",
+    LEGACY_HOLD_EXERCISED_AND_RELEASED: "a native legacy hold was exercised and then released",
+    PILOT_CAPTURE_BLOCKED: "capture refused before observing anything",
+    MIGRATION_PENDING: "the assessment found gaps; migration cannot proceed yet",
+    REGISTRY_COMMAND_ABORTED: "the command was recorded as aborted",
+  };
+  const lines = [`  ${status}${detail.length > 0 ? ` (${detail.join(" ")})` : ""}`];
+  if (meaning[status]) lines.push(`    · ${meaning[status]}`);
+  for (const gap of gaps) lines.push(`    gap: ${gap}`);
+  return lines;
+}
+
 async function writeResult(operation: AcquiredOperation, value: Record<string, unknown>): Promise<FileSeal> {
   const path = resolve(operation.paths.operationDirectory, REGISTRY_RESULT_FILE);
   await writeOperationJson(path, JSON.parse(canonicalBytes(value).toString("utf8")) as unknown);

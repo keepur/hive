@@ -1,9 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseBootIdentity } from "../deployment/health.js";
 import { readRelease, type BootIdentity, type Release } from "../deployment/release.js";
 import { buildServiceEnvironment, servicePortKeys } from "../deployment/services.js";
+import { REGISTRY_RESULT_FILE } from "../deployment/pilot.js";
 import {
   BUILTIN_ROUTABLE_PREFIXES,
   auditInstalledProviderDecls,
@@ -369,6 +370,8 @@ export interface DoctorVoiceRuntimeProbe {
   health: "healthy" | "unhealthy" | "unavailable";
   registration: "registered" | "unregistered" | "unavailable";
   maintenanceClassification: string;
+  /** The supervisor whose ledger reported the unresolved entries below. */
+  supervisor: { pid: number; bootId: string } | null;
   unresolved: Array<{
     jobId: string;
     acceptedAt: number;
@@ -413,6 +416,7 @@ export function localVoiceRuntimeForDoctor(input: {
       health: "unavailable",
       registration: "unavailable",
       maintenanceClassification: "legacy/unavailable",
+      supervisor: null,
       unresolved: [],
     };
   }
@@ -441,11 +445,16 @@ export function localVoiceRuntimeForDoctor(input: {
       maintenanceClassification?: unknown;
       socketOwned?: unknown;
       sdk?: { rootStatus?: unknown; agentName?: unknown };
-      status?: { snapshot?: { unresolved?: unknown } };
+      status?: { snapshot?: { unresolved?: unknown; supervisor?: { pid?: unknown; bootId?: unknown } } };
     };
     const unresolved = Array.isArray(result.status?.snapshot?.unresolved)
       ? (result.status!.snapshot!.unresolved as DoctorVoiceRuntimeProbe["unresolved"])
       : [];
+    const reported = result.status?.snapshot?.supervisor;
+    const supervisor =
+      typeof reported?.pid === "number" && typeof reported.bootId === "string"
+        ? { pid: reported.pid, bootId: reported.bootId }
+        : null;
     return {
       health:
         result.sdk?.rootStatus === 200 && result.socketOwned === true && result.classification === "worker-registered"
@@ -462,6 +471,7 @@ export function localVoiceRuntimeForDoctor(input: {
         typeof result.maintenanceClassification === "string"
           ? result.maintenanceClassification
           : "probe-response-invalid",
+      supervisor,
       unresolved,
     };
   } catch (error) {
@@ -480,9 +490,49 @@ export function localVoiceRuntimeForDoctor(input: {
       health: "unhealthy",
       registration: "unavailable",
       maintenanceClassification: classification,
+      supervisor: null,
       unresolved: [],
     };
   }
+}
+
+export interface DoctorRegistryOutcome {
+  operationId: string;
+  recordedAt: string;
+  result: unknown;
+}
+
+/**
+ * The most recently recorded pilot registry-command outcome, read from the
+ * operation directories the frozen helper writes. Informational: it reports
+ * what a command recorded, never a live held state.
+ */
+export function latestRegistryOutcomeForDoctor(hiveHome: string): DoctorRegistryOutcome | null {
+  const operations = resolve(hiveHome, ".hive-state", "deployment", "operations");
+  let entries: string[];
+  try {
+    entries = readdirSync(operations);
+  } catch {
+    return null;
+  }
+  let newest: DoctorRegistryOutcome | null = null;
+  let newestAt = -1;
+  for (const entry of entries) {
+    const path = resolve(operations, entry, REGISTRY_RESULT_FILE);
+    try {
+      const info = statSync(path);
+      if (!info.isFile() || info.mtimeMs <= newestAt) continue;
+      newestAt = info.mtimeMs;
+      newest = {
+        operationId: entry,
+        recordedAt: new Date(info.mtimeMs).toISOString(),
+        result: JSON.parse(readFileSync(path, "utf8")) as unknown,
+      };
+    } catch {
+      // A missing, unreadable or malformed result is simply not the newest.
+    }
+  }
+  return newest;
 }
 
 export async function voiceWorkerStatsForDoctor(uri: string, dbName: string): Promise<VoiceWorkerStatsRow | null> {
