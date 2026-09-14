@@ -58,6 +58,8 @@
 - A held → B throws → A finishes and commits (A is still newer than the retained set, since B never advanced `reloadCommitted`) → no "superseded" debug line is emitted for A → the next event's stamp reflects A's set.
 - `init()`'s own first `reloadSubscriptions()` call is held (on an empty collection) → a row is inserted and a concurrent `reloadSubscriptions()` call commits `{s1}` → the first load's held read is released, observes it was superseded, and is discarded → `init()` still resolves (timer armed, enable-gate audit ran, no throw) → the next event's stamp reflects `["s1"]`.
 - A newer commit has already raised `subscriptionRowAnomalies` to a nonzero count and fired the anomaly warn once → an older, already-in-flight success that had captured a *clean* set is released and discarded → the gauge stays at the newer count, `subscriptionReloadFaults` does not move, and no second anomaly warn (and no "reload failed" warn) is emitted for the discarded load.
+- The converse: a newer commit has repaired the set to zero anomalies → an older, already-in-flight success that had captured the *broken* set is released and discarded → the gauge stays at `0` and the anomaly warn does not fire for the discarded load.
+- `stopping` supersedes nothing: reload A is held after its find → `publisher.stop()` → a further `reloadSubscriptions()` returns without a find → A is released and commits (it already took a sequence number, per design D3) → `getSnapshot().subscriptions` reflects A's captured set.
 
 ### Regression Surface
 
@@ -92,6 +94,11 @@ Run from `/Users/mokie/github/hive-kpr-507-mature` on Node 22 or 24 (CLAUDE.md: 
 - Reuse the existing fixture shape from the file's "unusable subscription row" and "no-stored-list-cap" describe blocks: an admissible enabled row needs `_id` (a plain string ≤ 200 chars), `enabled: true`, a plain-object `filter` (e.g. `{}` to match everything), and a `transport: { adapterId: "slack", target: "C1" }` object (present so the row is a realistic document; the publisher's own matcher does not read `transport`).
 - The hoisted `mockLog` (`debug`, `info`, `warn`, `error`, all `vi.fn()`) already at the top of `publisher.integration.test.ts` is the log-call-counting surface for the new "superseded" debug line and for the existing anomaly-warn assertions; no new mock is needed.
 - No live Mongo, no Slack token, no Anthropic key, no real SIGUSR1, no fake timers for the 60 s interval — the overlap is constructed with `pause`, never with `vi.advanceTimers` or a `Date.now` spy.
+- A `pause` hook is one-shot: it is spliced out when its `when` predicate matches (`fake-db.ts`), so reload B's find runs unhooked *because* A consumed the hook. Arm a fresh `pause` per held call.
+- Never use `publisher.stop()` as a mid-scenario barrier in AC1–AC6 — it sets `stopping`, so later enqueues silently no-op (`publisher.ts` enqueue-side refusal). `stop()` appears only in the AC7 scenario, where it is the subject.
+- Do not import `src/ops/notifier-harness.ts`; this suite stays on the publisher test file's own fixtures.
+- Assert "no superseded debug line" as a fragment-filtered count over `mockLog.debug` (the `warnsMatching` idiom), never as a bare `expect(mockLog.debug).not.toHaveBeenCalled()` — the latter breaks the day an unrelated debug line is added to the publisher path.
+- AC5's observables are public: `init()` resolves without throwing, and the `"Ops publisher initialized"` `log.info` call reports the later set's subscription count. Do not read the private timer or enable-gate state.
 
 ### Non-Required Rationale
 
@@ -162,12 +169,12 @@ Run from `/Users/mokie/github/hive-kpr-507-mature` on Node 22 or 24 (CLAUDE.md: 
 **Acceptance criteria:** Each of AC1–AC7 from the design (quoted in full in [KPR-507 design](kpr-507-design.md) §Acceptance criteria) is a separate `it(...)` (or `it.each` where the disable/enable pair shares shape) that fails against the unmodified pre-Task-1 code and passes against Task 1's implementation.
 
 **Verification:**
-- Tests and critical failure cases: the six Critical Flows listed in the Testing Contract above map onto AC1 (disable direction), AC2 (enable direction), AC3/AC4 (fault-vs-supersede pair), AC5 (discarded first load inside `init()`), AC6 (discarded success is not a fault, does not touch the audit). AC7 is the `stopping`-skip case: after `publisher.stop()`, a subsequent `reloadSubscriptions()` call must produce no new `find` operation on `OPS_SUBSCRIPTIONS_COLLECTION` in `fakeDb.operations` and must not increment `subscriptionReloadFaults`.
+- Tests and critical failure cases: the eight Critical Flows listed in the Testing Contract above map onto AC1 (disable direction), AC2 (enable direction), AC3/AC4 (fault-vs-supersede pair), AC5 (discarded first load inside `init()`), AC6 (discarded success is not a fault, does not touch the audit — **two cases**: raised-then-discarded-clean and repaired-then-discarded-broken), and AC7. AC7 is the `stopping`-skip case and has two assertions: after `publisher.stop()`, a subsequent `reloadSubscriptions()` call must produce no new `find` operation on `OPS_SUBSCRIPTIONS_COLLECTION` in `fakeDb.operations` and must not increment `subscriptionReloadFaults`; and a reload already held before `stop()` still commits when released (the skipped call superseded nothing).
 - Harness/environment: none beyond `FakeDb` (already constructed in the file's `beforeEach`). No live Mongo, no Slack token, no Anthropic key, no real timers.
 - Run: `SLACK_APP_TOKEN=test SLACK_BOT_TOKEN=test SLACK_SIGNING_SECRET=test npx vitest run src/ops/publisher.integration.test.ts` (or, if a new adjacent file was created, add it to this command).
-- Expected: all seven new cases pass; the full file's existing test count is unchanged and still green. Additionally perform the three required negative-verifies from the Testing Contract's Verification Rules (temporarily reintroduce each of the three named implementation defects, confirm the specific test fails, then restore and re-confirm green) — record the outcome of each.
+- Expected: all eight new cases pass; the full file's existing test count is unchanged and still green. Additionally perform the three required negative-verifies from the Testing Contract's Verification Rules (temporarily reintroduce each of the three named implementation defects, confirm the specific test fails, then restore and re-confirm green) — record the outcome of each.
 
-- [ ] Add the seven AC1–AC7 tests (or an `it.each` covering the AC1/AC2 pair plus five further cases) to `src/ops/publisher.integration.test.ts` (or the adjacent file, if size forces the split), reusing the existing fixtures and barrier pattern.
+- [ ] Add the AC1–AC7 tests — eight cases, since AC6 is two (or an `it.each` covering the AC1/AC2 pair plus the remaining cases) to `src/ops/publisher.integration.test.ts` (or the adjacent file, if size forces the split), reusing the existing fixtures and barrier pattern.
 - [ ] Verify: run the targeted command and confirm all new and existing tests pass; perform and record the three negative-verifies.
 - [ ] Commit the completed task.
 
@@ -199,7 +206,7 @@ Run from `/Users/mokie/github/hive-kpr-507-mature` on Node 22 or 24 (CLAUDE.md: 
 ## Task order and commits
 
 1. Task 1 — implementation. Run typecheck + existing regression files; commit alone (no new test yet, matching the design's own separation of the mechanism from its proof).
-2. Task 2 — the seven AC tests, plus the three required negative-verifies (performed and reverted, not committed). Commit once all pass.
+2. Task 2 — the eight AC1–AC7 test cases, plus the three required negative-verifies (performed and reverted, not committed). Commit once all pass.
 3. Task 3 — the CLAUDE.md sentence, plus the full `npm run check` gate. Commit last.
 
 Do not parallelize: Task 2 asserts against the exact code Task 1 produces, and Task 3's full-suite gate is only meaningful once both are in place.
@@ -214,7 +221,7 @@ Do not parallelize: Task 2 asserts against the exact code Task 1 produces, and T
 | 4 | Task 1 (mechanism) + Task 2 fault-then-earlier-still-commits test, asserting no superseded debug line |
 | 5 | Task 1 (`init()` unchanged) + Task 2 discarded-first-load-inside-init test |
 | 6 | Task 1 (audit gated to committed branch only) + Task 2 gauge/fault/warn-count test, both directions (raised-then-discarded-clean, and repaired-then-discarded-broken) |
-| 7 | Task 1 (`stopping` guard unchanged, first statement) + Task 2 absent-find test |
+| 7 | Task 1 (`stopping` guard unchanged, first statement) + Task 2 absent-find test and held-before-stop-still-commits arm |
 | 8 | Task 3 CLAUDE.md sentence + grep verification |
 
 ## Engineering decisions and assumptions carried forward from the design (not re-decided here)
