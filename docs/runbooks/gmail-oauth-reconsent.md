@@ -1,9 +1,53 @@
 # Runbook — Restore Muriel's Gmail access (Google OAuth re-consent)
 
-**Owner:** Jim (VP Eng) · **Actor for Step 2:** Mike only · **Written:** 2026-09-07
+**Owner:** Jim (VP Eng) · **Actor for the Mike steps:** Mike only
+**Written:** 2026-09-07 · **Ordering corrected:** 2026-09-14
 **Account:** `mikewilliamscfo@gmail.com` · **OAuth client:** `727489179515-...apps.googleusercontent.com`
 
 ---
+
+## ⚠️ ORDERING CONSTRAINT — READ BEFORE DOING ANYTHING
+
+**PUBLISH THE CONSENT SCREEN TO PRODUCTION (§1A) BEFORE RE-LOGGING IN (§2).**
+If you re-consent first, you will be back here in seven days.
+
+**Why — and note what this is NOT.** Re-consent does **not** fail while the app is in Testing.
+It succeeds, prints a success line, and Muriel comes back. That is exactly the trap. A refresh
+token inherits the publishing status *in force at the moment it is issued*, and a token issued
+under **Testing** is hard-expired at 7 days regardless. Publishing to Production afterwards does
+**not** retroactively extend a token already minted — it only governs the *next* one.
+
+So the two orders are not equivalent:
+
+| Order | Outcome |
+|---|---|
+| Publish → re-consent | New token has no 7-day expiry. Fixed for real. |
+| Re-consent → publish | Looks identical today. Dies again in 7 days. Another outage. |
+
+**This is not hypothetical — it is what happened.** The 2026-09-07 cut of this runbook put
+re-consent first and filed publishing as a trailing ask. It predicted in its own §6 that "we will
+be running this runbook again around Sep 14." That prediction came true. Do not run §2 before §1A.
+
+**If Mike will not authorize publishing right now,** §2 alone still restores service today — do it.
+But log it as a 7-day patch with a known expiry date, not as a fix, and get the publish decision
+back in front of him before that week is out.
+
+---
+
+## 1A. Publish the consent screen — MIKE, and this goes FIRST
+
+Cloud Console → project `727489179515` → **APIs & Services → OAuth consent screen** →
+**Publish app** → confirm. Status must read **In production** before §2.
+
+No Google re-verification is required for an internal-use app with these scopes, so this is a
+click, not a review cycle. It is the step that stops the weekly expiry outright, and it has been
+asked for without an answer on Aug 17, Sep 2, and Sep 7.
+
+---
+
+> **Reading order note:** the two action steps (§1A then §2) are hoisted to the top on purpose, so
+> nobody scrolls past the gate. Everything below — §0 diagnosis, §3–§7 — is supporting detail and
+> keeps its original numbering.
 
 ## 0. Diagnosis — verified live 2026-09-07, not from memory
 
@@ -40,11 +84,14 @@ Nothing to write server-side. Nothing to restart. Confirmed in `src/google/googl
 every tool shells out via `execFileSync(GOG, ...)`, a **fresh `gog` process per call**, which reads
 the keyring from disk each time. The new token is live the instant `gog login` returns.
 
-**Mike has exactly one step. There is no step for him after it.**
+**Mike has exactly two steps: §1A (publish) then §2 (re-consent), in that order. Nothing after.**
 
 ---
 
-## 2. Mike's step — one command, ~90 seconds
+## 2. Mike's second step — one command, ~90 seconds
+
+> **GATE: do not run this until §1A shows status "In production."** Running it first still
+> "works" and still leaves you with a 7-day token. See the ordering constraint at the top.
 
 Paste into Terminal on the Mac Mini:
 
@@ -138,20 +185,23 @@ diagnosis. Third failure → escalate to me with the verbatim Terminal output.
 
 ---
 
-## 6. This will break again in ~7 days unless we also fix the cause
+## 6. Why §1A is a prerequisite and not a follow-up
 
-Re-consent restores service but is **not** a permanent fix. The pattern — Tony logs this as the 9th
-occurrence — is the documented Google behavior for an OAuth consent screen in **Testing** publishing
-status: refresh tokens are hard-expired after 7 days regardless of use. It fits: token issued
-Aug 26, Tony's escalation records the failure on Sep 2, exactly +7 days.
+*(This section previously sat here as "do this eventually." That ordering was the bug. Corrected
+2026-09-14 — the operative instruction is now §1A, above §2. This section is kept as the rationale.)*
 
-**Permanent fix:** publish the consent screen for project `727489179515` to **Production**
-(Cloud Console → APIs & Services → OAuth consent screen → *Publish app*). No re-verification is
-needed for an internal-use app with these scopes; it stops the weekly expiry outright.
+Re-consent alone is **not** a fix. The documented Google behavior for an OAuth consent screen in
+**Testing** publishing status is that refresh tokens are hard-expired after 7 days regardless of
+use. It fits the whole history: token issued Aug 26, failure recorded Sep 2, exactly +7 days;
+re-consented Sep 7, failed again ~Sep 14, exactly +7 days.
 
-Only Mike can authorize this, and Tony has asked twice (Aug 17, Sep 2) without an answer. **While
-Mike is already at the keyboard for §2 is the cheapest moment to also get this yes/no.** Ask for
-both in one message or we will be running this runbook again around Sep 14.
+The trap is that the expiry is fixed **at issuance**. A token minted while the app is in Testing
+carries the 7-day clock for its whole life; publishing to Production later does not reach back and
+extend it. That is why publishing has to happen *before* the `gog login`, not after it, and why
+"we'll publish it next time Mike is at the keyboard" quietly bought us nothing on Sep 7.
+
+Only Mike can authorize publishing. Asked Aug 17, Sep 2, Sep 7 — no answer yet. Ask for §1A and §2
+together, in one message, with §1A stated as the gate.
 
 ---
 
