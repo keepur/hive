@@ -11,7 +11,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { validateArchiveMembers } from "./artifact.js";
 import { deploymentDryRun, parseDeploymentArguments } from "./main.js";
 import {
   acquireOperation,
@@ -356,6 +355,25 @@ async function operationFixture(): Promise<{ root: string; operation: AcquiredOp
   return { root, operation };
 }
 
+/** Record `.hive.next` as the observed, verified clone written by promotion. */
+async function markVerifiedClone(operation: AcquiredOperation): Promise<void> {
+  const next = resolve(operation.record.canonicalHome, ".hive.next");
+  const identity = await directoryIdentity(next);
+  operation.record.staging.promotion = {
+    method: "clone",
+    source: resolve(operation.record.canonicalHome, ".hive-state", "jobs", operation.record.id, "install-1", "package"),
+    destination: next,
+    state: "observed",
+    copyPid: 1234,
+    copyStartTime: "fixture",
+    exitCode: 0,
+    destinationIdentity: { dev: identity.device, ino: identity.inode },
+    discarded: false,
+  };
+  operation.record.staging.cloneVerified = true;
+  await persistOperation(operation);
+}
+
 describe("durable operation and artifact ownership", () => {
   it("serializes symlink aliases through the same canonical lock", async () => {
     const { root, operation } = await operationFixture();
@@ -395,6 +413,7 @@ describe("durable operation and artifact ownership", () => {
       mkdirSync(resolve(root, name));
       writeFileSync(resolve(root, name, "identity"), name);
     }
+    await markVerifiedClone(operation);
     const rotation = new ArtifactRotation(operation, async () => true);
     await rotation.capture();
     await rotation.reserveBroken();
@@ -406,6 +425,74 @@ describe("durable operation and artifact ownership", () => {
     operation.record.resolution = "recovered";
     await rotation.disposeSupersededBroken();
     await finishOperationLock(operation);
+  });
+
+  it("refuses to rotate a .hive.next that is not the recorded verified clone", async () => {
+    const { root, operation } = await operationFixture();
+    mkdirSync(resolve(root, ".hive"));
+    mkdirSync(resolve(root, ".hive.next"));
+    const unverified = new ArtifactRotation(operation, async () => true);
+    await unverified.capture();
+    await expect(unverified.rotateUpdate()).rejects.toThrow("not the recorded verified clone");
+    await markVerifiedClone(operation);
+    operation.record.staging.cloneVerified = false;
+    await expect(unverified.rotateUpdate()).rejects.toThrow("not the recorded verified clone");
+    operation.record.staging.cloneVerified = true;
+    renameSync(resolve(root, ".hive.next"), resolve(root, "replaced"));
+    mkdirSync(resolve(root, ".hive.next"));
+    const swapped = new ArtifactRotation(operation, async () => true);
+    await swapped.capture();
+    await expect(swapped.rotateUpdate()).rejects.toThrow("not the recorded verified clone");
+    expect(realpathSync(resolve(root, ".hive"))).toBe(resolve(realpathSync(root), ".hive"));
+    await finishOperationLock(operation);
+  });
+
+  it("reconciles an interrupted staging operation: unverified clone discarded, job trees swept, never adopted", async () => {
+    const { root, operation } = await operationFixture();
+    const home = operation.record.canonicalHome;
+    mkdirSync(resolve(home, ".hive.next"));
+    writeFileSync(resolve(home, ".hive.next", "partial"), "torn");
+    const jobDirectory = resolve(home, ".hive-state", "jobs", operation.record.id, "install-1", "package");
+    mkdirSync(jobDirectory, { recursive: true });
+    writeFileSync(resolve(jobDirectory, "straggler-output"), "late");
+    await markVerifiedClone(operation);
+    operation.record.staging.cloneVerified = false;
+    await persistOperation(operation);
+    const filesystem = vi.fn();
+    await reconcileInterruptedOperation(root, {
+      ownerIsLive: async () => false,
+      releaseBarrier: async () => {},
+      reconcileFilesystem: filesystem,
+      recoverAfterSignals: async () => {
+        throw new Error("no signals were recorded");
+      },
+    });
+    expect(() => realpathSync(resolve(home, ".hive.next"))).toThrow();
+    expect(() => realpathSync(resolve(home, ".hive-state", "jobs", operation.record.id))).toThrow();
+    expect(filesystem).toHaveBeenCalledOnce();
+    const persisted = JSON.parse(readFileSync(resolve(home, ".hive-state", "deployment", "operation.json"), "utf8"));
+    expect(persisted).toMatchObject({ schemaVersion: 2, resolution: "deferred" });
+    expect(persisted.staging.promotion.discarded).toBe(true);
+  });
+
+  it("reports a live recorded promotion copy as busy without discarding anything", async () => {
+    const { root, operation } = await operationFixture();
+    const home = operation.record.canonicalHome;
+    mkdirSync(resolve(home, ".hive.next"));
+    await markVerifiedClone(operation);
+    operation.record.staging.promotion = { ...operation.record.staging.promotion!, state: "copying" };
+    operation.record.staging.cloneVerified = false;
+    await persistOperation(operation);
+    const live = vi.fn(async (owner: { pid: number }) => owner.pid === 1234);
+    await expect(
+      reconcileInterruptedOperation(root, {
+        ownerIsLive: live,
+        releaseBarrier: async () => {},
+        reconcileFilesystem: async () => {},
+        recoverAfterSignals: async () => {},
+      }),
+    ).rejects.toThrow("promotion copy is still running");
+    expect(realpathSync(resolve(home, ".hive.next"))).toBe(resolve(home, ".hive.next"));
   });
 
   it("ordinary rollback success consumes previous and retains replaced current as broken", async () => {
@@ -435,6 +522,7 @@ describe("durable operation and artifact ownership", () => {
       mkdirSync(resolve(root, name));
       writeFileSync(resolve(root, name, "identity"), marker);
     }
+    await markVerifiedClone(first);
     const firstRotation = new ArtifactRotation(first, async () => true);
     await firstRotation.capture();
     await firstRotation.rotateUpdate();
@@ -452,6 +540,7 @@ describe("durable operation and artifact ownership", () => {
     });
     mkdirSync(resolve(root, ".hive.next"));
     writeFileSync(resolve(root, ".hive.next", "identity"), "candidate-two");
+    await markVerifiedClone(second);
     const secondRotation = new ArtifactRotation(second, async () => true);
     await secondRotation.capture();
     await secondRotation.reserveBroken();
@@ -575,25 +664,6 @@ describe("durable operation and artifact ownership", () => {
   });
 });
 
-describe("archive boundary", () => {
-  it("accepts ordinary package files and directories", () => {
-    expect(
-      validateArchiveMembers(
-        "package/\npackage/pkg/server.min.js\n",
-        "drwx------ package/\n-rw------- package/pkg/server.min.js\n",
-      ),
-    ).toHaveLength(2);
-  });
-
-  it.each([
-    ["traversal", "package/../hive.yaml\n", "-rw------- package/../hive.yaml\n"],
-    ["operator state", "package/.env\n", "-rw------- package/.env\n"],
-    ["symlink", "package/pkg/server.min.js\n", "lrwxr-xr-x package/pkg/server.min.js -> /tmp/server\n"],
-  ])("rejects %s archive input", (_name, names, details) => {
-    expect(() => validateArchiveMembers(names, details)).toThrow();
-  });
-});
-
 describe("helper argument and pure dry-run boundary", () => {
   it("parses every S7 lifecycle selector", () => {
     expect(
@@ -637,6 +707,15 @@ describe("helper argument and pure dry-run boundary", () => {
       PATH: "/usr/bin:/bin",
     });
     expect(plan).toMatchObject({ status: "DRY_RUN", target: "dodi", voiceEnabled: true });
+    // Presence only: dry-run runs no self-test, promotion probe or artifact job.
+    expect(plan.stagingPrerequisites).toMatchObject({ selfTest: "unverified", promotionMethod: "unverified" });
+    const rollback = await deploymentDryRun(parseDeploymentArguments(["--rollback", "--dry-run"]), {
+      HIVE_HOME: root,
+      HIVE_CONFIG: "hive-personal.yaml",
+      HOME: root,
+      PATH: "/usr/bin:/bin",
+    });
+    expect(rollback.stagingPrerequisites).toBe("not-required");
     expect(readFileSync(join(root, "hive-personal.yaml"))).toEqual(before);
     expect(() => realpathSync(join(root, ".hive-state"))).toThrow();
   });

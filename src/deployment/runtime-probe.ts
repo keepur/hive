@@ -353,6 +353,7 @@ async function workerMode() {
     sdk: http,
     heartbeat,
     socketOwned: listener.pid === identity.pid,
+    healthPort: config.healthPort,
     maintenanceClassification,
   };
 }

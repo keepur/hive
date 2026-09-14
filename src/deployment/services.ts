@@ -348,6 +348,12 @@ export interface ServiceControllerOptions {
 
 export interface BootoutOptions {
   markIrreversible(): Promise<void>;
+  /**
+   * The worker supervisor's recorded health listener. A worker stop is
+   * complete only when the supervisor PID/start time has exited and this
+   * listener has no owner; any other owner is reported, never killed.
+   */
+  healthListenerPort?: number;
 }
 
 interface PlistFields {
@@ -569,26 +575,6 @@ export class ServiceController {
     return this.#enrichProcess(rows[0]);
   }
 
-  async children(pid: number): Promise<ProcessIdentity[]> {
-    if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("invalid PID");
-    const result = await this.#io.execFile("ps", ["-axo", "pid=,ppid=,lstart=,command="], { env: commandEnv });
-    const rows = parseProcessRows(result.stdout);
-    const wanted = new Set([pid]);
-    const descendants: ProcessRow[] = [];
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const row of rows) {
-        if (!wanted.has(row.pid) && wanted.has(row.ppid)) {
-          wanted.add(row.pid);
-          descendants.push(row);
-          changed = true;
-        }
-      }
-    }
-    return Promise.all(descendants.map((row) => this.#enrichProcess(row)));
-  }
-
   async inspect(label: string): Promise<ServiceInspection> {
     const targetPlistPath = this.#plistPath(label);
     const linkPath = this.#linkPath(label);
@@ -670,20 +656,19 @@ export class ServiceController {
     };
   }
 
-  async listener(port: number, expectedSupervisorPID: number): Promise<ListenerInspection> {
+  /** Every PID listening on a loopback/any TCP port; observation only, never signals. */
+  async listenerOwners(port: number): Promise<number[]> {
     assertPort(port);
-    if (!Number.isSafeInteger(expectedSupervisorPID) || expectedSupervisorPID < 1)
-      throw new Error("invalid expected PID");
     let result: ExecFileResult;
     try {
       result = await this.#io.execFile("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fpn"], {
         env: commandEnv,
       });
     } catch (error) {
-      if (errorCode(error) === 1 && !errorStdout(error).trim()) return { port, pid: null };
+      if (errorCode(error) === 1 && !errorStdout(error).trim()) return [];
       throw error;
     }
-    if (!result.stdout.trim()) return { port, pid: null };
+    if (!result.stdout.trim()) return [];
     const pids = new Set<number>();
     let currentPID: number | null = null;
     for (const line of result.stdout.trim().split("\n")) {
@@ -696,6 +681,15 @@ export class ServiceController {
         throw new Error("could not parse listener ownership");
       }
     }
+    return [...pids];
+  }
+
+  async listener(port: number, expectedSupervisorPID: number): Promise<ListenerInspection> {
+    assertPort(port);
+    if (!Number.isSafeInteger(expectedSupervisorPID) || expectedSupervisorPID < 1)
+      throw new Error("invalid expected PID");
+    const pids = new Set(await this.listenerOwners(port));
+    if (pids.size === 0) return { port, pid: null };
     if (pids.size !== 1 || !pids.has(expectedSupervisorPID)) {
       throw new Error("unexpected listener owner");
     }
@@ -830,15 +824,23 @@ export class ServiceController {
     );
   }
 
+  /**
+   * Stop one service after quiescence. The stop condition is the captured
+   * supervisor PID/start time exiting (and, for the worker, its recorded health
+   * listener having no owner) plus the label unloading. No descendant census
+   * is taken: a straggling SDK helper owns no instance listener and cannot
+   * touch the verified clone (spec §5.1 step 3). Nothing is ever killed.
+   */
   async bootout(definition: ServiceDefinition, options: BootoutOptions): Promise<void> {
+    const component = componentForLabel(definition.label);
+    const port = options.healthListenerPort;
+    if (port !== undefined) assertPort(port);
+    if (component === "engine" && port !== undefined) throw new Error("engine bootout has no worker health listener");
     const inspection = await this.inspect(definition.label);
     if (!inspection.loaded) return;
     const supervisor = inspection.process;
-    const descendants = new Map<string, ProcessIdentity>();
-    if (supervisor) {
-      for (const child of await this.children(supervisor.pid)) {
-        descendants.set(`${child.pid}:${child.startTime}`, child);
-      }
+    if (component === "voice-worker" && port === undefined) {
+      throw new Error("worker bootout requires its recorded health listener port");
     }
     await options.markIrreversible();
     await this.#io.execFile("launchctl", ["bootout", `gui/${this.#io.getuid()}/${definition.label}`], {
@@ -846,16 +848,24 @@ export class ServiceController {
     });
     const deadline = this.#io.now() + this.#options.stopTimeoutMs;
     while (true) {
-      if (supervisor && (await this.#sameProcess(supervisor))) {
-        for (const child of await this.children(supervisor.pid)) {
-          descendants.set(`${child.pid}:${child.startTime}`, child);
-        }
-      }
       const supervisorAlive = supervisor ? await this.#sameProcess(supervisor) : false;
-      const childStates = await Promise.all([...descendants.values()].map((child) => this.#sameProcess(child)));
+      const owners = port === undefined ? [] : await this.listenerOwners(port);
+      const foreign = owners.filter((pid) => !(supervisorAlive && supervisor && pid === supervisor.pid));
+      if (foreign.length > 0) {
+        // Recorded and reported only; an arbitrary port owner is never signaled.
+        throw new Error(
+          `unexpected health listener owner for ${definition.label} on port ${String(port)}: pid ${foreign.join(",")}`,
+        );
+      }
       const registration = await this.inspect(definition.label);
-      if (!registration.loaded && !supervisorAlive && childStates.every((alive) => !alive)) return;
-      if (this.#io.now() >= deadline) throw new Error(`service process tree survived bootout: ${definition.label}`);
+      if (!registration.loaded && !supervisorAlive && owners.length === 0) return;
+      if (this.#io.now() >= deadline) {
+        throw new Error(
+          component === "voice-worker"
+            ? `voice worker supervisor did not exit and release its health listener: ${definition.label}`
+            : `service supervisor did not exit: ${definition.label}`,
+        );
+      }
       await this.#io.sleep(this.#options.pollIntervalMs);
     }
   }

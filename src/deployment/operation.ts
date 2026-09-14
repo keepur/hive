@@ -2,6 +2,14 @@ import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm, rmdir, stat, unlink } from "node:fs/promises";
 import { constants } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import type { ConfinedJobRecord, ConfinementSelfTest } from "./confined-job.js";
+import {
+  reconcileStaging,
+  type PromotionMethodSelection,
+  type PromotionRecord,
+  type ReleaseIdentity,
+  type SweepFailure,
+} from "./clone-promotion.js";
 
 export type Phase =
   | "preflight"
@@ -19,13 +27,46 @@ export type Phase =
   | "deferred"
   | "unresolved";
 
+export class OperationBusyError extends Error {}
+export class OperationUnresolvedError extends Error {}
+
 export interface DirectoryIdentity {
   device: number;
   inode: number;
 }
 
+/**
+ * Staging facts for confined artifact jobs and clone-on-promote (spec §5.1,
+ * chunk 5 Task 8 Step 1a.3). There are deliberately no lineage, guardian or
+ * settlement-receipt fields: settlement is direct-child exit 0 plus a verified
+ * clone.
+ */
+export interface StagingRecord {
+  selfTest: ConfinementSelfTest | null;
+  promotionMethod: PromotionMethodSelection | null;
+  jobs: ConfinedJobRecord[];
+  promotion: PromotionRecord | null;
+  cloneVerified: boolean;
+  candidateRelease: ReleaseIdentity | null;
+  sweepFailures: SweepFailure[];
+}
+
+export function emptyStaging(): StagingRecord {
+  return {
+    selfTest: null,
+    promotionMethod: null,
+    jobs: [],
+    promotion: null,
+    cloneVerified: false,
+    candidateRelease: null,
+    sweepFailures: [],
+  };
+}
+
+export const OPERATION_SCHEMA_VERSION = 2;
+
 export interface OperationRecord {
-  schemaVersion: 1;
+  schemaVersion: typeof OPERATION_SCHEMA_VERSION;
   id: string;
   ownerPid: number;
   ownerStartTime: string;
@@ -56,6 +97,37 @@ export interface OperationRecord {
     directoryIdentity: DirectoryIdentity;
     state: "intended" | "observed";
   };
+  staging: StagingRecord;
+}
+
+/** Read-only decoder shape for records written before the staging revision. */
+export type LegacyOperationRecordV1 = Omit<OperationRecord, "schemaVersion" | "staging"> & { schemaVersion: 1 };
+
+/** Decode a current or legacy operation record; unknown schemas are unresolved. */
+export function decodeOperationRecord(value: unknown): OperationRecord | LegacyOperationRecordV1 {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new OperationUnresolvedError("operation record is not an object");
+  }
+  const record = value as { schemaVersion?: unknown; staging?: unknown };
+  if (record.schemaVersion === 1) return value as LegacyOperationRecordV1;
+  if (record.schemaVersion !== OPERATION_SCHEMA_VERSION) {
+    throw new OperationUnresolvedError("operation record schema is unsupported");
+  }
+  const staging = record.staging as Partial<StagingRecord> | undefined;
+  if (
+    !staging ||
+    typeof staging !== "object" ||
+    !Array.isArray(staging.jobs) ||
+    typeof staging.cloneVerified !== "boolean" ||
+    !Array.isArray(staging.sweepFailures) ||
+    !("selfTest" in staging) ||
+    !("promotionMethod" in staging) ||
+    !("promotion" in staging) ||
+    !("candidateRelease" in staging)
+  ) {
+    throw new OperationUnresolvedError("operation record staging fields are incomplete");
+  }
+  return value as OperationRecord;
 }
 
 export interface OperationPaths {
@@ -66,9 +138,6 @@ export interface OperationPaths {
   operationRecord: string;
   priorSnapshot: string;
 }
-
-export class OperationBusyError extends Error {}
-export class OperationUnresolvedError extends Error {}
 
 function inside(root: string, candidate: string): boolean {
   const path = relative(root, candidate);
@@ -156,10 +225,14 @@ export async function acquireOperation(input: AcquireOperationInput): Promise<Ac
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw new OperationUnresolvedError("existing operation record is unreadable");
   }
-  if (previousRecord && typeof previousRecord === "object") {
-    const previous = previousRecord as Partial<OperationRecord>;
+  if (previousRecord !== undefined) {
+    let previous: OperationRecord | LegacyOperationRecordV1;
+    try {
+      previous = decodeOperationRecord(previousRecord);
+    } catch (error) {
+      throw new OperationUnresolvedError("previous lifecycle operation requires reconciliation", { cause: error });
+    }
     if (
-      previous.schemaVersion !== 1 ||
       previous.canonicalHome !== canonicalHome ||
       previous.instanceId !== input.instanceId ||
       previous.phase === "unresolved" ||
@@ -192,7 +265,7 @@ export async function acquireOperation(input: AcquireOperationInput): Promise<Ac
     throw new OperationBusyError(`another lifecycle operation owns this instance (${detail})`);
   }
   const record: OperationRecord = {
-    schemaVersion: 1,
+    schemaVersion: OPERATION_SCHEMA_VERSION,
     id,
     ownerPid: input.ownerPid ?? process.pid,
     ownerStartTime: input.ownerStartTime,
@@ -206,6 +279,7 @@ export async function acquireOperation(input: AcquireOperationInput): Promise<Ac
     priorProfile: input.priorProfile ?? "stopped",
     priorSnapshotPath: paths.priorSnapshot,
     retainedPaths: [],
+    staging: emptyStaging(),
   };
   try {
     await writeOperationJson(resolve(paths.lockDirectory, "owner.json"), {
@@ -231,6 +305,20 @@ export async function acquireOperation(input: AcquireOperationInput): Promise<Ac
 export async function persistOperation(operation: AcquiredOperation): Promise<void> {
   await writeOperationJson(operation.paths.operationRecord, operation.record);
   await writeOperationJson(operation.paths.currentRecord, operation.record);
+}
+
+/** Upsert one confined job record into the marker and persist it. */
+export async function recordStagingJob(operation: AcquiredOperation, job: ConfinedJobRecord): Promise<void> {
+  const jobs = operation.record.staging.jobs.filter((candidate) => candidate.jobId !== job.jobId);
+  operation.record.staging.jobs = [...jobs, { ...job }];
+  await persistOperation(operation);
+}
+
+/** Persist the `.hive.next` promotion fence. */
+export async function recordStagingPromotion(operation: AcquiredOperation, promotion: PromotionRecord): Promise<void> {
+  operation.record.staging.promotion = { ...promotion };
+  if (promotion.state !== "observed" || promotion.discarded) operation.record.staging.cloneVerified = false;
+  await persistOperation(operation);
 }
 
 export async function setOperationPhase(operation: AcquiredOperation, phase: Phase): Promise<void> {
@@ -367,10 +455,16 @@ export async function reconcileInterruptedOperation(instanceHome: string, io: In
   const canonicalHome = await realpath(instanceHome);
   const deploymentRoot = resolve(canonicalHome, ".hive-state", "deployment");
   const currentPath = resolve(deploymentRoot, "operation.json");
-  const record = JSON.parse(await readFile(currentPath, "utf8")) as OperationRecord;
-  if (record.schemaVersion !== 1 || record.canonicalHome !== canonicalHome || !record.id) {
+  const decoded = decodeOperationRecord(JSON.parse(await readFile(currentPath, "utf8")));
+  if (decoded.canonicalHome !== canonicalHome || !decoded.id) {
     throw new OperationUnresolvedError("stale operation record identity is invalid");
   }
+  // A legacy record never staged through confined jobs; it gains empty staging
+  // facts only so its resolution can be persisted in the current schema.
+  const record: OperationRecord =
+    decoded.schemaVersion === 1
+      ? { ...decoded, schemaVersion: OPERATION_SCHEMA_VERSION, staging: emptyStaging() }
+      : decoded;
   const paths = operationPaths(canonicalHome, record.id);
   const owner = JSON.parse(await readFile(resolve(paths.lockDirectory, "owner.json"), "utf8")) as {
     id?: unknown;
@@ -383,6 +477,16 @@ export async function reconcileInterruptedOperation(instanceHome: string, io: In
   if (await io.ownerIsLive({ pid: record.ownerPid, startTime: record.ownerStartTime })) {
     throw new OperationBusyError("recorded lifecycle owner is still live");
   }
+  // Staging reconciliation applies to every interrupted operation: a live
+  // recorded promotion copy is busy, an unverified promotion destination is
+  // discarded, and leftover job directories are swept (failures reported).
+  const staging = await reconcileStaging({
+    canonicalInstanceHome: canonicalHome,
+    staging: record.staging,
+    isProcessLive: (owner) => io.ownerIsLive(owner),
+  });
+  if (staging.discarded.length > 0 && record.staging.promotion) record.staging.promotion.discarded = true;
+  record.staging.sweepFailures = [...record.staging.sweepFailures, ...staging.jobSweep.failures];
   const lastMove = record.artifactMove ? await reconcileArtifactMove(record) : null;
   if (record.barrierOperationId && !record.signalsBegun) {
     // A status observation is insufficient. The adapter must obtain the fresh,

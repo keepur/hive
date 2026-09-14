@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { chmod, copyFile, lstat, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,13 +7,16 @@ import { parse as parseYaml } from "yaml";
 import { sha256 } from "./release.js";
 import {
   acquireOperation,
+  decodeOperationRecord,
   finishOperationLock,
+  OPERATION_SCHEMA_VERSION,
   operationPaths,
   persistOperation,
   type AcquiredOperation,
   type OperationRecord,
 } from "./operation.js";
-import { runNodeLifecycle, type LifecycleCommand } from "./lifecycle.js";
+import { runNodeLifecycle, stagingRequired, type LifecycleCommand } from "./lifecycle.js";
+import { SANDBOX_EXEC } from "./confined-job.js";
 
 export interface DeploymentArguments extends LifecycleCommand {
   dryRun: boolean;
@@ -125,6 +128,10 @@ export async function deploymentDryRun(
     phases: ["preflight", "staged", "quiescent", "stop-worker", "stop-engine", "rotate", "start", "health"],
     recoveryProfile: args.pilotRecovery ? "registered-pilot" : "to-be-validated-under-lock",
     unknownEvidence: ["runtime process identity", "maintenance ledger", "candidate native imports", "paired health"],
+    // Presence only: dry-run runs no self-test, promotion probe or artifact job.
+    stagingPrerequisites: stagingRequired(args.mode)
+      ? { sandboxExecPresent: existsSync(SANDBOX_EXEC), selfTest: "unverified", promotionMethod: "unverified" }
+      : "not-required",
   };
 }
 
@@ -137,17 +144,19 @@ async function ownerStartTime(): Promise<string> {
 
 async function loadAcquired(recordPath: string): Promise<AcquiredOperation> {
   if (!isAbsolute(recordPath)) throw new Error("operation record path must be absolute");
-  const record = JSON.parse(await readFile(recordPath, "utf8")) as OperationRecord;
-  if (
-    record.schemaVersion !== 1 ||
-    !record.id ||
-    recordPath !== operationPaths(record.canonicalHome, record.id).operationRecord
-  ) {
+  const decoded = decodeOperationRecord(JSON.parse(await readFile(recordPath, "utf8")));
+  if (decoded.schemaVersion !== OPERATION_SCHEMA_VERSION) throw new Error("invalid frozen operation record");
+  const record: OperationRecord = decoded;
+  if (!record.id || recordPath !== operationPaths(record.canonicalHome, record.id).operationRecord) {
     throw new Error("invalid frozen operation record");
   }
   const paths = operationPaths(record.canonicalHome, record.id);
-  const current = JSON.parse(await readFile(paths.currentRecord, "utf8")) as OperationRecord;
-  if (current.id !== record.id || current.toolSha256 !== record.toolSha256) {
+  const current = decodeOperationRecord(JSON.parse(await readFile(paths.currentRecord, "utf8")));
+  if (
+    current.schemaVersion !== OPERATION_SCHEMA_VERSION ||
+    current.id !== record.id ||
+    current.toolSha256 !== record.toolSha256
+  ) {
     throw new Error("operation record ownership changed");
   }
   return { paths, record: current };

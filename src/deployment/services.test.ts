@@ -200,30 +200,6 @@ describe("service adapters", () => {
     expect(identity).not.toHaveProperty("argv");
   });
 
-  it("computes transitive child identities without reporting unrelated processes", async () => {
-    const census = [
-      `  200 100 Mon Sep  8 12:34:57 2026 ${nodePath} /sdk/job.js`,
-      `  300 200 Mon Sep  8 12:34:58 2026 ${nodePath} /sdk/inference.js`,
-      `  400   1 Mon Sep  8 12:34:59 2026 ${nodePath} /unrelated.js`,
-    ].join("\n");
-    const io = makeIO({
-      execFile: vi.fn(async (command, args) => {
-        if (command === "ps" && args.includes("comm=")) return { stdout: `${nodePath}\n`, stderr: "" };
-        if (command === "ps" && args[0] === "-axo") return { stdout: `${census}\n`, stderr: "" };
-        if (command === "ps") {
-          const pid = Number(args[args.indexOf("-p") + 1]);
-          const line = census.split("\n").find((candidate) => Number(candidate.trim().split(/\s+/)[0]) === pid);
-          return { stdout: line ? `${line}\n` : "", stderr: "" };
-        }
-        const pid = args[args.indexOf("-p") + 1];
-        if (args.includes("cwd")) return { stdout: `p${pid}\nfcwd\nn${hiveHome}\n`, stderr: "" };
-        return { stdout: `p${pid}\nftxt\nn${nodePath}\n`, stderr: "" };
-      }),
-    });
-
-    expect((await controller(io).children(100)).map(({ pid }) => pid)).toEqual([200, 300]);
-  });
-
   it("rejects listener ambiguity and unexpected owners without signaling", async () => {
     const exec = vi.fn(async () => ({ stdout: "p10\nn*:4107\np11\nn*:4107\n", stderr: "" }));
     const io = makeIO({ execFile: exec });
@@ -384,60 +360,21 @@ describe("service adapters", () => {
     await expect(controller(io).inspect(engine.label)).rejects.toThrow("could not parse launchctl disabled services");
   });
 
-  it("does not report bootout success while the captured supervisor survives", async () => {
-    const worker = definitions().worker;
+  function bootoutHarness(options: {
+    definition: ReturnType<typeof definitions>["worker"] | ReturnType<typeof definitions>["engine"];
+    supervisorExitsAfterBootout: boolean;
+    listener?: (bootedOut: boolean, supervisorAlive: boolean) => string;
+    survivingHelper?: boolean;
+  }) {
+    const service = options.definition;
     const plist = JSON.stringify({
-      Label: worker.label,
-      ProgramArguments: [worker.nodePath, worker.entrypoint, ...worker.args],
-      WorkingDirectory: worker.hiveHome,
-      EnvironmentVariables: buildServiceEnvironment(worker),
+      Label: service.label,
+      ProgramArguments: [service.nodePath, service.entrypoint, ...service.args],
+      WorkingDirectory: service.hiveHome,
+      EnvironmentVariables: buildServiceEnvironment(service),
     });
-    const row = `  123   1 Mon Sep  8 12:34:56 2026 ${worker.nodePath} ${worker.entrypoint} start\n`;
-    let now = 0;
-    const exec = vi.fn(async (command: string, args: readonly string[]) => {
-      if (command === "launchctl" && args[0] === "print") return { stdout: "state = running\npid = 123\n", stderr: "" };
-      if (command === "launchctl") return { stdout: "{ disabled services = {} }", stderr: "" };
-      if (command === "plutil") return { stdout: plist, stderr: "" };
-      if (command === "ps" && args[0] === "-axo") return { stdout: "", stderr: "" };
-      if (command === "ps" && args.includes("comm=")) return { stdout: `${nodePath}\n`, stderr: "" };
-      if (command === "ps") return { stdout: row, stderr: "" };
-      if (command === "lsof" && args.includes("cwd")) return { stdout: `p123\nfcwd\nn${hiveHome}\n`, stderr: "" };
-      if (command === "lsof") return { stdout: `p123\nftxt\nn${nodePath}\n`, stderr: "" };
-      throw new Error(`unexpected command ${command}`);
-    });
-    const io = makeIO({
-      execFile: exec,
-      lstat: vi.fn(async (path) => {
-        if (path.includes("Library/LaunchAgents")) throw enoent();
-        return stat();
-      }),
-      now: () => now,
-      sleep: vi.fn(async (milliseconds) => {
-        now += milliseconds;
-      }),
-    });
-    const mark = vi.fn(async () => {});
-
-    await expect(
-      controller(io, { stopTimeoutMs: 2_000, pollIntervalMs: 1_000 }).bootout(worker, {
-        markIrreversible: mark,
-      }),
-    ).rejects.toThrow("service process tree survived bootout");
-    expect(mark).toHaveBeenCalledOnce();
-    expect(exec.mock.calls.filter(([, args]) => args[0] === "bootout")).toHaveLength(1);
-  });
-
-  it("tracks a captured child after its supervisor exits and it is reparented", async () => {
-    const worker = definitions().worker;
-    const plist = JSON.stringify({
-      Label: worker.label,
-      ProgramArguments: [worker.nodePath, worker.entrypoint, ...worker.args],
-      WorkingDirectory: worker.hiveHome,
-      EnvironmentVariables: buildServiceEnvironment(worker),
-    });
-    const supervisor = `  123   1 Mon Sep  8 12:34:56 2026 ${worker.nodePath} ${worker.entrypoint} start\n`;
-    const child = (ppid: number) =>
-      `  200 ${String(ppid).padStart(3)} Mon Sep  8 12:34:57 2026 ${worker.nodePath} /sdk/job.js\n`;
+    const supervisorRow = `  123   1 Mon Sep  8 12:34:56 2026 ${service.nodePath} ${service.entrypoint}${service.args.length ? " start" : ""}\n`;
+    const helperRow = `  200   1 Mon Sep  8 12:34:57 2026 ${service.nodePath} /sdk/job_proc_lazy_main.js\n`;
     let now = 0;
     let bootedOut = false;
     const exec = vi.fn(async (command: string, args: readonly string[]) => {
@@ -451,15 +388,23 @@ describe("service adapters", () => {
       }
       if (command === "launchctl") return { stdout: "{ disabled services = {} }", stderr: "" };
       if (command === "plutil") return { stdout: plist, stderr: "" };
-      if (command === "ps" && args[0] === "-axo") return { stdout: child(123), stderr: "" };
+      if (command === "ps" && args[0] === "-axo") throw new Error("descendant census must not be taken");
       if (command === "ps" && args.includes("comm=")) return { stdout: `${nodePath}\n`, stderr: "" };
       if (command === "ps") {
         const pid = Number(args[args.indexOf("-p") + 1]);
-        if (pid === 123 && bootedOut) throw noProcess();
-        return { stdout: pid === 123 ? supervisor : child(bootedOut ? 1 : 123), stderr: "" };
+        if (pid === 123 && bootedOut && options.supervisorExitsAfterBootout) throw noProcess();
+        if (pid === 200 && options.survivingHelper) return { stdout: helperRow, stderr: "" };
+        return { stdout: supervisorRow, stderr: "" };
       }
-      if (command === "lsof" && args.includes("cwd")) return { stdout: `fcwd\nn${hiveHome}\n`, stderr: "" };
-      if (command === "lsof") return { stdout: `ftxt\nn${nodePath}\nftxt\nn/usr/lib/dyld\n`, stderr: "" };
+      if (command === "lsof" && args[0] === "-nP") {
+        const supervisorAlive = !(bootedOut && options.supervisorExitsAfterBootout);
+        const stdout = options.listener?.(bootedOut, supervisorAlive) ?? "";
+        if (!stdout) throw noProcess();
+        return { stdout, stderr: "" };
+      }
+      if (command === "lsof" && args.includes("cwd")) return { stdout: `p123\nfcwd\nn${hiveHome}\n`, stderr: "" };
+      if (command === "lsof") return { stdout: `p123\nftxt\nn${nodePath}\n`, stderr: "" };
+      if (command === "kill" || command === "/bin/kill") throw new Error("nothing may be killed");
       throw new Error(`unexpected command ${command}`);
     });
     const io = makeIO({
@@ -473,13 +418,87 @@ describe("service adapters", () => {
         now += milliseconds;
       }),
     });
+    return { io, exec, bootedOut: () => bootedOut };
+  }
 
+  it("does not report worker bootout success while the captured supervisor survives", async () => {
+    const worker = definitions().worker;
+    const { io, exec } = bootoutHarness({ definition: worker, supervisorExitsAfterBootout: false });
+    const mark = vi.fn(async () => {});
+    await expect(
+      controller(io, { stopTimeoutMs: 2_000, pollIntervalMs: 1_000 }).bootout(worker, {
+        markIrreversible: mark,
+        healthListenerPort: 3107,
+      }),
+    ).rejects.toThrow("voice worker supervisor did not exit and release its health listener");
+    expect(mark).toHaveBeenCalledOnce();
+    expect(exec.mock.calls.filter(([, args]) => args[0] === "bootout")).toHaveLength(1);
+  });
+
+  it("completes worker stop on supervisor exit plus listener release despite a surviving non-listener SDK helper", async () => {
+    const worker = definitions().worker;
+    const { io, exec } = bootoutHarness({
+      definition: worker,
+      supervisorExitsAfterBootout: true,
+      survivingHelper: true,
+      listener: (bootedOut) => (bootedOut ? "" : "p123\nn127.0.0.1:3107\n"),
+    });
+    await controller(io, { stopTimeoutMs: 2_000, pollIntervalMs: 1_000 }).bootout(worker, {
+      markIrreversible: async () => {},
+      healthListenerPort: 3107,
+    });
+    expect(exec.mock.calls.some(([command, args]) => command === "ps" && args[0] === "-axo")).toBe(false);
+    expect(exec.mock.calls.some(([, args]) => args.includes("200"))).toBe(false);
+  });
+
+  it("fails the stop when the old supervisor still holds its health listener past the budget", async () => {
+    const worker = definitions().worker;
+    const { io } = bootoutHarness({
+      definition: worker,
+      supervisorExitsAfterBootout: false,
+      listener: () => "p123\nn127.0.0.1:3107\n",
+    });
     await expect(
       controller(io, { stopTimeoutMs: 2_000, pollIntervalMs: 1_000 }).bootout(worker, {
         markIrreversible: async () => {},
+        healthListenerPort: 3107,
       }),
-    ).rejects.toThrow("service process tree survived bootout");
-    expect(bootedOut).toBe(true);
-    expect(exec.mock.calls.some(([, args]) => args.includes("200"))).toBe(true);
+    ).rejects.toThrow("did not exit and release its health listener");
+  });
+
+  it("reports a foreign health listener owner and never kills it", async () => {
+    const worker = definitions().worker;
+    const { io, exec } = bootoutHarness({
+      definition: worker,
+      supervisorExitsAfterBootout: true,
+      listener: (bootedOut) => (bootedOut ? "p999\nn127.0.0.1:3107\n" : "p123\nn127.0.0.1:3107\n"),
+    });
+    await expect(
+      controller(io, { stopTimeoutMs: 2_000, pollIntervalMs: 1_000 }).bootout(worker, {
+        markIrreversible: async () => {},
+        healthListenerPort: 3107,
+      }),
+    ).rejects.toThrow("unexpected health listener owner for com.hive.personal_1.voice-worker on port 3107: pid 999");
+    expect(exec.mock.calls.some(([command]) => command.includes("kill"))).toBe(false);
+  });
+
+  it("refuses a worker bootout without its recorded listener before any irreversible step", async () => {
+    const worker = definitions().worker;
+    const { io, exec } = bootoutHarness({ definition: worker, supervisorExitsAfterBootout: true });
+    const mark = vi.fn(async () => {});
+    await expect(controller(io).bootout(worker, { markIrreversible: mark })).rejects.toThrow(
+      "requires its recorded health listener port",
+    );
+    expect(mark).not.toHaveBeenCalled();
+    expect(exec.mock.calls.some(([, args]) => args[0] === "bootout")).toBe(false);
+  });
+
+  it("stops the engine on supervisor PID exit alone", async () => {
+    const engine = definitions().engine;
+    const { io, exec } = bootoutHarness({ definition: engine, supervisorExitsAfterBootout: true });
+    await controller(io, { stopTimeoutMs: 2_000, pollIntervalMs: 1_000 }).bootout(engine, {
+      markIrreversible: async () => {},
+    });
+    expect(exec.mock.calls.some(([command, args]) => command === "lsof" && args[0] === "-nP")).toBe(false);
   });
 });

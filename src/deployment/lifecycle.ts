@@ -1,5 +1,6 @@
 import { execFile as nodeExecFile } from "node:child_process";
 import { promisify } from "node:util";
+import { statSync } from "node:fs";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
@@ -9,7 +10,10 @@ import {
   ServiceController,
   type ServiceSnapshot,
 } from "./services.js";
-import { extractAndValidateArtifact, installAndPreflightStage, resolveArtifact } from "./artifact.js";
+import { preflightStagedConfig, stageVerifiedCandidate, type ArtifactStagingContext } from "./artifact.js";
+import { ConfinedJobRunner, runConfinementSelfTest } from "./confined-job.js";
+import { disposeOperationJobs, selectPromotionMethod, sweepLeftoverJobs } from "./clone-promotion.js";
+import { voiceWorkerPort } from "./ports.js";
 import {
   parseBootIdentity,
   packagedHealthy,
@@ -17,11 +21,13 @@ import {
   freshOrderedEngineMarkers,
   readEngineMarkersAfter,
 } from "./health.js";
-import { readRelease, type BootIdentity } from "./release.js";
+import { contained, readRelease, type BootIdentity, type Release } from "./release.js";
 import {
   directoryIdentity,
   disposeOwnedDirectory,
   persistOperation,
+  recordStagingJob,
+  recordStagingPromotion,
   writeOperationJson,
   type AcquiredOperation,
 } from "./operation.js";
@@ -50,6 +56,31 @@ interface ConfigSummary {
   instanceId: string;
   voiceEnabled: boolean;
   databaseName?: string;
+  /** Configured worker health listener; the running supervisor's recorded port is preferred. */
+  workerHealthPort: number;
+}
+
+/**
+ * Only operations that stage a new artifact run confined jobs, and therefore
+ * the confinement self-test and promotion-method preflight. Ordinary rollback,
+ * start, stop, restart and pilot recovery never need `sandbox-exec`.
+ */
+export function stagingRequired(mode: LifecycleCommand["mode"]): boolean {
+  return mode === "update" || mode === "check";
+}
+
+/**
+ * In-process validation of an already promoted release (current `.hive`,
+ * rollback `.hive.prev`): manifest/lock, packaged entries including the worker,
+ * and containment of its dependency tree. Runs no packaged diagnostic and no
+ * confined job, so it works without `sandbox-exec`.
+ */
+export function validatePromotedRelease(root: string): Release {
+  const release = readRelease(root);
+  const nodeModules = contained(root, resolve(root, "node_modules"));
+  if (!statSync(nodeModules).isDirectory()) throw new Error("promoted release has no installed dependency tree");
+  contained(root, resolve(root, release.voiceWorker.path));
+  return release;
 }
 
 interface WorkerProbe {
@@ -66,12 +97,13 @@ interface WorkerProbe {
   sdk: { rootStatus: number | null; agentName: string | null; activeJobs: number | null };
   heartbeat: { fresh: boolean; activeCalls: number | null; identity: BootIdentity | null };
   socketOwned: boolean;
+  healthPort?: number;
 }
 
 function configSummary(value: unknown): ConfigSummary {
   if (!value || typeof value !== "object") throw new Error("invalid Hive configuration");
   const config = value as {
-    instance?: { id?: unknown };
+    instance?: { id?: unknown; portBase?: unknown; ports?: { voiceWorker?: unknown } };
     voice?: { livekit?: { enabled?: unknown } };
     mongo?: { dbName?: unknown };
   };
@@ -83,6 +115,7 @@ function configSummary(value: unknown): ConfigSummary {
     instanceId,
     voiceEnabled: config.voice?.livekit?.enabled === true,
     databaseName: typeof config.mongo?.dbName === "string" ? config.mongo.dbName : undefined,
+    workerHealthPort: voiceWorkerPort(config.instance?.portBase, config.instance?.ports?.voiceWorker),
   };
 }
 
@@ -204,6 +237,7 @@ export async function runNodeLifecycle(
   let noOpHealthyStart = false;
   let noOpReleaseCheck = false;
   let runningWorkerEnvironment: Record<string, string> | undefined;
+  let recordedWorkerHealthPort: number | undefined;
   const activationStartedAt = Date.now();
 
   const observeWorker = async (): Promise<{ pid: number; bootId: string }> => {
@@ -225,6 +259,12 @@ export async function runNodeLifecycle(
     if (observed.pid !== result.supervisor.pid || observed.bootId !== result.supervisor.bootId) {
       throw new Error("worker probe and process identity disagree");
     }
+    if (result.healthPort !== undefined) {
+      if (!Number.isSafeInteger(result.healthPort) || result.healthPort < 1 || result.healthPort > 65535) {
+        throw new Error("worker probe reported an invalid health listener port");
+      }
+      recordedWorkerHealthPort = result.healthPort;
+    }
     return {
       supervisor: result.supervisor,
       registered: result.classification === "worker-registered" && result.sdk.rootStatus === 200,
@@ -240,16 +280,6 @@ export async function runNodeLifecycle(
     inspect: inspectIdle,
     corroborateSupervisor: async () => observeWorker(),
   });
-
-  async function validateOfflineRuntime(root: string): Promise<void> {
-    await execFile(process.execPath, [resolve(root, "pkg", "voice-worker-diagnostic.min.js"), "offline"], {
-      cwd: root,
-      env: { HOME: resolve(userHome!), PATH: pathEnv! },
-      timeout: 120_000,
-      encoding: "utf8",
-      maxBuffer: 2 * 1024 * 1024,
-    });
-  }
 
   async function artifactSlot(path: string): Promise<Record<string, unknown>> {
     try {
@@ -398,17 +428,16 @@ export async function runNodeLifecycle(
       });
       operation.record.priorProfile = engineWasRunning ? "packaged" : "stopped";
       await persistOperation(operation);
+      // Deferred disposal of earlier operations' job trees; a failed removal
+      // (for example a straggler still writing) is reported, never fatal.
+      const sweep = await sweepLeftoverJobs({ canonicalInstanceHome: home, keepOperationIds: [operation.record.id] });
+      operation.record.staging.sweepFailures.push(...sweep.failures);
+      await persistOperation(operation);
       if (command.mode === "update" || command.mode === "check" || command.mode === "rollback") {
-        readRelease(resolve(home, ".hive"));
-        await validateOfflineRuntime(resolve(home, ".hive"));
+        validatePromotedRelease(resolve(home, ".hive"));
       }
-      if (command.mode === "update" || command.mode === "check") {
+      if (stagingRequired(command.mode)) {
         const currentRelease = readRelease(resolve(home, ".hive"));
-        const downloads = resolve(operation.paths.operationDirectory, "downloads");
-        const artifact = await resolveArtifact({ tag: command.tag, artifact: command.artifact }, downloads);
-        operation.record.candidateArchiveSha256 = artifact.archiveSha256;
-        operation.record.retainedPaths.push(artifact.archivePath);
-        await persistOperation(operation);
         const nextPath = resolve(home, ".hive.next");
         try {
           await lstat(nextPath);
@@ -416,9 +445,54 @@ export async function runNodeLifecycle(
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
+        // Fail closed before any artifact job: no unconfined fallback exists.
+        const selfTest = await runConfinementSelfTest({
+          canonicalInstanceHome: home,
+          operationId: operation.record.id,
+          nodePath: operation.record.hostNodePath!,
+        });
+        operation.record.staging.selfTest = selfTest;
+        await persistOperation(operation);
+        const promotionMethod = await selectPromotionMethod({
+          sourceParent: resolve(home, ".hive-state", "jobs", operation.record.id),
+          destinationParent: home,
+        });
+        operation.record.staging.promotionMethod = promotionMethod;
         operation.record.retainedPaths.push(nextPath);
         await persistOperation(operation);
-        const candidate = await extractAndValidateArtifact(artifact, nextPath, Boolean(command.legacyHold));
+        const staging: ArtifactStagingContext = {
+          runner: new ConfinedJobRunner({
+            canonicalInstanceHome: home,
+            operationId: operation.record.id,
+            selfTest,
+            journal: (record) => recordStagingJob(operation, record),
+          }),
+          nodePath: operation.record.hostNodePath!,
+          npmCliPath: npmPath,
+          invokingHome: resolve(userHome),
+          pathEnv,
+          archiveDirectory: resolve(operation.paths.operationDirectory, "archive"),
+          promotionMethod: promotionMethod.method,
+        };
+        const candidate = await stageVerifiedCandidate({
+          selector: { tag: command.tag, artifact: command.artifact },
+          context: staging,
+          destination: nextPath,
+          requireClean: Boolean(command.legacyHold),
+          journalPromotion: (record) => recordStagingPromotion(operation, record),
+          onResolved: async (artifact, extracted) => {
+            operation.record.candidateArchiveSha256 = artifact.archiveSha256;
+            operation.record.staging.candidateRelease = {
+              packageVersion: extracted.release.packageVersion,
+              sourceRevision: extracted.release.sourceRevision,
+              dependencyLockSha256: extracted.release.dependencyLockSha256,
+            };
+            operation.record.retainedPaths.push(artifact.archivePath);
+            await persistOperation(operation);
+          },
+        });
+        operation.record.staging.cloneVerified = true;
+        await persistOperation(operation);
         rotation = new ArtifactRotation(operation, async (path) => {
           try {
             const prior = JSON.parse(
@@ -434,9 +508,9 @@ export async function runNodeLifecycle(
           }
         });
         await rotation.capture();
-        await installAndPreflightStage({
-          packageRoot: resolve(home, ".hive.next"),
-          npmPath,
+        await preflightStagedConfig({
+          clone: nextPath,
+          context: staging,
           serviceEnvironment: probeEnvironment,
           expectedInstanceId: summary.instanceId,
           expectedDatabaseName: summary.databaseName,
@@ -445,17 +519,15 @@ export async function runNodeLifecycle(
         candidateRuntimeValidated = true;
         noOpReleaseCheck =
           command.mode === "check" &&
-          candidate.release.packageVersion === currentRelease.packageVersion &&
-          candidate.release.sourceRevision === currentRelease.sourceRevision &&
-          candidate.release.dependencyLockSha256 === currentRelease.dependencyLockSha256;
+          candidate.verification.release.packageVersion === currentRelease.packageVersion &&
+          candidate.verification.release.sourceRevision === currentRelease.sourceRevision &&
+          candidate.verification.release.dependencyLockSha256 === currentRelease.dependencyLockSha256;
       } else if (command.mode === "rollback") {
-        readRelease(resolve(home, ".hive.prev"));
-        await validateOfflineRuntime(resolve(home, ".hive.prev"));
+        validatePromotedRelease(resolve(home, ".hive.prev"));
         await probeJson(resolve(home, ".hive.prev", "pkg", "runtime-probe.min.js"), "config", probeEnvironment);
         candidateRuntimeValidated = true;
       } else {
-        readRelease(resolve(home, ".hive"));
-        await validateOfflineRuntime(resolve(home, ".hive"));
+        validatePromotedRelease(resolve(home, ".hive"));
         await probeJson(currentProbePath, "config", probeEnvironment);
         candidateRuntimeValidated = true;
         if (command.mode === "start" && engineWasRunning && (!summary.voiceEnabled || workerWasRunning)) {
@@ -519,7 +591,12 @@ export async function runNodeLifecycle(
     },
     async stopWorkerAndChildren() {
       if (noOpHealthyStart || noOpReleaseCheck) return;
-      if (workerWasRunning) await controller.bootout(definitions.worker, { markIrreversible: async () => {} });
+      if (workerWasRunning) {
+        await controller.bootout(definitions.worker, {
+          markIrreversible: async () => {},
+          healthListenerPort: recordedWorkerHealthPort ?? summary.workerHealthPort,
+        });
+      }
     },
     async stopEngine() {
       if (noOpHealthyStart || noOpReleaseCheck) return;
@@ -581,7 +658,12 @@ export async function runNodeLifecycle(
     },
     async recoverPriorPair() {
       const worker = await controller.inspect(definitions.worker.label);
-      if (worker.loaded) await controller.bootout(definitions.worker, { markIrreversible: async () => {} });
+      if (worker.loaded) {
+        await controller.bootout(definitions.worker, {
+          markIrreversible: async () => {},
+          healthListenerPort: summary.workerHealthPort,
+        });
+      }
       const engine = await controller.inspect(definitions.engine.label);
       if (engine.loaded) await controller.bootout(definitions.engine, { markIrreversible: async () => {} });
       if (command.mode === "update" || command.mode === "check") await rotation!.recoverUpdate();
@@ -628,5 +710,18 @@ export async function runNodeLifecycle(
     },
   };
 
-  await activate(io);
+  try {
+    await activate(io);
+  } finally {
+    // Deferred disposal after the operation has its result; stragglers may keep
+    // writing into these trees, which are never promoted. Failures are reported.
+    const disposal = await disposeOperationJobs({ canonicalInstanceHome: home, operationId: operation.record.id });
+    if (disposal.failures.length > 0) {
+      operation.record.staging.sweepFailures.push(...disposal.failures);
+      await persistOperation(operation).catch(() => {});
+      process.stderr.write(
+        `Job directory disposal incomplete (non-fatal): ${disposal.failures.map((failure) => failure.path).join(", ")}\n`,
+      );
+    }
+  }
 }

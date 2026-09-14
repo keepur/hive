@@ -323,6 +323,21 @@ export class ArtifactRotation {
   async rotateUpdate(): Promise<void> {
     if (!this.captured.current || !this.captured.next)
       throw new Error("update requires current and owned next releases");
+    // `.hive.next` is only ever the verified clone written by promotion; an
+    // unverified or unrecorded tree is never rotated into service.
+    const staging = this.operation.record.staging;
+    const promoted = staging.promotion;
+    if (
+      !staging.cloneVerified ||
+      !promoted ||
+      promoted.state !== "observed" ||
+      promoted.discarded ||
+      promoted.destination !== this.slots.next ||
+      promoted.destinationIdentity?.dev !== this.captured.next.device ||
+      promoted.destinationIdentity?.ino !== this.captured.next.inode
+    ) {
+      throw new Error("update refuses a .hive.next that is not the recorded verified clone");
+    }
     if (this.captured.previous) {
       await moveOwnedDirectory(this.operation, this.slots.previous, this.slots.priorPrevious);
     }

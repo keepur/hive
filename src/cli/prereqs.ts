@@ -1,7 +1,11 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, writeFileSync, unlinkSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { runConfinementSelfTest, type ConfinementSelfTest } from "../deployment/confined-job.js";
+import { selectPromotionMethod, type PromotionMethodSelection } from "../deployment/clone-promotion.js";
 
 interface Prereq {
   name: string;
@@ -54,6 +58,85 @@ async function httpProbe(url: string, timeoutMs = 1500): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export interface ArtifactStagingPrerequisiteDeps {
+  selfTest(options: Parameters<typeof runConfinementSelfTest>[0]): Promise<ConfinementSelfTest>;
+  promotionMethod(options: Parameters<typeof selectPromotionMethod>[0]): Promise<PromotionMethodSelection>;
+  scratchParent(): Promise<string>;
+  /** Existing directory on the intended instance volume (HIVE_HOME's nearest ancestor, else HOME). */
+  destinationParent(): Promise<string>;
+  nodePath: string;
+}
+
+async function nearestExistingDirectory(path: string): Promise<string> {
+  let candidate = resolve(path);
+  while (!existsSync(candidate)) {
+    const parent = dirname(candidate);
+    if (parent === candidate) break;
+    candidate = parent;
+  }
+  return realpath(candidate);
+}
+
+const defaultStagingDeps: ArtifactStagingPrerequisiteDeps = {
+  selfTest: runConfinementSelfTest,
+  promotionMethod: selectPromotionMethod,
+  scratchParent: async () => realpath(await mkdtemp(resolve(tmpdir(), "hive-confinement-preflight-"))),
+  destinationParent: () => nearestExistingDirectory(process.env.HIVE_HOME ?? process.env.HOME ?? tmpdir()),
+  nodePath: process.execPath,
+};
+
+export interface ArtifactStagingPrerequisites {
+  selfTest: ConfinementSelfTest;
+  promotion: PromotionMethodSelection;
+}
+
+/**
+ * init/resume staging prerequisites (spec §4, chunk 5 Task 8 Step 1a.3): the
+ * fail-closed Seatbelt self-test plus a usable promotion method. Reported by
+ * name; never auto-installed. Ordinary rollback never consults this.
+ */
+export async function checkArtifactStagingPrerequisites(
+  deps: ArtifactStagingPrerequisiteDeps = defaultStagingDeps,
+): Promise<ArtifactStagingPrerequisites> {
+  const scratch = await deps.scratchParent();
+  try {
+    const operationId = `prereq-${randomUUID()}`;
+    const selfTest = await deps.selfTest({ canonicalInstanceHome: scratch, operationId, nodePath: deps.nodePath });
+    const promotion = await deps.promotionMethod({
+      sourceParent: resolve(scratch, ".hive-state", "jobs", operationId),
+      destinationParent: await deps.destinationParent(),
+    });
+    return { selfTest, promotion };
+  } finally {
+    await rm(scratch, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+export function artifactStagingPrereq(deps: ArtifactStagingPrerequisiteDeps = defaultStagingDeps): Prereq {
+  let lastError = "not checked";
+  return {
+    name: "Artifact staging confinement (/usr/bin/sandbox-exec self-test, clone or full-copy promotion)",
+    required: true,
+    check: async () => {
+      try {
+        const result = await checkArtifactStagingPrerequisites(deps);
+        console.log(
+          `  · sandbox-exec self-test passed (macOS ${result.selfTest.macosVersion}); promotion: ${result.promotion.method}`,
+        );
+        return true;
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+        return false;
+      }
+    },
+    install: () => {
+      throw new Error(
+        `cannot be installed automatically (${lastError}); staging requires a working /usr/bin/sandbox-exec and a clone-capable or sufficiently free instance volume`,
+      );
+    },
+  };
 }
 
 const prereqs: Prereq[] = [
@@ -164,6 +247,7 @@ const prereqs: Prereq[] = [
       execFileSync("brew", ["services", "start", "qdrant"], { stdio: "inherit" });
     },
   },
+  artifactStagingPrereq(),
   {
     name: "gh CLI",
     required: false,
