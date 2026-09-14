@@ -508,7 +508,11 @@ export class OpsNotifier {
    * deliberately none: `state: "degraded"` plus `timestamp` is the tell, and a
    * renderer must treat every gauge on a degraded document as as-of
    * `lastSuccessfulSweep`, not as-of `timestamp`. Clearing them instead would
-   * be worse — an operator would read a real backlog as zero.
+   * be worse — an operator would read a real backlog as zero. That reading is
+   * true only because `lastSuccessfulSweep` is committed AFTER the ok-path
+   * write lands (runPhases' last statement), never before its gauge reads —
+   * so a gauge or write fault leaves it naming the tick those gauges came from,
+   * and on a cold fault (no gauges ever written) it is absent.
    *
    * `cursorAt: this.lastCursorAt` is `undefined` when the FIRST tick of a
    * process degrades (nothing has set it yet); the driver writes that as
@@ -586,7 +590,14 @@ export class OpsNotifier {
     if (!this.canWrite()) return this.skipForIdentity();
 
     const allOk = ingest.ok && expiryOk && delivery.ok;
-    if (allOk) this.lastSuccessfulSweep = now;
+    // ⚠ NOT COMMITTED HERE. `lastSuccessfulSweep` is the as-of instant of the
+    // gauges on a degraded document (writeDegradedHeartbeat's contract), so it
+    // advances only once this tick's gauges have actually been WRITTEN — at
+    // the bottom of this method. Committed before the gauge reads, a gauge or
+    // heartbeat fault fell through to the degraded fallback, which retained
+    // the previous tick's gauges under THIS tick's marker: a stale count
+    // reported as fresh, and freshened again by every repeat of the fault.
+    const sweptAt = allOk ? now : this.lastSuccessfulSweep;
     const backlog = ingest.eventsBehind > 0 || delivery.deferred;
 
     const nf = this.store.notifications;
@@ -599,7 +610,7 @@ export class OpsNotifier {
 
     await this.store.writeHeartbeat({
       timestamp: now,
-      lastSuccessfulSweep: this.lastSuccessfulSweep,
+      lastSuccessfulSweep: sweptAt,
       cursorAt: ingest.cursorAt,
       eventsBehind: ingest.eventsBehind,
       oldestUnappliedAt: ingest.oldestUnappliedAt,
@@ -637,6 +648,7 @@ export class OpsNotifier {
       ...this.counters,
       state: allOk ? (backlog ? "backlog" : "ok") : "degraded",
     });
+    this.lastSuccessfulSweep = sweptAt;
   }
 
   /**

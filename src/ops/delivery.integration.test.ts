@@ -1268,6 +1268,71 @@ describe("the heartbeat", () => {
     expect(warnLines("ops heartbeat write failed")).toHaveLength(1);
   });
 
+  // ⚠ THE FRESHNESS CONTRACT (notifier.ts, writeDegradedHeartbeat): every gauge
+  // on a degraded document is as-of `lastSuccessfulSweep`. So the marker may
+  // only advance on a tick whose gauges were actually WRITTEN — an advanced
+  // marker over retained gauges reports a stale count as fresh.
+  const pendingGauge = (ctx: FaultContext) => (ctx.filter as { state?: unknown } | undefined)?.state === "pending";
+
+  it("a WARM gauge failure keeps lastSuccessfulSweep at the tick its retained gauges came from", async () => {
+    const h = await harness();
+    await h.tick();
+    expect(await h.heartbeat()).toMatchObject({ state: "ok", lastSuccessfulSweep: t(0), rowsCadenceUnresolved: 0 });
+
+    h.advance(60_000);
+    await h.store.notifications.insertOne(ledgerRow({ stalledReason: "cadence", stalledAt: t(1) }));
+    failOn(h.db, OPS_NOTIFICATIONS_COLLECTION, "countDocuments", pendingGauge);
+    await h.tick();
+
+    const degraded = await h.heartbeat();
+    expect(degraded.state).toBe("degraded");
+    expect(degraded.timestamp).toEqual(t(1));
+    // The retained 0 is honest ONLY as-of t(0) — the true count is now 1.
+    expect(degraded.rowsCadenceUnresolved).toBe(0);
+    expect(degraded.lastSuccessfulSweep).toEqual(t(0));
+
+    // Repeated failures do not freshen the stale values either.
+    h.advance(60_000);
+    failOn(h.db, OPS_NOTIFICATIONS_COLLECTION, "countDocuments", pendingGauge);
+    await h.tick();
+    expect(await h.heartbeat()).toMatchObject({ state: "degraded", timestamp: t(2), lastSuccessfulSweep: t(0) });
+
+    // The first tick whose gauges land commits both together.
+    h.advance(60_000);
+    await h.tick();
+    expect(await h.heartbeat()).toMatchObject({ state: "ok", lastSuccessfulSweep: t(3), rowsCadenceUnresolved: 1 });
+    expect(h.snapshot().lastSuccessfulSweep).toEqual(t(3));
+  });
+
+  it("a COLD gauge failure (no previous gauges) reports no lastSuccessfulSweep at all", async () => {
+    const h = await harness();
+    failOn(h.db, OPS_NOTIFICATIONS_COLLECTION, "countDocuments", pendingGauge);
+    await h.tick();
+
+    const hb = await h.heartbeat();
+    expect(hb.state).toBe("degraded");
+    expect(hb.lastSuccessfulSweep ?? null).toBeNull();
+    expect(Object.keys(hb)).not.toContain("rowsCadenceUnresolved");
+    expect(h.snapshot().lastSuccessfulSweep).toBeUndefined();
+  });
+
+  it("a failed ok-path heartbeat WRITE does not advance lastSuccessfulSweep", async () => {
+    const h = await harness();
+    await h.tick();
+    expect((await h.heartbeat()).lastSuccessfulSweep).toEqual(t(0));
+
+    h.advance(60_000);
+    await h.store.notifications.insertOne(ledgerRow({ stalledReason: "cadence", stalledAt: t(1) }));
+    // ONCE: the ok-path write fails, the degraded fallback lands.
+    h.db.failNext("telemetry", "updateOne", new Error("injected"), heartbeatWrite as never);
+    await h.tick();
+
+    const degraded = await h.heartbeat();
+    expect(degraded).toMatchObject({ state: "degraded", timestamp: t(1), rowsCadenceUnresolved: 0 });
+    expect(degraded.lastSuccessfulSweep).toEqual(t(0));
+    expect(h.snapshot().lastSuccessfulSweep).toEqual(t(0));
+  });
+
   it("the four saturating gauges saturate at GAUGE_COUNT_LIMIT", async () => {
     const h = await harness();
     let n = 0;
