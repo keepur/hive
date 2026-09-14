@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { acquireOperation, persistOperation, type AcquiredOperation } from "./operation.js";
 import {
   collectLivekitInventory,
@@ -25,6 +25,7 @@ import {
   type HistoricalProbeRequest,
 } from "./pilot-probe.js";
 import { canonicalBytes, sealFile, sha256Hex, type FileSeal, type InstanceKey } from "./pilot-records.js";
+import { writeNativeFixtureArtifacts } from "./testing/pilot-fixture.js";
 import type { Release } from "./release.js";
 
 const roots: string[] = [];
@@ -292,9 +293,31 @@ describe("historical ABI wire decoders", () => {
       writeFileSync(resolve(root, "package.json"), JSON.stringify({ name, version: "9.9.9", main: "index.js" }));
       writeFileSync(resolve(root, "index.js"), "module.exports = {};\n");
     }
+    writeNativeFixtureArtifacts(resolve(f.base, "historical"));
     const resolved = resolveRequiredDependencies(f.probePath, [resolve(f.base, "historical")]);
-    expect(resolved.map((item) => item.version)).toEqual(["9.9.9", "9.9.9", "9.9.9"]);
+    expect(resolved.slice(0, 3).map((item) => item.version)).toEqual(["9.9.9", "9.9.9", "9.9.9"]);
+    // The native artifacts the worker loads are captured too — a JS-only set
+    // would miss a stale addon, shared library or model swap.
+    const natives = resolved.slice(3).map((item) => relative(resolve(f.base, "historical"), item.realpath));
+    expect(natives).toContain(
+      `node_modules/@livekit/rtc-ffi-bindings-${process.platform}-${process.arch}/rtc-node.${process.platform}-${process.arch}.node`,
+    );
+    expect(natives).toContain(
+      `node_modules/onnxruntime-node/bin/napi-v6/${process.platform}/${process.arch}/libonnxruntime.1.24.3.dylib`,
+    );
+    expect(natives).toContain(
+      `node_modules/onnxruntime-node/bin/napi-v6/${process.platform}/${process.arch}/onnxruntime_binding.node`,
+    );
+    expect(natives).toContain("node_modules/@livekit/agents-plugin-silero/dist/silero_vad.onnx");
+    expect(natives).toContain("node_modules/@livekit/agents-plugin-silero/src/silero_vad.onnx");
+    // Another platform's ONNX payload is never captured.
+    expect(natives.some((path) => path.includes("napi-v6/linux/x64"))).toBe(false);
     expect(() => resolveRequiredDependencies(f.probePath, [resolve(f.base, "elsewhere")])).toThrow(
+      "PILOT_DEPENDENCY_MISMATCH",
+    );
+    // A missing native artifact fails the capture, never silently shrinks it.
+    rmSync(resolve(f.base, "historical/node_modules/@livekit/agents-plugin-silero"), { recursive: true, force: true });
+    expect(() => resolveRequiredDependencies(f.probePath, [resolve(f.base, "historical")])).toThrow(
       "PILOT_DEPENDENCY_MISMATCH",
     );
     expect(sameDependencySet([{ realpath: "/a", sha256: "1" }], [{ realpath: "/a", sha256: "1" }])).toBe(true);

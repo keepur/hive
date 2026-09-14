@@ -237,7 +237,7 @@ describe("registered bootstrap pilot probe chain", () => {
       io: w.io,
     });
     expect(invoked.result.configIdentity).toBe(w.f.snapshot.payload.configIdentity);
-    expect(invoked.result.dependencyFiles).toHaveLength(3);
+    expect(invoked.result.dependencyFiles).toHaveLength(8);
     expect(w.calls).toEqual(["outer:pilot"]);
     const text = JSON.stringify(invoked.result);
     for (const secret of Object.values(DUMMY_SECRETS)) expect(text).not.toContain(secret);

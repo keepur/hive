@@ -151,11 +151,7 @@ function stagingContext(home: string, overrides: StagingOverrides = {}): EngineS
     spawn: vi.fn(async (command, args) => {
       expect(command).toBe(SANDBOX_EXEC);
       const argv = args.slice(2);
-      if (argv.includes("ci")) {
-        const packageRoot = argv[0] === undefined ? "" : "";
-        void packageRoot;
-        return (overrides.install ?? defaultInstall)(installRoot);
-      }
+      if (argv.includes("ci")) return (overrides.install ?? defaultInstall)(installRoot);
       if (argv.includes("ls")) return (overrides.dependencyTree ?? (() => ok()))();
       const mode = argv.at(-1) ?? "";
       return (overrides.runtimeLoading ?? runtimeRecord)(mode);
@@ -433,9 +429,6 @@ describe("populateEngine (confined staging)", () => {
   });
 
   it("never reaches a confined job from the unit-test-only skipInstall option", async () => {
-    const staging = stagingContext(instanceDir);
-    const spawned = staging.runner as unknown as { prepare: unknown };
-    void spawned;
     const result = await populateEngine(pkgRoot, instanceDir, { skipInstall: true });
     expect(result).toBeNull();
     expect(existsSync(join(engineOf(), "pkg", "server.min.js"))).toBe(true);

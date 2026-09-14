@@ -78,6 +78,43 @@ export function writeFixtureFile(path: string, content: string, mode = 0o644): s
   return path;
 }
 
+/**
+ * The native artifacts `resolveRequiredNativeArtifacts` captures, laid out the
+ * way the real install does: the RTC addon in its platform-specific sibling
+ * package, the ONNX runtime partitioned by `<platform>/<arch>`, and both
+ * copies of the Silero model the plugin ships.
+ */
+export function writeNativeFixtureArtifacts(runtimeRoot: string): void {
+  const modules = resolve(runtimeRoot, "node_modules");
+  const rtcBindings = `@livekit/rtc-ffi-bindings-${process.platform}-${process.arch}`;
+  writeFixtureFile(
+    resolve(modules, rtcBindings, "package.json"),
+    JSON.stringify({ name: rtcBindings, version: "0.13.33" }),
+  );
+  writeFixtureFile(
+    resolve(modules, rtcBindings, `rtc-node.${process.platform}-${process.arch}.node`),
+    "rtc addon bytes\n",
+  );
+  writeFixtureFile(
+    resolve(modules, "onnxruntime-node", "package.json"),
+    JSON.stringify({ name: "onnxruntime-node", version: "1.24.3" }),
+  );
+  const onnxBin = resolve(modules, "onnxruntime-node", "bin", "napi-v6", process.platform, process.arch);
+  writeFixtureFile(resolve(onnxBin, "libonnxruntime.1.24.3.dylib"), "onnx shared library bytes\n");
+  writeFixtureFile(resolve(onnxBin, "onnxruntime_binding.node"), "onnx binding bytes\n");
+  // Another platform's payload must never enter the captured set.
+  writeFixtureFile(
+    resolve(modules, "onnxruntime-node", "bin", "napi-v6", "linux", "x64", "onnxruntime_binding.node"),
+    "foreign platform bytes\n",
+  );
+  writeFixtureFile(
+    resolve(modules, "@livekit/agents-plugin-silero", "package.json"),
+    JSON.stringify({ name: "@livekit/agents-plugin-silero", version: "1.6.4" }),
+  );
+  writeFixtureFile(resolve(modules, "@livekit/agents-plugin-silero", "dist", "silero_vad.onnx"), "silero model\n");
+  writeFixtureFile(resolve(modules, "@livekit/agents-plugin-silero", "src", "silero_vad.onnx"), "silero model\n");
+}
+
 async function tree(root: string, manifestPath: string): Promise<TreeSeal> {
   writeFileSync(manifestPath, await buildTreeManifest(root, { uid: FIXTURE_UID, closureRoots: [root] }), {
     mode: 0o600,
@@ -151,6 +188,10 @@ export async function createPilotFixture(
     );
     writeFixtureFile(resolve(runtimeRoot, "node_modules", name, "index.js"), "module.exports = {};\n");
   }
+  // Native artifacts the worker loads but no JS import graph names: the RTC
+  // addon in its platform-specific sibling package, the ONNX runtime's
+  // per-platform shared library and binding, and the Silero VAD model file.
+  writeNativeFixtureArtifacts(runtimeRoot);
   const node = writeFixtureFile(resolve(base, "runtime/node"), "#!node\n", 0o755);
   mkdirSync(resolve(base, "manifests"), { mode: 0o700 });
   const runtimeTree = await tree(runtimeRoot, resolve(base, "manifests/runtime.manifest"));

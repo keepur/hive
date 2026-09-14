@@ -10,9 +10,9 @@
  * request that produced it and against independent OS evidence by the caller.
  */
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync, statSync, type Dirent } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve, sep } from "node:path";
 import { canonical } from "./canonical.js";
 import { parseBootIdentity } from "./health.js";
 import {
@@ -1134,16 +1134,144 @@ function packageVersionOf(entryRealpath: string, name: string, roots: readonly s
 }
 
 /**
+ * Native runtime artifacts the worker actually loads. A JS import graph alone
+ * cannot see these: the RTC addon lives in a platform-specific sibling
+ * package, the ONNX runtime ships one shared library and binding per
+ * platform/arch, and the Silero VAD model is a data file no `require` names.
+ * Without them a stale native binary or model swap under an unchanged JS tree
+ * would pass `sameDependencySet` unnoticed.
+ *
+ * `packages` are tried in order and the first one present in the closure wins,
+ * so a vendor layout change surfaces as `PILOT_DEPENDENCY_MISMATCH` rather
+ * than a silently empty capture.
+ */
+export interface PilotNativeArtifact {
+  id: "rtc-addon" | "onnx-runtime" | "silero-model";
+  packages: readonly string[];
+  match: RegExp;
+  /** The package partitions its payload by `<platform>/<arch>` path segments. */
+  platformPartitioned: boolean;
+}
+
+export const PILOT_REQUIRED_NATIVE_ARTIFACTS: readonly PilotNativeArtifact[] = [
+  {
+    id: "rtc-addon",
+    packages: [
+      `@livekit/rtc-ffi-bindings-${process.platform}-${process.arch}`,
+      "@livekit/rtc-ffi-bindings",
+      "@livekit/rtc-node",
+    ],
+    match: /\.node$/,
+    platformPartitioned: false,
+  },
+  {
+    id: "onnx-runtime",
+    packages: ["onnxruntime-node"],
+    match: /\.(?:node|dylib|so(?:\.\d+)*)$/,
+    platformPartitioned: true,
+  },
+  {
+    id: "silero-model",
+    packages: ["@livekit/agents-plugin-silero"],
+    match: /(?:^|\/)silero_vad\.onnx$/,
+    platformPartitioned: false,
+  },
+];
+
+/** Every `node_modules` ancestor of `start`, innermost first. */
+function moduleDirectoriesOf(start: string): string[] {
+  const found: string[] = [];
+  let directory = dirname(start);
+  for (;;) {
+    if (basename(directory) === "node_modules") found.push(directory);
+    const parent = dirname(directory);
+    if (parent === directory) return found;
+    directory = parent;
+  }
+}
+
+function listFilesWithin(directory: string, roots: readonly string[], out: string[]): void {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    throw new ProbeFailure("PILOT_DEPENDENCY_MISMATCH", { cause: error });
+  }
+  for (const entry of entries) {
+    const path = resolve(directory, entry.name);
+    // A link inside the closure could point at bytes the capture never seals.
+    if (entry.isSymbolicLink()) throw new ProbeFailure("PILOT_DEPENDENCY_MISMATCH");
+    if (entry.isDirectory()) listFilesWithin(path, roots, out);
+    else if (entry.isFile()) out.push(path);
+  }
+}
+
+/**
+ * Resolve the native addon, shared library and model files the worker loads at
+ * runtime, relative to a captured entry and inside the sealed closure roots.
+ */
+export function resolveRequiredNativeArtifacts(
+  entry: string,
+  roots: readonly string[],
+): { path: string; realpath: string; version: string | null }[] {
+  const require = createRequire(entry);
+  let anchor: string;
+  try {
+    anchor = realpathSync(require.resolve("@livekit/rtc-node"));
+  } catch (error) {
+    throw new ProbeFailure("PILOT_DEPENDENCY_MISMATCH", { cause: error });
+  }
+  const moduleDirectories = moduleDirectoriesOf(anchor);
+  const partition = `${sep}${process.platform}${sep}${process.arch}${sep}`;
+  const resolved: { path: string; realpath: string; version: string | null }[] = [];
+  for (const artifact of PILOT_REQUIRED_NATIVE_ARTIFACTS) {
+    let root: string | null = null;
+    let name = "";
+    for (const candidate of artifact.packages) {
+      for (const modules of moduleDirectories) {
+        const directory = resolve(modules, ...candidate.split("/"));
+        try {
+          const real = realpathSync(directory);
+          if (!roots.some((base) => within(base, real))) continue;
+          if (!statSync(real).isDirectory()) continue;
+          root = real;
+          name = candidate;
+        } catch {
+          continue;
+        }
+        if (root) break;
+      }
+      if (root) break;
+    }
+    if (!root) throw new ProbeFailure("PILOT_DEPENDENCY_MISMATCH");
+    const files: string[] = [];
+    listFilesWithin(root, roots, files);
+    let matched = files.filter((file) => artifact.match.test(file));
+    if (artifact.platformPartitioned) matched = matched.filter((file) => file.includes(partition));
+    if (matched.length === 0) throw new ProbeFailure("PILOT_DEPENDENCY_MISMATCH");
+    const version = packageVersionOf(resolve(root, "package.json"), name, roots);
+    for (const file of matched.sort()) {
+      const real = realpathSync(file);
+      if (!roots.some((base) => within(base, real))) throw new ProbeFailure("PILOT_DEPENDENCY_MISMATCH");
+      resolved.push({ path: file, realpath: real, version });
+    }
+  }
+  return resolved;
+}
+
+/**
  * Resolve the required dependency files relative to a captured entry (never
  * the probe package's own dependencies). Every resolved realpath must stay
  * inside the sealed closure roots; hashes are computed by the caller's sealer.
+ * The set is the JS module entries plus the native artifacts those modules
+ * load — a native-only swap must not look like an unchanged dependency set.
  */
 export function resolveRequiredDependencies(
   entry: string,
   roots: readonly string[],
 ): { path: string; realpath: string; version: string | null }[] {
   const require = createRequire(entry);
-  return PILOT_REQUIRED_MODULES.map((name) => {
+  const modules = PILOT_REQUIRED_MODULES.map((name) => {
     let resolved: string;
     let real: string;
     try {
@@ -1155,6 +1283,7 @@ export function resolveRequiredDependencies(
     if (!roots.some((root) => within(root, real))) throw new ProbeFailure("PILOT_DEPENDENCY_MISMATCH");
     return { path: resolve(resolved), realpath: real, version: packageVersionOf(real, name, roots) };
   });
+  return [...modules, ...resolveRequiredNativeArtifacts(entry, roots)];
 }
 
 /** Exact dependency identity set equality, order-independent. */
