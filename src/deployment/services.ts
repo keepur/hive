@@ -382,6 +382,8 @@ export interface CaptureDiscovery {
   cwd: string;
   configSelection: string;
   serviceEnvironment: Record<string, string>;
+  stdout: string;
+  stderr: string;
   link: { path: string; target: string; resolvedTarget: string; dev: number; ino: number };
   effectivePlist: CaptureFileSeal;
   instancePlist: { path: string; existed: boolean; seal: CaptureFileSeal | null };
@@ -424,6 +426,8 @@ interface PlistFields {
   ProgramArguments?: unknown;
   WorkingDirectory?: unknown;
   EnvironmentVariables?: unknown;
+  StandardOutPath?: unknown;
+  StandardErrorPath?: unknown;
 }
 
 function errorText(error: unknown): string {
@@ -789,6 +793,75 @@ export class ServiceController {
   }
 
   /**
+   * TCP listening ports owned by one PID, loopback or wildcard only
+   * (observation-only; chunk 4 Step 4b.1 SDK listener discovery). Never
+   * signals and never selects a kill target.
+   */
+  async listenersOf(pid: number): Promise<number[]> {
+    if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("invalid PID");
+    let result: ExecFileResult;
+    try {
+      result = await this.#io.execFile("lsof", ["-nP", "-a", "-p", String(pid), "-iTCP", "-sTCP:LISTEN", "-Fn"], {
+        env: commandEnv,
+      });
+    } catch (error) {
+      if (errorCode(error) === 1 && !errorStdout(error).trim()) return [];
+      throw error;
+    }
+    const ports = new Set<number>();
+    for (const line of result.stdout.trim().split("\n").filter(Boolean)) {
+      if (/^[pf]/.test(line)) continue;
+      const match = /^n(127\.0\.0\.1|\*|\[::1\]|localhost):(\d{1,5})$/.exec(line);
+      if (!match) {
+        if (line.startsWith("n")) continue; // non-loopback listeners are not SDK candidates
+        throw new Error("could not parse listener ports");
+      }
+      const port = Number(match[2]);
+      assertPort(port);
+      ports.add(port);
+    }
+    return [...ports].sort((left, right) => left - right);
+  }
+
+  /** PIDs holding a file open for writing (observation-only exclusive-writer corroboration). */
+  async fileWriters(path: string): Promise<number[]> {
+    if (!isAbsolute(path)) throw new Error("writer query path must be absolute");
+    let result: ExecFileResult;
+    try {
+      result = await this.#io.execFile("lsof", ["-nP", "-Fpa", "--", path], { env: commandEnv });
+    } catch (error) {
+      if (errorCode(error) === 1 && !errorStdout(error).trim()) return [];
+      throw error;
+    }
+    const writers = new Set<number>();
+    let current: number | null = null;
+    for (const line of result.stdout.trim().split("\n").filter(Boolean)) {
+      if (/^p\d+$/.test(line)) current = Number(line.slice(1));
+      else if (/^a[rwu ]?$/.test(line)) {
+        if (current !== null && (line === "aw" || line === "au")) writers.add(current);
+      } else if (!/^f/.test(line)) {
+        throw new Error("could not parse open-file writers");
+      }
+    }
+    return [...writers];
+  }
+
+  /** Numeric UID of a live process (`ps -o uid=`); null when the process is absent. */
+  async processUid(pid: number): Promise<number | null> {
+    if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("invalid PID");
+    let result: ExecFileResult;
+    try {
+      result = await this.#io.execFile("ps", ["-p", String(pid), "-o", "uid="], { env: commandEnv });
+    } catch (error) {
+      if (errorCode(error) === 1 && !errorStdout(error).trim()) return null;
+      throw error;
+    }
+    const text = result.stdout.trim();
+    if (!/^\d+$/.test(text)) throw new Error("could not parse process UID");
+    return Number(text);
+  }
+
+  /**
    * Operation-private, read-only discovery of the live effective service pair
    * for a first pilot capture (chunk 5 Task 9 Step 4b.1a Step 2). The ticket is
    * an opaque in-memory object revalidated through the injected validator
@@ -881,6 +954,8 @@ export class ServiceController {
         args: parsed.args,
         cwd: parsed.cwd,
         configSelection: parsed.environment.HIVE_CONFIG,
+        stdout: parsed.stdout,
+        stderr: parsed.stderr,
         serviceEnvironment: parsed.environment,
         link: { path: linkPath, target: linkTarget, resolvedTarget, dev: linkStat.dev, ino: linkStat.ino },
         effectivePlist: effective,
@@ -935,7 +1010,7 @@ export class ServiceController {
     fields: PlistFields | null,
     label: string,
     lease: CaptureTicketLease,
-  ): { args: string[]; cwd: string; environment: Record<string, string> } {
+  ): { args: string[]; cwd: string; environment: Record<string, string>; stdout: string; stderr: string } {
     if (!fields || fields.Label !== label) throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} plist label mismatch`);
     if (
       !Array.isArray(fields.ProgramArguments) ||
@@ -967,7 +1042,19 @@ export class ServiceController {
     if (!environment.HOME || !environment.PATH) {
       throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} service environment lacks HOME or PATH`);
     }
-    return { args: fields.ProgramArguments as string[], cwd: fields.WorkingDirectory, environment };
+    const logPath = (value: unknown) => {
+      if (typeof value !== "string" || !isAbsolute(value)) {
+        throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} service log paths are not explicit absolute paths`);
+      }
+      return value;
+    };
+    return {
+      args: fields.ProgramArguments as string[],
+      cwd: fields.WorkingDirectory,
+      environment,
+      stdout: logPath(fields.StandardOutPath),
+      stderr: logPath(fields.StandardErrorPath),
+    };
   }
 
   async #validateDefinition(definition: ServiceDefinition): Promise<void> {

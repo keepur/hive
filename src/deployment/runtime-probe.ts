@@ -1,8 +1,11 @@
-import { randomUUID } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { execFile as nodeExecFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { constants, readFileSync, realpathSync } from "node:fs";
+import { mkdir, open, readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseBootIdentity } from "./health.js";
 import { buildServiceEnvironment, servicePortKeys, ServiceController } from "./services.js";
 import { requestMaintenance, type MaintenanceReply } from "../voice-worker/maintenance-ipc.js";
@@ -15,10 +18,38 @@ import {
   workerMaintenanceFailure,
   type WorkerMaintenanceProbeDeps,
 } from "./worker-maintenance-probe.js";
+import {
+  classificationOf,
+  HISTORICAL_PROBE_ABI,
+  MAX_PROBE_OUTPUT_BYTES,
+  resolveRequiredDependencies,
+} from "./pilot-probe.js";
+import {
+  probeFailureEnvelope,
+  runHistoricalProbe,
+  runPilotAbiHandshake,
+  type HistoricalLoaderConfig,
+  type HistoricalProbeDeps,
+  type LivekitReader,
+  type PilotProbeBoundaries,
+} from "./historical-probe.js";
+import { runPilotProfileProbe, type OuterProbeDeps } from "./pilot-profile-probe.js";
 
 export { readOwnLoaderTelemetry } from "./worker-maintenance-probe.js";
 
-export type RuntimeProbeMode = "config" | "bridge" | "worker" | "outbound" | "worker-maintenance";
+export type RuntimeProbeMode =
+  | "config"
+  | "bridge"
+  | "worker"
+  | "outbound"
+  | "worker-maintenance"
+  | "pilot"
+  | "pilot-inventory"
+  | "pilot-abi"
+  | "pilot-abi-v1";
+
+/** Private modes that take exactly one absolute sealed input path. */
+export const PRIVATE_INPUT_MODES = ["worker-maintenance", "pilot", "pilot-inventory", "pilot-abi-v1"] as const;
 
 export interface BridgeProbeResult {
   authenticated: boolean;
@@ -387,14 +418,26 @@ async function outboundMode() {
 }
 
 export async function runRuntimeProbe(mode: string, inputPath?: string): Promise<Record<string, unknown>> {
+  const privateInput = (PRIVATE_INPUT_MODES as readonly string[]).includes(mode);
+  if (privateInput && (inputPath === undefined || !isAbsolute(inputPath))) {
+    throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  }
   if (mode === "worker-maintenance") {
-    if (inputPath === undefined || !isAbsolute(inputPath)) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
-    return (await runWorkerMaintenanceProbe(inputPath, installedWorkerMaintenanceDeps())) as unknown as Record<
+    return (await runWorkerMaintenanceProbe(inputPath!, installedWorkerMaintenanceDeps())) as unknown as Record<
       string,
       unknown
     >;
   }
+  if (mode === "pilot" || mode === "pilot-inventory") {
+    return (await runPilotProfileProbe(mode, inputPath!, outerPilotProbeDeps())) as unknown as Record<string, unknown>;
+  }
+  if (mode === "pilot-abi-v1") {
+    return (await runHistoricalProbe(inputPath!, historicalProbeDeps())) as unknown as Record<string, unknown>;
+  }
   if (inputPath !== undefined) throw new Error("runtime probe mode accepts no private input path");
+  if (mode === "pilot-abi") {
+    return (await runPilotAbiHandshake(historicalProbeDeps())) as unknown as Record<string, unknown>;
+  }
   if (mode !== "config" && mode !== "bridge" && mode !== "worker" && mode !== "outbound") {
     throw new Error("runtime probe mode must be config, bridge, worker, outbound, or worker-maintenance");
   }
@@ -466,23 +509,201 @@ function installedWorkerMaintenanceDeps(): WorkerMaintenanceProbeDeps {
   };
 }
 
+/** Shared concrete OS/probe boundaries for the pilot probe modes. */
+function pilotProbeBoundaries(): PilotProbeBoundaries {
+  const controllerFor = (operationDirectory: string) => {
+    const home = resolve(operationDirectory, "..", "..", "..", "..");
+    return new ServiceController({
+      instanceId: instanceIdOf(operationDirectory),
+      hiveHome: home,
+      home: process.env.HOME!,
+      operationDir: operationDirectory,
+    });
+  };
+  return {
+    now: Date.now,
+    uid: () => process.getuid!(),
+    selfPath: fileURLToPath(import.meta.url),
+    env: process.env,
+    serviceEnvironment: (env) => assertRuntimeProbeEnvironment(env),
+    readRelease: (root) => readRelease(root),
+    processIdentity: (pid, operationDirectory) => controllerFor(operationDirectory).process(pid),
+    listenerOwners: (port, operationDirectory) => controllerFor(operationDirectory).listenerOwners(port),
+    probeBridge: (url, token) => probeBridge(url, token),
+    probeWorkerHttp: (port) => probeWorkerHttp(port),
+    readTelemetry: (wc, request) => readOwnLoaderTelemetry(wc, request),
+    requestMaintenance: (options) => requestMaintenance(options),
+    livekit: async (wc) => livekitReader(await import("livekit-server-sdk"), wc),
+    resolveDependencies: (entry, roots) => resolveRequiredDependencies(entry, roots),
+    sha256File: async (path) =>
+      createHash("sha256")
+        .update(await readFile(path))
+        .digest("hex"),
+  };
+}
+
+/** Instance ID recorded by the acquired operation that owns this probe directory. */
+function instanceIdOf(operationDirectory: string): string {
+  const record = JSON.parse(readFileSync(resolve(operationDirectory, "operation.json"), "utf8")) as {
+    instanceId?: unknown;
+  };
+  if (typeof record.instanceId !== "string") throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  return record.instanceId;
+}
+
+interface LivekitSdk {
+  RoomServiceClient: new (
+    url: string,
+    key: string,
+    secret: string,
+  ) => {
+    listRooms(): Promise<unknown[]>;
+    listParticipants(room: string): Promise<unknown[]>;
+  };
+  AgentDispatchClient: new (
+    url: string,
+    key: string,
+    secret: string,
+  ) => { listDispatch(room: string): Promise<unknown[]> };
+  SipClient: new (
+    url: string,
+    key: string,
+    secret: string,
+  ) => {
+    listSipDispatchRule(options: { page: { limit: number; afterId: string } }): Promise<unknown[]>;
+    listSipInboundTrunk(options: { page: { limit: number; afterId: string } }): Promise<unknown[]>;
+  };
+}
+
+/** Read-only pinned 2.14.1 client surface; credentials stay in this probe process. */
+function livekitReader(sdk: unknown, wc: HistoricalLoaderConfig): LivekitReader {
+  const { RoomServiceClient, AgentDispatchClient, SipClient } = sdk as LivekitSdk;
+  const rooms = new RoomServiceClient(wc.livekitUrl, wc.livekitApiKey, wc.livekitApiSecret);
+  const dispatch = new AgentDispatchClient(wc.livekitUrl, wc.livekitApiKey, wc.livekitApiSecret);
+  const sip = new SipClient(wc.livekitUrl, wc.livekitApiKey, wc.livekitApiSecret);
+  return {
+    listRooms: () => rooms.listRooms() as ReturnType<LivekitReader["listRooms"]>,
+    listParticipants: (room) => rooms.listParticipants(room) as ReturnType<LivekitReader["listParticipants"]>,
+    listDispatch: (room) => dispatch.listDispatch(room) as ReturnType<LivekitReader["listDispatch"]>,
+    listSipDispatchRule: (page) =>
+      sip.listSipDispatchRule({ page }) as ReturnType<LivekitReader["listSipDispatchRule"]>,
+    listSipInboundTrunk: (page) =>
+      sip.listSipInboundTrunk({ page }) as ReturnType<LivekitReader["listSipInboundTrunk"]>,
+  };
+}
+
+/** `pilot-abi` / `pilot-abi-v1` inside this (historical) release: its own loader only. */
+function historicalProbeDeps(): HistoricalProbeDeps {
+  const self = fileURLToPath(import.meta.url);
+  return {
+    ...pilotProbeBoundaries(),
+    async loadWorkerConfig() {
+      const { loadWorkerConfig } = await import("../voice-worker/worker-config.js");
+      return loadWorkerConfig();
+    },
+    serverSdkVersion() {
+      try {
+        const require = createRequire(self);
+        let directory = dirname(realpathSync(require.resolve("livekit-server-sdk")));
+        while (dirname(directory) !== directory) {
+          try {
+            const manifest = JSON.parse(readFileSync(resolve(directory, "package.json"), "utf8")) as {
+              name?: unknown;
+              version?: unknown;
+            };
+            if (manifest.name === "livekit-server-sdk")
+              return typeof manifest.version === "string" ? manifest.version : null;
+          } catch {
+            // keep walking
+          }
+          directory = dirname(directory);
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+/** Outer `pilot` / `pilot-inventory` in the registered bootstrap probe. */
+function outerPilotProbeDeps(): OuterProbeDeps {
+  return {
+    ...pilotProbeBoundaries(),
+    run(node, args, env, timeoutMs) {
+      return new Promise((done) => {
+        nodeExecFile(
+          node,
+          [...args],
+          {
+            env,
+            timeout: Math.max(1, timeoutMs),
+            killSignal: "SIGKILL",
+            encoding: "utf8",
+            maxBuffer: MAX_PROBE_OUTPUT_BYTES,
+          },
+          (error, stdout) => {
+            const code = error
+              ? typeof (error as { code?: unknown }).code === "number"
+                ? (error as { code: number }).code
+                : 1
+              : 0;
+            done({ exitCode: code, stdout: String(stdout ?? "") });
+          },
+        );
+      });
+    },
+    async writeRequest(path, bytes) {
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      const handle = await open(
+        path,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        await handle.writeFile(bytes);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+    },
+    async importLegacyLoader(realpath) {
+      const module = (await import(pathToFileURL(realpath).href)) as { loadWorkerConfig?: unknown };
+      if (typeof module.loadWorkerConfig !== "function") throw new ProbeFailure("PILOT_LOADER_UNAVAILABLE");
+      return module.loadWorkerConfig as () => unknown;
+    },
+    async livekitFrom(loaderRealpath, wc) {
+      const resolved = createRequire(loaderRealpath).resolve("livekit-server-sdk");
+      return livekitReader(await import(pathToFileURL(resolved).href), wc);
+    },
+  };
+}
+
 async function main(): Promise<void> {
   const stdoutWrite = process.stdout.write;
   const stderrWrite = process.stderr.write;
   process.stdout.write = (() => true) as typeof process.stdout.write;
   process.stderr.write = (() => true) as typeof process.stderr.write;
   const mode = process.argv[2] ?? "";
-  const privateMode = mode === "worker-maintenance";
+  const inputMode = (PRIVATE_INPUT_MODES as readonly string[]).includes(mode);
+  const privateMode = inputMode || mode === "pilot-abi";
   const inputPath = process.argv[3];
   let output: Record<string, unknown>;
   try {
-    if (privateMode ? process.argv.length !== 4 : process.argv.length !== 3) {
+    if (inputMode ? process.argv.length !== 4 : process.argv.length !== 3) {
       throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
     }
-    output = await runRuntimeProbe(mode, privateMode ? inputPath : undefined);
+    output = await runRuntimeProbe(mode, inputMode ? inputPath : undefined);
     if (output.ok === false) process.exitCode = 1;
   } catch (error) {
-    output = privateMode ? await workerMaintenanceFailure(inputPath, error) : runtimeProbeErrorResult(error);
+    output =
+      mode === "worker-maintenance"
+        ? await workerMaintenanceFailure(inputPath, error)
+        : mode === "pilot-abi" || mode === "pilot-abi-v1"
+          ? await probeFailureEnvelope(inputPath, classificationOf(error), HISTORICAL_PROBE_ABI)
+          : mode === "pilot" || mode === "pilot-inventory"
+            ? await probeFailureEnvelope(inputPath, classificationOf(error), null)
+            : runtimeProbeErrorResult(error);
     process.exitCode = 1;
   } finally {
     process.stdout.write = stdoutWrite;

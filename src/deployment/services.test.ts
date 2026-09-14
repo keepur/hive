@@ -576,6 +576,28 @@ describe("signal fence, ordered restore and observation-only adapters", () => {
     expect(exec.mock.calls.some(([, args]) => args[0] === "bootout")).toBe(false);
   });
 
+  it("listener, writer and UID adapters only observe and parse strictly", async () => {
+    const exec = vi.fn(async (command: string, args: readonly string[]) => {
+      if (command === "lsof" && args.includes("-p")) {
+        return { stdout: "p701\nf21\nn127.0.0.1:8081\nf22\nn*:3108\nf23\nn192.168.1.4:9000\n", stderr: "" };
+      }
+      if (command === "lsof" && args.includes("-Fpa")) {
+        return { stdout: "p701\nf1\naw\np702\nf3\nar\np703\nf4\nau\n", stderr: "" };
+      }
+      if (command === "ps" && args.includes("uid=")) return { stdout: "  501\n", stderr: "" };
+      throw new Error(`unexpected ${command} ${args.join(" ")}`);
+    });
+    const service = controller(makeIO({ execFile: exec }));
+    await expect(service.listenersOf(701)).resolves.toEqual([3108, 8081]);
+    await expect(service.fileWriters("/tmp/voice-worker.log")).resolves.toEqual([701, 703]);
+    await expect(service.processUid(701)).resolves.toBe(501);
+    expect(exec.mock.calls.every(([command, args]) => command !== "launchctl" && !args.includes("kill"))).toBe(true);
+    const garbage = controller(makeIO({ execFile: vi.fn(async () => ({ stdout: "zzz\n", stderr: "" })) }));
+    await expect(garbage.listenersOf(701)).rejects.toThrow("could not parse");
+    await expect(garbage.fileWriters("/tmp/x")).rejects.toThrow("could not parse");
+    await expect(garbage.processUid(701)).rejects.toThrow("could not parse");
+  });
+
   it("process census observes descendants only and never signals", async () => {
     const exec = vi.fn(async (command: string, args: readonly string[]) => {
       if (command === "ps" && args.includes("-axo")) {
@@ -810,6 +832,8 @@ describe("read-only first-capture discovery", () => {
           `${pilotRoot}/${label.endsWith("agent") ? "pkg/server.min.js" : "dist/voice-worker/main.js"}`,
         ],
         WorkingDirectory: hiveHome,
+        StandardOutPath: `${hiveHome}/logs/${label}.log`,
+        StandardErrorPath: `${hiveHome}/logs/${label}.err`,
         EnvironmentVariables: options.env ?? {
           HIVE_HOME: hiveHome,
           HIVE_CONFIG: configPath,

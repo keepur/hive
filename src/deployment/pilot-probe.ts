@@ -10,6 +10,9 @@
  * request that produced it and against independent OS evidence by the caller.
  */
 import { createHash } from "node:crypto";
+import { readFileSync, realpathSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
 import { canonical } from "./canonical.js";
 import { parseBootIdentity } from "./health.js";
 import {
@@ -23,14 +26,17 @@ import {
   object,
   path,
   processSeal,
+  recordRef,
   release,
   str,
   uuid,
+  within,
   type Digest,
   type FileSeal,
   type InstanceKey,
   type PilotSubject,
   type ProcessSeal,
+  type RecordRef,
 } from "./pilot-records.js";
 import { parseMaintenanceReply, type MaintenanceReply } from "../voice-worker/maintenance-ipc.js";
 import type { BootIdentity, Release } from "./release.js";
@@ -532,3 +538,631 @@ export function inventoryItems(value: unknown): InventoryItem[] {
 
 export { decodePilotSubject };
 export type { PilotSubject };
+
+// ── historical probe ABI wire types (chunk 5 Step 1) ──────────────────────
+
+export const HISTORICAL_SERVER_SDK = "2.14.1";
+export const INVENTORY_BUDGET_MS = 30_000;
+export const INVENTORY_MAX_ITEMS = 10_000;
+export const INVENTORY_LIMITATIONS = ["EXTERNAL_PRODUCERS_UNFENCED", "PENDING_ASSIGNMENTS_UNOBSERVABLE"] as const;
+
+export type PilotAbiHandshake = {
+  schemaVersion: 1;
+  abi: typeof HISTORICAL_PROBE_ABI;
+  projection: 1;
+  serverSdk: typeof HISTORICAL_SERVER_SDK;
+  operations: ["observe", "inventory"];
+  release: Release;
+};
+
+export function decodePilotAbiHandshake(value: unknown): PilotAbiHandshake {
+  const o = object(value, ["schemaVersion", "abi", "projection", "serverSdk", "operations", "release"]);
+  if (
+    o.schemaVersion !== 1 ||
+    o.projection !== 1 ||
+    !Array.isArray(o.operations) ||
+    canonical(o.operations) !== canonical(["observe", "inventory"])
+  ) {
+    throw new ProbeFailure("PILOT_PROBE_ABI_UNSUPPORTED");
+  }
+  try {
+    return {
+      schemaVersion: 1,
+      abi: literal(o.abi, [HISTORICAL_PROBE_ABI]),
+      projection: 1,
+      serverSdk: literal(o.serverSdk, [HISTORICAL_SERVER_SDK]),
+      operations: ["observe", "inventory"],
+      release: release(o.release),
+    };
+  } catch (error) {
+    throw new ProbeFailure("PILOT_PROBE_ABI_UNSUPPORTED", { cause: error });
+  }
+}
+
+export type DependencyFile = { path: string; realpath: string; sha256: Digest; version: string | null };
+
+export function dependencyFile(value: unknown): DependencyFile {
+  const o = object(value, ["path", "realpath", "sha256", "version"]);
+  return {
+    path: path(o.path),
+    realpath: path(o.realpath),
+    sha256: digest(o.sha256),
+    version: o.version === null ? null : str(o.version, 128),
+  };
+}
+
+export type BridgeObservation = {
+  correctStatus: number;
+  correctClassification: "missing-agent";
+  missingStatus: number;
+  wrongStatus: number;
+};
+
+function bridgeObservation(value: unknown): BridgeObservation {
+  const o = object(value, ["correctStatus", "correctClassification", "missingStatus", "wrongStatus"]);
+  return {
+    correctStatus: int(o.correctStatus, 100, 599),
+    correctClassification: literal(o.correctClassification, ["missing-agent"]),
+    missingStatus: int(o.missingStatus, 100, 599),
+    wrongStatus: int(o.wrongStatus, 100, 599),
+  };
+}
+
+export type HistoricalProbeRequest = {
+  schemaVersion: 1;
+  abi: typeof HISTORICAL_PROBE_ABI;
+  action: "observe" | "inventory";
+  requestId: string;
+  operationId: string;
+  subject: PilotSubject;
+  instance: InstanceKey;
+  requestedAt: number;
+  deadline: number;
+  expectedRelease: Release;
+  expectedProbe: FileSeal;
+  sdkPort: number;
+  dependencyFiles: FileSeal[];
+  idle: HistoricalIdleRequest | null;
+};
+
+export type HistoricalObservation = {
+  schemaVersion: 1;
+  abi: typeof HISTORICAL_PROBE_ABI;
+  action: "observe";
+  requestId: string;
+  operationId: string;
+  subject: PilotSubject;
+  instance: InstanceKey;
+  startedAt: number;
+  finishedAt: number;
+  release: Release;
+  projection: 1;
+  configIdentity: Digest;
+  bridge: BridgeObservation;
+  sdk: SdkObservation;
+  idle: HistoricalIdle | null;
+  dependencyFiles: DependencyFile[];
+};
+
+export type InventoryCounts = {
+  rooms: number;
+  participants: number;
+  dispatches: number;
+  rules: number;
+  inboundTrunks: number;
+};
+
+export type HistoricalInventory = {
+  schemaVersion: 1;
+  abi: typeof HISTORICAL_PROBE_ABI;
+  action: "inventory";
+  requestId: string;
+  operationId: string;
+  subject: PilotSubject;
+  instance: InstanceKey;
+  startedAt: number;
+  finishedAt: number;
+  release: Release;
+  projection: 1;
+  configIdentity: Digest;
+  items: InventoryItem[];
+  counts: InventoryCounts;
+  limitations: ["EXTERNAL_PRODUCERS_UNFENCED", "PENDING_ASSIGNMENTS_UNOBSERVABLE"];
+};
+
+function ids(...values: string[]): void {
+  if (new Set(values).size !== values.length) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+}
+
+export function decodeHistoricalProbeRequest(value: unknown): HistoricalProbeRequest {
+  const o = object(value, [
+    "schemaVersion",
+    "abi",
+    "action",
+    "requestId",
+    "operationId",
+    "subject",
+    "instance",
+    "requestedAt",
+    "deadline",
+    "expectedRelease",
+    "expectedProbe",
+    "sdkPort",
+    "dependencyFiles",
+    "idle",
+  ]);
+  if (o.schemaVersion !== 1) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  const request: HistoricalProbeRequest = {
+    schemaVersion: 1,
+    abi: literal(o.abi, [HISTORICAL_PROBE_ABI]),
+    action: literal(o.action, ["observe", "inventory"]),
+    requestId: uuid(o.requestId),
+    operationId: uuid(o.operationId),
+    subject: decodePilotSubject(o.subject),
+    instance: instanceKey(o.instance),
+    requestedAt: time(o.requestedAt),
+    deadline: time(o.deadline),
+    expectedRelease: release(o.expectedRelease),
+    expectedProbe: fileSeal(o.expectedProbe),
+    sdkPort: int(o.sdkPort, 1, 65535),
+    dependencyFiles: array(o.dependencyFiles, fileSeal, 0, 64),
+    idle: o.idle === null ? null : historicalIdleRequest(o.idle),
+  };
+  ids(request.requestId, request.operationId, ...(request.idle ? [request.idle.statusRequestId] : []));
+  const budget = request.action === "observe" ? DECISIVE_PROBE_BUDGET_MS : INVENTORY_BUDGET_MS;
+  if (request.deadline <= request.requestedAt || request.deadline > request.requestedAt + budget) {
+    throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  }
+  if (request.action === "inventory" && request.idle !== null) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  if (request.subject.kind === "capture-draft" && request.subject.operationId !== request.operationId) {
+    throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  }
+  if (request.idle && canonical(request.idle.expectedSupervisor.release) !== canonical(request.expectedRelease)) {
+    throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  }
+  return request;
+}
+
+export function decodeHistoricalObservation(value: unknown): HistoricalObservation {
+  const o = object(value, [
+    "schemaVersion",
+    "abi",
+    "action",
+    "requestId",
+    "operationId",
+    "subject",
+    "instance",
+    "startedAt",
+    "finishedAt",
+    "release",
+    "projection",
+    "configIdentity",
+    "bridge",
+    "sdk",
+    "idle",
+    "dependencyFiles",
+  ]);
+  if (o.schemaVersion !== 1 || o.projection !== 1) throw new ProbeFailure("PILOT_PROBE_ABI_UNSUPPORTED");
+  return {
+    schemaVersion: 1,
+    abi: literal(o.abi, [HISTORICAL_PROBE_ABI]),
+    action: literal(o.action, ["observe"]),
+    requestId: uuid(o.requestId),
+    operationId: uuid(o.operationId),
+    subject: decodePilotSubject(o.subject),
+    instance: instanceKey(o.instance),
+    startedAt: time(o.startedAt),
+    finishedAt: time(o.finishedAt),
+    release: release(o.release),
+    projection: 1,
+    configIdentity: digest(o.configIdentity),
+    bridge: bridgeObservation(o.bridge),
+    sdk: sdkObservation(o.sdk),
+    idle: o.idle === null ? null : historicalIdle(o.idle),
+    dependencyFiles: array(o.dependencyFiles, dependencyFile, 0, 64),
+  };
+}
+
+function inventoryCounts(value: unknown): InventoryCounts {
+  const o = object(value, ["rooms", "participants", "dispatches", "rules", "inboundTrunks"]);
+  const count = (item: unknown) => int(item, 0, INVENTORY_MAX_ITEMS);
+  return {
+    rooms: count(o.rooms),
+    participants: count(o.participants),
+    dispatches: count(o.dispatches),
+    rules: count(o.rules),
+    inboundTrunks: count(o.inboundTrunks),
+  };
+}
+
+function limitations(value: unknown): HistoricalInventory["limitations"] {
+  if (canonical(value) !== canonical(INVENTORY_LIMITATIONS)) throw new ProbeFailure("PILOT_INVENTORY_INCOMPLETE");
+  return [...INVENTORY_LIMITATIONS];
+}
+
+/** Counts must equal the normalized items (rules counted by distinct rule ID). */
+export function countInventory(items: readonly InventoryItem[]): InventoryCounts {
+  const distinct = (kind: InventoryItem["kind"]) =>
+    new Set(items.filter((item) => item.kind === kind).map((item) => item.id)).size;
+  return {
+    rooms: distinct("room"),
+    participants: distinct("participant"),
+    dispatches: distinct("dispatch"),
+    rules: distinct("sip-rule"),
+    inboundTrunks: distinct("inbound-trunk"),
+  };
+}
+
+export function decodeHistoricalInventory(value: unknown): HistoricalInventory {
+  const o = object(value, [
+    "schemaVersion",
+    "abi",
+    "action",
+    "requestId",
+    "operationId",
+    "subject",
+    "instance",
+    "startedAt",
+    "finishedAt",
+    "release",
+    "projection",
+    "configIdentity",
+    "items",
+    "counts",
+    "limitations",
+  ]);
+  if (o.schemaVersion !== 1 || o.projection !== 1) throw new ProbeFailure("PILOT_PROBE_ABI_UNSUPPORTED");
+  const items = inventoryItems(o.items);
+  const counts = inventoryCounts(o.counts);
+  if (canonical(counts) !== canonical(countInventory(items))) throw new ProbeFailure("PILOT_INVENTORY_INCOMPLETE");
+  if (canonical(sortInventory(items)) !== canonical(items)) throw new ProbeFailure("PILOT_INVENTORY_INCOMPLETE");
+  return {
+    schemaVersion: 1,
+    abi: literal(o.abi, [HISTORICAL_PROBE_ABI]),
+    action: literal(o.action, ["inventory"]),
+    requestId: uuid(o.requestId),
+    operationId: uuid(o.operationId),
+    subject: decodePilotSubject(o.subject),
+    instance: instanceKey(o.instance),
+    startedAt: time(o.startedAt),
+    finishedAt: time(o.finishedAt),
+    release: release(o.release),
+    projection: 1,
+    configIdentity: digest(o.configIdentity),
+    items,
+    counts,
+    limitations: limitations(o.limitations),
+  };
+}
+
+// ── outer `pilot` / `pilot-inventory` request and results (chunk 4 Step 4b.2) ──
+
+export type PilotProbeMode = "pilot" | "pilot-inventory";
+
+export type PilotProbeRequest = {
+  schemaVersion: 1;
+  requestId: string;
+  operationId: string;
+  subject: PilotSubject;
+  instance: InstanceKey;
+  requestedAt: number;
+  deadline: number;
+  expectedEngine: ProcessSeal;
+  expectedWorker: ProcessSeal;
+  bootstrap: RecordRef;
+  draftOrSnapshotSeal: FileSeal;
+  idle: HistoricalIdleRequest | null;
+};
+
+export type PilotProbeResult = {
+  schemaVersion: 1;
+  requestId: string;
+  instance: InstanceKey;
+  subject: PilotSubject;
+  startedAt: number;
+  finishedAt: number;
+  classification: "PILOT_OBSERVED";
+  configIdentity: Digest;
+  bridge: BridgeObservation;
+  sdk: SdkObservation;
+  idle: HistoricalIdle | null;
+  dependencyFiles: DependencyFile[];
+};
+
+export type PilotInventoryResult = {
+  schemaVersion: 1;
+  requestId: string;
+  instance: InstanceKey;
+  subject: PilotSubject;
+  startedAt: number;
+  finishedAt: number;
+  classification: "PILOT_INVENTORY_OBSERVED";
+  configIdentity: Digest;
+  items: InventoryItem[];
+  counts: InventoryCounts;
+  limitations: HistoricalInventory["limitations"];
+  evidenceDigest: Digest;
+};
+
+export type PilotFailureEnvelope = { schemaVersion: 1; requestId: string; classification: ProbeClassification };
+
+export function pilotProbeRequestPath(
+  canonicalHome: string,
+  request: { operationId: string; requestId: string },
+  mode: PilotProbeMode,
+): string {
+  return resolve(
+    canonicalHome,
+    ".hive-state",
+    "deployment",
+    "operations",
+    request.operationId,
+    "probes",
+    request.requestId,
+    `${mode}.json`,
+  );
+}
+
+export function historicalRequestPath(
+  canonicalHome: string,
+  request: { operationId: string; requestId: string },
+): string {
+  return resolve(
+    canonicalHome,
+    ".hive-state",
+    "deployment",
+    "operations",
+    request.operationId,
+    "probes",
+    request.requestId,
+    "historical.json",
+  );
+}
+
+export function decodePilotProbeRequest(value: unknown, mode: PilotProbeMode): PilotProbeRequest {
+  const o = object(value, [
+    "schemaVersion",
+    "requestId",
+    "operationId",
+    "subject",
+    "instance",
+    "requestedAt",
+    "deadline",
+    "expectedEngine",
+    "expectedWorker",
+    "bootstrap",
+    "draftOrSnapshotSeal",
+    "idle",
+  ]);
+  if (o.schemaVersion !== 1) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  const request: PilotProbeRequest = {
+    schemaVersion: 1,
+    requestId: uuid(o.requestId),
+    operationId: uuid(o.operationId),
+    subject: decodePilotSubject(o.subject),
+    instance: instanceKey(o.instance),
+    requestedAt: time(o.requestedAt),
+    deadline: time(o.deadline),
+    expectedEngine: processSeal(o.expectedEngine),
+    expectedWorker: processSeal(o.expectedWorker),
+    bootstrap: recordRef(o.bootstrap),
+    draftOrSnapshotSeal: fileSeal(o.draftOrSnapshotSeal),
+    idle: o.idle === null ? null : historicalIdleRequest(o.idle),
+  };
+  ids(request.requestId, request.operationId, ...(request.idle ? [request.idle.statusRequestId] : []));
+  const budget = mode === "pilot" ? DECISIVE_PROBE_BUDGET_MS : INVENTORY_BUDGET_MS;
+  if (request.deadline <= request.requestedAt || request.deadline > request.requestedAt + budget) {
+    throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  }
+  if (mode === "pilot-inventory" && request.idle !== null) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  if (request.subject.kind === "capture-draft") {
+    if (request.subject.operationId !== request.operationId) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+    if (request.draftOrSnapshotSeal.sha256 !== request.subject.draftSha256) {
+      throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+    }
+  } else if (request.draftOrSnapshotSeal.sha256 !== request.subject.snapshot.sha256) {
+    throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  }
+  if (request.idle && request.idle.expectedSupervisor.pid !== request.expectedWorker.pid) {
+    throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  }
+  return request;
+}
+
+export function decodePilotProbeResult(value: unknown): PilotProbeResult {
+  const o = object(value, [
+    "schemaVersion",
+    "requestId",
+    "instance",
+    "subject",
+    "startedAt",
+    "finishedAt",
+    "classification",
+    "configIdentity",
+    "bridge",
+    "sdk",
+    "idle",
+    "dependencyFiles",
+  ]);
+  if (o.schemaVersion !== 1) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  return {
+    schemaVersion: 1,
+    requestId: uuid(o.requestId),
+    instance: instanceKey(o.instance),
+    subject: decodePilotSubject(o.subject),
+    startedAt: time(o.startedAt),
+    finishedAt: time(o.finishedAt),
+    classification: literal(o.classification, ["PILOT_OBSERVED"]),
+    configIdentity: digest(o.configIdentity),
+    bridge: bridgeObservation(o.bridge),
+    sdk: sdkObservation(o.sdk),
+    idle: o.idle === null ? null : historicalIdle(o.idle),
+    dependencyFiles: array(o.dependencyFiles, dependencyFile, 0, 64),
+  };
+}
+
+export function decodePilotInventoryResult(value: unknown): PilotInventoryResult {
+  const o = object(value, [
+    "schemaVersion",
+    "requestId",
+    "instance",
+    "subject",
+    "startedAt",
+    "finishedAt",
+    "classification",
+    "configIdentity",
+    "items",
+    "counts",
+    "limitations",
+    "evidenceDigest",
+  ]);
+  if (o.schemaVersion !== 1) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  const items = inventoryItems(o.items);
+  const counts = inventoryCounts(o.counts);
+  const limits = limitations(o.limitations);
+  if (canonical(counts) !== canonical(countInventory(items))) throw new ProbeFailure("PILOT_INVENTORY_INCOMPLETE");
+  const evidence = digest(o.evidenceDigest);
+  if (evidence !== sha256Canonical({ items, counts, limitations: limits })) {
+    throw new ProbeFailure("PILOT_INVENTORY_INCOMPLETE");
+  }
+  return {
+    schemaVersion: 1,
+    requestId: uuid(o.requestId),
+    instance: instanceKey(o.instance),
+    subject: decodePilotSubject(o.subject),
+    startedAt: time(o.startedAt),
+    finishedAt: time(o.finishedAt),
+    classification: literal(o.classification, ["PILOT_INVENTORY_OBSERVED"]),
+    configIdentity: digest(o.configIdentity),
+    items,
+    counts,
+    limitations: limits,
+    evidenceDigest: evidence,
+  };
+}
+
+export function decodePilotFailure(value: unknown): PilotFailureEnvelope {
+  const o = object(value, ["schemaVersion", "requestId", "classification"]);
+  if (o.schemaVersion !== 1) throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  return {
+    schemaVersion: 1,
+    requestId: str(o.requestId, 36),
+    classification: literal(o.classification, probeClassifications),
+  };
+}
+
+/**
+ * Correlate an owner-correlated idle read with the request that produced it:
+ * status UUID/operation/supervisor/admission, `requestedAt <= start <= status
+ * and query <= finish <= deadline`, and the strict telemetry boot/heartbeat
+ * rules. Returns the fixed classification of the first failure or null.
+ */
+export function historicalIdleFault(
+  idle: HistoricalIdle,
+  request: { operationId: string; requestedAt: number; deadline: number; idle: HistoricalIdleRequest },
+  expectedRelease: Release,
+  window: { startedAt: number; finishedAt: number },
+): ProbeClassification | null {
+  const { status, telemetry } = idle;
+  if (
+    window.startedAt < request.requestedAt ||
+    status.requestedAt < window.startedAt ||
+    telemetry.queryStartedAt < window.startedAt ||
+    status.requestedAt > status.finishedAt ||
+    telemetry.queryStartedAt > telemetry.queryFinishedAt ||
+    status.finishedAt > window.finishedAt ||
+    telemetry.queryFinishedAt > window.finishedAt ||
+    window.finishedAt > request.deadline
+  ) {
+    return "PILOT_PROBE_DEADLINE";
+  }
+  const reply = status.reply;
+  if (
+    reply.requestId !== request.idle.statusRequestId ||
+    reply.operationId !== request.operationId ||
+    reply.writtenAt < status.requestedAt ||
+    reply.writtenAt > status.finishedAt ||
+    reply.supervisor.pid !== request.idle.expectedSupervisor.pid ||
+    reply.supervisor.bootId !== request.idle.expectedSupervisor.bootId ||
+    reply.snapshot.admission !== request.idle.expectedAdmission ||
+    (request.idle.expectedAdmission === "open" && reply.snapshot.operationId !== null) ||
+    (request.idle.expectedAdmission === "closed" && reply.snapshot.operationId !== request.operationId)
+  ) {
+    return "PILOT_ADMISSION_MISMATCH";
+  }
+  if (
+    telemetry.supervisorIdentity.component !== "voice-worker" ||
+    canonical(telemetry.supervisorIdentity) !== canonical(request.idle.expectedSupervisor) ||
+    canonical(telemetry.supervisorIdentity.release) !== canonical(expectedRelease)
+  ) {
+    return "PILOT_TELEMETRY_WRONG_BOOT";
+  }
+  const bootStartedAt = Date.parse(telemetry.supervisorIdentity.startedAt);
+  if (!Number.isFinite(bootStartedAt) || telemetry.supervisorUpdatedAt < bootStartedAt)
+    return "PILOT_TELEMETRY_INVALID";
+  if (
+    telemetry.supervisorUpdatedAt > telemetry.queryFinishedAt ||
+    telemetry.queryFinishedAt - telemetry.supervisorUpdatedAt > TELEMETRY_MAX_AGE_MS
+  ) {
+    return "PILOT_TELEMETRY_STALE";
+  }
+  return null;
+}
+
+// ── required dependency closure (chunk 5 Step 2) ──────────────────────────
+
+/** Worker runtime modules whose resolved entry files form the required dependency set. */
+export const PILOT_REQUIRED_MODULES = ["livekit-server-sdk", "@livekit/agents", "@livekit/rtc-node"] as const;
+
+function packageVersionOf(entryRealpath: string, name: string, roots: readonly string[]): string | null {
+  let directory = dirname(entryRealpath);
+  while (roots.some((root) => within(root, directory))) {
+    try {
+      const manifest = JSON.parse(readFileSync(resolve(directory, "package.json"), "utf8")) as {
+        name?: unknown;
+        version?: unknown;
+      };
+      if (manifest.name === name) return typeof manifest.version === "string" ? manifest.version : null;
+    } catch {
+      // Keep walking within the sealed closure only.
+    }
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  return null;
+}
+
+/**
+ * Resolve the required dependency files relative to a captured entry (never
+ * the probe package's own dependencies). Every resolved realpath must stay
+ * inside the sealed closure roots; hashes are computed by the caller's sealer.
+ */
+export function resolveRequiredDependencies(
+  entry: string,
+  roots: readonly string[],
+): { path: string; realpath: string; version: string | null }[] {
+  const require = createRequire(entry);
+  return PILOT_REQUIRED_MODULES.map((name) => {
+    let resolved: string;
+    let real: string;
+    try {
+      resolved = require.resolve(name);
+      real = realpathSync(resolved);
+    } catch (error) {
+      throw new ProbeFailure("PILOT_DEPENDENCY_MISMATCH", { cause: error });
+    }
+    if (!roots.some((root) => within(root, real))) throw new ProbeFailure("PILOT_DEPENDENCY_MISMATCH");
+    return { path: resolve(resolved), realpath: real, version: packageVersionOf(real, name, roots) };
+  });
+}
+
+/** Exact dependency identity set equality, order-independent. */
+export function sameDependencySet(
+  left: readonly { realpath: string; sha256: string }[],
+  right: readonly { realpath: string; sha256: string }[],
+): boolean {
+  const key = (items: readonly { realpath: string; sha256: string }[]) =>
+    canonical(items.map((item) => `${item.realpath}\0${item.sha256}`).sort());
+  return left.length === right.length && key(left) === key(right);
+}

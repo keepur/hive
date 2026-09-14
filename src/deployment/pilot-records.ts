@@ -1458,3 +1458,10 @@ export function isRegistrySelector(canonicalHome: string, selector: string): boo
     UUID_PATTERN.test(basename(directory))
   );
 }
+
+/** The draft-shaped baseline fields of a registered snapshot (no identity/config digest). */
+export function snapshotBaseline(snapshot: PilotSnapshot): CaptureDraft["baseline"] {
+  const { instance, captureOperationId, toolSha256, bootstrap, services, runtime, configFiles, slots, admission } =
+    snapshot;
+  return { instance, captureOperationId, toolSha256, bootstrap, services, runtime, configFiles, slots, admission };
+}
