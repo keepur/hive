@@ -82,6 +82,14 @@ export class OpsNotifier {
    * it false.
    */
   private subscriptionsLoaded = false;
+  /**
+   * The reload ordering pair. Every read-performing reload takes the next
+   * `reloadsStarted` number; its result replaces the map only if it is later
+   * than `reloadCommitted`, the number of the last load that did. See
+   * reloadSubscriptions for why an older finisher must lose.
+   */
+  private reloadsStarted = 0;
+  private reloadCommitted = 0;
   private reasons = new Map<string, LoadedReason>();
   /**
    * D5's three-valued policy state, and the third value is load-bearing.
@@ -295,6 +303,14 @@ export class OpsNotifier {
     // leaves `subscriptionsLoaded` false and why run() gates on it: the skip
     // is harmless only because nothing ingests until a real load lands.
     if (!this.canWrite()) return;
+    // ⚠ ORDERED, NOT SINGLE-FLIGHT. The 60 s timer and SIGUSR1 overlap freely,
+    // and an unordered commit let an earlier read that finished LAST replace a
+    // later one — restoring a subscription whose `enabled: false` had already
+    // been committed, or a target/cadenceProfile already replaced (D11, AC16).
+    // A result commits only if no later-STARTED load has committed; a faulted
+    // or guard-skipped load commits nothing, so it supersedes nothing, and an
+    // earlier read landing after it is still fresher than the retained set.
+    const seq = ++this.reloadsStarted;
     try {
       const rows = await this.opsStore.loadSubscriptions();
       const next = new Map<string, OpsSubscription>();
@@ -368,6 +384,17 @@ export class OpsNotifier {
         // are created and left to delivery-time transportUnbound.
         next.set(sub._id, sub);
       }
+      if (seq < this.reloadCommitted) {
+        // Not a fault, so not counted: a later load already committed a fresher
+        // read (and flipped `subscriptionsLoaded` when it did — start()'s reset
+        // is followed by its own, later-numbered load).
+        log.debug("ops subscription reload result superseded by a later reload — discarded", {
+          reload: seq,
+          committed: this.reloadCommitted,
+        });
+        return;
+      }
+      this.reloadCommitted = seq;
       this.subscriptions = next;
       this.subscriptionsLoaded = true;
     } catch (err) {

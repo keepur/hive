@@ -1810,6 +1810,134 @@ describe("a malformed subscription row costs THAT row, never the load (D6)", () 
   });
 });
 
+describe("an OLDER reload never undoes a NEWER one (D11, AC16)", () => {
+  /** Holds the next ops_subscriptions read AFTER its result is captured. */
+  const holdNextLoad = (h: NotifierHarness) => h.db.pause(OPS_SUBSCRIPTIONS_COLLECTION, "find", () => true, true);
+  const supersededLines = () =>
+    mockLog.debug.mock.calls.filter((call) => String(call[0]).includes("superseded by a later reload"));
+
+  it("a disable committed by a later reload is not restored by an earlier reload finishing after it", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE. The 60 s timer and SIGUSR1 can overlap: reload
+    // A reads while s1 is still enabled, the operator disables s1, reload B
+    // reads and commits the disable, and A's older result then replaced the
+    // map and put s1 back — so the next cadence posted to a stopped subscriber.
+    const h = await harness({ subscriptions: [sub("s1")], policy: policyWith() });
+    const e = await h.seedEvent();
+    await h.tick();
+    expect(h.transport.views).toHaveLength(1);
+
+    const gate = holdNextLoad(h);
+    const reloadA = h.notifier.reloadSubscriptions();
+    await gate.reached;
+    await h.db.collection(OPS_SUBSCRIPTIONS_COLLECTION).updateOne({ _id: "s1" }, { $set: { enabled: false } });
+    await h.notifier.reloadSubscriptions();
+    expect(h.snapshot().subscriptions).toBe(0);
+    gate.release();
+    await reloadA;
+
+    expect(h.snapshot().subscriptions).toBe(0);
+    expect(supersededLines()).toHaveLength(1);
+    h.advance(CADENCE);
+    await h.tick();
+    expect(h.transport.views).toHaveLength(1);
+    expect((await h.row("s1", e.dedupeKey)).stalledReason).toBe("subscription");
+  });
+
+  it("an earlier reload cannot restore a stale target or cadence profile over a later one", async () => {
+    const h = await harness({
+      subscriptions: [sub("s1")],
+      policy: policyWith({ profiles: { slow: CADENCE * 3 } }),
+    });
+    const e = await h.seedEvent();
+    await h.tick();
+    expect(h.transport.views.map((v) => v.target)).toEqual(["C0000001"]);
+
+    const gate = holdNextLoad(h);
+    const reloadA = h.notifier.reloadSubscriptions();
+    await gate.reached;
+    await h.db
+      .collection(OPS_SUBSCRIPTIONS_COLLECTION)
+      .updateOne(
+        { _id: "s1" },
+        { $set: { transport: { adapterId: "fake", target: "C0000002" }, cadenceProfile: "slow" } },
+      );
+    await h.notifier.reloadSubscriptions();
+    gate.release();
+    await reloadA;
+
+    h.advance(CADENCE);
+    const now = h.now();
+    await h.tick();
+    // The due nudge goes to the NEW target and is re-scheduled on the NEW profile.
+    expect(h.transport.views.map((v) => v.target)).toEqual(["C0000001", "C0000002"]);
+    const row = await h.row("s1", e.dedupeKey);
+    expect(row.nextNudgeAt).toEqual(new Date(now.getTime() + CADENCE * 3));
+  });
+
+  it("a later reload that FAILS does not block the one after it, and that one still beats the earlier read", async () => {
+    const h = await harness({ subscriptions: [sub("s1")] });
+    const subs = h.db.collection(OPS_SUBSCRIPTIONS_COLLECTION);
+    await subs.insertOne(sub("s2"));
+
+    const gate = holdNextLoad(h);
+    const reloadA = h.notifier.reloadSubscriptions(); // reads {s1, s2}
+    await gate.reached;
+    failNth(h.db, OPS_SUBSCRIPTIONS_COLLECTION, "find", 1);
+    await h.notifier.reloadSubscriptions(); // B: faults, retains {s1}
+    expect(h.snapshot().subscriptionReloadFaults).toBe(1);
+    expect(h.snapshot().subscriptions).toBe(1);
+
+    await subs.updateOne({ _id: "s1" }, { $set: { enabled: false } });
+    await h.notifier.reloadSubscriptions(); // C: commits {s2}
+    expect(h.snapshot().subscriptions).toBe(1); // {s2}
+    gate.release();
+    await reloadA;
+
+    expect(h.snapshot().subscriptions).toBe(1); // still {s2}, not A's {s1, s2}
+    expect(supersededLines()).toHaveLength(1);
+  });
+
+  it("an earlier read finishing after ONLY a failed later reload commits — it is newer than the retained set", async () => {
+    // Retention semantics: a failed (or guard-skipped) reload commits nothing,
+    // so it supersedes nothing — the in-flight earlier read is still a fresher
+    // snapshot than the set the failure retained.
+    const h = await harness({ subscriptions: [sub("s1")] });
+    await h.db.collection(OPS_SUBSCRIPTIONS_COLLECTION).insertOne(sub("s2"));
+
+    const gate = holdNextLoad(h);
+    const reloadA = h.notifier.reloadSubscriptions();
+    await gate.reached;
+    failNth(h.db, OPS_SUBSCRIPTIONS_COLLECTION, "find", 1);
+    await h.notifier.reloadSubscriptions();
+    expect(h.snapshot().subscriptions).toBe(1);
+    gate.release();
+    await reloadA;
+
+    expect(h.snapshot().subscriptions).toBe(2);
+    expect(supersededLines()).toHaveLength(0);
+  });
+
+  it("a discarded earlier FIRST load leaves the map loaded by the later one", async () => {
+    const h = await harness({ subscriptions: [sub("s1")], firstLoad: false });
+    expect(h.snapshot().subscriptionsLoaded).toBe(false);
+
+    const gate = holdNextLoad(h);
+    const reloadA = h.notifier.reloadSubscriptions();
+    await gate.reached;
+    await h.db.collection(OPS_SUBSCRIPTIONS_COLLECTION).insertOne(sub("s2"));
+    await h.notifier.reloadSubscriptions();
+    gate.release();
+    await reloadA;
+
+    expect(h.snapshot().subscriptionsLoaded).toBe(true);
+    expect(h.snapshot().subscriptions).toBe(2);
+    const e = await h.seedEvent({ matchedSubscriptionIds: ["s1", "s2"] });
+    await h.tick();
+    expect(await h.ledgerCount()).toBe(2);
+    expect((await h.row("s2", e.dedupeKey)).subscriptionId).toBe("s2");
+  });
+});
+
 // ───────────────────────────────────────────────────────────────────────────
 // The single-flight sweep and the per-row latch.
 // ───────────────────────────────────────────────────────────────────────────
