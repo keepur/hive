@@ -3,6 +3,9 @@ import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm, rmdir, stat,
 import { constants } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { ConfinedJobRecord, ConfinementSelfTest } from "./confined-job.js";
+import type { RegistrationFence } from "./pilot-records.js";
+import type { BootstrapWork } from "./bootstrap.js";
+import type { RegistryWork } from "./pilot.js";
 import {
   reconcileStaging,
   type PromotionMethodSelection,
@@ -78,6 +81,30 @@ export interface ProcessOwner {
  */
 export type OperationWorkKind = "lifecycle" | "bootstrap" | "registry";
 
+export type LifecycleMode = "update" | "check" | "rollback" | "start" | "stop" | "restart" | "pilot-rollback";
+/** Internal helper runbook modes (chunk 4 Task 9 Step 4b.1); never lifecycle work. */
+export type NonLifecycleMode =
+  | "bootstrap"
+  | "capture-pilot"
+  | "inventory-pilot"
+  | "prepare-legacy-hold"
+  | "verify-legacy-hold"
+  | "release-legacy-hold";
+
+export function workKindForMode(mode: LifecycleMode | NonLifecycleMode): OperationWorkKind {
+  if (mode === "bootstrap") return "bootstrap";
+  if (
+    mode === "capture-pilot" ||
+    mode === "inventory-pilot" ||
+    mode === "prepare-legacy-hold" ||
+    mode === "verify-legacy-hold" ||
+    mode === "release-legacy-hold"
+  ) {
+    return "registry";
+  }
+  return "lifecycle";
+}
+
 export interface OperationRecord {
   schemaVersion: typeof OPERATION_SCHEMA_VERSION;
   id: string;
@@ -92,7 +119,7 @@ export interface OperationRecord {
   frozenOwner: ProcessOwner | null;
   canonicalHome: string;
   instanceId: string;
-  mode: "update" | "check" | "rollback" | "start" | "stop" | "restart" | "pilot-rollback";
+  mode: LifecycleMode | NonLifecycleMode;
   phase: Phase;
   toolSha256: string;
   hostNodePath?: string;
@@ -121,6 +148,15 @@ export interface OperationRecord {
     state: "intended" | "observed";
   };
   staging: StagingRecord;
+  /**
+   * Registry creation/commit fences (chunk 5 Task 8 Step 1a.3 Step 2). Only
+   * bootstrap and registry work write registrations.
+   */
+  registrations?: RegistrationFence[];
+  /** Bootstrap work state; present only when `workKind === "bootstrap"`. */
+  bootstrap?: BootstrapWork;
+  /** Registry work state; present only when `workKind === "registry"`. */
+  registry?: RegistryWork;
 }
 
 /** Read-only decoder shape for records written before the staging revision. */
@@ -151,6 +187,20 @@ export function decodeOperationRecord(value: unknown): OperationRecord | LegacyO
       (!Number.isSafeInteger(frozen.pid) || (frozen.pid ?? 0) < 1 || typeof frozen.startTime !== "string"))
   ) {
     throw new OperationUnresolvedError("operation record frozen owner is missing or invalid");
+  }
+  const work = value as { signalsBegun?: unknown; bootstrap?: unknown; registry?: unknown; artifactMove?: unknown };
+  if (record.workKind !== "lifecycle") {
+    // Non-lifecycle work can never signal services or move artifact slots.
+    if (work.signalsBegun !== false || work.artifactMove !== undefined) {
+      throw new OperationUnresolvedError("non-lifecycle work carries lifecycle signal or artifact fields");
+    }
+    const branch = record.workKind === "bootstrap" ? work.bootstrap : work.registry;
+    const other = record.workKind === "bootstrap" ? work.registry : work.bootstrap;
+    if (!branch || typeof branch !== "object" || Array.isArray(branch) || other !== undefined) {
+      throw new OperationUnresolvedError(`${record.workKind} work state is missing or mismatched`);
+    }
+  } else if (work.bootstrap !== undefined || work.registry !== undefined) {
+    throw new OperationUnresolvedError("lifecycle work carries non-lifecycle state");
   }
   const staging = record.staging as Partial<StagingRecord> | undefined;
   if (
@@ -236,6 +286,9 @@ export interface AcquireOperationInput {
   ownerStartTime: string;
   priorProfile?: OperationRecord["priorProfile"];
   workKind?: OperationWorkKind;
+  /** Initial non-lifecycle work state; required for bootstrap/registry work. */
+  bootstrap?: BootstrapWork;
+  registry?: RegistryWork;
   operationId?: string;
   ownerPid?: number;
   startedAt?: string;
@@ -257,6 +310,14 @@ export async function acquireOperation(input: AcquireOperationInput): Promise<Ac
   if (!homeStat.isDirectory() || homeStat.isSymbolicLink()) throw new Error("invalid canonical instance home");
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(input.instanceId)) throw new Error("invalid Hive instance ID");
   if (!/^[a-f0-9]{64}$/.test(input.toolSha256)) throw new Error("invalid deployment helper digest");
+  const workKind = input.workKind ?? "lifecycle";
+  if (workKindForMode(input.mode) !== workKind) throw new Error("operation mode does not match its work kind");
+  if ((workKind === "bootstrap") !== (input.bootstrap !== undefined)) {
+    throw new Error("bootstrap work requires exactly its bootstrap state");
+  }
+  if ((workKind === "registry") !== (input.registry !== undefined)) {
+    throw new Error("registry work requires exactly its registry state");
+  }
   const id = input.operationId ?? randomUUID();
   const paths = operationPaths(canonicalHome, id);
   let previousRecord: unknown;
@@ -307,7 +368,7 @@ export async function acquireOperation(input: AcquireOperationInput): Promise<Ac
   const record: OperationRecord = {
     schemaVersion: OPERATION_SCHEMA_VERSION,
     id,
-    workKind: input.workKind ?? "lifecycle",
+    workKind,
     ownerPid: input.ownerPid ?? process.pid,
     frozenOwner: null,
     ownerStartTime: input.ownerStartTime,
@@ -322,6 +383,8 @@ export async function acquireOperation(input: AcquireOperationInput): Promise<Ac
     priorSnapshotPath: paths.priorSnapshot,
     retainedPaths: [],
     staging: emptyStaging(),
+    ...(input.bootstrap ? { bootstrap: input.bootstrap, registrations: [] } : {}),
+    ...(input.registry ? { registry: input.registry, registrations: [] } : {}),
   };
   try {
     await writeOperationJson(resolve(paths.lockDirectory, "owner.json"), {

@@ -673,3 +673,19 @@ export async function verifyStoppedPrior(
     }
   }
 }
+
+/** Strict exact-key `ServiceDefinition` decoder shared by registered pilot evidence. */
+export function decodeServiceDefinition(value: unknown): ServiceDefinition {
+  const missing: string[] = [];
+  const definition = decodeDefinition(value, missing);
+  if (missing.length) throw new PriorSnapshotIncompleteError(missing);
+  return definition;
+}
+
+/** Strict exact-key `ServiceInspection` decoder shared by registered pilot evidence. */
+export function decodeServiceInspection(value: unknown): ServiceInspection {
+  const missing: string[] = [];
+  const inspection = decodeInspection(value, missing);
+  if (missing.length) throw new PriorSnapshotIncompleteError(missing);
+  return inspection;
+}

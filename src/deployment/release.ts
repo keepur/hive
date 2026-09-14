@@ -158,3 +158,50 @@ export function writeBootIdentityRecord(path: string, identity: BootIdentity): v
   writeFileSync(temporary, JSON.stringify(identity) + "\n", { flag: "wx", mode: 0o600 });
   renameSync(temporary, path);
 }
+
+/**
+ * Strict exact-key decoder for a serialized `Release` (registered evidence
+ * records). Unlike `readRelease` it reads no files; it rejects unknown fields.
+ */
+export function parseReleaseManifest(value: unknown): Release {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("release must be an object");
+  const row = value as Record<string, unknown>;
+  const keys = [
+    "schemaVersion",
+    "packageVersion",
+    "sourceRevision",
+    "sourceDirty",
+    "dependencyLockSha256",
+    "voiceWorker",
+  ];
+  if (Object.keys(row).length !== keys.length || keys.some((key) => !Object.hasOwn(row, key))) {
+    throw new Error("unexpected release fields");
+  }
+  const worker = row.voiceWorker as Record<string, unknown> | null;
+  if (
+    row.schemaVersion !== 1 ||
+    typeof row.packageVersion !== "string" ||
+    !/^[0-9A-Za-z.+-]{1,128}$/.test(row.packageVersion) ||
+    typeof row.sourceRevision !== "string" ||
+    !/^[a-f0-9]{40}$/.test(row.sourceRevision) ||
+    (row.sourceDirty !== true && row.sourceDirty !== false) ||
+    typeof row.dependencyLockSha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(row.dependencyLockSha256) ||
+    worker === null ||
+    typeof worker !== "object" ||
+    Array.isArray(worker) ||
+    Object.keys(worker).length !== 2 ||
+    worker.path !== "pkg/voice-worker.min.js" ||
+    worker.admissionProtocol !== 1
+  ) {
+    throw new Error("unsupported or inconsistent release manifest");
+  }
+  return {
+    schemaVersion: 1,
+    packageVersion: row.packageVersion,
+    sourceRevision: row.sourceRevision,
+    sourceDirty: row.sourceDirty,
+    dependencyLockSha256: row.dependencyLockSha256,
+    voiceWorker: { path: "pkg/voice-worker.min.js", admissionProtocol: 1 },
+  };
+}
