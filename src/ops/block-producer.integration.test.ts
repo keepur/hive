@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mockLog = vi.hoisted(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
 vi.mock("../logging/logger.js", () => ({ createLogger: () => mockLog }));
 
-import { buildOpsFixture, type OpsFixture } from "./testing/lane-harness.js";
+import { buildLaneBHarness, buildOpsFixture, makeHarnessAgentConfig, type OpsFixture } from "./testing/lane-harness.js";
 import { OpsPublisher } from "./publisher.js";
 import { observeToolFailure } from "./observe.js";
 import { HIVE_RUNTIME_PRODUCER, REASON_TOOL_FAILED } from "./reasons.js";
@@ -38,7 +38,20 @@ import {
 import { setOpsPublisher, __resetOpsPublisherForTests } from "./publisher-singleton.js";
 import { clearingProvenanceOk } from "./ingest.js";
 import type { OpsNotification } from "./notification-types.js";
-import type { WorkItemContext, WorkItemContextRef } from "../agents/agent-runner.js";
+import {
+  AgentRunner,
+  type AgentRunnerOptions,
+  type WorkItemContext,
+  type WorkItemContextRef,
+} from "../agents/agent-runner.js";
+import type { MemoryManager } from "../memory/memory-manager.js";
+import { IN_PROCESS_PORTED_SERVERS } from "../agents/in-process-servers.js";
+import { TURN_CONTEXT_DEPENDENT_SERVERS } from "../agents/server-traits.js";
+import { WORKER_SERVER_DENYLIST } from "../workers/meeting-worker-pool.js";
+import type { ToolBridge } from "../agents/provider-adapters/tool-bridge.js";
+import { partitionInventoryForProvider } from "../agents/provider-adapters/tool-transport.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { Db } from "mongodb";
 
 /**
@@ -1229,5 +1242,222 @@ describe("KPR-501 block tools — handler level", () => {
       // The held job plus the fillers; the dropped block job is the only loss.
       expect(agentEvents()).toHaveLength(depth + 1);
     }, 30_000);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Surface and containment (Task 6): REAL `AgentRunner`s holding the fixture's
+// database, asserted on the BUILT server set (`buildInProcessServers`) and the
+// `buildToolTransportInventory` output — never on a config array alone
+// (CLAUDE.md, KPR-390). The Lane B case executes through a REAL `ToolBridge`
+// on its in-process `connect()` path. Every connected case takes its own
+// runner: `McpServer.connect` throws on a second connect of one instance.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** A memory manager the built-set drive never reaches (no `memory` in any coreServers here). */
+const UNUSED_MEMORY_MANAGER = {} as unknown as MemoryManager;
+
+function runnerWithDb(
+  db: Db,
+  coreServers: string[],
+  runnerOptions?: AgentRunnerOptions,
+  identity: { id: string; name: string } = { id: AGENT, name: "Mokie" },
+): AgentRunner {
+  // Positional shape of `agent-runner.test.ts`'s `makeRunnerWithDb`, plus the
+  // trailing runner options the worker pool's adapter factory passes.
+  return new AgentRunner(
+    makeHarnessAgentConfig({ ...identity, coreServers }),
+    UNUSED_MEMORY_MANAGER,
+    [],
+    new Map(),
+    "{}",
+    undefined,
+    undefined,
+    db,
+    undefined,
+    undefined,
+    runnerOptions,
+  );
+}
+
+describe("KPR-501 block tools — surface, worker containment and Lane B execution (AC1, D2, Edges 11–12)", () => {
+  let fixture: OpsFixture;
+  const bridges: ToolBridge[] = [];
+
+  beforeEach(async () => {
+    mockLog.debug.mockClear();
+    mockLog.info.mockClear();
+    mockLog.warn.mockClear();
+    mockLog.error.mockClear();
+    __resetBlockProducerCountersForTests();
+    fixture = await buildOpsFixture();
+  });
+
+  afterEach(async () => {
+    for (const b of bridges.splice(0)) await b.close();
+    await fixture.dispose();
+    __resetOpsPublisherForTests();
+  });
+
+  it("AC1: the event-bus server a db-holding runner with coreServers [event-bus] builds lists report_block and clear_block", async () => {
+    const context = turn(SLACK_TS_1, THREAD_1);
+    const runner = runnerWithDb(fixture.fakeDb.db, ["event-bus"]);
+    const built = runner.buildInProcessServers(context);
+    // Containment of event-bus, never set equality — the auto-injected servers ride along.
+    expect(Object.keys(built)).toContain("event-bus");
+
+    // Listed through a connected client over the server's own request handler
+    // (the `connectInProcess` shape). This runner's instance is connected once.
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await built["event-bus"]!.instance.connect(serverTransport);
+    const client = new Client({ name: "kpr-501-surface", version: "1.0.0" });
+    await client.connect(clientTransport);
+    try {
+      const names = (await client.listTools()).tools.map((t) => t.name);
+      expect(names).toEqual(expect.arrayContaining(["emit_event", REPORT_BLOCK_TOOL, CLEAR_BLOCK_TOOL]));
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("AC1: a db-holding runner whose coreServers omit event-bus builds no event-bus server", () => {
+    const runner = runnerWithDb(fixture.fakeDb.db, ["contacts"]);
+    const built = Object.keys(runner.buildInProcessServers(turn(SLACK_TS_1, THREAD_1)));
+    // The db gate is open (a sibling in-process server was built), so the absence is not vacuous.
+    expect(built).toContain("contacts");
+    expect(built).not.toContain("event-bus");
+  });
+
+  it("Edge 11: a worker-mode runner (suppressAutoInjectedServers, denylist-filtered coreServers from [event-bus]) has no event-bus in its built set or its inventory", () => {
+    const context = turn(SLACK_TS_1, THREAD_1);
+    // Mirrors `spawnFetchWorker`'s role construction: boss coreServers minus the denylist.
+    const bossCoreServers = ["event-bus"];
+    const workerCoreServers = bossCoreServers.filter((s) => !WORKER_SERVER_DENYLIST.has(s));
+    const worker = runnerWithDb(fixture.fakeDb.db, workerCoreServers, { suppressAutoInjectedServers: true });
+
+    expect(Object.keys(worker.buildInProcessServers(context))).not.toContain("event-bus");
+    const inventory = worker.buildToolTransportInventory(context).map((e) => e.name);
+    expect(inventory).not.toContain("event-bus");
+    for (const name of [REPORT_BLOCK_TOOL, CLEAR_BLOCK_TOOL]) {
+      expect(inventory.some((n) => n.includes(name))).toBe(false);
+    }
+
+    // Control: the same worker-mode construction WITHOUT the denylist filter
+    // does build event-bus — so the denylist, not the db gate or the
+    // suppression flag, is what keeps the block tools off a contained worker.
+    const unfiltered = runnerWithDb(fixture.fakeDb.db, bossCoreServers, { suppressAutoInjectedServers: true });
+    expect(Object.keys(unfiltered.buildInProcessServers(context))).toContain("event-bus");
+  });
+
+  it("AC1 / D14: IN_PROCESS_PORTED_SERVERS, WORKER_SERVER_DENYLIST and TURN_CONTEXT_DEPENDENT_SERVERS keep their current membership", () => {
+    // Pinned literally. A future legitimate change to any of these sets updates
+    // this pin TOGETHER WITH a KPR-501 containment re-check — the pin records
+    // what the block tools' containment was verified against; it is not a
+    // prohibition on changing the sets.
+    expect([...IN_PROCESS_PORTED_SERVERS].sort()).toEqual(
+      [
+        "admin",
+        "callback",
+        "code-search",
+        "contacts",
+        "event-bus",
+        "memory",
+        "schedule",
+        "structured-memory",
+        "team",
+        "worker-pool",
+        "workflow",
+      ].sort(),
+    );
+    expect([...WORKER_SERVER_DENYLIST].sort()).toEqual(
+      [
+        "admin",
+        "background",
+        "callback",
+        "code-task",
+        "event-bus",
+        "keychain",
+        "quo",
+        "recall",
+        "resend",
+        "schedule",
+        "slack",
+        "team",
+        "voice",
+        "worker-pool",
+      ].sort(),
+    );
+    expect([...TURN_CONTEXT_DEPENDENT_SERVERS].sort()).toEqual(
+      ["background", "callback", "code-task", "recall", "structured-memory", "worker-pool"].sort(),
+    );
+  });
+
+  it("Edge 12 / AC1: the Lane B partitioned inventory bridges event-bus in-process, and report_block executed through connect() stores the same document as the handler path", async () => {
+    const context = turn(SLACK_TS_1, THREAD_1);
+    const args = { kind: "coordination", blockedOn: "agent", blockedOnAgentId: "jasper" };
+
+    // ── Handler-direct path, first fixture: a first report at generation 0.
+    const direct = blockTools(fixture.fakeDb.db, AGENT, context);
+    const { result: directResult, body: directBody } = await direct.report(args);
+    expectNonError(directResult);
+    expect(directBody).toEqual({ state: "queued", kind: "coordination" });
+    await fixture.drain();
+    const directDocs = fixture.events().filter((e) => e.producer === HIVE_AGENT_PRODUCER);
+    expect(directDocs).toHaveLength(1);
+    const directDoc = directDocs[0]!;
+
+    // ── Lane B path, a separate fixture so its document is also a first report.
+    await fixture.dispose();
+    fixture = await buildOpsFixture();
+    const runner = runnerWithDb(fixture.fakeDb.db, ["event-bus"]);
+    const inventory = runner.buildToolTransportInventory(context);
+    const { bridgeable } = partitionInventoryForProvider(inventory, "codex");
+    const entry = bridgeable.find((e) => e.name === "event-bus");
+    expect(entry).toMatchObject({
+      name: "event-bus",
+      transport: "sdk-in-process",
+      inProcess: true,
+      compatibility: { codex: "requires-hive-bridge", laneB: "requires-hive-bridge" },
+    });
+    expect(entry).not.toHaveProperty("serverConfig");
+
+    const inProcessServers = runner.buildInProcessServers(context);
+    const harness = buildLaneBHarness({
+      bridge: {
+        inventory: [entry!],
+        inProcessServers: { "event-bus": inProcessServers["event-bus"]! },
+        workItemContext: context,
+      },
+    });
+    bridges.push(harness.bridge);
+    const connected = await harness.bridge.connect();
+    expect(harness.bridge.runtimeOmissions).toEqual([]);
+    const names = connected.map((t) => t.name);
+    expect(names).toEqual(
+      expect.arrayContaining([`mcp__event-bus__${REPORT_BLOCK_TOOL}`, `mcp__event-bus__${CLEAR_BLOCK_TOOL}`]),
+    );
+    const bridged = connected.find((t) => t.name === `mcp__event-bus__${REPORT_BLOCK_TOOL}`)!;
+
+    const text = await bridged.execute(args);
+    // The handler's JSON text, not a thrown error or the containment prefix.
+    expect(JSON.parse(text)).toEqual({ state: "queued", kind: "coordination" });
+    expect(harness.abortController.signal.aborted).toBe(false);
+    await fixture.drain();
+
+    const laneBDocs = fixture.events().filter((e) => e.producer === HIVE_AGENT_PRODUCER);
+    expect(laneBDocs).toHaveLength(1);
+    expect(fixture.events().filter((e) => e.producer === HIVE_RUNTIME_PRODUCER)).toHaveLength(0);
+    const laneBDoc = laneBDocs[0]!;
+
+    expect(Object.keys(laneBDoc).sort()).toEqual(D9_KEYS);
+    expect(Object.keys(directDoc).sort()).toEqual(D9_KEYS);
+    const strip = ({ _id: _ignoredId, publishedAt: _ignoredAt, ...rest }: OpsEvent) => rest;
+    expect(strip(laneBDoc)).toEqual(strip(directDoc));
+    expect(laneBDoc).toMatchObject({
+      reasonId: REASON_COORDINATION_BLOCK,
+      generation: 0,
+      waiting: "human-now",
+      subject: { kind: BLOCK_SUBJECT_KIND, id: `${AGENT}:${THREAD_1}` },
+    });
   });
 });
