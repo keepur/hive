@@ -58,6 +58,8 @@ import {
   assessPilotRecoveryRoute,
   assemblePilotRecoveryEvidence,
   captureLogFence,
+  PILOT_ACTIVATION_FILE,
+  PILOT_GENERATION_FILE,
   pilotRollbackTransaction,
   stopPilotWorkerUnderHold,
   unavailablePilotEvidence,
@@ -541,6 +543,12 @@ export async function runNodeLifecycle(
     stopped,
   });
 
+  /** Durable before the pilot engine starts, so interrupted recovery can verify the same fences. */
+  const recordPilotActivationFences = async (fences: ActivationFences): Promise<ActivationFences> => {
+    await writeOperationJson(resolve(operation.paths.operationDirectory, PILOT_ACTIVATION_FILE), fences);
+    return fences;
+  };
+
   if (command.mode === "pilot-rollback") {
     await runPilotRollback();
     return;
@@ -686,6 +694,8 @@ export async function runNodeLifecycle(
           requireClean: Boolean(command.legacyHold),
           journalPromotion: (record) => recordStagingPromotion(operation, record),
           onResolved: async (artifact, extracted) => {
+            // Reapply must stage exactly the retained archive of its migration lineage.
+            if (legacyPilot) await pilotEvidence.assertArtifactLineage(legacyPilot, artifact.archiveSha256);
             operation.record.candidateArchiveSha256 = artifact.archiveSha256;
             operation.record.staging.candidateRelease = {
               packageVersion: extracted.release.packageVersion,
@@ -931,10 +941,12 @@ export async function runNodeLifecycle(
       if (!serviceSnapshot) throw new Error("prior service snapshot missing");
       if (legacyPilot) {
         await pilotEvidence.verifyRecoveryPrerequisites(legacyPilot);
-        pilotFences = pilotActivationFences({
-          engine: legacyPilot.generation.engine,
-          worker: legacyPilot.generation.worker,
-        });
+        pilotFences = await recordPilotActivationFences(
+          pilotActivationFences({
+            engine: legacyPilot.generation.engine,
+            worker: legacyPilot.generation.worker,
+          }),
+        );
         await controller().restoreFilesAndState(serviceSnapshot);
         await controller().restoreService(serviceSnapshot, legacyPilot.services.services[0].definition.label, {
           requireNewGeneration: true,
@@ -943,11 +955,11 @@ export async function runNodeLifecycle(
           requireNewGeneration: true,
         });
         const observations = await pilotEvidence.observePilotRecovery(legacyPilot, pilotFences);
-        operation.record.resolution = "recovered";
-        await persistOperation(operation);
         if (!pilotRecovered(assemblePilotRecoveryEvidence(observations))) {
           throw new Error("pilot recovery profile verification failed");
         }
+        operation.record.resolution = "recovered";
+        await persistOperation(operation);
       } else {
         engineLogOffset = await fileSize(definitions.engine.stdout);
         await restorePrior(
@@ -1120,10 +1132,14 @@ export async function runNodeLifecycle(
             await verifyCurrentPair();
           },
           captureFences: () =>
-            pilotActivationFences({
-              engine: engine.process ? { pid: engine.process.pid, startTime: engine.process.startTime } : null,
-              worker: worker.process ? { pid: worker.process.pid, startTime: worker.process.startTime } : null,
-            }),
+            recordPilotActivationFences(
+              pilotActivationFences({
+                engine: engine.process ? { pid: engine.process.pid, startTime: engine.process.startTime } : null,
+                worker: worker.process ? { pid: worker.process.pid, startTime: worker.process.startTime } : null,
+              }),
+            ),
+          recordPilotGeneration: (generation) =>
+            writeOperationJson(resolve(operation.paths.operationDirectory, PILOT_GENERATION_FILE), generation),
           finishResolved: finish,
           retainUnresolved,
         });

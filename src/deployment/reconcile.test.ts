@@ -20,6 +20,7 @@ import {
   lifecycleInterruptedIO,
   PREVIOUS_OPERATION_RECONCILED,
   runReconcileOperation,
+  settleRecordedBarrier,
   type LifecycleReconcileDeps,
   type ReconcileHostIO,
 } from "./reconcile.js";
@@ -463,6 +464,51 @@ describe("frozen-side reconciliation by work kind", () => {
     await expect(lifecycleInterruptedIO(d.value).releaseBarrier(f.operation.record)).rejects.toThrow(
       "unidentified owner",
     );
+    await finishOperationLock(f.operation);
+  });
+
+  it("a terminal release that leaves admission closed, names an owner or faults persistence is never accepted", async () => {
+    const f = await fixture((record) => {
+      record.barrierOperationId = record.id;
+      record.supervisor = { pid: 600, bootId: SUPERVISOR_BOOT };
+      record.supervisorProcess = { pid: 600, startTime: "sup-start" };
+      record.workerHealthPort = 3107;
+    });
+    const reply = (snapshot: Record<string, unknown>) => ({
+      protocol: 1,
+      requestId: "r",
+      operationId: f.operation.record.id,
+      supervisor: { pid: 600, bootId: SUPERVISOR_BOOT },
+      ok: true,
+      snapshot: { admission: "open", operationId: null, persistenceFault: false, ...snapshot },
+      writtenAt: 1,
+    });
+    for (const bad of [{ admission: "closed" }, { operationId: "other" }, { persistenceFault: true }]) {
+      const d = deps(f, {
+        host: { processStartTime: async () => "sup-start" },
+        request: vi.fn(async () => reply(bad)) as never,
+      });
+      await expect(lifecycleInterruptedIO(d.value).releaseBarrier(f.operation.record)).rejects.toThrow(
+        "did not correlate",
+      );
+    }
+    const settled = await settleRecordedBarrier(
+      {
+        canonicalHome: f.operation.record.canonicalHome,
+        instanceId: f.operation.record.instanceId,
+        operationDirectory: f.operation.paths.operationDirectory,
+        barrierOperationId: f.operation.record.id,
+        supervisor: { pid: 600, bootId: SUPERVISOR_BOOT },
+        supervisorProcess: { pid: 600, startTime: "sup-start" },
+        healthListenerPort: 3107,
+      },
+      {
+        host: { processStartTime: async () => "sup-start" },
+        controller: { listenerOwners: async () => [] },
+        request: vi.fn(async () => reply({})) as never,
+      },
+    );
+    expect(settled).toBe("released");
     await finishOperationLock(f.operation);
   });
 

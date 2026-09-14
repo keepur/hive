@@ -473,6 +473,124 @@ async function finishPendingDisposal(acquired: AcquiredOperation): Promise<void>
   await persistOperation(acquired);
 }
 
+/** A same-operation maintenance barrier recorded durably before its close was sent. */
+export interface RecordedBarrier {
+  canonicalHome: string;
+  instanceId: string;
+  operationDirectory: string;
+  barrierOperationId: string;
+  supervisor: { pid: number; bootId: string };
+  supervisorProcess: ProcessOwner;
+  healthListenerPort: number;
+}
+
+export interface BarrierSettlementDeps {
+  host: Pick<ReconcileHostIO, "processStartTime">;
+  controller: Pick<ServiceController, "listenerOwners">;
+  request?: typeof requestMaintenance;
+  now?: () => number;
+}
+
+/**
+ * Settle a recorded barrier (chunk 4 Task 8 Step 1a.2 `releaseBarrier`, chunk 5
+ * Task 8 Step 1a.3 Step 4 registry rows). A live recorded supervisor gets a
+ * fresh terminal release for the recorded operation — even if the close never
+ * arrived — whose envelope must correlate and whose snapshot must name no
+ * owner. An exited supervisor is recorded as `supervisor-exited` only after its
+ * PID/start-time tuple is gone and its health listener is released or owned by
+ * a corroborated replacement whose admission is open. A foreign listener owner
+ * stays unresolved and is never killed. Never fakes an acknowledgement.
+ */
+export async function settleRecordedBarrier(
+  barrier: RecordedBarrier,
+  deps: BarrierSettlementDeps,
+): Promise<"released" | "supervisor-exited"> {
+  const request = deps.request ?? requestMaintenance;
+  const now = deps.now ?? Date.now;
+  const runtimeRecord = resolve(barrier.canonicalHome, ".hive-state", "runtime", "voice-worker.json");
+  const corroborate = async () => {
+    const identity = parseBootIdentity(JSON.parse(await readFile(runtimeRecord, "utf8")));
+    const startTime = await deps.host.processStartTime(identity.pid);
+    if (startTime === null) throw new Error("current voice supervisor is not running");
+    return { pid: identity.pid, bootId: identity.bootId };
+  };
+  if (await processIsLive(deps.host, barrier.supervisorProcess)) {
+    const reply = await request({
+      instanceHome: barrier.canonicalHome,
+      instanceId: barrier.instanceId,
+      operationId: barrier.barrierOperationId,
+      kind: "release",
+      deadline: now() + 2_000,
+      expectedAdmission: "open",
+      supervisor: barrier.supervisor,
+      corroborateSupervisor: corroborate,
+    });
+    if (
+      !reply.ok ||
+      reply.operationId !== barrier.barrierOperationId ||
+      reply.supervisor.pid !== barrier.supervisor.pid ||
+      reply.supervisor.bootId !== barrier.supervisor.bootId ||
+      reply.snapshot.operationId !== null ||
+      reply.snapshot.admission !== "open" ||
+      reply.snapshot.persistenceFault !== false
+    ) {
+      throw new OperationUnresolvedError("terminal maintenance release did not correlate");
+    }
+    await writeOperationJson(resolve(barrier.operationDirectory, "barrier-release.json"), {
+      outcome: "released",
+      requestId: reply.requestId,
+      operationId: reply.operationId,
+      supervisor: reply.supervisor,
+      writtenAt: reply.writtenAt,
+    });
+    return "released";
+  }
+  // The recorded supervisor exited: prove exit + listener release, never fake an ack.
+  const owners = await deps.controller.listenerOwners(barrier.healthListenerPort);
+  if (owners.length > 0) {
+    let replacement: { pid: number; bootId: string };
+    try {
+      replacement = await corroborate();
+    } catch (cause) {
+      throw new OperationUnresolvedError("health listener has an unidentified owner after supervisor exit", {
+        cause,
+      });
+    }
+    if (owners.length !== 1 || owners[0] !== replacement.pid || replacement.bootId === barrier.supervisor.bootId) {
+      throw new OperationUnresolvedError("health listener owner is not a corroborated replacement supervisor");
+    }
+    const requestedAt = now();
+    const reply = await request({
+      instanceHome: barrier.canonicalHome,
+      instanceId: barrier.instanceId,
+      operationId: barrier.barrierOperationId,
+      kind: "status",
+      deadline: requestedAt + 2_000,
+      expectedAdmission: "open",
+      corroborateSupervisor: corroborate,
+    });
+    if (
+      !freshAdmissionStatus({
+        reply,
+        requestId: reply.requestId,
+        operationId: barrier.barrierOperationId,
+        requestedAt,
+        expectedSupervisor: replacement,
+        processCorroborated: true,
+      })
+    ) {
+      throw new OperationUnresolvedError("replacement supervisor admission is not open");
+    }
+  }
+  await writeOperationJson(resolve(barrier.operationDirectory, "barrier-release.json"), {
+    outcome: "supervisor-exited",
+    supervisor: { ...barrier.supervisorProcess, bootId: barrier.supervisor.bootId },
+    healthListenerPort: barrier.healthListenerPort,
+    listenerReleased: owners.length === 0,
+  });
+  return "supervisor-exited";
+}
+
 export function lifecycleInterruptedIO(deps: LifecycleReconcileDeps): InterruptedOperationIO {
   const request = deps.request ?? requestMaintenance;
   const now = deps.now ?? Date.now;
@@ -501,80 +619,18 @@ export function lifecycleInterruptedIO(deps: LifecycleReconcileDeps): Interrupte
       if (!supervisorProcess || record.workerHealthPort === undefined) {
         throw new OperationUnresolvedError("recorded barrier lacks supervisor start time or health listener");
       }
-      const runtimeRecord = resolve(record.canonicalHome, ".hive-state", "runtime", "voice-worker.json");
-      const corroborate = async () => {
-        const identity = parseBootIdentity(JSON.parse(await readFile(runtimeRecord, "utf8")));
-        const startTime = await deps.host.processStartTime(identity.pid);
-        if (startTime === null) throw new Error("current voice supervisor is not running");
-        return { pid: identity.pid, bootId: identity.bootId };
-      };
-      if (await processIsLive(deps.host, supervisorProcess)) {
-        // Fresh same-boot terminal release even if the close never arrived.
-        const reply = await request({
-          instanceHome: record.canonicalHome,
+      await settleRecordedBarrier(
+        {
+          canonicalHome: record.canonicalHome,
           instanceId: record.instanceId,
-          operationId: record.barrierOperationId,
-          kind: "release",
-          deadline: now() + 2_000,
-          expectedAdmission: "open",
+          operationDirectory: acquiredFor(record).paths.operationDirectory,
+          barrierOperationId: record.barrierOperationId,
           supervisor: record.supervisor,
-          corroborateSupervisor: corroborate,
-        });
-        if (reply.operationId !== record.barrierOperationId || reply.snapshot.operationId !== null) {
-          throw new OperationUnresolvedError("terminal maintenance release did not correlate");
-        }
-        await writeOperationJson(resolve(acquiredFor(record).paths.operationDirectory, "barrier-release.json"), {
-          outcome: "released",
-          requestId: reply.requestId,
-          operationId: reply.operationId,
-          supervisor: reply.supervisor,
-          writtenAt: reply.writtenAt,
-        });
-        return;
-      }
-      // The recorded supervisor exited: prove exit + listener release, never fake an ack.
-      const owners = await deps.controller.listenerOwners(record.workerHealthPort);
-      if (owners.length > 0) {
-        let replacement: { pid: number; bootId: string };
-        try {
-          replacement = await corroborate();
-        } catch (cause) {
-          throw new OperationUnresolvedError("health listener has an unidentified owner after supervisor exit", {
-            cause,
-          });
-        }
-        if (owners.length !== 1 || owners[0] !== replacement.pid || replacement.bootId === record.supervisor.bootId) {
-          throw new OperationUnresolvedError("health listener owner is not a corroborated replacement supervisor");
-        }
-        const requestedAt = now();
-        const reply = await request({
-          instanceHome: record.canonicalHome,
-          instanceId: record.instanceId,
-          operationId: record.barrierOperationId,
-          kind: "status",
-          deadline: requestedAt + 2_000,
-          expectedAdmission: "open",
-          corroborateSupervisor: corroborate,
-        });
-        if (
-          !freshAdmissionStatus({
-            reply,
-            requestId: reply.requestId,
-            operationId: record.barrierOperationId,
-            requestedAt,
-            expectedSupervisor: replacement,
-            processCorroborated: true,
-          })
-        ) {
-          throw new OperationUnresolvedError("replacement supervisor admission is not open");
-        }
-      }
-      await writeOperationJson(resolve(acquiredFor(record).paths.operationDirectory, "barrier-release.json"), {
-        outcome: "supervisor-exited",
-        supervisor: { ...supervisorProcess, bootId: record.supervisor.bootId },
-        healthListenerPort: record.workerHealthPort,
-        listenerReleased: owners.length === 0,
-      });
+          supervisorProcess,
+          healthListenerPort: record.workerHealthPort,
+        },
+        { host: deps.host, controller: deps.controller, request, now },
+      );
     },
 
     async reconcileFilesystem(record) {

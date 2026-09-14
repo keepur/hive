@@ -125,9 +125,19 @@ export interface PilotEvidenceProvider {
   ): Promise<NativeHoldSession>;
   /** Durable first-migration lineage referencing this snapshot/bootstrap, or null. */
   resolveMigrationLineage(pilot: RegisteredPilot, canonicalHome: string): Promise<PilotLineage | null>;
+  /**
+   * Reapply lineage: when a resolved migration already references this
+   * snapshot/bootstrap, the staged archive must be its retained archive SHA.
+   */
+  assertArtifactLineage(pilot: RegisteredPilot, archiveSha256: string): Promise<void>;
   /** Current pilot-profile observations after activation fences. */
   observePilotRecovery(pilot: RegisteredPilot, fences: ActivationFences): Promise<PilotRecoveryObservations>;
 }
+
+/** Operation-private activation fences written before a pilot pair is started. */
+export const PILOT_ACTIVATION_FILE = "pilot-activation.json";
+/** Verified pilot generation written by a healthy pilot rollback. */
+export const PILOT_GENERATION_FILE = "pilot-generation.json";
 
 function unavailable(): never {
   throw new PilotEvidenceUnavailableError("PILOT_EVIDENCE_REGISTRY_UNAVAILABLE");
@@ -144,6 +154,7 @@ export const unavailablePilotEvidence: PilotEvidenceProvider = {
   assessHoldCapability: async () => ({ kind: "unavailable", gaps: [...LEGACY_HOLD_GAP_CODES], holdRecordPath: null }),
   establishHold: async () => unavailable(),
   resolveMigrationLineage: async () => null,
+  assertArtifactLineage: async () => unavailable(),
   observePilotRecovery: async () => unavailable(),
 };
 
@@ -460,7 +471,10 @@ export interface PilotRollbackIO {
   /** After a verified deferred stop: the candidate pair is still the captured generation. */
   verifyCandidateUnsignaled?(): Promise<void>;
   verifyCandidatePacked(): Promise<void>;
-  captureFences(): ActivationFences;
+  /** Capture and durably record the activation fences before the pilot engine starts. */
+  captureFences(): ActivationFences | Promise<ActivationFences>;
+  /** Durably record the verified recovered pilot generation (lineage for later hold/reapply). */
+  recordPilotGeneration?(generation: { engine: ProcessOwner; worker: ProcessOwner }): Promise<void>;
   finishResolved(resolution: "healthy" | "recovered" | "deferred"): Promise<void>;
   retainUnresolved(error: unknown): Promise<void>;
 }
@@ -513,7 +527,7 @@ export function pilotRollbackTransaction(io: PilotRollbackIO): TransactionIO {
       await io.controller.restoreFilesAndState(io.pilot.services);
     },
     async startEngineAndVerifyBoot() {
-      fences = io.captureFences();
+      fences = await io.captureFences();
       await io.controller.restoreService(io.pilot.services, labels.engine, { requireNewGeneration: true });
     },
     async startWorker() {
@@ -525,6 +539,13 @@ export function pilotRollbackTransaction(io: PilotRollbackIO): TransactionIO {
       if (!pilotRecovered(assemblePilotRecoveryEvidence(observations))) {
         throw new Error("pilot recovery profile verification failed");
       }
+      const engine = observations.live.engine.process;
+      const worker = observations.live.worker.process;
+      if (!engine || !worker) throw new Error("recovered pilot generation is unobservable");
+      await io.recordPilotGeneration?.({
+        engine: { pid: engine.pid, startTime: engine.startTime },
+        worker: { pid: worker.pid, startTime: worker.startTime },
+      });
     },
     async finalizeHealthy() {
       resolution = "healthy";

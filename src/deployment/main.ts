@@ -40,16 +40,33 @@ import {
   type LifecycleCommand,
 } from "./lifecycle.js";
 import { SANDBOX_EXEC } from "./confined-job.js";
-import { initialRegistryWork, type RegistryWork } from "./pilot.js";
+import {
+  abortRegistryCommand,
+  initialRegistryWork,
+  pilotProfileVerifier,
+  reconcileRegistryWork,
+  registryPilotEvidence,
+  runInventoryPilot,
+  runPrepareLegacyHold,
+  runReleaseLegacyHold,
+  runVerifyLegacyHold,
+  type RegistryCommandDeps,
+  type RegistryCommandResult,
+  type RegistryWork,
+} from "./pilot.js";
 import {
   inspectOrReconcile,
   processIsLive,
   nodeReconcileHostIO,
   PREVIOUS_OPERATION_RECONCILED,
   runReconcileOperation,
+  settleRecordedBarrier,
   type LifecycleReconcileDeps,
 } from "./reconcile.js";
-import { MigrationPendingError } from "./pilot-lifecycle.js";
+import { MigrationPendingError, PilotEvidenceUnavailableError } from "./pilot-lifecycle.js";
+import { RegistryUnresolvedError } from "./pilot-records.js";
+import { ServiceController } from "./services.js";
+import { DeferredMaintenance } from "./transaction.js";
 import { planBetaPluginCompatibility } from "./plugin-compat.js";
 
 export interface DeploymentArguments extends Omit<LifecycleCommand, "mode"> {
@@ -325,6 +342,98 @@ async function runFrozenBootstrap(operation: AcquiredOperation, env: NodeJS.Proc
   }
 }
 
+type LifecycleContext = Awaited<ReturnType<typeof resolveLifecycleContext>>;
+
+/**
+ * Evidence dependencies for the selected instance. The service reader is a
+ * read-only controller scoped to the snapshot's captured external targets;
+ * no captured-loader bridge probe or exclusive-writer corroboration is wired,
+ * so the pilot recovery profile fails closed rather than being guessed.
+ */
+function pilotEvidenceDeps(context: LifecycleContext, operationDirectory: string): RegistryCommandDeps {
+  return {
+    instance: context.pilotInstance,
+    controllerFor: (capturedPilotProfile) =>
+      new ServiceController({
+        instanceId: context.summary.instanceId,
+        hiveHome: context.home,
+        home: context.userHome,
+        operationDir: operationDirectory,
+        capturedPilotProfile,
+      }),
+    settleBarrier: (barrier) =>
+      settleRecordedBarrier(barrier, {
+        host: nodeReconcileHostIO,
+        controller: new ServiceController({
+          instanceId: context.summary.instanceId,
+          hiveHome: context.home,
+          home: context.userHome,
+          operationDir: operationDirectory,
+        }),
+      }),
+  };
+}
+
+function registryFailureCode(error: unknown): string {
+  if (error instanceof PilotEvidenceUnavailableError) return error.code;
+  if (error instanceof DeferredMaintenance) return error.message.split(":")[0] || "REGISTRY_COMMAND_DEFERRED";
+  return "REGISTRY_COMMAND_FAILED";
+}
+
+async function runFrozenRegistry(
+  operation: AcquiredOperation,
+  args: DeploymentArguments,
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  if (workKindForMode(args.mode) !== "registry" || operation.record.mode !== args.mode) {
+    throw new Error("frozen invocation mode does not match registry work");
+  }
+  let retainLock = false;
+  let outcome: RegistryCommandResult;
+  try {
+    const context = await resolveLifecycleContext(operation, env);
+    const deps = pilotEvidenceDeps(context, operation.paths.operationDirectory);
+    switch (args.mode) {
+      case "inventory-pilot":
+        outcome = await runInventoryPilot(operation, args.inventoryPilot!, deps);
+        break;
+      case "prepare-legacy-hold":
+        outcome = await runPrepareLegacyHold(operation, args.prepareLegacyHold!, deps);
+        break;
+      case "verify-legacy-hold":
+        outcome = await runVerifyLegacyHold(operation, args.verifyLegacyHold!, deps);
+        break;
+      case "release-legacy-hold":
+        outcome = await runReleaseLegacyHold(operation, args.releaseLegacyHold!, deps);
+        break;
+      default:
+        // First capture needs the registered bootstrap probe's `pilot` profile
+        // ABI (captured loader bridge, owner-correlated SDK/log evidence). It
+        // is not wired, so capture fails closed and registers nothing.
+        outcome = await abortRegistryCommand(operation, "PILOT_CAPTURE_BLOCKED");
+    }
+  } catch (error) {
+    if (error instanceof OperationUnresolvedError || error instanceof RegistryUnresolvedError) {
+      retainLock = true;
+      operation.record.phase = "unresolved";
+      await persistOperation(operation).catch(() => {});
+      throw error;
+    }
+    try {
+      outcome = await abortRegistryCommand(operation, registryFailureCode(error));
+    } catch (abortError) {
+      retainLock = true;
+      operation.record.phase = "unresolved";
+      await persistOperation(operation).catch(() => {});
+      throw abortError;
+    }
+  } finally {
+    if (!retainLock && operation.record.resolution) await finishOperationLock(operation);
+  }
+  if (outcome.exitCode !== 0) throw new DeploymentExit(outcome.exitCode, outcome.result);
+  process.stdout.write(`${JSON.stringify(outcome.result)}\n`);
+}
+
 async function ownerStartTime(): Promise<string> {
   return execFileSync("ps", ["-p", String(process.pid), "-o", "lstart="], {
     encoding: "utf8",
@@ -376,12 +485,19 @@ async function runFrozen(args: DeploymentArguments, env: NodeJS.ProcessEnv): Pro
     await runFrozenBootstrap(operation, env);
     return;
   }
+  if (operation.record.workKind === "registry") {
+    await runFrozenRegistry(operation, args, env);
+    return;
+  }
   if (operation.record.workKind !== "lifecycle" || workKindForMode(args.mode) !== "lifecycle") {
-    throw new Error("REGISTRY_HELPER_MODE_NOT_WIRED");
+    throw new Error("frozen invocation mode does not match lifecycle work");
   }
   let resolved = false;
   try {
-    await runNodeLifecycle(operation, args as LifecycleCommand, env);
+    const context = await resolveLifecycleContext(operation, env);
+    await runNodeLifecycle(operation, args as LifecycleCommand, env, {
+      pilotEvidence: registryPilotEvidence(pilotEvidenceDeps(context, operation.paths.operationDirectory)),
+    });
     resolved = Boolean(operation.record.resolution);
   } catch (error) {
     resolved = Boolean(operation.record.resolution) && operation.record.phase !== "unresolved";
@@ -408,6 +524,7 @@ export function lifecycleReconcileDepsFactory(
     return {
       controller: context.controller,
       host: nodeReconcileHostIO,
+      verifyPilot: pilotProfileVerifier(pilotEvidenceDeps(context, acquired.paths.operationDirectory)),
       verifyPackaged: async ({ minimumStartedAt }) => {
         validatePromotedRelease(resolve(record.canonicalHome, ".hive"));
         await verifyPackagedPair(context, { minimumStartedAt, engineLogOffset: 0, dependenciesContained: true });
@@ -434,6 +551,17 @@ async function runReconcileMode(args: DeploymentArguments, env: NodeJS.ProcessEn
           configPath,
           isProcessLive: (owner) => processIsLive(nodeReconcileHostIO, owner),
         });
+        await writeOperationJson(resolve(acquired.paths.operationDirectory, "reconciliation.json"), outcome);
+        await finishOperationLock(acquired, { reconcileClaimId: claimId });
+        return outcome;
+      },
+      registry: async (record, claimId) => {
+        const acquired: AcquiredOperation = { paths: operationPaths(record.canonicalHome, record.id), record };
+        const context = await resolveLifecycleContext(acquired, env);
+        const outcome = await reconcileRegistryWork(
+          acquired,
+          pilotEvidenceDeps(context, acquired.paths.operationDirectory),
+        );
         await writeOperationJson(resolve(acquired.paths.operationDirectory, "reconciliation.json"), outcome);
         await finishOperationLock(acquired, { reconcileClaimId: claimId });
         return outcome;

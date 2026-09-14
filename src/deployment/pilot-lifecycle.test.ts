@@ -169,6 +169,7 @@ function provider(
       throw new Error("not used");
     }),
     resolveMigrationLineage: vi.fn(async () => null),
+    assertArtifactLineage: vi.fn(async () => {}),
     observePilotRecovery: vi.fn(async () => {
       throw new Error("not used");
     }),
@@ -486,6 +487,8 @@ describe("pilot rollback transaction", () => {
         wallStartedAt: 0,
         stopped: { engine: null, worker: null },
       }),
+      recordPilotGeneration: async (generation) =>
+        void calls.push(`generation:${generation.engine.pid}/${generation.worker.pid}`),
       finishResolved: async (resolution) => void calls.push(`resolved:${resolution}`),
       retainUnresolved: async () => void calls.push("unresolved"),
     });
@@ -506,6 +509,7 @@ describe("pilot rollback transaction", () => {
       "start:pilot:engine",
       "start:pilot:worker",
       "observe-pilot",
+      "generation:200/201",
       "resolved:healthy",
     ]);
     expect(calls.some((call) => call.includes("rotate") || call.includes("move"))).toBe(false);
