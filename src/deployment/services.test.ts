@@ -502,3 +502,441 @@ describe("service adapters", () => {
     expect(exec.mock.calls.some(([command, args]) => command === "lsof" && args[0] === "-nP")).toBe(false);
   });
 });
+
+describe("signal fence, ordered restore and observation-only adapters", () => {
+  function bootHarness(definition: ReturnType<typeof definitions>["engine"]) {
+    const order: string[] = [];
+    const plist = JSON.stringify({
+      Label: definition.label,
+      ProgramArguments: [definition.nodePath, definition.entrypoint, ...definition.args],
+      WorkingDirectory: definition.hiveHome,
+      EnvironmentVariables: buildServiceEnvironment(definition),
+    });
+    let bootedOut = false;
+    const exec = vi.fn(async (command: string, args: readonly string[]) => {
+      if (command === "launchctl" && args[0] === "print") {
+        order.push("inspect");
+        if (bootedOut) throw unloaded();
+        return { stdout: "state = running\npid = 123\n", stderr: "" };
+      }
+      if (command === "launchctl" && args[0] === "bootout") {
+        order.push("bootout");
+        bootedOut = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (command === "launchctl") return { stdout: "{ disabled services = {} }", stderr: "" };
+      if (command === "plutil") return { stdout: plist, stderr: "" };
+      if (command === "ps" && args.includes("comm=")) return { stdout: `${nodePath}\n`, stderr: "" };
+      if (command === "ps") {
+        if (bootedOut) throw noProcess();
+        return {
+          stdout: `  123   1 Mon Sep  8 12:34:56 2026 ${definition.nodePath} ${definition.entrypoint}\n`,
+          stderr: "",
+        };
+      }
+      if (command === "lsof" && args.includes("cwd")) return { stdout: `p123\nfcwd\nn${hiveHome}\n`, stderr: "" };
+      if (command === "lsof") return { stdout: `p123\nftxt\nn${nodePath}\n`, stderr: "" };
+      throw new Error(`unexpected command ${command}`);
+    });
+    const io = makeIO({
+      execFile: exec,
+      lstat: vi.fn(async (path) => {
+        if (path.includes("Library/LaunchAgents")) throw enoent();
+        return stat();
+      }),
+    });
+    return { io, exec, order };
+  }
+
+  it("calls beforeExec after markIrreversible and every inspection, immediately before dispatch", async () => {
+    const engine = definitions().engine;
+    const { io, order } = bootHarness(engine);
+    await controller(io).bootout(engine, {
+      markIrreversible: async () => {
+        order.push("mark");
+      },
+      beforeExec: () => {
+        order.push("fence");
+      },
+    });
+    expect(order.slice(0, 4)).toEqual(["inspect", "mark", "fence", "bootout"]);
+  });
+
+  it("a throwing fence issues no launchd signal", async () => {
+    const engine = definitions().engine;
+    const { io, exec } = bootHarness(engine);
+    await expect(
+      controller(io).bootout(engine, {
+        markIrreversible: async () => {},
+        beforeExec: () => {
+          throw new Error("fresh operation hold required");
+        },
+      }),
+    ).rejects.toThrow("fresh operation hold required");
+    expect(exec.mock.calls.some(([, args]) => args[0] === "bootout")).toBe(false);
+  });
+
+  it("process census observes descendants only and never signals", async () => {
+    const exec = vi.fn(async (command: string, args: readonly string[]) => {
+      if (command === "ps" && args.includes("-axo")) {
+        return {
+          stdout: [
+            "  100     1 Mon Sep  8 12:34:56 2026 node engine",
+            "  200   100 Mon Sep  8 12:34:57 2026 node mcp",
+            "  300   200 Mon Sep  8 12:34:58 2026 node grandchild",
+            "  400     1 Mon Sep  8 12:34:59 2026 unrelated",
+          ].join("\n"),
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected ${command}`);
+    });
+    const census = await controller(makeIO({ execFile: exec })).processCensus(100);
+    expect(census.map((row) => [row.pid, row.depth])).toEqual([
+      [200, 1],
+      [300, 2],
+    ]);
+    expect(exec).toHaveBeenCalledOnce();
+  });
+
+  function restoreHarness(
+    options: { externalEffective?: boolean; externalChanged?: boolean; loadedAtStart?: string[] } = {},
+  ) {
+    const pair = definitions();
+    const events: string[] = [];
+    const loaded = new Set(options.loadedAtStart ?? []);
+    const external = "/Users/example/github/pilot/com.hive.personal_1.agent.plist";
+    const inspection = (definition: typeof pair.engine, pid: number) => ({
+      label: definition.label,
+      loaded: true,
+      enabled: true,
+      livePID: pid,
+      startTime: "Mon Sep  8 12:34:56 2026",
+      args: [definition.nodePath, definition.entrypoint, ...definition.args],
+      cwd: hiveHome,
+      configSelection: configPath,
+      serviceEnvironment: buildServiceEnvironment(definition),
+      plist: null,
+      link: null,
+      process: {
+        pid,
+        ppid: 1,
+        startTime: "Mon Sep  8 12:34:56 2026",
+        command: [definition.nodePath, definition.entrypoint, ...definition.args].join(" "),
+        executable: nodePath,
+        cwd: hiveHome,
+      },
+    });
+    const engineEffective = options.externalEffective
+      ? external
+      : getServicePlistPath(hiveHome, "personal_1", "engine");
+    const snapshot = {
+      services: [
+        {
+          definition: pair.engine,
+          inspection: inspection(pair.engine, 123),
+          plist: { path: engineEffective, existed: true, bytes: Buffer.from("engine-effective"), mode: 0o644 },
+          instancePlist: options.externalEffective
+            ? {
+                path: getServicePlistPath(hiveHome, "personal_1", "engine"),
+                existed: true,
+                bytes: Buffer.from("instance-sentinel"),
+                mode: 0o600,
+              }
+            : { path: engineEffective, existed: true, bytes: Buffer.from("engine-effective"), mode: 0o644 },
+          link: {
+            path: getServiceLaunchAgentLink(userHome, "personal_1", "engine"),
+            existed: true,
+            target: engineEffective,
+          },
+          loaded: true,
+          enabled: true,
+        },
+        {
+          definition: pair.worker,
+          inspection: inspection(pair.worker, 124),
+          plist: { path: getServicePlistPath(hiveHome, "personal_1", "voice-worker"), existed: false },
+          instancePlist: { path: getServicePlistPath(hiveHome, "personal_1", "voice-worker"), existed: false },
+          link: { path: getServiceLaunchAgentLink(userHome, "personal_1", "voice-worker"), existed: false },
+          loaded: true,
+          enabled: true,
+        },
+      ],
+    };
+    const exec = vi.fn(async (command: string, args: readonly string[]) => {
+      if (command === "launchctl" && args[0] === "print") {
+        const label = args[1].split("/").pop()!;
+        if (!loaded.has(label)) throw unloaded();
+        const pid = label.endsWith("agent") ? 900 : 901;
+        return { stdout: `state = running\npid = ${pid}\n`, stderr: "" };
+      }
+      if (command === "launchctl" && args[0] === "print-disabled")
+        return { stdout: "{ disabled services = {} }", stderr: "" };
+      if (command === "launchctl" && args[0] === "bootstrap") {
+        const label = args[2].includes("voice-worker") ? pair.worker.label : pair.engine.label;
+        events.push(`bootstrap:${label.endsWith("agent") ? "engine" : "worker"}`);
+        loaded.add(label);
+        return { stdout: "", stderr: "" };
+      }
+      if (command === "plutil") {
+        const worker = args[args.length - 1].includes("voice-worker");
+        const definition = worker ? pair.worker : pair.engine;
+        return {
+          stdout: JSON.stringify({
+            Label: definition.label,
+            ProgramArguments: [definition.nodePath, definition.entrypoint, ...definition.args],
+            WorkingDirectory: hiveHome,
+            EnvironmentVariables: buildServiceEnvironment(definition),
+          }),
+          stderr: "",
+        };
+      }
+      if (command === "ps" && args.includes("comm=")) return { stdout: `${nodePath}\n`, stderr: "" };
+      if (command === "ps") {
+        const pid = Number(args[args.indexOf("-p") + 1]);
+        const definition = pid === 901 ? pair.worker : pair.engine;
+        return {
+          stdout: `  ${pid}   1 Mon Sep  8 12:40:00 2026 ${[definition.nodePath, definition.entrypoint, ...definition.args].join(" ")}\n`,
+          stderr: "",
+        };
+      }
+      if (command === "lsof" && args.includes("cwd")) return { stdout: `p1\nfcwd\nn${hiveHome}\n`, stderr: "" };
+      if (command === "lsof") return { stdout: `p1\nftxt\nn${nodePath}\n`, stderr: "" };
+      throw new Error(`unexpected command ${command} ${args.join(" ")}`);
+    });
+    const io = makeIO({
+      execFile: exec,
+      lstat: vi.fn(async (path) => {
+        if (path.includes("Library/LaunchAgents")) return stat("symlink");
+        return stat();
+      }),
+      readlink: vi.fn(async (path: string) =>
+        path.includes("voice-worker") ? getServicePlistPath(hiveHome, "personal_1", "voice-worker") : engineEffective,
+      ),
+      readFile: vi.fn(async (path: string) =>
+        Buffer.from(path === external && options.externalChanged ? "tampered" : "engine-effective"),
+      ),
+      writeFile: vi.fn(async (path: string) => {
+        events.push(`write:${path}`);
+      }),
+      unlink: vi.fn(async (path: string) => {
+        events.push(`unlink:${path}`);
+      }),
+      symlink: vi.fn(async (target: string) => {
+        events.push(`link:${target}`);
+      }),
+    });
+    const ctl = new ServiceController(
+      {
+        instanceId: "personal_1",
+        hiveHome,
+        home: userHome,
+        operationDir: `${hiveHome}/.hive-state/deployment/operations/test`,
+        capturedPilotProfile: [{ label: pair.engine.label, plistPath: external }],
+      },
+      io,
+    );
+    return { ctl, snapshot, events, external, exec };
+  }
+
+  it("restores files and state first, then engine, the engine check, then worker", async () => {
+    const { ctl, snapshot, events } = restoreHarness();
+    await ctl.restore(snapshot, {
+      afterEngine: async (engine) => {
+        events.push(`engine-check:${engine?.livePID}`);
+      },
+    });
+    const firstBootstrap = events.findIndex((event) => event.startsWith("bootstrap"));
+    expect(events.slice(0, firstBootstrap).every((event) => !event.startsWith("bootstrap"))).toBe(true);
+    expect(events.filter((event) => event.startsWith("bootstrap") || event.startsWith("engine-check"))).toEqual([
+      "bootstrap:engine",
+      "engine-check:900",
+      "bootstrap:worker",
+    ]);
+  });
+
+  it("refuses to restore over a still-loaded registration", async () => {
+    const pair = definitions();
+    const { ctl, snapshot, events } = restoreHarness({ loadedAtStart: [pair.worker.label] });
+    await expect(ctl.restoreFilesAndState(snapshot)).rejects.toThrow("to be unloaded first");
+    expect(events).toEqual([]);
+  });
+
+  it("verifies an external effective plist without rewriting it and restores the distinct instance file", async () => {
+    const { ctl, snapshot, events, external } = restoreHarness({ externalEffective: true });
+    await ctl.restoreFilesAndState(snapshot);
+    expect(events.some((event) => event.includes(external) && event.startsWith("write"))).toBe(false);
+    expect(events.some((event) => event.startsWith("write:") && event.includes(".plist.tmp-"))).toBe(true);
+    expect(events).toContain(`link:${external}`);
+  });
+
+  it("blocks restoration when the external original changed since capture", async () => {
+    const { ctl, snapshot, events } = restoreHarness({ externalEffective: true, externalChanged: true });
+    await expect(ctl.restoreFilesAndState(snapshot)).rejects.toThrow("external service plist changed since capture");
+    expect(events.filter((event) => !event.startsWith("unlink"))).toEqual([]);
+  });
+
+  it("requires a new process generation when asked", async () => {
+    const { ctl, snapshot } = restoreHarness();
+    snapshot.services[0].inspection.process!.pid = 900;
+    snapshot.services[0].inspection.process!.startTime = "Mon Sep  8 12:40:00 2026";
+    await ctl.restoreFilesAndState(snapshot);
+    await expect(
+      ctl.restoreService(snapshot, snapshot.services[0].definition.label, { requireNewGeneration: true }),
+    ).rejects.toThrow("did not start a new process generation");
+  });
+});
+
+describe("read-only first-capture discovery", () => {
+  const pilotRoot = "/Users/example/github/kpr-320-live-call";
+  const lease = { operationId: "op", instanceId: "personal_1", hiveHome, configPath };
+
+  function discoveryHarness(
+    options: {
+      env?: Record<string, string>;
+      linkIsSymlink?: boolean;
+      processChanges?: boolean;
+      foreignWritable?: boolean;
+      instancePlistExists?: boolean;
+    } = {},
+  ) {
+    const mutations: string[] = [];
+    let psCalls = 0;
+    const plistFor = (label: string) =>
+      JSON.stringify({
+        Label: label,
+        ProgramArguments: [
+          nodePath,
+          `${pilotRoot}/${label.endsWith("agent") ? "pkg/server.min.js" : "dist/voice-worker/main.js"}`,
+        ],
+        WorkingDirectory: hiveHome,
+        EnvironmentVariables: options.env ?? {
+          HIVE_HOME: hiveHome,
+          HIVE_CONFIG: configPath,
+          HOME: userHome,
+          PATH: "/usr/bin",
+        },
+      });
+    const exec = vi.fn(async (command: string, args: readonly string[]) => {
+      if (command === "launchctl" && args[0] === "print") {
+        return { stdout: `state = running\npid = ${args[1].endsWith("agent") ? 700 : 701}\n`, stderr: "" };
+      }
+      if (command === "launchctl" && args[0] === "print-disabled")
+        return { stdout: "{ disabled services = {} }", stderr: "" };
+      if (command === "launchctl") {
+        mutations.push(`launchctl ${args[0]}`);
+        throw new Error("discovery must not mutate launchd");
+      }
+      if (command === "plutil")
+        return {
+          stdout: plistFor(
+            args[args.length - 1].includes("voice-worker")
+              ? getServiceLabel("personal_1", "voice-worker")
+              : getServiceLabel("personal_1", "engine"),
+          ),
+          stderr: "",
+        };
+      if (command === "ps" && args.includes("comm=")) return { stdout: `${nodePath}\n`, stderr: "" };
+      if (command === "ps") {
+        psCalls += 1;
+        const pid = Number(args[args.indexOf("-p") + 1]);
+        const entry = pid === 700 ? "pkg/server.min.js" : "dist/voice-worker/main.js";
+        const start = options.processChanges && psCalls > 2 ? "Mon Sep  8 13:00:00 2026" : "Mon Sep  8 12:34:56 2026";
+        return { stdout: `  ${pid}   1 ${start} ${nodePath} ${pilotRoot}/${entry}\n`, stderr: "" };
+      }
+      if (command === "lsof" && args.includes("cwd")) return { stdout: `p1\nfcwd\nn${hiveHome}\n`, stderr: "" };
+      if (command === "lsof") return { stdout: `p1\nftxt\nn${nodePath}\n`, stderr: "" };
+      throw new Error(`unexpected ${command}`);
+    });
+    const stats = (kind: "file" | "directory" | "symlink", mode: number, uid = 501) => ({
+      ...stat(kind),
+      mode,
+      uid,
+      size: 5,
+    });
+    const io = makeIO({
+      execFile: exec,
+      lstat: vi.fn(async (path: string) => {
+        if (path.includes("Library/LaunchAgents/"))
+          return options.linkIsSymlink === false ? stats("file", 0o100644) : stats("symlink", 0o120755);
+        if (path.endsWith(".plist") && path.startsWith(pilotRoot)) return stats("file", 0o100644);
+        if (path.startsWith(`${hiveHome}/service/`)) {
+          if (!options.instancePlistExists) throw enoent();
+          return stats("file", 0o100600);
+        }
+        if (options.foreignWritable && path === pilotRoot) return stats("directory", 0o40777);
+        return stats("directory", 0o40755, path === "/" || path === "/Users" ? 0 : 501);
+      }),
+      readlink: vi.fn(async (path: string) => `${pilotRoot}/${path.split("/").pop()}`),
+      readFile: vi.fn(async () => Buffer.from("plist")),
+      writeFile: vi.fn(async (path: string) => {
+        mutations.push(`write ${path}`);
+      }),
+      rename: vi.fn(async (path: string) => {
+        mutations.push(`rename ${path}`);
+      }),
+      unlink: vi.fn(async (path: string) => {
+        mutations.push(`unlink ${path}`);
+      }),
+      symlink: vi.fn(async (path: string) => {
+        mutations.push(`symlink ${path}`);
+      }),
+    });
+    return { io, mutations };
+  }
+
+  function discoveryController(io: ServiceIO, validator?: (ticket: object) => Promise<typeof lease>) {
+    return new ServiceController(
+      {
+        instanceId: "personal_1",
+        hiveHome,
+        home: userHome,
+        operationDir: `${hiveHome}/.hive-state/deployment/operations/test`,
+        captureTicketValidator: validator,
+      },
+      io,
+    );
+  }
+
+  it("discovers external effective targets and distinct instance plist roles without mutation", async () => {
+    const { io, mutations } = discoveryHarness({ instancePlistExists: true });
+    const ticket = Object.freeze({});
+    const validator = vi.fn(async (candidate: object) => {
+      if (candidate !== ticket) throw new Error("unknown ticket");
+      return lease;
+    });
+    const found = await discoveryController(io, validator).discoverForCapture(ticket);
+    expect(found.map((item) => item.label)).toEqual(["com.hive.personal_1.agent", "com.hive.personal_1.voice-worker"]);
+    expect(found[0].effectivePlist.path).toBe(`${pilotRoot}/com.hive.personal_1.agent.plist`);
+    expect(found[0].instancePlist.path).toBe(getServicePlistPath(hiveHome, "personal_1", "engine"));
+    expect(found[0].instancePlist.existed).toBe(true);
+    expect(validator).toHaveBeenCalledTimes(2);
+    expect(mutations).toEqual([]);
+  });
+
+  it.each([
+    ["no validator", {}, undefined, "no capture ticket validator"],
+    ["foreign lease", {}, async () => ({ ...lease, instanceId: "keepur" }), "another instance"],
+    ["non-symlink LaunchAgent", { linkIsSymlink: false }, async () => lease, "not an owned symlink"],
+    [
+      "secret environment",
+      {
+        env: {
+          HIVE_HOME: hiveHome,
+          HIVE_CONFIG: configPath,
+          HOME: userHome,
+          PATH: "/usr/bin",
+          LIVEKIT_API_SECRET: "dummy",
+        },
+      },
+      async () => lease,
+      "not allowlisted",
+    ],
+    ["process replaced during capture", { processChanges: true }, async () => lease, "changed during capture"],
+    ["foreign-writable ancestor", { foreignWritable: true }, async () => lease, "foreign-writable ancestor"],
+  ] as const)("blocks capture on %s", async (_name, options, validator, message) => {
+    const { io, mutations } = discoveryHarness(options);
+    await expect(discoveryController(io, validator).discoverForCapture({})).rejects.toThrow(message);
+    expect(mutations).toEqual([]);
+  });
+});

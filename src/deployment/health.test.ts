@@ -9,6 +9,7 @@ import {
   bootIdentityIsCurrent,
   boundedHealthWindows,
   freshAdmissionStatus,
+  freshClosedAdmissionStatus,
   freshOrderedEngineMarkers,
   packagedHeartbeatFresh,
   packagedHealthy,
@@ -253,6 +254,51 @@ describe("fresh evidence validation", () => {
     expect(freshAdmissionStatus({ ...context, requestId: "77777777-7777-4777-8777-777777777777" })).toBe(false);
     expect(freshAdmissionStatus({ ...context, requestedAt: 1_002 })).toBe(false);
     expect(freshAdmissionStatus({ ...context, processCorroborated: false })).toBe(false);
+  });
+
+  it("keeps closed same-owner status distinct from open activation health", () => {
+    const operationId = "66666666-6666-4666-8666-666666666666";
+    const closedSnapshot = { ...SNAPSHOT, admission: "closed" as const, operationId };
+    const reply: MaintenanceReply = {
+      protocol: 1,
+      requestId: "55555555-5555-4555-8555-555555555555",
+      operationId,
+      supervisor: SNAPSHOT.supervisor,
+      ok: true,
+      snapshot: closedSnapshot,
+      writtenAt: 1_001,
+    };
+    const context = {
+      reply,
+      requestId: reply.requestId,
+      operationId,
+      requestedAt: 1_000,
+      expectedSupervisor: SNAPSHOT.supervisor,
+      processCorroborated: true,
+      now: 1_010,
+    };
+    expect(freshClosedAdmissionStatus(context)).toBe(true);
+    // A closed gate never passes activation health, and open never passes closed.
+    expect(freshAdmissionStatus(context)).toBe(false);
+    expect(
+      freshClosedAdmissionStatus({ ...context, reply: { ...reply, snapshot: { ...SNAPSHOT, operationId: null } } }),
+    ).toBe(false);
+    // Another owner, stale request, future reply and fault all fail.
+    expect(
+      freshClosedAdmissionStatus({
+        ...context,
+        reply: { ...reply, snapshot: { ...closedSnapshot, operationId: "77777777-7777-4777-8777-777777777777" } },
+      }),
+    ).toBe(false);
+    expect(freshClosedAdmissionStatus({ ...context, now: 3_001 })).toBe(false);
+    expect(freshClosedAdmissionStatus({ ...context, reply: { ...reply, writtenAt: 1_011 } })).toBe(false);
+    expect(
+      freshClosedAdmissionStatus({
+        ...context,
+        reply: { ...reply, snapshot: { ...closedSnapshot, persistenceFault: true } },
+      }),
+    ).toBe(false);
+    expect(freshClosedAdmissionStatus({ ...context, processCorroborated: false })).toBe(false);
   });
 });
 

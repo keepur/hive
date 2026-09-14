@@ -12,9 +12,9 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const execFile = promisify(nodeExecFile);
 
@@ -210,6 +210,9 @@ export interface ServiceFileStat {
   mode: number;
   dev: number;
   ino: number;
+  /** Owner UID; required by read-only capture discovery. */
+  uid?: number;
+  size?: number;
   isFile(): boolean;
   isDirectory(): boolean;
   isSymbolicLink(): boolean;
@@ -326,7 +329,14 @@ interface PreviousLink {
 export interface CapturedServiceDefinition {
   definition: ServiceDefinition;
   inspection: ServiceInspection;
+  /** Effective plist role: the file the LaunchAgent link actually loads. */
   plist: PreviousFile;
+  /**
+   * Instance-owned generated plist role (`<home>/service/<label>.plist`). It is
+   * recorded separately even when both roles name the same file; an external
+   * effective original is verified and never rewritten.
+   */
+  instancePlist: PreviousFile;
   link: PreviousLink;
   loaded: boolean;
   enabled: boolean;
@@ -336,12 +346,58 @@ export interface ServiceSnapshot {
   services: CapturedServiceDefinition[];
 }
 
+export interface ProcessCensusRow {
+  pid: number;
+  ppid: number;
+  startTime: string;
+  command: string;
+  depth: number;
+}
+
+/** What an operation-owned capture ticket asserts after live revalidation. */
+export interface CaptureTicketLease {
+  operationId: string;
+  instanceId: string;
+  hiveHome: string;
+  configPath: string;
+}
+
+export interface CaptureFileSeal {
+  path: string;
+  realpath: string;
+  uid: number;
+  mode: number;
+  dev: number;
+  ino: number;
+  size: number;
+  sha256: string;
+  bytes: Buffer;
+}
+
+export interface CaptureDiscovery {
+  label: string;
+  enabled: boolean;
+  process: ProcessIdentity;
+  args: string[];
+  cwd: string;
+  configSelection: string;
+  serviceEnvironment: Record<string, string>;
+  link: { path: string; target: string; resolvedTarget: string; dev: number; ino: number };
+  effectivePlist: CaptureFileSeal;
+  instancePlist: { path: string; existed: boolean; seal: CaptureFileSeal | null };
+}
+
 export interface ServiceControllerOptions {
   instanceId: string;
   hiveHome: string;
   home: string;
   operationDir: string;
   capturedPilotProfile?: readonly { label: string; plistPath: string }[];
+  /**
+   * Validates an opaque, in-memory capture ticket against the live acquired
+   * capture operation (owned by the pilot evidence module). Never serialized.
+   */
+  captureTicketValidator?: (ticket: object) => Promise<CaptureTicketLease>;
   stopTimeoutMs?: number;
   pollIntervalMs?: number;
 }
@@ -354,6 +410,13 @@ export interface BootoutOptions {
    * listener has no owner; any other owner is reported, never killed.
    */
   healthListenerPort?: number;
+  /**
+   * Last-moment signal fence (chunk 5 Step 4c.2a): called synchronously after
+   * `markIrreversible` and every awaited inspection, immediately before the
+   * `launchctl bootout` dispatch, with no await in between. A throw aborts the
+   * stop before any signal is issued.
+   */
+  beforeExec?(): void;
 }
 
 interface PlistFields {
@@ -696,6 +759,217 @@ export class ServiceController {
     return { port, pid: expectedSupervisorPID };
   }
 
+  /**
+   * Inventory-only process census (chunk 4 Task 9 Step 4b.3 `process-census`):
+   * the descendants of one root PID from a single `ps` snapshot. This is an
+   * observation for evidence; it is never a stop, rotation or staging
+   * settlement gate and never selects a kill target.
+   */
+  async processCensus(rootPid: number): Promise<ProcessCensusRow[]> {
+    if (!Number.isSafeInteger(rootPid) || rootPid < 1) throw new Error("invalid PID");
+    const result = await this.#io.execFile("ps", ["-ww", "-axo", "pid=,ppid=,lstart=,command="], {
+      env: commandEnv,
+    });
+    const rows = parseProcessRows(result.stdout);
+    const byParent = new Map<number, ProcessRow[]>();
+    for (const row of rows) byParent.set(row.ppid, [...(byParent.get(row.ppid) ?? []), row]);
+    const out: ProcessCensusRow[] = [];
+    const depth = new Map<number, number>([[rootPid, 0]]);
+    const queue = [rootPid];
+    while (queue.length > 0) {
+      const parent = queue.shift()!;
+      for (const child of byParent.get(parent) ?? []) {
+        if (depth.has(child.pid)) continue;
+        depth.set(child.pid, depth.get(parent)! + 1);
+        out.push({ ...child, depth: depth.get(child.pid)! });
+        queue.push(child.pid);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Operation-private, read-only discovery of the live effective service pair
+   * for a first pilot capture (chunk 5 Task 9 Step 4b.1a Step 2). The ticket is
+   * an opaque in-memory object revalidated through the injected validator
+   * before each label read; no serialized flag grants this path. An external
+   * LaunchAgent target is permitted for this read only. Nothing is written,
+   * signaled, loaded or unloaded, and the ordinary `inspect` target check is
+   * not loosened.
+   */
+  async discoverForCapture(ticket: object): Promise<CaptureDiscovery[]> {
+    const validator = this.#options.captureTicketValidator;
+    if (!validator) throw new Error("PILOT_CAPTURE_BLOCKED: no capture ticket validator");
+    const uid = this.#io.getuid();
+    const domain = `gui/${uid}`;
+    const out: CaptureDiscovery[] = [];
+    for (const component of ["engine", "voice-worker"] as const) {
+      const label = getServiceLabel(this.#options.instanceId, component);
+      const lease = await validator(ticket);
+      if (lease.instanceId !== this.#options.instanceId || lease.hiveHome !== this.#options.hiveHome) {
+        throw new Error("PILOT_CAPTURE_BLOCKED: capture ticket belongs to another instance");
+      }
+      const printed = await this.#io.execFile("launchctl", ["print", `${domain}/${label}`], { env: commandEnv });
+      const livePID = parseLaunchctl(printed.stdout).pid;
+      if (livePID === null) throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} is not running`);
+      const enabled = parseDisabled(
+        (await this.#io.execFile("launchctl", ["print-disabled", domain], { env: commandEnv })).stdout,
+        label,
+      );
+      const before = await this.process(livePID);
+      if (!before) throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} process disappeared`);
+
+      const linkPath = this.#linkPath(label);
+      const linkStat = await this.#io.lstat(linkPath).catch((error: unknown) => {
+        if (missingFile(error)) throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} has no owned LaunchAgent link`);
+        throw error;
+      });
+      if (!linkStat.isSymbolicLink() || linkStat.uid !== uid) {
+        throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} LaunchAgent is not an owned symlink`);
+      }
+      await this.#assertNotForeignWritable(dirname(linkPath), uid, label);
+      const linkTarget = await this.#io.readlink(linkPath);
+      const resolvedTarget = resolve(dirname(linkPath), linkTarget);
+      const effective = await this.#sealRegularFile(resolvedTarget, uid, label);
+      const fields = await this.#readPlist(effective.realpath);
+      const parsed = this.#capturePlistFields(fields, label, lease);
+
+      const processRealCwd = before.cwd;
+      if (
+        before.command !== parsed.args.join(" ") ||
+        processRealCwd !== (await this.#io.realpath(parsed.cwd)) ||
+        before.executable !== (await this.#io.realpath(parsed.args[0]))
+      ) {
+        throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} live process does not match its effective plist`);
+      }
+
+      const instancePath = this.#plistPath(label);
+      let instance: CaptureDiscovery["instancePlist"];
+      if (instancePath === resolvedTarget) {
+        instance = { path: instancePath, existed: true, seal: effective };
+      } else {
+        try {
+          await this.#io.lstat(instancePath);
+          instance = { path: instancePath, existed: true, seal: await this.#sealRegularFile(instancePath, uid, label) };
+        } catch (error) {
+          if (!missingFile(error)) throw error;
+          instance = { path: instancePath, existed: false, seal: null };
+        }
+      }
+
+      // Re-read correspondence after hashing: any replacement invalidates capture.
+      const after = await this.process(livePID);
+      const linkAfter = await this.#io.lstat(linkPath);
+      const effectiveAfter = await this.#sealRegularFile(resolvedTarget, uid, label);
+      if (
+        !after ||
+        after.startTime !== before.startTime ||
+        after.command !== before.command ||
+        (await this.#io.readlink(linkPath)) !== linkTarget ||
+        linkAfter.dev !== linkStat.dev ||
+        linkAfter.ino !== linkStat.ino ||
+        effectiveAfter.sha256 !== effective.sha256 ||
+        effectiveAfter.dev !== effective.dev ||
+        effectiveAfter.ino !== effective.ino
+      ) {
+        throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} changed during capture discovery`);
+      }
+      out.push({
+        label,
+        enabled,
+        process: before,
+        args: parsed.args,
+        cwd: parsed.cwd,
+        configSelection: parsed.environment.HIVE_CONFIG,
+        serviceEnvironment: parsed.environment,
+        link: { path: linkPath, target: linkTarget, resolvedTarget, dev: linkStat.dev, ino: linkStat.ino },
+        effectivePlist: effective,
+        instancePlist: instance,
+      });
+    }
+    return out;
+  }
+
+  async #assertNotForeignWritable(path: string, uid: number, label: string): Promise<void> {
+    const info = await this.#io.lstat(path);
+    if ((info.uid !== uid && info.uid !== 0) || (info.mode & 0o022) !== 0) {
+      throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} path has a foreign-writable ancestor`);
+    }
+  }
+
+  async #sealRegularFile(path: string, uid: number, label: string): Promise<CaptureFileSeal> {
+    const realpath = await this.#io.realpath(path);
+    const leaf = await this.#io.lstat(realpath);
+    if (!leaf.isFile() || leaf.isSymbolicLink()) {
+      throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} plist is not a regular file`);
+    }
+    if (leaf.uid === undefined || (leaf.uid !== uid && leaf.uid !== 0) || (leaf.mode & 0o022) !== 0) {
+      throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} plist ownership or mode is unsafe`);
+    }
+    let ancestor = dirname(realpath);
+    while (true) {
+      await this.#assertNotForeignWritable(ancestor, uid, label);
+      const parent = dirname(ancestor);
+      if (parent === ancestor) break;
+      ancestor = parent;
+    }
+    const bytes = await this.#io.readFile(realpath);
+    const again = await this.#io.lstat(realpath);
+    if (again.dev !== leaf.dev || again.ino !== leaf.ino || (leaf.size !== undefined && again.size !== bytes.length)) {
+      throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} plist changed while it was read`);
+    }
+    return {
+      path,
+      realpath,
+      uid: leaf.uid,
+      mode: leaf.mode & 0o777,
+      dev: leaf.dev,
+      ino: leaf.ino,
+      size: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      bytes,
+    };
+  }
+
+  #capturePlistFields(
+    fields: PlistFields | null,
+    label: string,
+    lease: CaptureTicketLease,
+  ): { args: string[]; cwd: string; environment: Record<string, string> } {
+    if (!fields || fields.Label !== label) throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} plist label mismatch`);
+    if (
+      !Array.isArray(fields.ProgramArguments) ||
+      fields.ProgramArguments.length < 2 ||
+      !fields.ProgramArguments.every((item) => typeof item === "string" && isAbsolute(item))
+    ) {
+      throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} ProgramArguments are not absolute executable paths`);
+    }
+    if (typeof fields.WorkingDirectory !== "string" || !isAbsolute(fields.WorkingDirectory)) {
+      throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} WorkingDirectory is invalid`);
+    }
+    const env = fields.EnvironmentVariables;
+    if (!env || typeof env !== "object" || Array.isArray(env)) {
+      throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} has no explicit service environment`);
+    }
+    const allowed = new Set<string>(["HIVE_HOME", "HIVE_CONFIG", "HOME", "PATH", ...servicePortKeys]);
+    const environment: Record<string, string> = {};
+    for (const [key, value] of Object.entries(env as Record<string, unknown>)) {
+      // Unsupported (possibly secret) keys are rejected, never copied to evidence.
+      if (!allowed.has(key) || typeof value !== "string") {
+        throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} service environment is not allowlisted`);
+      }
+      if (servicePortKeys.some((portKey) => portKey === key)) assertServicePortOverride(key, value);
+      environment[key] = value;
+    }
+    if (environment.HIVE_HOME !== lease.hiveHome || environment.HIVE_CONFIG !== lease.configPath) {
+      throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} selectors differ from the selected instance`);
+    }
+    if (!environment.HOME || !environment.PATH) {
+      throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} service environment lacks HOME or PATH`);
+    }
+    return { args: fields.ProgramArguments as string[], cwd: fields.WorkingDirectory, environment };
+  }
+
   async #validateDefinition(definition: ServiceDefinition): Promise<void> {
     const component = componentForLabel(definition.label);
     this.#plistPath(definition.label);
@@ -843,7 +1117,10 @@ export class ServiceController {
       throw new Error("worker bootout requires its recorded health listener port");
     }
     await options.markIrreversible();
-    await this.#io.execFile("launchctl", ["bootout", `gui/${this.#io.getuid()}/${definition.label}`], {
+    const target = `gui/${this.#io.getuid()}/${definition.label}`;
+    // No await may separate the fence from the dispatch below.
+    options.beforeExec?.();
+    await this.#io.execFile("launchctl", ["bootout", target], {
       env: commandEnv,
     });
     const deadline = this.#io.now() + this.#options.stopTimeoutMs;
@@ -870,18 +1147,24 @@ export class ServiceController {
     }
   }
 
-  async #capture(definition: ServiceDefinition): Promise<CapturedServiceDefinition> {
-    const inspection = await this.inspect(definition.label);
-    const plistPath = inspection.plist?.path ?? this.#plistPath(definition.label);
-    const linkPath = this.#linkPath(definition.label);
-    let plist: PreviousFile = { path: plistPath, existed: false };
+  async #previousFile(path: string): Promise<PreviousFile> {
     try {
-      const stat = await this.#io.lstat(plistPath);
+      const stat = await this.#io.lstat(path);
       if (!stat.isFile()) throw new Error("existing service plist is not a file");
-      plist = { path: plistPath, existed: true, bytes: await this.#io.readFile(plistPath), mode: stat.mode & 0o777 };
+      return { path, existed: true, bytes: await this.#io.readFile(path), mode: stat.mode & 0o777 };
     } catch (error) {
       if (!missingFile(error)) throw error;
+      return { path, existed: false };
     }
+  }
+
+  async #capture(definition: ServiceDefinition): Promise<CapturedServiceDefinition> {
+    const inspection = await this.inspect(definition.label);
+    const instancePath = this.#plistPath(definition.label);
+    const plistPath = inspection.plist?.path ?? instancePath;
+    const linkPath = this.#linkPath(definition.label);
+    const plist = await this.#previousFile(plistPath);
+    const instancePlist = plistPath === instancePath ? plist : await this.#previousFile(instancePath);
     let link: PreviousLink = { path: linkPath, existed: false };
     try {
       const stat = await this.#io.lstat(linkPath);
@@ -892,7 +1175,15 @@ export class ServiceController {
     } catch (error) {
       if (!missingFile(error)) throw error;
     }
-    return { definition, inspection, plist, link, loaded: inspection.loaded, enabled: inspection.enabled };
+    return {
+      definition,
+      inspection,
+      plist,
+      instancePlist,
+      link,
+      loaded: inspection.loaded,
+      enabled: inspection.enabled,
+    };
   }
 
   /** Capture exact bytes/link/load state before any service or plist mutation. */
@@ -905,6 +1196,12 @@ export class ServiceController {
     for (const prior of captured) {
       const privatePath = resolve(this.#options.operationDir, `${prior.definition.label}.plist.original`);
       if (prior.plist.existed) await this.#atomicWrite(privatePath, prior.plist.bytes!);
+      if (prior.instancePlist.path !== prior.plist.path && prior.instancePlist.existed) {
+        await this.#atomicWrite(
+          resolve(this.#options.operationDir, `${prior.definition.label}.instance.plist.original`),
+          prior.instancePlist.bytes!,
+        );
+      }
     }
     return { services: captured };
   }
@@ -975,18 +1272,47 @@ export class ServiceController {
     await this.removeServiceLink(definition);
   }
 
-  async restore(snapshot: ServiceSnapshot): Promise<void> {
+  async #restoreFile(prior: PreviousFile): Promise<void> {
+    if (prior.existed) {
+      await this.#atomicWrite(prior.path, prior.bytes!);
+      await this.#io.chmod(prior.path, prior.mode ?? 0o600);
+    } else {
+      try {
+        await this.#io.unlink(prior.path);
+      } catch (error) {
+        if (!missingFile(error)) throw error;
+      }
+    }
+  }
+
+  /**
+   * Restore phase 1 (chunk 4 Task 8 Step 5a.3): with every captured label
+   * unloaded, restore instance-owned plist bytes/modes (or captured absence),
+   * verify any external effective original byte-for-byte without writing it,
+   * restore the LaunchAgent link target and enablement. Nothing is bootstrapped.
+   */
+  async restoreFilesAndState(snapshot: ServiceSnapshot): Promise<void> {
     for (const prior of snapshot.services) {
-      if (prior.plist.existed) {
-        await this.#atomicWrite(prior.plist.path, prior.plist.bytes!);
-        await this.#io.chmod(prior.plist.path, prior.plist.mode ?? 0o600);
-      } else {
-        try {
-          await this.#io.unlink(prior.plist.path);
-        } catch (error) {
-          if (!missingFile(error)) throw error;
+      if ((await this.inspect(prior.definition.label)).loaded) {
+        throw new Error(`service restore requires ${prior.definition.label} to be unloaded first`);
+      }
+    }
+    for (const prior of snapshot.services) {
+      if (prior.plist.path !== prior.instancePlist.path) {
+        // External effective original: verify, never rewrite from backup.
+        if (prior.plist.existed) {
+          let current: Buffer;
+          try {
+            current = await this.#io.readFile(prior.plist.path);
+          } catch (error) {
+            throw new Error(`external service plist is missing: ${prior.definition.label}`, { cause: error });
+          }
+          if (!current.equals(prior.plist.bytes!)) {
+            throw new Error(`external service plist changed since capture: ${prior.definition.label}`);
+          }
         }
       }
+      await this.#restoreFile(prior.instancePlist);
       if (prior.link.existed) await this.#atomicLink(prior.link.path, prior.link.target!);
       else {
         try {
@@ -1006,23 +1332,60 @@ export class ServiceController {
           { env: commandEnv },
         );
       }
-      if (current.loaded && !prior.loaded) {
-        await this.#io.execFile("launchctl", ["bootout", `${domain}/${prior.definition.label}`], {
-          env: commandEnv,
-        });
-        if ((await this.inspect(prior.definition.label)).loaded) {
-          throw new Error("service registration survived snapshot restore bootout");
-        }
-      } else if (!current.loaded && prior.loaded) {
-        await this.#io.execFile("launchctl", ["bootstrap", domain, prior.plist.path], { env: commandEnv });
-        const restored = await this.inspect(prior.definition.label);
-        if (!this.#matchesCapturedService(restored, prior.inspection)) {
-          throw new Error("restored service does not match captured definition");
-        }
-      } else if (current.loaded && prior.loaded && !this.#matchesCapturedService(current, prior.inspection)) {
-        throw new Error("unexpected service remains loaded during snapshot restore");
-      }
     }
+  }
+
+  /**
+   * Restore phase 2/3: bootstrap one captured service from its effective plist
+   * (if it was loaded) and compare the live definition to the capture. The new
+   * process must be a different generation from the captured one when the
+   * caller requires it.
+   */
+  async restoreService(
+    snapshot: ServiceSnapshot,
+    label: string,
+    options: { requireNewGeneration?: boolean } = {},
+  ): Promise<ServiceInspection | null> {
+    const prior = snapshot.services.find((candidate) => candidate.definition.label === label);
+    if (!prior) throw new Error(`service ${label} is absent from the restore snapshot`);
+    const current = await this.inspect(label);
+    if (!prior.loaded) {
+      if (current.loaded) throw new Error("service registration appeared during restore of an unloaded capture");
+      return null;
+    }
+    if (current.loaded) throw new Error("unexpected service remains loaded during snapshot restore");
+    const domain = `gui/${this.#io.getuid()}`;
+    await this.#io.execFile("launchctl", ["bootstrap", domain, prior.plist.path], { env: commandEnv });
+    const restored = await this.inspect(label);
+    if (!this.#matchesCapturedService(restored, prior.inspection)) {
+      throw new Error("restored service does not match captured definition");
+    }
+    if (
+      options.requireNewGeneration &&
+      prior.inspection.process !== null &&
+      restored.process !== null &&
+      restored.process.pid === prior.inspection.process.pid &&
+      restored.process.startTime === prior.inspection.process.startTime
+    ) {
+      throw new Error("restored service did not start a new process generation");
+    }
+    return restored;
+  }
+
+  /**
+   * Ordered restoration: files/links/enablement with services unloaded, then
+   * engine, then the caller's engine check (fresh boot), then worker.
+   */
+  async restore(
+    snapshot: ServiceSnapshot,
+    hooks: { afterEngine?: (engine: ServiceInspection | null) => Promise<void> } = {},
+  ): Promise<void> {
+    await this.restoreFilesAndState(snapshot);
+    const engine = snapshot.services.find((prior) => componentForLabel(prior.definition.label) === "engine");
+    const worker = snapshot.services.find((prior) => componentForLabel(prior.definition.label) === "voice-worker");
+    const started = engine ? await this.restoreService(snapshot, engine.definition.label) : null;
+    await hooks.afterEngine?.(started);
+    if (worker) await this.restoreService(snapshot, worker.definition.label);
   }
 
   #matchesCapturedService(current: ServiceInspection, captured: ServiceInspection): boolean {

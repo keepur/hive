@@ -342,6 +342,36 @@ export function freshAdmissionStatus(context: AdmissionReplyContext): boolean {
   );
 }
 
+/**
+ * Closed, same-owner maintenance status (chunk 5 Task 9 Step 4c.2a). Distinct
+ * from `freshAdmissionStatus`: an open/null-owner status never passes here and
+ * a closed status never passes activation health. The request must carry the
+ * owning maintenance operation ID, never a fresh unrelated one, and the reply
+ * must be at most 2 seconds old with no future skew.
+ */
+export function freshClosedAdmissionStatus(context: AdmissionReplyContext): boolean {
+  const reply = context.reply;
+  const now = context.now ?? Date.now();
+  return (
+    reply !== null &&
+    reply.protocol === 1 &&
+    reply.ok &&
+    reply.requestId === context.requestId &&
+    reply.operationId === context.operationId &&
+    reply.writtenAt >= context.requestedAt &&
+    reply.writtenAt <= now &&
+    now - context.requestedAt <= 2_000 &&
+    reply.supervisor.pid === context.expectedSupervisor.pid &&
+    reply.supervisor.bootId === context.expectedSupervisor.bootId &&
+    reply.snapshot.supervisor.pid === context.expectedSupervisor.pid &&
+    reply.snapshot.supervisor.bootId === context.expectedSupervisor.bootId &&
+    context.processCorroborated &&
+    reply.snapshot.admission === "closed" &&
+    reply.snapshot.operationId === context.operationId &&
+    reply.snapshot.persistenceFault === false
+  );
+}
+
 export async function boundedHealthWindows<T>(
   check: (deadline: number, attempt: number) => Promise<T | null>,
   options: {
