@@ -302,6 +302,10 @@ fetch_engine() {
     mkdir -p "$instance_dir/.hive.next/scripts"
     [[ -f "$src/scripts/honeypot" ]] && cp "$src/scripts/honeypot" "$instance_dir/.hive.next/scripts/honeypot"
     cp "$src/package.json" "$instance_dir/.hive.next/"
+    # npm always packs npm-shrinkwrap.json without listing it in `files`; the
+    # rsync fallback must carry it too or the engine tree has no dependency
+    # lock for readRelease to hash.
+    [[ -f "$src/npm-shrinkwrap.json" ]] && cp "$src/npm-shrinkwrap.json" "$instance_dir/.hive.next/"
   fi
 
   # Sanity check — if the tarball/rsync was broken, catch it before the swap.

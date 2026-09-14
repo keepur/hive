@@ -621,6 +621,10 @@ step_populate_engine() {
 
   # PACKAGE_ENTRIES — must match Phase 4's src/setup/populate-engine.ts exactly.
   # If you change this list, change it there too (and in deploy.sh fetch_engine).
+  # Deliberate exception: npm-shrinkwrap.json (KPR-463) is NOT listed here.
+  # This script is the frozen one-time 0.1.x → 0.2.0 migration and pins
+  # @keepur/hive@0.2.0, which predates the packaged lock; every entry below is
+  # a hard requirement, so naming it would fail the migration outright.
   local entries=(pkg seeds templates scripts/honeypot install service package.json)
   for entry in "${entries[@]}"; do
     local src="$cli_root/$entry"
