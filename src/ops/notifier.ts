@@ -561,7 +561,9 @@ export class OpsNotifier {
     if (!this.canWrite()) return this.skipForIdentity();
 
     const ctx = {
-      subscriptions: this.subscriptions,
+      // A FUNCTION, not the map: reloadSubscriptions replaces `this.subscriptions`
+      // mid-tick, and delivery must resolve against the replacement (D11).
+      subscriptions: () => this.subscriptions,
       transports: this.transports,
       reasons: this.reasons,
       policy: this.policy ?? null,

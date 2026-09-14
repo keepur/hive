@@ -393,6 +393,62 @@ describe("the stall — a declined row is PUSHED FORWARD, never left untouched",
     expect(h.transport.views).toHaveLength(1);
   });
 
+  it("a subscription disabled by a reload that COMPLETES MID-TICK is not posted to afterwards (D11, AC16)", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE for "stops within one reload". The tick's
+    // context was built before the reload replaced the map, so a phase that
+    // resolved subscriptions from a map captured at tick start posted to s2 —
+    // a post that BEGAN after a successful reload had already unloaded it.
+    const h = await harness({
+      subscriptions: [sub("s1"), sub("s2", { transport: { adapterId: "fake", target: "C0000002" } })],
+      policy: policyWith(),
+    });
+    const e = await h.seedEvent();
+    h.transport.onDeliver = async () => {
+      h.transport.onDeliver = undefined;
+      await h.db.collection(OPS_SUBSCRIPTIONS_COLLECTION).updateOne({ _id: "s2" }, { $set: { enabled: false } });
+      await h.notifier.reloadSubscriptions();
+      expect(h.snapshot().subscriptions).toBe(1);
+    };
+    await h.tick();
+
+    expect(h.transport.views.map((v) => v.target)).toEqual(["C0000001"]);
+    const s2 = await h.row("s2", e.dedupeKey);
+    expect(s2.attemptCount).toBe(0);
+    expect(s2.lastOutcome).toBeUndefined();
+    expect(s2.stalledReason).toBe("subscription");
+    expect(h.snapshot().deliveriesAccepted).toBe(1);
+    expect(h.snapshot().subscriptionUnresolved).toBe(1);
+  });
+
+  it("a reload that lands between a row's own admission and its post still stops that post (D11)", async () => {
+    // The narrower window: s2's row has ALREADY passed steps 1–3 against the
+    // live map, and the reload completes while the row sits in the pre-post
+    // re-read. Only the resolution at the post boundary (step 4c) catches it.
+    const h = await harness({
+      subscriptions: [sub("s1"), sub("s2", { transport: { adapterId: "fake", target: "C0000002" } })],
+      policy: policyWith(),
+    });
+    const e = await h.seedEvent();
+    let rereads = 0;
+    const gate = h.db.pause(OPS_NOTIFICATIONS_COLLECTION, "findOne", (ctx) => {
+      const keys = Object.keys(ctx.filter ?? {});
+      return keys.length === 1 && keys[0] === "_id" && (rereads += 1) === 2;
+    });
+    const tick = h.tick();
+    await gate.reached;
+    await h.db.collection(OPS_SUBSCRIPTIONS_COLLECTION).updateOne({ _id: "s2" }, { $set: { enabled: false } });
+    await h.notifier.reloadSubscriptions();
+    expect(h.snapshot().subscriptions).toBe(1);
+    gate.release();
+    await tick;
+
+    expect(h.transport.views.map((v) => v.target)).toEqual(["C0000001"]);
+    const s2 = await h.row("s2", e.dedupeKey);
+    expect(s2.attemptCount).toBe(0);
+    expect(s2.stalledReason).toBe("subscription");
+    expect(h.snapshot().subscriptionUnresolved).toBe(1);
+  });
+
   it("an unbound adapter stalls with its own reason and counter", async () => {
     const h = await harness({ subscriptions: [sub("s1")], policy: policyWith(), transport: null });
     const e = await h.seedEvent();
@@ -1850,7 +1906,7 @@ describe("DeliveryPhase is constructible on its own", () => {
     const counters = freshCounters();
     const phase = new DeliveryPhase(store.notifications, counters, 30);
     const ctx = {
-      subscriptions: new Map<string, OpsSubscription>(),
+      subscriptions: () => new Map<string, OpsSubscription>(),
       transports: new Map(),
       reasons: new Map(),
       policy: null,

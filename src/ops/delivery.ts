@@ -128,7 +128,14 @@ export function __resetCadenceWarningsForTests(): void {
 }
 
 export interface DeliveryContext {
-  subscriptions: Map<string, OpsSubscription>;
+  /**
+   * The LIVE subscription map, read through a function — never a Map captured
+   * when the tick built this context. reloadSubscriptions REPLACES the
+   * notifier's map, and a tick's delivery phase can outlast a reload by many
+   * posts; a captured map kept posting to a subscription a completed reload
+   * had already unloaded, which breaks D11's "stops within one reload".
+   */
+  subscriptions: () => Map<string, OpsSubscription>;
   transports: Map<string, OpsTransport>;
   reasons: Map<string, LoadedReason>;
   policy: OpsPolicy | null;
@@ -388,30 +395,13 @@ export class DeliveryPhase {
     //    post or an intake call, so the loop-head check is not enough.
     if (!ctx.canWrite()) return "declined";
 
-    // 1. Resolve the subscription. Unresolved ⇒ stall. This is D11 lever 1 —
-    //    ops_subscriptions.enabled: false — taking effect.
-    const sub = ctx.subscriptions.get(row.subscriptionId);
-    if (!sub) {
-      this.counters.subscriptionUnresolved += 1;
-      await this.stall(row, "subscription", now);
-      return "declined";
-    }
-
-    // 2. Resolve the cadence and apply the THREE-DISJUNCT attempt gate.
-    const interval = resolveCadence(row, sub, ctx.policy, now);
-    if (!(row.attemptCount === 0 || row.forceDeliver === true || interval !== undefined)) {
-      this.counters.cadenceUnresolved += 1;
-      await this.stall(row, "cadence", now);
-      return "declined";
-    }
-
-    // 3. Resolve the adapter. Unbound ⇒ stall. This is the single, already
-    //    specified home for a subscription whose adapterId names no registered
-    //    adapter (D6's "unjudged binding" branch).
-    const adapter = ctx.transports.get(sub.transport.adapterId);
-    if (!adapter) {
-      this.counters.transportUnbound += 1;
-      await this.stall(row, "transport", now);
+    // 1–3. Resolve the subscription, the cadence gate and the adapter (see
+    //      resolveAttempt). Declining here, before the spacing sleep and the
+    //      re-read, is the cheap path; step 4c repeats the resolution at the
+    //      post boundary, and THAT one decides.
+    const early = this.resolveAttempt(row, ctx, now);
+    if (typeof early === "string") {
+      await this.stall(row, early, now);
       return "declined";
     }
 
@@ -462,6 +452,24 @@ export class DeliveryPhase {
     // reads that chose this row may be answering out of ANOTHER instance's
     // database. Declining writes nothing and is not an attempt.
     if (!ctx.canWrite()) return "declined";
+
+    // 4c. RE-RESOLVE AGAINST THE LIVE SUBSCRIPTION MAP, synchronously, with no
+    //     await between here and the post — so a reload that has COMPLETED
+    //     before this post begins is always honoured.
+    //
+    // ⚠ Not defensive, and the failure it closes is D11's kill switch. Step 1
+    // ran before the spacing sleep and the re-read, and the phase itself can
+    // hold a row across earlier rows' posts; a reload that unloaded this
+    // subscription (`enabled: false`) in that window used to be ignored and
+    // the row was posted anyway — a post that began after the operator's stop
+    // had taken effect. Resolved from `fresh`, so the gate reads the row as it
+    // is now. Its stall is covered by 4b's guard check just above.
+    const admitted = this.resolveAttempt(fresh, ctx, now);
+    if (typeof admitted === "string") {
+      await this.stall(row, admitted, now);
+      return "declined";
+    }
+    const { sub, interval, adapter } = admitted;
 
     // 5. Build the view FROM THE FRESH READ and deliver, bounded by THE
     //    ADAPTER'S OWN DEADLINE, not by the sweep's patience (D12).
@@ -526,6 +534,41 @@ export class DeliveryPhase {
       return "attempted-unrecorded";
     }
     return "attempted";
+  }
+
+  /**
+   * D5 steps 1–3, SYNCHRONOUS so step 4c can run with no await before the
+   * post. Returns the resolved attempt, or the stall reason to decline on
+   * (counted here; the caller writes the stall).
+   *
+   *  1. The subscription, from the LIVE map. Unresolved ⇒ `subscription`.
+   *     This is D11 lever 1 — ops_subscriptions.enabled: false — taking effect.
+   *  2. The cadence, and the THREE-DISJUNCT attempt gate ⇒ `cadence`.
+   *  3. The adapter. Unbound ⇒ `transport`. This is the single, already
+   *     specified home for a subscription whose adapterId names no registered
+   *     adapter (D6's "unjudged binding" branch).
+   */
+  private resolveAttempt(
+    row: OpsNotification,
+    ctx: DeliveryContext,
+    now: Date,
+  ): { sub: OpsSubscription; interval: number | undefined; adapter: OpsTransport } | StalledReason {
+    const sub = ctx.subscriptions().get(row.subscriptionId);
+    if (!sub) {
+      this.counters.subscriptionUnresolved += 1;
+      return "subscription";
+    }
+    const interval = resolveCadence(row, sub, ctx.policy, now);
+    if (!(row.attemptCount === 0 || row.forceDeliver === true || interval !== undefined)) {
+      this.counters.cadenceUnresolved += 1;
+      return "cadence";
+    }
+    const adapter = ctx.transports.get(sub.transport.adapterId);
+    if (!adapter) {
+      this.counters.transportUnbound += 1;
+      return "transport";
+    }
+    return { sub, interval, adapter };
   }
 
   /**
