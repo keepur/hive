@@ -195,16 +195,17 @@ If May's go never arrives after Task 2 passes, Task 7 still runs and closes the 
 **Outcome / spec coverage:** Establishes the remaining preconditions for dialing — the KPR-465 configuration readback, May's go, a confirmed quiet window, and the stop procedure in hand — so Tasks 4–6 proceed on a fully authorized, drift-free basis. Covers spec §4.3 and §7.1.
 
 **Components and known files:**
-- `docs/epics/kpr-462/kpr-465-latency-evidence.md` §6.4 (the decision register entry, if any) or the epic canon's KPR-465 decision line.
-- Dodi's live `hive.yaml` readback (`voice.warmPath`, `voice.livekit.endpointing`, `defaultStt`/`defaultTts`), Mokie's `effort` field via `agent_get mokie`, `@livekit/agents` version pin.
+- `docs/epics/kpr-462/kpr-465-latency-evidence.md` §9 "Decision, target provenance, rollback" (the decision register entry, if any — that file's §6 is "Per-turn correctness", not the decision) or the epic canon's KPR-465 decision line. KPR-465 **spec** §6.4 is the *procedure* for writing that decision, not the evidence-file section that records it — reading spec §6.4 instead of evidence §9 risks treating an applied E6 decision as absent.
+- Dodi's live `hive.yaml` readback (`voice.warmPath`, `voice.livekit.endpointing`, `defaultStt`/`defaultTts`), Mokie's `effort` field and model via `agent_get mokie`, `@livekit/agents` version pin (spec §7.1 item 3 lists model alongside warm/effort/endpointing/Cartesia-mapping/SDK-pin — do not drop it from the readback).
 - `db.telemetry` (`spawn_coordinator_stats`), `db.meeting_worker_claims`.
 
 **Dependencies:** Task 2 passed for this session.
 
-**Interfaces, compatibility, and invariants:** Standing Invariants 3, 4, 7, 9. A KPR-465 configuration change observed after this readback invalidates it — re-run this task before dialing again.
+**Interfaces, compatibility, and invariants:** Standing Invariants 3, 4, 7, 9. A KPR-465 configuration change observed after this readback invalidates it — re-run this task before dialing again. **Must-never live-setting gate (spec §4.3 Forbidden; §7.1 closing sentence):** if the live `hive.yaml`/Mokie `effort` readback does not match the KPR-465 written decision (or does not reflect keep-cold-by-absence when no decision exists), or a KPR-465 arm switch is observed in flight, **stop here** — never `launchctl kickstart` or otherwise rotate services to align them as a 466 proof (Standing Invariant 8); return to KPR-465 instead. This gate is checked before May's go is treated as sufficient to dial.
 
 **Acceptance criteria:**
 - 465 sequencing determined: if KPR-465 spec §6.4 / the epic canon carries a written decision (warm on + effort level, or explicit keep-cold), read it back on the live identity; otherwise "keep-cold by absence" applies and is recorded as such — this ticket does not choose an arm itself.
+- The live-setting gate above holds: the readback matches the decision (or keep-cold-by-absence) and no arm switch is in flight. If it does not hold, this task stops without proceeding to May's go.
 - May's go for this specific session is in hand (not Gate 1, not a prior session's go).
 - Quiet window confirmed via the query below, or the specific accepted residuals recorded instead of waited out.
 - Stop procedure understood by the operator before the first call (Standing Invariant 4).
@@ -220,10 +221,11 @@ If May's go never arrives after Task 2 passes, Task 7 still runs and closes the 
     printjson(rows.map(r => ({ agent: r.agentId, activeSpawns: r.activeSpawns, warmVoiceSessions: r.warmVoiceSessions ?? 0, updatedAt: r.updatedAt })));
     print("running claims:", db.meeting_worker_claims.countDocuments({ status: "running" }));'
   ```
-  (same query shape as KPR-465's own quiescence check, generalized to every agent rather than one).
+  (same query shape as KPR-465's own quiescence check — that query is already unfiltered across agents, so this reuses it rather than generalizing it).
 - Expected: every row shows `activeSpawns: 0` and `warmVoiceSessions: 0`; `running claims: 0`; no live call already up.
 
 - [ ] Read back the KPR-465 configuration decision (or record keep-cold-by-absence) on the live identity; write it to evidence §3.
+- [ ] Confirm the readback matches the decision (or keep-cold-by-absence) and no 465 arm switch is in flight; if either fails, **stop** — do not kickstart/rotate services — and return to KPR-465 instead of proceeding to May's go.
 - [ ] Confirm May's go for this session; record who gave it and when.
 - [ ] Run the quiet-window query; record the result or the accepted residual that applied.
 - [ ] Confirm the stop procedure is understood before dialing.
@@ -247,24 +249,24 @@ If May's go never arrives after Task 2 passes, Task 7 still runs and closes the 
 **Acceptance criteria** (per spec §6.1/§6.2, one call):
 1. **I1** — May messages Mokie in Slack to call her without stating digits; Mokie resolves the destination via contacts/memory and invokes `voice_call`; the record captures the dispatch id + room/call id and confirms the agent is Mokie, with the destination itself never written down; May confirms the ringing handset was her known line and that Mokie did not ask for the number.
 2. **V (if applicable)** — classify per spec §6.2 (`no_sip_answer` / `answered_voicemail` / `answered_human` / `unclassified`). If `no_sip_answer` or `answered_voicemail`: do not score L1/X/B/T/H/C on this attempt; retry once under the same go (Standing Invariant 3).
-3. **L1** — May answers and stays quiet through startup; record exactly one relevant opening, complete attempt accounting, and May's first-audible words with no prolonged unexplained silence.
+3. **L1** — May answers and stays quiet through startup; record exactly one relevant opening, complete attempt accounting, and May's first-audible words with no prolonged unexplained silence. Keep generated-audio/worker-playout evidence rows distinct from May's handset-receipt report in the evidence record (the September 7 trap: a clean playout event is not proof the handset received it); git gets the sanitized first-audible class (§7.2), never verbatim wording.
 4. **X** — two short factual questions per the script; May marks each answer correct/wrong/missing; ≥ 2 completed non-interrupted `sdk_response` speeches bound to turn ids; the `warm` flag matches Task 3's readback.
 5. **B** — one mid-sentence interruption on the longer script line; the interrupted speech terminal reads `interrupted`; the replacement progresses; May confirms nothing replayed.
-6. **T** — one turn forcing Mokie's actual read-only tool (prefer `conversation_search`; `contacts_search` acceptable, naming May, never a number); `toolCount ≥ 1`; May heard an acknowledgement (or `toolAckInjected: true`) and a spoken result, then normal talk resumed.
-7. **H** — goodbye and hangup; `call_closed`; every started attempt terminal or explicit incomplete; no `speech_started`/engine write/generated frame after close; `voice_worker_stats.activeCalls` returns to its pre-call value on a document whose `updatedAt` postdates hangup — wait for that post-hangup heartbeat rather than sampling immediately; if warm, wait for `warmVoiceSessions == 0` or the 120s idle timeout. May confirms no late speech after hangup.
-8. **C** — record `voice.warmPath.enabled`, Mokie's `effort`, endpointing presence, and the JSONL `warm`/`selectedContinuity` fields; run the confirmatory compare CLI on this call's id; record May's pause verdict (acceptable/borderline/annoying) as an observation only, never a pass/fail input for C (spec §4.3).
+6. **T** — one turn forcing Mokie's actual read-only tool (prefer `conversation_search`; `contacts_search` acceptable, naming May, never a number); `toolCount ≥ 1`; May heard an acknowledgement (or `toolAckInjected: true`) and a spoken result, then normal talk resumed; record `bridge_terminal.maximumGapMs` when present (spec §6.1 T).
+7. **H** — goodbye and hangup; `call_closed`; every started attempt terminal or explicit incomplete; no `speech_started`/engine write/generated frame after close; `voice_worker_stats.activeCalls` returns to its pre-call value on a document whose `updatedAt` postdates hangup — `activeCalls` is decremented by `noteCallEnded` at job teardown, never by the 30s supervisor `writeOnce` tick (which `$set`s `cellDefaults`/`updatedAt` only), so a post-hangup `writeOnce` alone with a stale counter is neither H pass nor H fail; wait for the post-hangup heartbeat that actually reflects teardown rather than sampling immediately; if warm, wait for `warmVoiceSessions == 0` or the 120s idle timeout. May confirms no late speech after hangup.
+8. **C** — record `voice.warmPath.enabled`, Mokie's `effort`, endpointing presence, and the JSONL `warm`/`selectedContinuity` fields; run the confirmatory compare CLI on this call's id with `--call <id>=<arm>` where `<arm>` names the arm Task 3 actually read back (warm or cold) — never an arbitrary label. **C's pass/fail rule is the compare CLI's own consistency check, not a pasted-report judgment call:** a warm-labelled arm whose steady turns are not `warm: true` (`warm_arm_has_cold_steady_turn`) or a cold-labelled arm containing any `warm: true` steady turn (`cold_arm_has_warm_steady_turn`) is a C `fail`; the CLI accepting the run without that failure is C `pass` (`armKindOf` + arm-report failure checks in `src/voice/voice-latency-compare.ts`). Record May's pause verdict (acceptable/borderline/annoying) as an observation only, never a pass/fail input for C (spec §4.3).
 
 **Verification:**
-- Tests and critical failure cases: an unexpected destination trips the stop rule (no retry); a `fail` on any required row (wrong destination, late speech after hangup, duplicate/stale opening, tool claimed but never ran, leftover warm session) stops the ticket at `live end-to-end acceptance failed` for this run, filed as a defect rather than patched in-ticket.
+- Tests and critical failure cases: an unexpected destination trips the stop rule (no retry); a `fail` on any required row (wrong destination, late speech after hangup, duplicate/stale opening, tool claimed but never ran, leftover warm session, or C's `warm_arm_has_cold_steady_turn`/`cold_arm_has_warm_steady_turn` capture-consistency failure) stops the ticket at `live end-to-end acceptance failed` for this run, filed as a defect rather than patched in-ticket.
 - Harness/environment: Slack (May's request to Mokie), the live dodi identity from Tasks 2–3, May available to answer and give verdicts.
-- Run: the I1 six-line controlled script (spec §6.1: quiet through opening; one short factual question with a go-time expected keyword; one second short factual question; one longer prompt interrupted mid-sentence; one lookup prompt naming the chosen tool's job without personal data; goodbye and hangup); the harvest commands from the plan-level Testing Contract, scoped to this call's id.
+- Run: the I1 six-line controlled script (spec §6.1: quiet through opening; one short factual question with a go-time expected keyword; one second short factual question; one longer prompt interrupted mid-sentence; one lookup prompt naming the chosen tool's job without personal data; goodbye and hangup); the harvest commands from the plan-level Testing Contract, scoped to this call's id, with `--call <id>=<arm>` labeled per Task 3's readback.
 - Expected: 7–8 recorded rows (I1, L1, X, B, T, H, C, and V if the outcome required it) each with call/speech/turn ids, a result from Invariant 1's vocabulary, and a link to its sanitized JSONL slice; the caller-verdict form (spec §7.3) filled in.
 
 - [ ] Have May message Mokie in Slack with no digits in the request; confirm Mokie resolves via contacts/memory and invokes `voice_call`; record the dispatch id + call/room id (never the destination).
 - [ ] Observe and classify the call per §6.2; if voicemail/no-answer, retry once under the same go before proceeding.
 - [ ] Run the six-line script and capture May's live observations per §7.3 as they happen.
-- [ ] After hangup, wait for the post-hangup `activeCalls` heartbeat (and the warm idle/zero condition if warm) before declaring H closed.
-- [ ] Harvest and sanitize this call's JSONL slice; run the compare CLI; paste sanitized results plus the caller-verdict form into evidence §6/§7 (sanitized classes and booleans in git; verbatim wording only in the operator-only record outside git, with May's ok).
+- [ ] After hangup, wait for the post-hangup `activeCalls` heartbeat that reflects `noteCallEnded` teardown (not merely a fresh supervisor `writeOnce` tick) — and the warm idle/zero condition if warm — before declaring H closed.
+- [ ] Harvest and sanitize this call's JSONL slice; run the compare CLI with the arm label matching Task 3's readback (a mismatched or arbitrary label is a harness error, not a valid C capture); paste sanitized results plus the caller-verdict form into evidence §6/§7 (sanitized classes and booleans in git; verbatim wording only in the operator-only record outside git, with May's ok).
 - [ ] Commit the evidence-record update for Call 1.
 
 ### Task 5 (LIVE-CALL): Calls 2–4 — startup regression (L2, L3, L4), + V if that's the outcome
@@ -282,17 +284,17 @@ If May's go never arrives after Task 2 passes, Task 7 still runs and closes the 
 
 **Acceptance criteria:**
 
-**Call 2 — L2.** May says hello immediately before or at answer (itself controlled script text). Classify from the JSONL fields above into exactly one class:
+**Call 2 — L2.** May says hello immediately before or at answer (itself controlled script text). Classify the *ordering* from the JSONL fields above into exactly one class — this classification step alone may be done from JSONL:
 
-| Class | Condition | Result |
+| Class | Condition | Machine-side result condition |
 | --- | --- | --- |
-| `l2_suppressed` | Nonempty final and/or accepted-turn occurs before any opening request | `pass` when no optional opening was requested, exactly one caller-owned response proceeds, attempt accounting complete |
-| `l2_late_final_replaced` | Opening requested, then nonempty final arrived, then application cancellation wrote `startup_superseded` on the opening's `speechId` | `pass` when exactly one opening is requested then superseded, exactly one replacement proceeds, the opening is not queued behind the replacement, no extra utterance needed. A brief heard-both is not `fail` |
-| `l2_late_final_sdk_interrupted` | Same ordering, but the SDK already interrupted or settled the opening before acceptance (no cancel marker written) | Same `pass` condition, identified by the opening's own `origin: "opening"` speechId and its terminal ordered before acceptance — never by ordering against a speculative replacement's `speech_started` |
+| `l2_suppressed` | Nonempty final and/or accepted-turn occurs before any opening request | Ordering supports `pass` when no optional opening was requested, exactly one caller-owned response proceeds, attempt accounting complete |
+| `l2_late_final_replaced` | Opening requested, then nonempty final arrived, then application cancellation wrote `startup_superseded` on the opening's `speechId` | Ordering supports `pass` when exactly one opening is requested then superseded, exactly one replacement proceeds, the opening is not queued behind the replacement, no extra utterance needed. A brief heard-both is not `fail` |
+| `l2_late_final_sdk_interrupted` | Same ordering, but the SDK already interrupted or settled the opening before acceptance (no cancel marker written) | Ordering supports the same `pass` condition, identified by the opening's own `origin: "opening"` speechId whose `speech_terminal` `outcome` is `interrupted` (cause may be `unknown`) **or** `completed` — either counts, not `interrupted` only — ordered before acceptance; never by ordering against a speculative replacement's `speech_started` |
 | `l2_ordering_unknown` | Decision events missing, or interim-only/empty-final ordering | `unknown` — never `fail`; required L2 coverage incomplete on this attempt |
 | (defect) | Suppression was required but an opening was still requested; a late-final opening stayed queued behind the replacement; replacement required an extra utterance; a later stale opening replayed | `fail` |
 
-Any of the first three classes completes required L2 coverage; Call 2 is still required even after a late-final pass (it does not absorb L3).
+**L2 is one of Standing Invariant 1's rows (spec §3.2: "I1, L1–L3, X, B, or T" need May's corroborating observation) — a "machine-side result condition" above is never itself a recorded `pass`.** The class is finalized to `pass` only once May's sanitized first-audible class (§7.2: `heard_opening`/`heard_greeting_response`/`heard_both`/`heard_none`/`heard_other`) and her no-stale-replay confirmation are also in hand and consistent with that class's condition; absent that corroboration the row stays `unknown`, exactly like L1/L3. `l2_ordering_unknown` is `unknown` regardless of caller input. Any of the first three classes, once caller-corroborated, completes required L2 coverage; Call 2 is still required even after a late-final pass (it does not absorb L3).
 
 **Call 3 — L3.** May begins a greeting as the opening starts (464 live table caller action). Record: the obsolete opening interrupted, one replacement proceeding, no later stale opening; May confirms the interruption felt normal, the response arrived, and old speech did not replay.
 
@@ -301,12 +303,12 @@ Any of the first three classes completes required L2 coverage; Call 2 is still r
 **V (if applicable, any of the three calls).** Same classification and retry-once rule as Task 4's V step (Standing Invariant 3); keep the attempt in the denominator; do not fail L2/L3/L4 on a voicemail/no-answer attempt.
 
 **Verification:**
-- Tests and critical failure cases: copying KPR-464's frozen L2 cell instead of classifying from this session's own JSONL is an execution error, not a pass; an `l2_ordering_unknown` result must never be recorded as `fail`.
+- Tests and critical failure cases: copying KPR-464's frozen L2 cell instead of classifying from this session's own JSONL is an execution error, not a pass; an `l2_ordering_unknown` result must never be recorded as `fail`; recording L2 `pass` from the JSONL ordering class alone, without May's sanitized first-audible class and no-stale-replay confirmation, is the same class of error as treating `sip_answered`/playout as a conversation pass (Standing Invariant 1) and must not happen.
 - Harness/environment: same as Task 4; May available for three short calls plus any voicemail retries.
 - Run: the harvest commands from the plan-level Testing Contract, scoped to each call's id.
 - Expected: three recorded rows (L2, L3, L4), each with its class/result, call/speech/turn ids, and a link to its sanitized JSONL slice; any V outcomes recorded per §6.2.
 
-- [ ] Place Call 2 (Mokie `voice_call` preferred); say hello immediately before/at answer; classify per the table above from content-free JSONL fields only; retry once if voicemail/no-answer.
+- [ ] Place Call 2 (Mokie `voice_call` preferred); say hello immediately before/at answer; classify the ordering from content-free JSONL fields per the table above, then record May's sanitized first-audible class and no-stale-replay confirmation; finalize to `pass` only when both agree, otherwise `unknown` — never `pass` from JSONL ordering alone; retry once if voicemail/no-answer.
 - [ ] Place Call 3; begin a greeting as the opening starts; record the interruption/replacement/no-stale-opening outcome and May's confirmation.
 - [ ] Place Call 4; hang up during startup; record the terminal/incomplete outcome and May's qualitative recollection.
 - [ ] Harvest and sanitize each call's JSONL slice; paste results into evidence §6/§7.
@@ -348,23 +350,23 @@ Any of the first three classes completes required L2 coverage; Call 2 is still r
 **Interfaces, compatibility, and invariants:** Standing Invariant 5 (R8 split) applies to any before/after table including warm-opener `initToFirstTokenMs`.
 
 **Acceptance criteria:**
-- Confirmatory compare CLI run on I1's call id(s) with the seed echoed; output pasted into evidence §8 alongside the R8-split statement.
+- If any live call ran (Tasks 4–6 reached dialing): confirmatory compare CLI run on I1's call id(s) with the seed echoed; output pasted into evidence §8 alongside the R8-split statement. If no live call ran (the session closed at the preflight-only state before dialing), evidence §8 records that no I1 call id exists and the compare-CLI step is `pending` — never fabricated, never silently skipped without that note.
 - Hypothesis-vs-observation table for the September 7 handset-silence root cause (evidence §9): recorded as still unexplained unless this session's live run actually produced supported new evidence — never declared proved from a SIP-race hypothesis alone (spec §2; 464 spec §6).
 - Final Status line set to exactly one of the four §3.3 terminal states:
   - `live end-to-end acceptance passed` — every required scenario `pass`, voicemail `pass` or `unobserved`, restart/rollback `consumed` or `pass` (I1 pause verdict and any KPR-465-written p50/p95 are **not** gates on this — spec §4.3).
   - `live end-to-end acceptance failed` — a required scenario `fail`; the defect is named and filed, not silently retried inside this ticket.
   - `live end-to-end acceptance incomplete` — the run started and stopped (drift, stop request, lost correlation) leaving required rows `unknown`/`pending`.
-  - `no-call preflight verified; live end-to-end acceptance pending` — if May's go never materialized after Task 2/3, or the session never reached dialing.
+  - `no-call preflight verified; live end-to-end acceptance pending` — **only** when Task 2's preflight actually passed (463 T9 passed and every required P1–P7 row green on the current identity, matching spec §3.3's own condition for this exact state) and May's go never materialized, or the session closed before dialing for any other reason after reaching that point. **This state must never overwrite an earlier honest blocker:** if T9 was not yet passed, or any required P-row failed, Task 2 already recorded that specific blocker on the Status line per its own rule (and Task 1's "name the actual blocker" rule) — Task 7 carries that blocker forward verbatim rather than relabeling it as preflight-verified.
 
 **Verification:**
-- Tests and critical failure cases: setting a terminal state not on this exact list; marking the ticket complete while any required row is `unknown` or `pending`; treating a KPR-465-written latency number as an SLO that can fail the ticket.
+- Tests and critical failure cases: setting a terminal state not on this exact list; marking the ticket complete while any required row is `unknown` or `pending`; treating a KPR-465-written latency number as an SLO that can fail the ticket; running the compare CLI against a fabricated or reused call id when no live call actually ran; relabeling a Task 2 preflight-failure blocker as `no-call preflight verified; live end-to-end acceptance pending`.
 - Harness/environment: none beyond what Tasks 1–6 already used.
-- Run: the compare CLI command from the plan-level Testing Contract, scoped to the I1 call id(s), with the session's actual seed echoed.
-- Expected: the evidence record is internally consistent — every §6.1 row has a result, every result traces to a call/speech/turn id or an explicit reason, and the Status line matches what those rows actually show.
+- Run: the compare CLI command from the plan-level Testing Contract, scoped to the I1 call id(s), with the session's actual seed echoed — only if a live call ran.
+- Expected: the evidence record is internally consistent — every §6.1 row has a result, every result traces to a call/speech/turn id or an explicit reason, and the Status line matches what those rows actually show and does not overwrite an earlier recorded blocker.
 
-- [ ] Run the confirmatory compare CLI on I1's call id(s); paste output with the seed echoed and the R8-split statement into evidence §8.
+- [ ] If any live call ran: run the confirmatory compare CLI on I1's call id(s); paste output with the seed echoed and the R8-split statement into evidence §8. If no live call ran, record evidence §8 as `pending` with the reason (no call id exists).
 - [ ] Fill the hypothesis-vs-observation table in evidence §9 from this session's actual data, not assumption.
-- [ ] Set the final Status line to one of the four §3.3 states based on the recorded rows.
+- [ ] Set the final Status line to one of the four §3.3 states based on the recorded rows, carrying forward any earlier Task 2 blocker verbatim rather than relabeling it as preflight-verified.
 - [ ] Final privacy pass: confirm no transcript text, phone numbers, destination, tokens, tool arguments, ack phrase text, prompt bytes, or audio appears anywhere in the git-committed evidence record (Standing Invariant 2); move any such content to the operator-only record outside git.
 - [ ] Commit the closed (or honestly-still-pending) evidence record.
 
