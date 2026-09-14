@@ -33,6 +33,7 @@ import {
   type LifecycleReconcileDeps,
 } from "./reconcile.js";
 import { MigrationPendingError } from "./pilot-lifecycle.js";
+import { planBetaPluginCompatibility } from "./plugin-compat.js";
 
 export interface DeploymentArguments extends LifecycleCommand {
   dryRun: boolean;
@@ -169,6 +170,16 @@ export async function deploymentDryRun(
     phases: ["preflight", "staged", "quiescent", "stop-worker", "stop-engine", "rotate", "start", "health"],
     recoveryProfile: args.pilotRecovery ? "registered-pilot" : "to-be-validated-under-lock",
     unknownEvidence: ["runtime process identity", "maintenance ledger", "candidate native imports", "paired health"],
+    // Read-only plan; no directory is created, journaled or moved.
+    pluginCompatibility: stagingRequired(args.mode)
+      ? await planBetaPluginCompatibility(selected.home).then(
+          (plan) => ({
+            relocate: plan.relocate.map((item) => item.name),
+            destinationExists: plan.destinationExists,
+          }),
+          (error: unknown) => ({ status: "PLUGIN_COMPATIBILITY_PENDING", reason: String(error) }),
+        )
+      : "not-required",
     // Presence only: dry-run runs no self-test, promotion probe or artifact job.
     stagingPrerequisites: stagingRequired(args.mode)
       ? { sandboxExecPresent: existsSync(SANDBOX_EXEC), selfTest: "unverified", promotionMethod: "unverified" }

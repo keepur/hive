@@ -42,10 +42,16 @@ import {
   operationPhaseAdapter,
   proveBarrierBeforeStop,
   quiesce,
+  UnresolvedMaintenance,
   type IdleEvidence,
   type TransactionIO,
 } from "./transaction.js";
 import { capturePrior, restorePrior } from "./prior.js";
+import {
+  applyBetaPluginCompatibility,
+  PluginCompatibilityPendingError,
+  PluginCompatibilityUnresolvedError,
+} from "./plugin-compat.js";
 import {
   assessLegacyHoldRoute,
   assessPilotRecoveryRoute,
@@ -576,6 +582,19 @@ export async function runNodeLifecycle(
           throw new Error("existing .hive.next is not owned by this operation");
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        // Locked beta-plugin compatibility (Task 9 Step 1b): after lock and
+        // migration eligibility, before any candidate stage.
+        try {
+          await applyBetaPluginCompatibility({ operation });
+        } catch (error) {
+          if (error instanceof PluginCompatibilityUnresolvedError) {
+            throw new UnresolvedMaintenance(error.message, { cause: error });
+          }
+          if (error instanceof PluginCompatibilityPendingError) {
+            throw new DeferredMaintenance(error.message, { cause: error });
+          }
+          throw error;
         }
         // Fail closed before any artifact job: no unconfined fallback exists.
         const selfTest = await runConfinementSelfTest({

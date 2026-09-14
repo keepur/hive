@@ -56,6 +56,7 @@ import {
   type LoadedPrior,
 } from "./prior.js";
 import { ArtifactRotation } from "./transaction.js";
+import { PluginCompatibilityUnresolvedError, reconcileBetaPluginCompatibility } from "./plugin-compat.js";
 import type { ServiceController, ServiceInspection } from "./services.js";
 
 const log = createLogger("deployment-reconcile");
@@ -418,6 +419,18 @@ async function assertLivePairUnchanged(deps: LifecycleReconcileDeps, loaded: Loa
   }
 }
 
+/** Interrupted beta-plugin relocation uses the same list and algorithm (Task 9 Step 1b). */
+async function reconcilePluginCompatibility(acquired: AcquiredOperation): Promise<void> {
+  try {
+    await reconcileBetaPluginCompatibility(acquired);
+  } catch (error) {
+    if (error instanceof PluginCompatibilityUnresolvedError) {
+      throw new OperationUnresolvedError(`PLUGIN_COMPATIBILITY_UNRESOLVED: ${error.message}`, { cause: error });
+    }
+    throw error;
+  }
+}
+
 async function removeOwnedIncompleteNext(acquired: AcquiredOperation): Promise<void> {
   const promoted = acquired.record.staging.promotion;
   if (!promoted?.destinationIdentity || promoted.discarded) return;
@@ -580,12 +593,15 @@ export function lifecycleInterruptedIO(deps: LifecycleReconcileDeps): Interrupte
         await assertLivePairUnchanged(deps, loaded);
         await restoreReservedBroken(acquired, loaded);
       }
+      await reconcilePluginCompatibility(acquired);
       await removeOwnedIncompleteNext(acquired);
     },
 
     async recoverAfterSignals(record) {
       const acquired = acquiredFor(record);
       const loaded = await loadPriorOrUnresolved(record);
+      // A relocation is committed before staging; an uncommitted list here is unresolved.
+      await reconcilePluginCompatibility(acquired);
       // Stop only identified services, worker before engine.
       const ordered = [
         ...loaded.prior.services.filter((item) => item.definition.label.endsWith(".voice-worker")),
@@ -681,6 +697,7 @@ export function lifecycleInterruptedIO(deps: LifecycleReconcileDeps): Interrupte
         await assertLivePairUnchanged(deps, loaded);
         await restoreReservedBroken(acquired, loaded);
       }
+      await reconcilePluginCompatibility(acquired);
       await removeOwnedIncompleteNext(acquired);
     },
   };
