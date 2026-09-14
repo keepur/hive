@@ -85,7 +85,7 @@ A filter change on an already-enabled row is the same commit race with the same 
 
 - **`auditLoadedEnableGate` (`publisher.ts:261-288`).** Runs once at the end of `init()`, over the reasons map, contained, never assigns `this.subscriptions`. Reasons do not reload (restart is the lever). Not in this race.
 - **Match evaluation.** A pure read of the current array. No assignment.
-- **The notifier's reload.** Already ordered (`notifier.ts:294-405`, `reloadsStarted` / `reloadCommitted`). Separate projection: compiled filters above the spawn-capable boundary vs. transport bindings validated against adapters registered below it. Canon keeps them separate.
+- **The notifier's reload.** Already ordered (`notifier.ts:294-405`, `reloadsStarted` / `reloadCommitted`). Separate projection: loaded subscription rows evaluated at accept time above the spawn-capable boundary vs. transport bindings validated against adapters registered below it. Canon keeps them separate.
 - **KPR-455.** Reads stored `ops_events` (and the notifier heartbeat). It never consults the publisher's in-memory array. This fix makes the stamps it already renders as `matchedAtPublish` honest under overlap; it does not change the envelope, the rendering rule, or any KPR-455 file.
 
 ## Goals and non-goals
