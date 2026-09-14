@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   appendFileSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   renameSync,
@@ -53,6 +54,7 @@ import {
 import {
   buildServiceDefinitions,
   buildServiceEnvironment,
+  type ServiceController,
   type ServiceInspection,
   type ServiceSnapshot,
 } from "./services.js";
@@ -631,5 +633,180 @@ describe("lifecycle wiring of the pilot routes", () => {
       signalsBegun: false,
     });
     await finishOperationLock(operation);
+  });
+});
+
+/**
+ * The native (protocol-capable) historical pilot's FIRST migration through
+ * `runNodeLifecycle`, as a transaction. Every boundary is injected: the
+ * evidence provider, the service controller, and the `execFile` mock above.
+ * Nothing here calls launchd, `sandbox-exec`, npm or a vendor endpoint, so
+ * these cases stop at the first real-confinement boundary by construction —
+ * the committing half of the route belongs to the real confinement harness.
+ */
+describe("native first migration through runNodeLifecycle", () => {
+  type Controller = {
+    inspect: ReturnType<typeof vi.fn>;
+    capture: ReturnType<typeof vi.fn>;
+    bootout: ReturnType<typeof vi.fn>;
+  };
+
+  async function bed(options: { generationDrift?: boolean } = {}) {
+    const root = mkdtempSync(join(tmpdir(), "pilot-first-migration-"));
+    roots.push(root);
+    writeFileSync(join(root, "hive.yaml"), "instance:\n  id: kpr463unit\nvoice:\n  livekit:\n    enabled: true\n");
+    const operation = await acquireOperation({
+      instanceHome: root,
+      instanceId: "kpr463unit",
+      mode: "update",
+      toolSha256: "f".repeat(64),
+      ownerStartTime: "start",
+    });
+    const home = operation.record.canonicalHome;
+    const local = {
+      canonicalHome: home,
+      configPath: resolve(home, "hive.yaml"),
+      instanceId: "kpr463unit",
+      uid: process.getuid!(),
+    };
+    const definitions = buildServiceDefinitions({
+      instanceId: "kpr463unit",
+      nodePath: process.execPath,
+      hiveHome: home,
+      configPath: local.configPath,
+      home: root,
+      pathEnv: "/usr/bin:/bin",
+    });
+    // The historical pilot runs from its own checkout, not from `.hive`.
+    const services: ServiceSnapshot = {
+      services: (
+        [
+          [definitions.engine, 100, PILOT_ENGINE],
+          [definitions.worker, 101, PILOT_WORKER],
+        ] as const
+      ).map(([definition, pid, entry]) => ({
+        definition,
+        inspection: inspection(definition, pid, entry, `start-${pid}`),
+        plist: {
+          path: `/Users/example/pilot/${definition.label}.plist`,
+          existed: true,
+          bytes: Buffer.from("p"),
+          mode: 0o644,
+        },
+        instancePlist: { path: `${home}/service/${definition.label}.plist`, existed: false },
+        link: {
+          path: `${root}/Library/LaunchAgents/${definition.label}.plist`,
+          existed: true,
+          target: `/Users/example/pilot/${definition.label}.plist`,
+        },
+        loaded: true,
+        enabled: true,
+      })),
+    };
+    const pilot = registered({
+      instance: local,
+      services,
+      capturedPilotProfile: services.services.map((item) => ({
+        label: item.definition.label,
+        plistPath: item.plist.path,
+      })),
+    });
+    const drift = options.generationDrift === true;
+    const controller: Controller = {
+      inspect: vi.fn(async (label: string) => {
+        const entry = services.services.find((item) => item.definition.label === label)!;
+        const pid = entry.inspection.livePID! + (drift ? 50 : 0);
+        return inspection(entry.definition, pid, entry.inspection.args[1], `start-${entry.inspection.livePID}`);
+      }),
+      capture: vi.fn(async () => services),
+      bootout: vi.fn(async () => {}),
+    };
+    const run = (extra: Partial<PilotEvidenceProvider> = {}) =>
+      runNodeLifecycle(
+        operation,
+        { mode: "update", artifact: "/tmp/candidate.tgz", legacyHold: "/tmp/hold.json" },
+        { HOME: root, PATH: "/usr/bin:/bin", HIVE_CONFIG: "hive.yaml" },
+        {
+          pilotEvidence: provider({ selectHoldSnapshot: vi.fn(async () => pilot), ...extra }),
+          controller: controller as unknown as ServiceController,
+        },
+      );
+    const record = () => JSON.parse(readFileSync(operation.paths.currentRecord, "utf8"));
+    return { root, home, operation, pilot, controller, run, record };
+  }
+
+  it("captures pilot lineage and reaches staging without a packaged .hive", async () => {
+    const b = await bed();
+    // Occupy `.hive.next` so the transaction stops at the first staging step,
+    // proving everything before it ran: route assessment, the live-generation
+    // check, the prior capture, the leftover-job sweep, and the first-migration
+    // carve-out that skips `validatePromotedRelease` when `.hive` is absent.
+    mkdirSync(resolve(b.home, ".hive.next"), { recursive: true });
+    await expect(b.run()).rejects.toThrow(/existing \.hive\.next is not owned by this operation/);
+    expect(existsSync(resolve(b.home, ".hive"))).toBe(false);
+    const record = b.record();
+    expect(record.priorProfile).toBe("pilot");
+    expect(record.signalsBegun).toBe(false);
+    expect(record.resolution).toBe("deferred");
+    // The prior snapshot names the pilot's registered lineage, not a packaged one.
+    const prior = JSON.parse(readFileSync(b.operation.paths.priorSnapshot, "utf8"));
+    expect(prior.pilot).toMatchObject({ snapshotPath: b.pilot.selector, snapshotSha256: b.pilot.sha256 });
+    // Only host `which` ran; no launchd, sandbox-exec, npm or vendor call.
+    expect(commands.map((entry) => entry.command)).toEqual(["which"]);
+    await finishOperationLock(b.operation);
+  });
+
+  it("defers with no capture when the live pilot generation drifted from the snapshot", async () => {
+    const b = await bed({ generationDrift: true });
+    await expect(b.run()).rejects.toBeInstanceOf(DeferredMaintenance);
+    expect(existsSync(b.operation.paths.priorSnapshot)).toBe(false);
+    expect(existsSync(resolve(b.home, ".hive.next"))).toBe(false);
+    expect(existsSync(resolve(b.home, ".hive"))).toBe(false);
+    const record = b.record();
+    expect(record.signalsBegun).toBe(false);
+    expect(record.resolution).toBe("deferred");
+    expect(record.staging.selfTest).toBeNull();
+    await finishOperationLock(b.operation);
+  });
+
+  it("stays MIGRATION_PENDING when the hold is not natively capable, before any capture", async () => {
+    const b = await bed();
+    await expect(
+      b.run({
+        assessHoldCapability: vi.fn(async () => ({ kind: "uninstrumented" as const, gaps: ["no admission protocol"] })),
+      }),
+    ).rejects.toBeInstanceOf(MigrationPendingError);
+    expect(b.controller.inspect).not.toHaveBeenCalled();
+    expect(existsSync(b.operation.paths.priorSnapshot)).toBe(false);
+    expect(existsSync(resolve(b.home, ".hive.next"))).toBe(false);
+    expect(b.record()).toMatchObject({ resolution: "deferred", signalsBegun: false });
+    await finishOperationLock(b.operation);
+  });
+
+  it("refuses a registered snapshot that belongs to another instance, before any capture", async () => {
+    const b = await bed();
+    const foreign = registered({ instance: { ...b.pilot.instance, instanceId: "other" } });
+    await expect(b.run({ selectHoldSnapshot: vi.fn(async () => foreign) })).rejects.toThrow(
+      /belongs to another instance or config/,
+    );
+    expect(b.controller.inspect).not.toHaveBeenCalled();
+    expect(existsSync(b.operation.paths.priorSnapshot)).toBe(false);
+    expect(b.record()).toMatchObject({ signalsBegun: false });
+    await finishOperationLock(b.operation);
+  });
+
+  it("propagates a recovery-prerequisite failure before the live generation is ever inspected", async () => {
+    const b = await bed();
+    await expect(
+      b.run({
+        verifyRecoveryPrerequisites: vi.fn(async () => {
+          throw new Error("candidate in .hive does not match the migration lineage");
+        }),
+      }),
+    ).rejects.toThrow(/does not match the migration lineage/);
+    expect(b.controller.inspect).not.toHaveBeenCalled();
+    expect(existsSync(resolve(b.home, ".hive.next"))).toBe(false);
+    expect(b.record()).toMatchObject({ signalsBegun: false });
+    await finishOperationLock(b.operation);
   });
 });

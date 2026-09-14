@@ -99,6 +99,13 @@ export interface LifecycleOptions {
    */
   pilotEvidence?: PilotEvidenceProvider;
   clock?: StopProofClock;
+  /**
+   * Service-inspection boundary. Production leaves this unset and uses the
+   * controller `resolveLifecycleContext` builds (which shells out to
+   * `launchctl`); unit tests inject one so a route can be driven without any
+   * real launchd call. It survives the mid-flight context re-resolve.
+   */
+  controller?: ServiceController;
 }
 
 interface ConfigSummary {
@@ -423,7 +430,7 @@ export async function runNodeLifecycle(
   let pilotFences: ActivationFences | null = null;
   const activationStartedAt = Date.now();
 
-  const controller = () => context.controller;
+  const controller = () => options.controller ?? context.controller;
   const observeWorker = () => observeWorkerIdentity(context);
   // Private installed-worker `worker-maintenance` observer bound to THIS
   // acquired operation (chunk 5 Step 2b). Baseline until this operation's own
@@ -442,7 +449,7 @@ export async function runNodeLifecycle(
       onHealthPort: (port) => {
         recordedWorkerHealthPort = port;
       },
-      controller: context.controller,
+      controller: controller(),
       clock,
     });
     return workerObserver;
