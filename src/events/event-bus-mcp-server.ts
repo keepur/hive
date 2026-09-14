@@ -5,6 +5,10 @@
  * the shared engine `Db` plus the runner-supplied subscriber map; subscriber
  * and agent configuration are constructor-stable; optional runtime identity
  * arrives through the runner-owned context reference.
+ *
+ * KPR-501: the array also carries `report_block` and `clear_block`, built by
+ * `buildBlockTools` in `src/ops/block-producer.ts` — operational records into
+ * the ops log, not coordination-bus events.
  */
 
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
@@ -12,6 +16,7 @@ import { z } from "zod";
 import type { Db } from "mongodb";
 import type { WorkItemContextRef } from "../agents/agent-runner.js";
 import { EVENT_SCHEMAS, eventDomain } from "./event-types.js";
+import { buildBlockTools } from "../ops/block-producer.js";
 
 export interface EventBusToolDeps {
   /** Optional live runtime context; never copy it into a stored document. */
@@ -128,6 +133,7 @@ export function buildEventBusTools(deps: EventBusToolDeps) {
         }
       },
     ),
+    ...buildBlockTools(deps),
   ];
 }
 

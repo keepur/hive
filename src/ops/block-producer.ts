@@ -1,4 +1,7 @@
+import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import type { EventBusToolDeps } from "../events/event-bus-mcp-server.js";
+import { createLogger } from "../logging/logger.js";
 import { waitingFor } from "../outage/outage-notices.js";
 import {
   BLOCK_EVIDENCE_KIND_RULING,
@@ -10,16 +13,42 @@ import {
   REASON_SEMANTIC_BLOCK,
 } from "./block-reasons.js";
 import { ADMISSIBLE_ID_RE, OPS_ID_MAX_LENGTH, admissibleIdOrUndefined } from "./ids.js";
+import { opsPublisher } from "./publisher-singleton.js";
 import type { OpsDetail, OpsEvidence, OpsPublishInput, OpsSubject } from "./types.js";
+
+const log = createLogger("ops-block-producer");
 
 /**
  * KPR-501 — the agent-facing block producer (`hive-agent`).
  *
- * This half is PURE: declared parameter shapes, handler-side value rules,
- * subject / detail / evidence composition and the module-global counters. It
- * performs no I/O, holds no store handle, loads no subscription set and arms
- * no timer. The tool handlers that consume it are built separately and publish
- * only through the publisher's serial queue (D8).
+ * Two halves. The PURE half: declared parameter shapes, handler-side value
+ * rules, subject / detail / evidence composition and the module-global
+ * counters — no I/O, no store handle, no subscription set, no timer. The
+ * HANDLER half, `buildBlockTools(deps)`: the `report_block` and `clear_block`
+ * descriptors the event-bus server appends to its tool array. They publish
+ * only through the publisher's serial queue (`enqueuePublish`, D8) and read
+ * the log only through `findOpenCondition`; nothing here touches an ops log
+ * collection handle, loads subscriptions or arms a timer. No turn is spawned.
+ *
+ * ⚠ EVERY HANDLER ANSWER IS NON-`isError` — `queued`, `no-open-block`,
+ * `refused`, `disabled`, `unavailable` (publisher unset) AND the caught fault
+ * (`unavailable` with `cause: "fault"`). This deliberately departs from the
+ * `emit_event` catch in `src/events/event-bus-mcp-server.ts`, which returns
+ * `isError: true` (the KPR-122 convention), and from the `schedule` server's
+ * KPR-456 tools, which answer `unavailable` with `isError: true`. The reason is
+ * KPR-458 D10(a) / canon C14: a fault of the ops path is logged and counted,
+ * never published — and KPR-454's Claude-lane hooks and Lane B bridge publish
+ * any `isError` result as `hive-runtime:tool-failed`, so an `isError` here
+ * would be the ops path publishing about itself through another producer's
+ * rows. D13 adds the second reason: the operator's kill switch (`disabled`)
+ * must not mint tool-health facts. NV8 exists to catch a "normalize the
+ * catches" edit. The only `isError` either tool can produce is the MCP layer's
+ * own input-validation error on a call the handler never ran.
+ *
+ * A non-`isError` answer on a tool whose runtime family already holds an open
+ * fault entry makes KPR-454's success capture point publish a true
+ * `tool-recovered`. That is minted by the same control flow as any successful
+ * answer, and must not be suppressed here or anywhere else.
  *
  * ⚠ This file is read AS TEXT by repository scans, comments included. Name the
  * turn path, the event bus's event collection, the event schema registry and
@@ -461,4 +490,139 @@ export function getBlockProducerSnapshot(): BlockProducerCounters {
 /** Test seam only. */
 export function __resetBlockProducerCountersForTests(): void {
   counters = zeroCounters();
+}
+
+// ---------------------------------------------------------------------------
+// D2/D7/D9: the tool handlers
+// ---------------------------------------------------------------------------
+
+export const REPORT_BLOCK_TOOL = "report_block";
+export const CLEAR_BLOCK_TOOL = "clear_block";
+
+/**
+ * JSON text in the `schedule` server's `response(value)` shape — WITHOUT its
+ * `isError` flag (module header). No answer built here ever carries one.
+ */
+function answer(value: Record<string, unknown>) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
+}
+
+function refusedAnswer(refusal: BlockRefusal) {
+  countBlockProducer("refused");
+  return answer({ state: "refused", reason: refusal.reason, admitted: refusal.admitted });
+}
+
+function unsetAnswer() {
+  countBlockProducer("unavailable");
+  return answer({ state: "unavailable", cause: "publisher-unset" });
+}
+
+function disabledAnswer() {
+  countBlockProducer("disabled");
+  return answer({ state: "disabled" });
+}
+
+/**
+ * D9/C15: the one catch. Counts `faults` (not `unavailable`) and warns once
+ * with the tool name and `String(err)` — the error object never reaches a
+ * stored field. Logged and counted, never published.
+ */
+function faultAnswer(toolName: string, err: unknown) {
+  countBlockProducer("faults");
+  log.warn("Ops block tool faulted", { tool: toolName, error: String(err) });
+  return answer({ state: "unavailable", cause: "fault" });
+}
+
+const REPORT_BLOCK_DESCRIPTION =
+  'Record that your work on this thread is blocked. kind "coordination": you are waiting on another party\'s act (blockedOn "agent", "human" or "external"; add blockedOnAgentId when it is an agent). kind "semantic": you cannot proceed without a decision above your authority. This only RECORDS an operational fact — it notifies nobody. To alert whoever you are waiting on, use send_message (team) as usual. When you resume or give up, clear the block yourself with clear_block. Reporting again while still blocked is harmless.';
+
+const CLEAR_BLOCK_DESCRIPTION =
+  'Clear a block you recorded with report_block, when you resume ("resumed") or give up ("cancelled"). A semantic block is cleared only by citing the ruling that resolved it: rulingRef is required, and must be a Slack message ts (1757900000.123456), a conversation-qualified ts (C0AB12CD3EF:1757900000.123456), or an issue key optionally anchored to a comment (KPR-451 or KPR-451#comment-60079ae4). Pass threadId only when the block was raised in another thread of yours. Answers "no-open-block" when there is nothing to clear.';
+
+/**
+ * The two block tools, appended by the event-bus server to its tool array.
+ * `deps.agentId` is read at construction (constructor-stable); the publisher
+ * singleton and `deps.workItemContext?.current` are read AT EXECUTION — the
+ * server is cached across turns, so capturing either at build time would pin
+ * the first turn's identity (D11, KPR-453).
+ */
+export function buildBlockTools(deps: EventBusToolDeps) {
+  const { agentId } = deps;
+
+  return [
+    tool(REPORT_BLOCK_TOOL, REPORT_BLOCK_DESCRIPTION, REPORT_BLOCK_SHAPE, async (raw) => {
+      try {
+        const publisher = opsPublisher();
+        if (!publisher) return unsetAnswer();
+
+        // The enabled check needs a valid kind to pick its row.
+        const kind = validateBlockKind(raw.kind);
+        if (!kind.ok) return refusedAnswer(kind);
+        if (!publisher.isReasonEnabled(HIVE_AGENT_PRODUCER, conditionReasonIdFor(kind.params))) {
+          return disabledAnswer();
+        }
+
+        const validated = validateReportParams(raw);
+        if (!validated.ok) return refusedAnswer(validated);
+
+        const current = deps.workItemContext?.current;
+        const composed = composeReportInput({ agentId, current, params: validated.params });
+        if (composed.subjectFallback) countBlockProducer("subjectFallback");
+        for (let i = 0; i < composed.idsOmitted; i++) publisher.countIdOmitted();
+
+        // D8: enqueue and return; acceptance is the drainer's.
+        publisher.enqueuePublish(composed.input);
+        countBlockProducer("reported");
+        return answer({ state: "queued", kind: validated.params.kind });
+      } catch (err) {
+        return faultAnswer(REPORT_BLOCK_TOOL, err);
+      }
+    }),
+
+    tool(CLEAR_BLOCK_TOOL, CLEAR_BLOCK_DESCRIPTION, CLEAR_BLOCK_SHAPE, async (raw) => {
+      try {
+        // D7 step 1: availability, gated on the row THIS tool publishes.
+        const publisher = opsPublisher();
+        if (!publisher) return unsetAnswer();
+        if (!publisher.isReasonEnabled(HIVE_AGENT_PRODUCER, REASON_BLOCK_CLEARED)) return disabledAnswer();
+
+        // Step 2: value and class rules — no I/O, so a refusal wins over no-open-block.
+        const validated = validateClearParams(raw);
+        if (!validated.ok) return refusedAnswer(validated);
+        const params = validated.params;
+
+        // Step 3: the family, from the live (or overridden) thread.
+        const current = deps.workItemContext?.current;
+        const { subject, fallback } = composeClearSubject(agentId, current, params);
+        if (fallback) countBlockProducer("subjectFallback");
+
+        // Step 4: bounded flush so a report queued earlier in this turn is visible.
+        const queueIdle = await publisher.flush(FLUSH_DEADLINE_MS);
+
+        // Step 5: openness from the log. A rejection lands in the catch.
+        const clears = await publisher.findOpenCondition({
+          producer: HIVE_AGENT_PRODUCER,
+          subject,
+          reasonId: conditionReasonIdFor(params.kind),
+        });
+
+        // Step 6.
+        if (clears === undefined) {
+          countBlockProducer("clearNoOpen");
+          return answer({ state: "no-open-block", queueIdle });
+        }
+
+        // Step 7.
+        const composed = composeClearInput({ agentId, current, params, subject, clears });
+        for (let i = 0; i < composed.idsOmitted; i++) publisher.countIdOmitted();
+        publisher.enqueuePublish(composed.input);
+        countBlockProducer("cleared");
+
+        // Step 8.
+        return answer({ state: "queued", clears, outcome: params.outcome, queueIdle });
+      } catch (err) {
+        return faultAnswer(CLEAR_BLOCK_TOOL, err);
+      }
+    }),
+  ];
 }
