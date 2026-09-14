@@ -13,7 +13,7 @@
 - **`init()` / the enable-gate / match evaluation do not have a second unordered-commit site.** The only assignment to `this.subscriptions` is inside `reloadSubscriptions`. `init()` awaits that method and arms the timer *after* the await. `auditLoadedEnableGate` reads the reasons map, once, and never the subscription array. SIGUSR1 is registered after `init()` at boot (`index.ts:566` then `:719`), so production first-load cannot overlap the signal; tests still pin the first-load interleaving.
 - **Do not share or merge the two caches.** KPR-468 canon: this ordering is local to the publisher the same way the notifier's is local to the notifier. KPR-501 consumes the fix by publishing through the existing `OpsPublisher` accept path; it must not fork a second unordered loader.
 - **In scope:** ordered commit in `reloadSubscriptions`, preservation of every counter and latch that path already touches, barrier-driven regressions through the real publisher + matcher + insert, a one-line `CLAUDE.md` note. **Out of scope:** downstream re-matching, cache consolidation, KPR-501's producer, KPR-455's reader, any `ops_events` / subscription schema change, any new `hive.yaml` key.
-- **⚠ Residual, inherited from KPR-468, not enlarged:** two overlapping reads that both *started* before a mutation can both snapshot the pre-mutation set; the next timer or SIGUSR1 heals. Start-order is the operator-intent case (SIGUSR1 after a disable, overlapping a timer that started before it). Named, not solved.
+- **⚠ Residual, inherited from KPR-468, not enlarged:** two overlapping reads that both *started* before a mutation can both snapshot the pre-mutation set; a subsequent successful reload that observes the updated collection heals the cache (60 s is the nominal polling interval, not a recovery deadline). Start-order is the operator-intent guarantee (SIGUSR1 after a disable, overlapping a timer that started before it), not a strictly-smaller residual than last-finisher-wins. Named, not solved.
 
 ## Scope and authority
 
@@ -139,7 +139,7 @@ The reload path already touches four observables. After D1 they mean:
 | `subscriptionAnomalySignature` | change-latch for the warn | updated inside the audit | **must not run the audit** | unchanged | unchanged |
 | `subscriptionReloadFaults` | monotonic | unchanged | **unchanged** (not a fault) | `+= 1` | unchanged |
 | `reloadCommitted` | mechanism | set to `seq` | unchanged | unchanged | unchanged |
-| anomaly warn | change-latched | fires iff the signature of `next` differs | must not fire | must not fire | must not fire |
+| anomaly warn | change-latched | fires iff the signature of `next` differs AND the anomaly count is nonzero | must not fire | must not fire | must not fire |
 | "reload failed" warn | per fault | no | no | yes, existing text | no |
 | debug "superseded by a later reload" | per discard | no | yes, once | no | no |
 
@@ -176,9 +176,9 @@ No new counter. No new `getSnapshot()` field. The existing `subscriptionReloadFa
 
 ### D5. Named residual
 
-Start-order commits the later-*started* snapshot, not the later-*observed* one. If reload B starts after A, B's find runs, then a mutation happens, then A's find runs, B can commit the pre-mutation set and A's post-mutation set is discarded. The window is one overlap; the next timer (≤ 60 s) or SIGUSR1 heals. This is the same residual KPR-468 accepted. It is strictly smaller than today's last-finisher-wins, which loses the operator-intent case (A started before the disable, B started after it, A finishes last and restores the subscriber).
+Start-order commits the later-*started* snapshot, not the later-*observed* one. If reload B starts after A, B's find runs, then a mutation happens, then A's find runs, B can commit the pre-mutation set and A's post-mutation set is discarded. The window is one overlap; a subsequent successful reload that observes the updated collection heals the cache. The 60 s timer is the nominal polling interval that schedules a reload, not a recovery deadline: `loadSubscriptions()` (`src/ops/store.ts:266`) has no completion deadline, and a failed load retains the stale set. SIGUSR1 likewise only schedules a reload. This is the same residual KPR-468 accepted. The chosen rule is the operator-intent guarantee: a later-started successful reload cannot be undone by an earlier-started one finishing after it (SIGUSR1 after a disable, overlapping a timer that started before it). Last-finisher-wins loses that case (A started before the disable, B started after it, A finishes last and restores the subscriber). The reverse-observation example above is an ordering where last-finisher-wins retains the fresher post-mutation set and start-order discards it, so the residual is not strictly smaller than last-finisher-wins. The rule remains consistent with canon.
 
-Two overlapping reads that both started before the mutation can both snapshot the pre-mutation set. Same healing path. KPR-458 D12 (via KPR-454 D9's loaded-set paragraph) already rules that a reload lag may miss an event by seconds and that this is not a new failure mode, because KPR-458 D5 forbids retrospective enrolment.
+Two overlapping reads that both started before the mutation can both snapshot the pre-mutation set. Same healing condition: a subsequent successful reload that observes the updated collection. KPR-458 D12 (via KPR-454 D9's loaded-set paragraph) already rules that a reload lag may miss an event by seconds and that this is not a new failure mode, because KPR-458 D5 forbids retrospective enrolment.
 
 ## Acceptance criteria
 
