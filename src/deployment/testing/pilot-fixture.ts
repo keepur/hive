@@ -143,6 +143,7 @@ export async function createPilotFixture(
     resolve(runtimeRoot, layout === "legacy" ? "dist/voice-worker/worker-config.js" : "pkg/runtime-probe.min.js"),
     layout === "legacy" ? "export function loadWorkerConfig(){}\n" : "// historical probe\n",
   );
+  writeFixtureFile(resolve(runtimeRoot, "package.json"), JSON.stringify({ name: "@keepur/hive", version: "1.2.3" }));
   for (const name of ["livekit-server-sdk", "@livekit/agents", "@livekit/rtc-node"]) {
     writeFixtureFile(
       resolve(runtimeRoot, "node_modules", name, "package.json"),

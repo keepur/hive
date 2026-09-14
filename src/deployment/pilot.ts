@@ -9,8 +9,11 @@
  * is `unavailable` — the described uninstrumented pilot — every hold route
  * returns the executed `MIGRATION_PENDING` result with fixed gap codes before
  * any stage, close or signal. A native hold is accepted only through an
- * independently corroborated historical runtime; until that adapter is wired
- * the capable branch also defers with an explicit code.
+ * independently corroborated historical runtime (`pilot-observer.ts`): the
+ * capable branch closes under the owning operation through the shared
+ * maintenance client and proves idle from owner-correlated historical reads;
+ * without wired probe boundaries or current corroboration it defers with a
+ * fixed code.
  */
 import { randomUUID } from "node:crypto";
 import { lstat, readdir, readFile } from "node:fs/promises";
@@ -71,7 +74,23 @@ import {
 } from "./pilot-records.js";
 import { decodePriorSnapshot, type LoadedPrior } from "./prior.js";
 import type { RecordedBarrier } from "./reconcile.js";
-import { DeferredMaintenance } from "./transaction.js";
+import { DeferredMaintenance, UnresolvedMaintenance } from "./transaction.js";
+import {
+  corroborateNativeCapability,
+  establishNativeHold,
+  invokePilotInventory,
+  invokePilotProbe,
+  PilotProbeFault,
+  preparePilotProbe,
+  processSealOf,
+  registeredProbeSubject,
+  type EstablishedNativeHold,
+  type NativeHoldDeps,
+  type PilotProbeLaunchIO,
+  type PilotProbeSubject,
+} from "./pilot-observer.js";
+import type { StopProofClock } from "./stop-proof.js";
+import type { PilotInventoryResult } from "./pilot-probe.js";
 import type {
   CaptureTicketLease,
   CapturedServiceDefinition,
@@ -222,9 +241,11 @@ export interface LoadedRegisteredPilot {
   pilot: RegisteredPilot;
   snapshot: PilotSnapshot;
   bootstrap: RegisteredRecord<BootstrapRecord>;
+  /** The registration's exact payload seal (the probe subject seal). */
+  payloadSeal: FileSeal;
 }
 
-function toRecordInstance(instance: PilotInstanceKey): InstanceKey {
+export function toRecordInstance(instance: PilotInstanceKey): InstanceKey {
   return { ...instance };
 }
 
@@ -319,7 +340,7 @@ export async function loadRegisteredPilot(
       worker: { pid: snapshot.runtime.worker.pid, startTime: snapshot.runtime.worker.startTime },
     },
   };
-  return { pilot, snapshot, bootstrap };
+  return { pilot, snapshot, bootstrap, payloadSeal: read.registration.payload };
 }
 
 /**
@@ -542,6 +563,72 @@ export interface PilotEvidenceDeps {
   bridgeProbe?: (loaded: LoadedRegisteredPilot) => Promise<PilotRecoveryObservations["bridge"]>;
   /** OS open-file corroboration of an exclusive legacy log writer; absent means not corroborated. */
   exclusiveWriter?: (path: string, pid: number) => Promise<boolean>;
+  /**
+   * Registered bootstrap probe and native hold boundaries for the acquired
+   * operation. Absent means no probe runs: the bridge profile stays
+   * unavailable and no native capability can be corroborated.
+   */
+  probes?: PilotProbeDeps;
+}
+
+export interface PilotProbeDeps {
+  /** The acquired operation that owns every probe request. */
+  operationId: string;
+  clock: StopProofClock;
+  randomId?: () => string;
+  io?: PilotProbeLaunchIO;
+  readDescriptor?: NativeHoldDeps["readDescriptor"];
+  readRelease?: NativeHoldDeps["readRelease"];
+  request?: NativeHoldDeps["request"];
+  wait?: NativeHoldDeps["wait"];
+}
+
+function probeSubjectOf(loaded: LoadedRegisteredPilot): PilotProbeSubject {
+  return registeredProbeSubject(loaded.snapshot, loaded.payloadSeal, loaded.bootstrap.payload);
+}
+
+function nativeDepsOf(loaded: LoadedRegisteredPilot, deps: PilotEvidenceDeps, probes: PilotProbeDeps): NativeHoldDeps {
+  return {
+    instance: toRecordInstance(deps.instance),
+    controller: deps.controllerFor(loaded.pilot.capturedPilotProfile),
+    clock: probes.clock,
+    randomId: probes.randomId ?? randomUUID,
+    probeIO: probes.io,
+    readDescriptor: probes.readDescriptor,
+    readRelease: probes.readRelease,
+    request: probes.request,
+    wait: probes.wait,
+  };
+}
+
+/**
+ * Captured-loader bridge profile through the registered bootstrap probe, with
+ * the live generation as the expected processes. Any probe fault is an
+ * unauthenticated profile, never a partial pass.
+ */
+export async function registeredBridgeProfile(
+  loaded: LoadedRegisteredPilot,
+  live: { engine: ServiceInspection; worker: ServiceInspection },
+  probes: PilotProbeDeps,
+): Promise<PilotRecoveryObservations["bridge"]> {
+  try {
+    const prepared = await preparePilotProbe(probeSubjectOf(loaded), probes.io);
+    await invokePilotProbe(prepared, {
+      operationId: probes.operationId,
+      expectedEngine: processSealOf(live.engine),
+      expectedWorker: processSealOf(live.worker),
+      idle: null,
+      clock: probes.clock,
+      randomId: probes.randomId ?? randomUUID,
+      io: probes.io,
+    });
+    return { authenticated: true, missingDenied: true, wrongDenied: true };
+  } catch (error) {
+    log.warn("Captured-loader pilot profile probe failed", {
+      classification: error instanceof PilotProbeFault ? error.classification : "PILOT_PROFILE_PROBE_FAILED",
+    });
+    return { authenticated: false, missingDenied: false, wrongDenied: false };
+  }
 }
 
 export interface SdkReadback {
@@ -607,7 +694,9 @@ export async function observeRegisteredPilotRecovery(
   const owners = await controller.listenerOwners(port);
   const bridge = deps.bridgeProbe
     ? await deps.bridgeProbe(loaded)
-    : { authenticated: false, missingDenied: false, wrongDenied: false };
+    : deps.probes
+      ? await registeredBridgeProfile(loaded, { engine, worker }, deps.probes)
+      : { authenticated: false, missingDenied: false, wrongDenied: false };
   const engineLog = readFencedMarkers(fences.engineLog);
   const workerLog = readFencedMarkers(fences.workerLog);
   const exclusive = async (path: string, inspection: ServiceInspection) =>
@@ -641,6 +730,7 @@ export async function observeRegisteredPilotRecovery(
 export interface HoldAssessment {
   capability: HoldCapability;
   pilotWorker: ProcessSeal;
+  pilotEngine: ProcessSeal;
   sources: SourceObservation[];
   checks: CheckSpec[];
   gaps: { category: InventoryClass; reason: string }[];
@@ -648,27 +738,83 @@ export interface HoldAssessment {
   readback: Record<string, unknown>;
 }
 
-function processSealOf(inspection: ServiceInspection): ProcessSeal {
-  if (!inspection.process || inspection.livePID === null) {
-    throw new PilotEvidenceUnavailableError("PILOT_NOT_RUNNING");
-  }
-  const { pid, startTime, executable, command, cwd } = inspection.process;
-  return { pid, startTime, executable, command, cwd };
-}
-
 function sameGeneration(seal: ProcessSeal, owner: ProcessOwner): boolean {
   return seal.pid === owner.pid && seal.startTime === owner.startTime;
 }
 
-/** Gap codes a hold route reports; never derived from a record field or operator input. */
+/**
+ * Record-only capability view: never native-capable. A record claiming native
+ * admission still needs fresh runtime corroboration (`currentHoldCapability`).
+ */
 export function holdCapabilityFor(snapshot: PilotSnapshot): HoldCapability {
-  // The historical own-loader idle/telemetry probe that a native hold proof
-  // consumes is not wired, so even a snapshot whose capture corroborated the
-  // admission protocol cannot yet produce a proof. Neither branch can be made
-  // positive by JSON; both defer before any stage, close or signal.
   return snapshot.admission.kind === "unavailable"
     ? { kind: "unavailable", gaps: [...LEGACY_HOLD_GAP_CODES], holdRecordPath: null }
     : { kind: "unavailable", gaps: [NATIVE_HOLD_ADAPTER_UNAVAILABLE, ...LEGACY_HOLD_GAP_CODES], holdRecordPath: null };
+}
+
+/**
+ * Current hold capability (chunk 4 Step 4b.1): the uninstrumented layout keeps
+ * its fixed gaps; a snapshot recording native admission is native-capable only
+ * when the probe boundaries are wired AND the historical runtime corroborates
+ * right now. Gap codes are fixed, never operator text.
+ */
+export async function currentHoldCapability(
+  loaded: LoadedRegisteredPilot,
+  deps: PilotEvidenceDeps,
+): Promise<HoldCapability> {
+  const recorded = holdCapabilityFor(loaded.snapshot);
+  if (loaded.snapshot.admission.kind === "unavailable" || !deps.probes) return recorded;
+  try {
+    await corroborateNativeCapability(
+      { snapshot: loaded.snapshot, generation: loaded.pilot.generation },
+      nativeDepsOf(loaded, deps, deps.probes),
+    );
+    return { kind: "native-capable" };
+  } catch (error) {
+    if (error instanceof PilotEvidenceUnavailableError) {
+      return { kind: "unavailable", gaps: [error.code, ...LEGACY_HOLD_GAP_CODES], holdRecordPath: null };
+    }
+    throw error;
+  }
+}
+
+/**
+ * Establish a native hold for a capable registered pilot under THIS operation.
+ * Failures before close are verified deferrals (no close was sent); faults
+ * after close are released by the same owner inside the shared quiescence
+ * contract; an unacknowledged release stays unresolved.
+ */
+export async function establishRegisteredHold(
+  loaded: LoadedRegisteredPilot,
+  operation: AcquiredOperation,
+  recordIntent: (supervisor: { seal: ProcessSeal; bootId: string }) => Promise<void>,
+  deps: PilotEvidenceDeps,
+): Promise<EstablishedNativeHold> {
+  if (loaded.snapshot.admission.kind === "unavailable") {
+    throw new PilotEvidenceUnavailableError("LEGACY_ADMISSION_UNOBSERVABLE");
+  }
+  if (!deps.probes) throw new PilotEvidenceUnavailableError(NATIVE_HOLD_ADAPTER_UNAVAILABLE);
+  if (deps.probes.operationId !== operation.record.id) {
+    throw new PilotEvidenceUnavailableError("NATIVE_HOLD_OPERATION_MISMATCH");
+  }
+  try {
+    return await establishNativeHold({
+      subject: { snapshot: loaded.snapshot, generation: loaded.pilot.generation },
+      probe: probeSubjectOf(loaded),
+      operation,
+      recordIntent,
+      deps: nativeDepsOf(loaded, deps, deps.probes),
+    });
+  } catch (error) {
+    if (error instanceof DeferredMaintenance || error instanceof UnresolvedMaintenance) throw error;
+    const code =
+      error instanceof PilotEvidenceUnavailableError
+        ? error.code
+        : error instanceof PilotProbeFault
+          ? error.classification
+          : "NATIVE_HOLD_NOT_ESTABLISHED";
+    throw new DeferredMaintenance(`NATIVE_HOLD_DEFERRED: ${code}`, { cause: error });
+  }
 }
 
 /**
@@ -678,10 +824,51 @@ export function holdCapabilityFor(snapshot: PilotSnapshot): HoldCapability {
  * jobs or an owned listener are observations, not negative proof. No reader
  * stops, kills, disables or mutates anything.
  */
+function probeClassification(error: unknown): string {
+  return error instanceof PilotProbeFault ? error.classification : "PILOT_INVENTORY_INCOMPLETE";
+}
+
+/**
+ * Map sanitized LiveKit inventory to observations-only sources (chunk 5 Step
+ * 3): room/participant/dispatch items to room-and-token dispatch, SIP rules and
+ * trunks to SIP dispatch rules, scope unknown, one fresh source UUID per item;
+ * empty results still yield an observations-only category row.
+ */
+export function livekitSources(
+  result: PilotInventoryResult,
+  checkId: string,
+  randomId: () => string,
+): SourceObservation[] {
+  const categoryOf = (kind: PilotInventoryResult["items"][number]["kind"]): InventoryClass =>
+    kind === "sip-rule" || kind === "inbound-trunk" ? "sip-dispatch-rules" : "room-and-token-dispatch";
+  const out: SourceObservation[] = result.items.map((item) => ({
+    id: randomId(),
+    category: categoryOf(item.kind),
+    locator: `${item.kind}:${item.id}${item.agentName === null ? "" : `:${item.agentName}`}`,
+    checks: [checkId],
+    scope: "unknown",
+    accounting: "observations-only",
+  }));
+  for (const category of ["room-and-token-dispatch", "sip-dispatch-rules"] as const) {
+    if (!out.some((source) => source.category === category)) {
+      out.push({
+        id: randomId(),
+        category,
+        locator: `livekit:${category}:observed-empty`,
+        checks: [checkId],
+        scope: "unknown",
+        accounting: "observations-only",
+      });
+    }
+  }
+  return out;
+}
+
 export async function assessHold(
   loaded: LoadedRegisteredPilot,
   deps: PilotEvidenceDeps,
   randomId: () => string = randomUUID,
+  options: { livekit?: boolean } = {},
 ): Promise<HoldAssessment> {
   const { snapshot, pilot } = loaded;
   const now = deps.now ?? Date.now;
@@ -744,13 +931,44 @@ export async function assessHold(
   ];
   // Zero rooms/jobs never completes assignment accounting; every class keeps a gap.
   const gaps = inventoryClasses.map((category) => ({ category, reason: INVENTORY_GAP_REASONS[category] }));
+  const checks: CheckSpec[] = [engineCheck, workerCheck, censusCheck, sdkCheck];
+  let livekit: Record<string, unknown> = { status: "not-requested" };
+  if (options.livekit && deps.probes) {
+    const livekitCheck: CheckSpec = { id: randomId(), kind: "livekit-inventory" };
+    checks.push(livekitCheck);
+    try {
+      const prepared = await preparePilotProbe(probeSubjectOf(loaded), deps.probes.io);
+      const inventory = await invokePilotInventory(prepared, {
+        operationId: deps.probes.operationId,
+        expectedEngine: engineSeal,
+        expectedWorker: workerSeal,
+        idle: null,
+        clock: deps.probes.clock,
+        randomId,
+        io: deps.probes.io,
+      });
+      sources.push(...livekitSources(inventory.result, livekitCheck.id, randomId));
+      livekit = {
+        status: "observed",
+        evidenceDigest: inventory.result.evidenceDigest,
+        counts: inventory.result.counts,
+        items: inventory.result.items,
+        limitations: inventory.result.limitations,
+      };
+    } catch (error) {
+      // Denied/partial/failed inventory is never a completeness claim; the gaps stay.
+      livekit = { status: "PILOT_INVENTORY_INCOMPLETE", classification: probeClassification(error) };
+    }
+  }
   return {
-    capability: holdCapabilityFor(snapshot),
+    capability: await currentHoldCapability(loaded, deps),
     pilotWorker: workerSeal,
+    pilotEngine: engineSeal,
     sources,
-    checks: [engineCheck, workerCheck, censusCheck, sdkCheck],
+    checks,
     gaps,
     readback: {
+      livekit,
       observedAt,
       completedAt: now(),
       engine: { pid: engineSeal.pid, startTime: engineSeal.startTime },
@@ -767,10 +985,11 @@ export async function assessHold(
 
 /**
  * The registry-backed provider plugged into `LifecycleOptions.pilotEvidence`.
- * Hold capability never comes from a record field: every snapshot (the
- * uninstrumented `unavailable` pilot, and any capable snapshot without the
- * wired native adapter) returns the executed MIGRATION_PENDING gaps before any
- * stage/close/signal.
+ * Hold capability never comes from a record field: the uninstrumented
+ * `unavailable` pilot, and any recorded-capable snapshot that fails fresh
+ * corroboration or lacks wired probes, returns the executed MIGRATION_PENDING
+ * gaps before any stage/close/signal. Only a corroborated historical runtime
+ * reaches `establishHold`, which closes under the calling operation.
  */
 export function registryPilotEvidence(deps: PilotEvidenceDeps): PilotEvidenceProvider {
   const cache = new Map<string, LoadedRegisteredPilot>();
@@ -811,9 +1030,8 @@ export function registryPilotEvidence(deps: PilotEvidenceDeps): PilotEvidencePro
         throw error;
       }
     },
-    async establishHold() {
-      // No native hold adapter is wired; capability assessment never reports native-capable.
-      throw new PilotEvidenceUnavailableError(NATIVE_HOLD_ADAPTER_UNAVAILABLE);
+    async establishHold(pilot, operation, recordIntent) {
+      return (await establishRegisteredHold(loadedFor(pilot), operation, recordIntent, deps)).session;
     },
     resolveMigrationLineage: (pilot, canonicalHome) => resolvePilotMigrationLineage(pilot, canonicalHome),
     assertArtifactLineage: (pilot, archiveSha256) => assertPilotArtifactLineage(pilot, archiveSha256),
@@ -926,7 +1144,7 @@ export interface RegistryCommandResult {
   result: Record<string, unknown>;
 }
 
-function registry(operation: AcquiredOperation): RegistryWork {
+export function registry(operation: AcquiredOperation): RegistryWork {
   const state = operation.record.registry;
   if (operation.record.workKind !== "registry" || !state) throw new Error("registry command requires registry work");
   return state;
@@ -949,7 +1167,7 @@ function uidOf(operation: AcquiredOperation): number {
   return uid;
 }
 
-async function complete(
+export async function complete(
   operation: AcquiredOperation,
   outcome: NonNullable<RegistryWork["outcome"]>,
   result: Record<string, unknown>,
@@ -1008,7 +1226,7 @@ export async function runInventoryPilot(
   await verifyPilotRecoveryPrerequisites(loaded);
   registry(operation).phase = "probing";
   await persistOperation(operation);
-  const assessment = await assessHold(loaded, deps, deps.randomId);
+  const assessment = await assessHold(loaded, deps, deps.randomId, { livekit: true });
   await writeOperationJson(resolve(operation.paths.operationDirectory, "inventory-readback.json"), assessment.readback);
   return complete(
     operation,
@@ -1039,11 +1257,9 @@ export async function runPrepareLegacyHold(
   const state = registry(operation);
   state.phase = "probing";
   await persistOperation(operation);
-  const assessment = await assessHold(loaded, deps, deps.randomId);
+  const assessment = await assessHold(loaded, deps, deps.randomId, { livekit: true });
   const capability = assessment.capability;
-  if (capability.kind !== "unavailable") {
-    throw new OperationUnresolvedError("native hold capability without a wired adapter");
-  }
+  if (capability.kind === "native-capable") return exerciseNativeHold(operation, loaded, assessment, deps);
   const gapCodes = [...capability.gaps];
   const reason = gapCodes[0] ?? "LEGACY_ADMISSION_UNOBSERVABLE";
   state.phase = "registering";
@@ -1078,6 +1294,150 @@ export async function runPrepareLegacyHold(
   return complete(operation, "migration-pending", pending(loaded.pilot.selector, registered.selector, gapCodes), 1);
 }
 
+/** Every inventory class fenced through the one verified worker acceptance ingress. */
+function admissionLedgerSources(checkId: string, randomId: () => string): SourceObservation[] {
+  return inventoryClasses.map((category) => ({
+    id: randomId(),
+    category,
+    locator: "admission-ledger:worker-acceptance-ingress",
+    checks: [checkId],
+    scope: "unknown",
+    accounting: "admission-ledger",
+  }));
+}
+
+/**
+ * `--prepare-legacy-hold` for a freshly corroborated capable historical runtime
+ * (chunk 4 Step 4c.2): a diagnostic prepare/verify/release exercise under THIS
+ * operation. The close intent is durable before close; the closed readback is
+ * registered; the same owner then terminal-releases (durable intent first) and
+ * the command exits. The registered record is a selector only — never an
+ * already-held claim; a lifecycle update acquires its own new close.
+ */
+async function exerciseNativeHold(
+  operation: AcquiredOperation,
+  loaded: LoadedRegisteredPilot,
+  assessment: HoldAssessment,
+  deps: RegistryCommandDeps,
+): Promise<RegistryCommandResult> {
+  const state = registry(operation);
+  const randomId = deps.randomId ?? randomUUID;
+  const port = loaded.snapshot.runtime.sdkListener.port;
+  state.phase = "closing";
+  await persistOperation(operation);
+  const hold = await establishRegisteredHold(
+    loaded,
+    operation,
+    async ({ seal, bootId }) => {
+      state.barrier = {
+        operationId: operation.record.id,
+        supervisor: seal,
+        bootId,
+        descriptor: null,
+        healthListenerPort: port,
+        state: "close-intended",
+        terminalEvidence: null,
+      };
+      await persistOperation(operation);
+    },
+    deps,
+  );
+  state.barrier!.state = "closed";
+  await persistOperation(operation);
+  let registered: Awaited<ReturnType<typeof registerRecord>>;
+  try {
+    const clock = deps.probes!.clock;
+    const readback = await hold.session.collect({
+      operationId: operation.record.id,
+      requestId: randomId(),
+      requestedAt: clock.now(),
+    });
+    if (
+      readback.admission !== "closed" ||
+      readback.closedOperationId !== operation.record.id ||
+      readback.unresolvedAccepted !== 0 ||
+      readback.sdkActiveJobs !== 0 ||
+      readback.telemetryActiveCalls !== 0 ||
+      readback.persistenceFault
+    ) {
+      throw new DeferredMaintenance("NATIVE_HOLD_READBACK_NOT_IDLE");
+    }
+    state.phase = "registering";
+    await persistOperation(operation);
+    const instance = toRecordInstance(deps.instance);
+    const now = deps.now ?? Date.now;
+    const admissionCheck: CheckSpec = { id: randomId(), kind: "admission-status" };
+    registered = await registerRecord({
+      operation,
+      instance,
+      kind: "legacy-hold",
+      now,
+      files: [
+        { name: "inventory-readback.json", bytes: canonicalBytes(assessment.readback) },
+        {
+          name: "hold-readback.json",
+          // Evidence only (never a proof): monotonic samples are local floats, recorded as whole milliseconds.
+          bytes: canonicalBytes({
+            ...readback,
+            observedMono: Math.floor(readback.observedMono),
+            completedMono: Math.ceil(readback.completedMono),
+          }),
+        },
+      ],
+      buildPayload: ({ id }) =>
+        ({
+          schemaVersion: 1,
+          kind: "legacy-hold",
+          id,
+          instance,
+          snapshot: { id: loaded.snapshot.id, sha256: loaded.pilot.sha256 },
+          toolSha256: operation.record.toolSha256,
+          createdAt: now(),
+          pilotWorker: hold.capability.worker,
+          sources: [...assessment.sources, ...admissionLedgerSources(admissionCheck.id, randomId)],
+          checks: [...assessment.checks, admissionCheck],
+          gaps: [],
+          procedure: {
+            kind: "hive-maintenance-v1",
+            operationId: operation.record.id,
+            bootId: hold.capability.descriptor.bootId,
+            establish: "request-close",
+            verify: "fresh-status-and-ledger",
+            release: "terminal-release-or-confirmed-supervisor-exit",
+          },
+        }) satisfies HoldRecord,
+    });
+    state.selectedHold = registered.reference;
+    await persistOperation(operation);
+  } finally {
+    // Release intent is durable before the request; a failed release keeps the barrier unresolved.
+    state.phase = "releasing";
+    state.barrier!.state = "release-intended";
+    await persistOperation(operation);
+    await hold.session.release();
+    await writeOperationJson(resolve(operation.paths.operationDirectory, "barrier-release.json"), {
+      outcome: "released",
+      operationId: operation.record.id,
+      supervisor: { pid: hold.capability.worker.pid, bootId: hold.capability.descriptor.bootId },
+    });
+    const { bytes: _bytes, ...evidence } = await sealFile(
+      resolve(operation.paths.operationDirectory, "barrier-release.json"),
+      { uid: uidOf(operation) },
+    );
+    void _bytes;
+    state.barrier!.terminalEvidence = evidence;
+    state.barrier!.state = "released";
+    await persistOperation(operation);
+  }
+  log.info("Native legacy hold exercised and released", { operationId: operation.record.id });
+  return complete(
+    operation,
+    "assessment-complete",
+    { status: "LEGACY_HOLD_EXERCISED_AND_RELEASED", snapshot: loaded.pilot.selector, holdRecord: registered.selector },
+    0,
+  );
+}
+
 /** `--verify-legacy-hold`: rerun current checks for a registered record; never reports a held state from JSON. */
 export async function runVerifyLegacyHold(
   operation: AcquiredOperation,
@@ -1095,16 +1455,27 @@ export async function runVerifyLegacyHold(
   await verifyPilotRecoveryPrerequisites(loaded);
   state.phase = "probing";
   await persistOperation(operation);
-  const assessment = await assessHold(loaded, deps, deps.randomId);
+  const assessment = await assessHold(loaded, deps, deps.randomId, { livekit: true });
   await writeOperationJson(resolve(operation.paths.operationDirectory, "verify-readback.json"), assessment.readback);
   // A registered record is a selector only: the verdict comes from this
   // invocation's capability assessment, never from the record's procedure.
   const capability = assessment.capability;
-  const gaps =
-    capability.kind === "unavailable"
-      ? [...capability.gaps]
-      : [NATIVE_HOLD_ADAPTER_UNAVAILABLE, ...LEGACY_HOLD_GAP_CODES];
-  return complete(operation, "migration-pending", pending(loaded.pilot.selector, selector, gaps), 1);
+  if (capability.kind === "native-capable") {
+    // Read-only: capability is freshly corroborated, but no close is issued here.
+    // A lifecycle update or reapply must acquire its own new close.
+    return complete(
+      operation,
+      "assessment-complete",
+      {
+        status: "NATIVE_HOLD_AVAILABLE",
+        snapshot: loaded.pilot.selector,
+        holdRecord: selector,
+        establishment: "requires-new-operation-close",
+      },
+      0,
+    );
+  }
+  return complete(operation, "migration-pending", pending(loaded.pilot.selector, selector, [...capability.gaps]), 1);
 }
 
 /**
@@ -1230,9 +1601,10 @@ export async function reconcileRegistryWork(
       state.capture.registration = committed;
     }
   } else if (state.command === "prepare-legacy-hold" && committed) {
-    // The only hold registration this command makes is the explicit unavailable deferral.
+    // An unavailable deferral stays pending; a native exercise completes only
+    // after its recorded barrier has been settled above.
     state.selectedHold = committed;
-    outcome = "migration-pending";
+    outcome = barrierOutcome !== null ? "assessment-complete" : "migration-pending";
   } else if (state.command === "release-legacy-hold" && barrierOutcome !== null) {
     outcome = "assessment-complete";
   } else {

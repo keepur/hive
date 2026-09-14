@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { constants, existsSync } from "node:fs";
 import { chmod, copyFile, lstat, readFile, realpath } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { sha256 } from "./release.js";
@@ -40,8 +40,10 @@ import {
   type LifecycleCommand,
 } from "./lifecycle.js";
 import { SANDBOX_EXEC } from "./confined-job.js";
+import { PilotCaptureBlockedError, runCapturePilot } from "./pilot-capture.js";
 import {
   abortRegistryCommand,
+  captureTicketValidator,
   initialRegistryWork,
   pilotProfileVerifier,
   reconcileRegistryWork,
@@ -351,6 +353,12 @@ type LifecycleContext = Awaited<ReturnType<typeof resolveLifecycleContext>>;
  * so the pilot recovery profile fails closed rather than being guessed.
  */
 function pilotEvidenceDeps(context: LifecycleContext, operationDirectory: string): RegistryCommandDeps {
+  const observer = new ServiceController({
+    instanceId: context.summary.instanceId,
+    hiveHome: context.home,
+    home: context.userHome,
+    operationDir: operationDirectory,
+  });
   return {
     instance: context.pilotInstance,
     controllerFor: (capturedPilotProfile) =>
@@ -361,6 +369,12 @@ function pilotEvidenceDeps(context: LifecycleContext, operationDirectory: string
         operationDir: operationDirectory,
         capturedPilotProfile,
       }),
+    // Registered bootstrap probe and native hold boundaries owned by this operation.
+    probes: { operationId: basename(operationDirectory), clock: { now: Date.now, mono: () => performance.now() } },
+    exclusiveWriter: async (path, pid) => {
+      const writers = await observer.fileWriters(path);
+      return writers.length === 1 && writers[0] === pid;
+    },
     settleBarrier: (barrier) =>
       settleRecordedBarrier(barrier, {
         host: nodeReconcileHostIO,
@@ -375,6 +389,7 @@ function pilotEvidenceDeps(context: LifecycleContext, operationDirectory: string
 }
 
 function registryFailureCode(error: unknown): string {
+  if (error instanceof PilotCaptureBlockedError) return `${error.code}:${error.reason}`;
   if (error instanceof PilotEvidenceUnavailableError) return error.code;
   if (error instanceof DeferredMaintenance) return error.message.split(":")[0] || "REGISTRY_COMMAND_DEFERRED";
   return "REGISTRY_COMMAND_FAILED";
@@ -406,11 +421,28 @@ async function runFrozenRegistry(
       case "release-legacy-hold":
         outcome = await runReleaseLegacyHold(operation, args.releaseLegacyHold!, deps);
         break;
+      case "capture-pilot": {
+        // Read-only discovery through the opaque capture ticket; this
+        // controller has no captured pilot profile and is never used to
+        // stop, start or restore a service.
+        const isProcessLive = (owner: { pid: number; startTime: string }) => processIsLive(nodeReconcileHostIO, owner);
+        outcome = await runCapturePilot(operation, args.bootstrapRecord!, {
+          instance: context.pilotInstance,
+          isProcessLive,
+          discovery: new ServiceController({
+            instanceId: context.summary.instanceId,
+            hiveHome: context.home,
+            home: context.userHome,
+            operationDir: operation.paths.operationDirectory,
+            captureTicketValidator: captureTicketValidator({ isProcessLive }),
+          }),
+          probes: deps.probes!,
+          pilotSdkPort: args.pilotSdkPort,
+        });
+        break;
+      }
       default:
-        // First capture needs the registered bootstrap probe's `pilot` profile
-        // ABI (captured loader bridge, owner-correlated SDK/log evidence). It
-        // is not wired, so capture fails closed and registers nothing.
-        outcome = await abortRegistryCommand(operation, "PILOT_CAPTURE_BLOCKED");
+        throw new Error("unknown registry command");
     }
   } catch (error) {
     if (error instanceof OperationUnresolvedError || error instanceof RegistryUnresolvedError) {
