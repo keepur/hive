@@ -98,7 +98,7 @@ Existing suites read repository files **as text, comments included**, and severa
 - `reasons.ts`, `publisher.ts` and the block modules: "the notifier's acknowledgement ledger" or "KPR-468's ledger" for the forbidden collection name. The scan is case-sensitive, so the existing constant identifier would not trip it, but these modules have no reason to import it.
 - Reserved prefixes, in production modules: name them in prose or as a bare quoted string (for example "a `team-` id"), never as a `startsWith` argument, an anchored regex literal or a sliced-prefix equality, in code or comment. Classification goes through `waitingFor` only.
 - Test files: `obligations` may appear in prose; never in a `from "…"` import clause, in code or comment.
-- `CLAUDE.md` (Task 8): keep "notifier", any form of "repair" and "publisher" out of the same ~80-character window in the new bullet. Edge 13's residual ("a renewal repairs it" beside "the publisher's counters") is the live risk; write "a later report restores it" and do not name the notifier in that sentence. The new bullet begins with `- **` directly after the KPR-468 bullet so it ends that bullet's slice, and neither says "ordered by start" nor names `ops_sweep_cursor`.
+- `CLAUDE.md` (Task 8): use no form of "repair" anywhere in the new bullet. The scan's regex is ordered and dot-all (`notifier`, then within 80 characters a form of `repair`, then within 80 more `publisher`), and the preceding KPR-468 bullet already ends with "repair or remove the offending `ops_events` document", so a window-based rule is not safe. Edge 13's residual ("a renewal repairs it" beside "the publisher's counters") is the live risk; write "a later report restores it" and do not name the notifier in that sentence. The new bullet begins with `- **` directly after the KPR-468 bullet so it ends that bullet's slice, and neither says "ordered by start" nor names `ops_sweep_cursor`.
 
 ---
 
@@ -148,7 +148,7 @@ Derived from the design's Testing Contract; groups, commands and harness are fix
 - `src/ops/delivery.integration.test.ts`, `ingest.integration.test.ts`, `intake.integration.test.ts`, `notifier-acceptance.integration.test.ts` — the shared double and the notifier are untouched.
 - `src/ops/single-prefix-predicate.test.ts` — no new hit, no allowlist change.
 - `src/boot-order.test.ts` — unchanged file, green.
-- `src/events/event-bus-mcp-server.test.ts` — `emit_event` behaviour unchanged.
+- `src/events/event-bus-mcp-server.ts` — `emit_event` behaviour unchanged. No existing test exercises `emit_event` (`event-bus-mcp-server.test.ts` imports only `event-types.js`), so the evidence is `git diff epic/kpr-451 -- src/events/event-bus-mcp-server.ts` showing only the tool spread and, at most, the header comment.
 - `src/agents/agent-runner.test.ts` — mocks `@anthropic-ai/claude-agent-sdk`'s `tool`/`createSdkMcpServer` and pins KPR-453 live-identity wiring for `event-bus` (the "every enabled cached MCP gets live identity" case and "event-bus becomes an in-process SDK server"); the new import chain from `event-bus-mcp-server.ts` into `src/ops/` must not break it.
 - `src/agents/agent-manager.test.ts` — worker-mode and scribe built-set containment pins still hold.
 - Worker-pool containment tests (`src/workers/*.test.ts`).
