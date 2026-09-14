@@ -6,10 +6,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mockLog = vi.hoisted(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
 vi.mock("../logging/logger.js", () => ({ createLogger: () => mockLog }));
 
-import { buildLaneBHarness, buildOpsFixture, makeHarnessAgentConfig, type OpsFixture } from "./testing/lane-harness.js";
+import {
+  buildClaudeLaneHarness,
+  buildLaneBHarness,
+  buildOpsFixture,
+  makeHarnessAgentConfig,
+  type OpsFixture,
+} from "./testing/lane-harness.js";
 import { OpsPublisher } from "./publisher.js";
 import { observeToolFailure } from "./observe.js";
-import { HIVE_RUNTIME_PRODUCER, REASON_TOOL_FAILED } from "./reasons.js";
+import { HIVE_RUNTIME_PRODUCER, REASON_TOOL_FAILED, REASON_TOOL_RECOVERED } from "./reasons.js";
 import {
   BLOCK_EVIDENCE_KIND_RULING,
   BLOCK_EVIDENCE_KIND_WORK_ITEM,
@@ -50,6 +56,7 @@ import { TURN_CONTEXT_DEPENDENT_SERVERS } from "../agents/server-traits.js";
 import { WORKER_SERVER_DENYLIST } from "../workers/meeting-worker-pool.js";
 import type { ToolBridge } from "../agents/provider-adapters/tool-bridge.js";
 import { partitionInventoryForProvider } from "../agents/provider-adapters/tool-transport.js";
+import { createEventBusMcpServer } from "../events/event-bus-mcp-server.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { Db } from "mongodb";
@@ -1459,5 +1466,475 @@ describe("KPR-501 block tools — surface, worker containment and Lane B executi
       waiting: "human-now",
       subject: { kind: BLOCK_SUBJECT_KIND, id: `${AGENT}:${THREAD_1}` },
     });
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// The `isError` boundary (Task 7): every handler answer — the caught fault
+// included — is a SUCCESS to KPR-454's capture points on both lanes and mints
+// no `hive-runtime:tool-failed`; the only `isError` a caller sees is the MCP
+// layer's own input-validation error, recorded as one `tool-failed` like any
+// tool; and the three C15 limbs complete the calling turn unchanged.
+//
+// Fidelity (advisory A2). Claude lane: the harness has no SDK, so the TEST
+// routes the handler's answer — `fireSuccess` when `isError` is absent,
+// `fireFailure` when it is `true` — through the runner's REAL hook bodies; the
+// routing itself is the SDK's, measured by probe class 2
+// (`scripts/probe-posttooluse-failure.ts`). Lane B: a REAL `ToolBridge` over the
+// runner-built, connected `event-bus` instance, where the SDK server and
+// `discover()` decide the routing. "RunResult classification unchanged" =
+// `wasAborted` false / the signal un-aborted, the hook resolving `{}`, and the
+// bridged call resolving with the handler's JSON text — never a throw or the
+// `Tool execution failed (…)` containment prefix.
+//
+// Every case owns a fresh fixture and fresh instances (advisory A1, one
+// connect per instance). Assertions on the hive-runtime rows run AFTER the
+// drain and BEFORE the answer-shape assertions, so a wrongly `isError` answer
+// fails on the stored-fact limb rather than only on its flag.
+// ───────────────────────────────────────────────────────────────────────────
+
+const CLAUDE_LANE = "Claude lane (SDK routing per probe class 2)";
+const LANE_B = "Lane B (connected bridge)";
+type LaneName = typeof CLAUDE_LANE | typeof LANE_B;
+const LANES: LaneName[] = [CLAUDE_LANE, LANE_B];
+
+const CONTAINMENT_PREFIX = "Tool execution failed (";
+
+/** `capture-points.integration.test.ts`'s payload shapes, copied (no cross-`.test.ts` imports). */
+const failureHookInput = (toolName: string, error: string) => ({
+  hook_event_name: "PostToolUseFailure",
+  tool_name: toolName,
+  tool_input: {},
+  tool_use_id: "tu-1",
+  error,
+  duration_ms: 12,
+  session_id: "s-1",
+  transcript_path: "/dev/null",
+  cwd: "/tmp",
+});
+const successHookInput = (toolName: string) => ({
+  hook_event_name: "PostToolUse",
+  tool_name: toolName,
+  tool_input: {},
+  tool_response: { secret: "never read" },
+  tool_use_id: "tu-2",
+  duration_ms: 12,
+  session_id: "s-1",
+  transcript_path: "/dev/null",
+  cwd: "/tmp",
+});
+
+const canonical = (toolName: string) => `mcp__event-bus__${toolName}`;
+
+interface LaneAnswer {
+  /** The model-visible text. */
+  text: string;
+  /** The handler/SDK flag where the lane exposes it (Claude lane); Lane B cannot see it except as a throw. */
+  isError: boolean | undefined;
+  hasIsErrorKey: boolean;
+}
+
+interface LaneDriver {
+  lane: LaneName;
+  call(toolName: string, args: Record<string, unknown>): Promise<LaneAnswer>;
+  /** The capture-point fidelity conditions: no own-abort, nothing escaped. */
+  expectTurnUnchanged(): void;
+  close(): Promise<void>;
+}
+
+async function buildLaneDriver(lane: LaneName, db: Db, context: WorkItemContext): Promise<LaneDriver> {
+  if (lane === CLAUDE_LANE) {
+    const direct = blockTools(db, AGENT, context);
+    const harness = buildClaudeLaneHarness({
+      config: { id: AGENT, name: "Mokie", coreServers: ["event-bus"] },
+      workItemContext: context,
+    });
+    return {
+      lane,
+      call: async (toolName, args) => {
+        const { result } = toolName === REPORT_BLOCK_TOOL ? await direct.report(args) : await direct.clear(args);
+        const text = result.content[0]!.text;
+        // The test routes; the SDK's routing is what probe class 2 measured.
+        const hookResult =
+          result.isError === true
+            ? await harness.fireFailure(failureHookInput(canonical(toolName), text))
+            : await harness.fireSuccess(successHookInput(canonical(toolName)));
+        expect(hookResult).toEqual({});
+        return { text, isError: result.isError, hasIsErrorKey: "isError" in result };
+      },
+      expectTurnUnchanged: () => expect(harness.runner.wasAborted).toBe(false),
+      close: async () => {},
+    };
+  }
+
+  const runner = runnerWithDb(db, ["event-bus"]);
+  const entry = runner.buildToolTransportInventory(context).find((e) => e.name === "event-bus");
+  expect(entry).toBeDefined();
+  const inProcessServers = runner.buildInProcessServers(context);
+  const harness = buildLaneBHarness({
+    bridge: {
+      inventory: [entry!],
+      inProcessServers: { "event-bus": inProcessServers["event-bus"]! },
+      workItemContext: context,
+    },
+  });
+  const connected = await harness.bridge.connect();
+  const byName = (toolName: string) => {
+    const found = connected.find((t) => t.name === canonical(toolName));
+    expect(found, canonical(toolName)).toBeDefined();
+    return found!;
+  };
+  return {
+    lane,
+    call: async (toolName, args) => {
+      // `execute` never throws (wrap's structural promise); an `isError` would
+      // surface only as the containment prefix.
+      const text = await byName(toolName).execute(args);
+      return { text, isError: undefined, hasIsErrorKey: false };
+    },
+    expectTurnUnchanged: () => expect(harness.abortController.signal.aborted).toBe(false),
+    close: () => harness.bridge.close(),
+  };
+}
+
+/** The answer is a non-`isError` handler answer carrying `expected` as its JSON body. */
+function expectHandlerAnswer(answer: LaneAnswer, expected: Body): void {
+  expect(answer.hasIsErrorKey).toBe(false);
+  expect(answer.isError).toBeUndefined();
+  expect(answer.text.startsWith(CONTAINMENT_PREFIX)).toBe(false);
+  expect(JSON.parse(answer.text)).toEqual(expected);
+}
+
+describe("KPR-501 block tools — the isError boundary through both capture points, the MCP-layer residual, and C15 on both lanes (D2, D6, D9, AC5, AC9, AC11)", () => {
+  let fixture: OpsFixture;
+  const drivers: LaneDriver[] = [];
+  const clients: Client[] = [];
+
+  const agentEvents = () => fixture.events().filter((e) => e.producer === HIVE_AGENT_PRODUCER);
+  const runtimeEventsNamingBlockTools = () =>
+    fixture
+      .events()
+      .filter(
+        (e) =>
+          e.producer === HIVE_RUNTIME_PRODUCER &&
+          (e.subject.id === canonical(REPORT_BLOCK_TOOL) || e.subject.id === canonical(CLEAR_BLOCK_TOOL)),
+      );
+  const faultWarns = () =>
+    mockLog.warn.mock.calls.filter(([msg]) => String(msg).includes("Ops block tool faulted")).length;
+  const counters = () => getBlockProducerSnapshot();
+  const pub = () => fixture.publisher.getSnapshot();
+
+  const driver = async (lane: LaneName, context = turn(SLACK_TS_1, THREAD_1)) => {
+    const d = await buildLaneDriver(lane, fixture.fakeDb.db, context);
+    drivers.push(d);
+    return d;
+  };
+
+  const disableReason = async (reasonId: string) => {
+    fixture.fakeDb
+      .collection(OPS_REASONS_COLLECTION)
+      .rows.find((r) => r._id === `${HIVE_AGENT_PRODUCER}:${reasonId}`)!.enabled = false;
+    await fixture.publisher.init();
+  };
+
+  beforeEach(async () => {
+    mockLog.debug.mockClear();
+    mockLog.info.mockClear();
+    mockLog.warn.mockClear();
+    mockLog.error.mockClear();
+    __resetBlockProducerCountersForTests();
+    fixture = await buildOpsFixture();
+  });
+
+  afterEach(async () => {
+    // AC9: the coordination-bus and team collections take no write in this describe either.
+    const writes = fixture.fakeDb.operations.filter(
+      (o) => NEVER_WRITTEN.includes(o.collection) && /insert|update|replace|delete/i.test(o.operation),
+    );
+    expect(writes).toEqual([]);
+    for (const c of clients.splice(0)) await c.close();
+    for (const d of drivers.splice(0)) await d.close();
+    await fixture.dispose();
+    __resetOpsPublisherForTests();
+  });
+
+  // ── AC9 capture-point limbs: every handler answer is a success ────────────
+
+  for (const lane of LANES) {
+    describe(lane, () => {
+      it(`AC9 refused: both tools answer refused non-isError and no hive-runtime document names either tool — ${lane}`, async () => {
+        const d = await driver(lane);
+        const r = await d.call(REPORT_BLOCK_TOOL, { kind: "nope" });
+        const c = await d.call(CLEAR_BLOCK_TOOL, { kind: "coordination", outcome: "nope" });
+        await fixture.drain();
+
+        expect(runtimeEventsNamingBlockTools()).toEqual([]);
+        expect(fixture.events()).toEqual([]);
+        expectHandlerAnswer(r, { state: "refused", reason: REFUSAL_KIND, admitted: expect.anything() });
+        expectHandlerAnswer(c, { state: "refused", reason: REFUSAL_OUTCOME, admitted: expect.anything() });
+        expect(counters().refused).toBe(2);
+        d.expectTurnUnchanged();
+      });
+
+      it(`AC9 disabled: both tools answer disabled non-isError and no hive-runtime document names either tool — ${lane}`, async () => {
+        await disableReason(REASON_COORDINATION_BLOCK);
+        await disableReason(REASON_BLOCK_CLEARED);
+        const d = await driver(lane);
+        const r = await d.call(REPORT_BLOCK_TOOL, { kind: "coordination", blockedOn: "human" });
+        const c = await d.call(CLEAR_BLOCK_TOOL, { kind: "coordination", outcome: "resumed" });
+        await fixture.drain();
+
+        expect(runtimeEventsNamingBlockTools()).toEqual([]);
+        expect(fixture.events()).toEqual([]);
+        expectHandlerAnswer(r, { state: "disabled" });
+        expectHandlerAnswer(c, { state: "disabled" });
+        expect(counters().disabled).toBe(2);
+        expect(pub().rejected).toBe(0);
+        d.expectTurnUnchanged();
+      });
+
+      it(`AC9 no-open-block: clear_block with nothing open answers non-isError and no hive-runtime document names either tool — ${lane}`, async () => {
+        const d = await driver(lane);
+        const c = await d.call(CLEAR_BLOCK_TOOL, { kind: "coordination", outcome: "resumed" });
+        await fixture.drain();
+
+        expect(runtimeEventsNamingBlockTools()).toEqual([]);
+        expect(fixture.events()).toEqual([]);
+        expectHandlerAnswer(c, { state: "no-open-block", queueIdle: true });
+        expect(counters().clearNoOpen).toBe(1);
+        d.expectTurnUnchanged();
+      });
+
+      it(`AC9 queued: report then clear each answer queued non-isError, store their hive-agent documents and no hive-runtime document names either tool — ${lane}`, async () => {
+        const d = await driver(lane);
+        const r = await d.call(REPORT_BLOCK_TOOL, { kind: "coordination", blockedOn: "human" });
+        await fixture.drain();
+        const c = await d.call(CLEAR_BLOCK_TOOL, { kind: "coordination", outcome: "resumed" });
+        await fixture.drain();
+
+        expect(runtimeEventsNamingBlockTools()).toEqual([]);
+        expect(fixture.events().filter((e) => e.producer === HIVE_RUNTIME_PRODUCER)).toEqual([]);
+        expectHandlerAnswer(r, { state: "queued", kind: "coordination" });
+        const key = agentEvents().find((e) => e.reasonId === REASON_COORDINATION_BLOCK)!.dedupeKey;
+        expectHandlerAnswer(c, { state: "queued", clears: key, outcome: "resumed", queueIdle: true });
+        expect(agentEvents().map((e) => e.reasonId)).toEqual([REASON_COORDINATION_BLOCK, REASON_BLOCK_CLEARED]);
+        d.expectTurnUnchanged();
+      });
+
+      it(`AC9 / AC11 (ii): a findOne fault on clear_block answers unavailable/fault non-isError, faults +1, one warn, and no hive-runtime document names either tool — ${lane}`, async () => {
+        const d = await driver(lane);
+        await d.call(REPORT_BLOCK_TOOL, { kind: "coordination", blockedOn: "human" });
+        await fixture.drain(); // drained BEFORE arming, so no queued resolve consumes the fault
+        const stored = fixture.events().length;
+        expect(stored).toBe(1);
+
+        fixture.fakeDb.failNext(OPS_EVENTS_COLLECTION, "findOne");
+        const c = await d.call(CLEAR_BLOCK_TOOL, { kind: "coordination", outcome: "resumed" });
+        await fixture.drain();
+
+        expect(runtimeEventsNamingBlockTools()).toEqual([]);
+        expect(fixture.events()).toHaveLength(stored);
+        expectHandlerAnswer(c, { state: "unavailable", cause: "fault" });
+        expect(counters().faults).toBe(1);
+        expect(faultWarns()).toBe(1);
+        expect(agentEvents().filter((e) => e.reasonId === REASON_BLOCK_CLEARED)).toEqual([]);
+        d.expectTurnUnchanged();
+      });
+
+      it(`AC9 / Edge 1: with the singleton unset both tools answer unavailable/publisher-unset and both producers are silent — ${lane}`, async () => {
+        const d = await driver(lane);
+        __resetOpsPublisherForTests();
+        const r = await d.call(REPORT_BLOCK_TOOL, { kind: "coordination", blockedOn: "human" });
+        const c = await d.call(CLEAR_BLOCK_TOOL, { kind: "coordination", outcome: "resumed" });
+        await fixture.drain();
+
+        expect(fixture.events()).toEqual([]);
+        expectHandlerAnswer(r, { state: "unavailable", cause: "publisher-unset" });
+        expectHandlerAnswer(c, { state: "unavailable", cause: "publisher-unset" });
+        expect(counters().unavailable).toBe(2);
+        d.expectTurnUnchanged();
+      });
+
+      // ── AC11 (C15) ────────────────────────────────────────────────────────
+
+      it(`AC11 (i): a throwing enqueuePublish double makes each tool answer unavailable/fault non-isError, faults +1 each, one warn each, and nothing new is stored by either producer — ${lane}`, async () => {
+        const d = await driver(lane);
+        // A stored block for the clear to find (so its limb reaches enqueuePublish).
+        await d.call(REPORT_BLOCK_TOOL, { kind: "coordination", blockedOn: "human" });
+        await fixture.drain();
+        const stored = fixture.events().length;
+        expect(stored).toBe(1);
+
+        const spy = vi.spyOn(fixture.publisher, "enqueuePublish").mockImplementation(() => {
+          throw new Error("enqueue double");
+        });
+        let r: LaneAnswer;
+        let c: LaneAnswer;
+        try {
+          r = await d.call(REPORT_BLOCK_TOOL, { kind: "semantic" });
+          c = await d.call(CLEAR_BLOCK_TOOL, { kind: "coordination", outcome: "resumed" });
+        } finally {
+          spy.mockRestore();
+        }
+        await fixture.drain();
+
+        expect(runtimeEventsNamingBlockTools()).toEqual([]);
+        expect(fixture.events()).toHaveLength(stored);
+        expectHandlerAnswer(r, { state: "unavailable", cause: "fault" });
+        expectHandlerAnswer(c, { state: "unavailable", cause: "fault" });
+        expect(counters().faults).toBe(2);
+        expect(faultWarns()).toBe(2);
+        d.expectTurnUnchanged();
+      });
+
+      it(`AC11 (iii): an insertOne rejecting once (failNext, armed before the call) under each tool — each answers queued, publishFaults +1 per call, nothing stored, no hive-runtime document — ${lane}`, async () => {
+        const d = await driver(lane);
+        fixture.fakeDb.failNext(OPS_EVENTS_COLLECTION, "insertOne");
+        const r = await d.call(REPORT_BLOCK_TOOL, { kind: "coordination", blockedOn: "human" });
+        await fixture.drain();
+        expect(runtimeEventsNamingBlockTools()).toEqual([]);
+        expect(fixture.events()).toEqual([]);
+        expect(pub().publishFaults).toBe(1);
+        expectHandlerAnswer(r, { state: "queued", kind: "coordination" });
+
+        // A stored block for the clear to name.
+        await d.call(REPORT_BLOCK_TOOL, { kind: "coordination", blockedOn: "human" });
+        await fixture.drain();
+        expect(fixture.events()).toHaveLength(1);
+
+        fixture.fakeDb.failNext(OPS_EVENTS_COLLECTION, "insertOne");
+        const c = await d.call(CLEAR_BLOCK_TOOL, { kind: "coordination", outcome: "resumed" });
+        await fixture.drain();
+        expect(runtimeEventsNamingBlockTools()).toEqual([]);
+        expect(fixture.events()).toHaveLength(1);
+        expect(pub().publishFaults).toBe(2);
+        expect(c.text.startsWith(CONTAINMENT_PREFIX)).toBe(false);
+        expect(JSON.parse(c.text)).toMatchObject({ state: "queued", outcome: "resumed" });
+        expect(c.hasIsErrorKey).toBe(false);
+        expect(counters().faults).toBe(0);
+        d.expectTurnUnchanged();
+      });
+
+      it(`AC11: decided answers (refused, disabled, no-open-block) through the same two turns record nothing — ${lane}`, async () => {
+        const d = await driver(lane);
+        const answers = [
+          await d.call(REPORT_BLOCK_TOOL, { kind: "coordination", blockedOn: "nope" }),
+          await d.call(CLEAR_BLOCK_TOOL, { kind: "coordination", outcome: "resumed" }),
+        ];
+        await disableReason(REASON_SEMANTIC_BLOCK);
+        answers.push(await d.call(REPORT_BLOCK_TOOL, { kind: "semantic" }));
+        await fixture.drain();
+
+        expect(fixture.events()).toEqual([]);
+        expect(answers.map((a) => JSON.parse(a.text).state)).toEqual(["refused", "no-open-block", "disabled"]);
+        for (const a of answers) expect(a.hasIsErrorKey).toBe(false);
+        d.expectTurnUnchanged();
+      });
+    });
+  }
+
+  // ── AC9 residual limb: the SDK's own isError, through the Lane B bridge ───
+
+  it("AC9 residual (Lane B, own fixture): report_block with kind 42 is the SDK's isError — exactly one hive-runtime tool-failed on the tool; a following valid report stores its block plus one tool-recovered", async () => {
+    const d = await driver(LANE_B);
+    const refusedBefore = counters().refused;
+
+    const bad = await d.call(REPORT_BLOCK_TOOL, { kind: 42 });
+    // discover() saw `isError: true` and threw, so wrap() contained it.
+    expect(bad.text.startsWith(`${CONTAINMENT_PREFIX}${canonical(REPORT_BLOCK_TOOL)}): `)).toBe(true);
+    expect(bad.text).toContain("Input validation error");
+    await fixture.drain();
+
+    const failed = fixture.events().filter((e) => e.producer === HIVE_RUNTIME_PRODUCER);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({
+      producer: HIVE_RUNTIME_PRODUCER,
+      reasonId: REASON_TOOL_FAILED,
+      subject: { kind: "tool", id: canonical(REPORT_BLOCK_TOOL) },
+    });
+    expect(agentEvents()).toEqual([]);
+    expect(counters().refused).toBe(refusedBefore);
+
+    // Advisory A6: the true tool-recovered after a non-isError answer is expected, not suppressed.
+    const good = await d.call(REPORT_BLOCK_TOOL, { kind: "coordination", blockedOn: "human" });
+    expectHandlerAnswer(good, { state: "queued", kind: "coordination" });
+    await fixture.drain();
+
+    expect(agentEvents().map((e) => e.reasonId)).toEqual([REASON_COORDINATION_BLOCK]);
+    const recovered = fixture.events().filter((e) => e.reasonId === REASON_TOOL_RECOVERED);
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]).toMatchObject({
+      producer: HIVE_RUNTIME_PRODUCER,
+      subject: { kind: "tool", id: canonical(REPORT_BLOCK_TOOL) },
+      clears: failed[0]!.dedupeKey,
+    });
+    expect(fixture.events().filter((e) => e.reasonId === REASON_TOOL_FAILED)).toHaveLength(1);
+    d.expectTurnUnchanged();
+  });
+
+  // ── AC5 MCP-layer residual (Edge 20): a raw Client over a fresh instance ──
+
+  it("AC5 / Edge 20 / NV9: through the SDK server's own request handler — an unknown key is stripped, kind 42 and a missing outcome are Input validation errors, and a wrong kind value is the handler's counted refusal", async () => {
+    const ref: WorkItemContextRef = { current: turn(SLACK_TS_1, THREAD_1) };
+    const server = createEventBusMcpServer({
+      db: fixture.fakeDb.db,
+      agentId: AGENT,
+      workItemContext: ref,
+      eventSubscribersJson: "{}",
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.instance.connect(serverTransport);
+    const client = new Client({ name: "kpr-501-residual", version: "1.0.0" });
+    await client.connect(clientTransport);
+    clients.push(client);
+
+    type RawResult = { isError?: boolean; content: Array<{ type: string; text: string }> };
+    const callRaw = async (name: string, args: Record<string, unknown>) =>
+      (await client.callTool({ name, arguments: args })) as unknown as RawResult;
+
+    // (1) An extra unknown key is stripped; the call proceeds on its declared keys.
+    const STRAY_KEY = "strayUndeclaredKey";
+    const STRAY_VALUE = "stray-value-7f3a";
+    const stripped = await callRaw(REPORT_BLOCK_TOOL, {
+      kind: "coordination",
+      blockedOn: "human",
+      [STRAY_KEY]: STRAY_VALUE,
+    });
+    expect(stripped.isError).not.toBe(true);
+    expect(JSON.parse(stripped.content[0]!.text)).toEqual({ state: "queued", kind: "coordination" });
+    await fixture.drain();
+    expect(agentEvents()).toHaveLength(1);
+    const storedText = JSON.stringify(agentEvents()[0]);
+    expect(storedText).not.toContain(STRAY_KEY);
+    expect(storedText).not.toContain(STRAY_VALUE);
+    expect(counters().refused).toBe(0);
+
+    // (2) A non-string kind and (3) a missing required outcome: the MCP layer's isError, no reason, no counter.
+    const residuals: Array<[string, Record<string, unknown>]> = [
+      [REPORT_BLOCK_TOOL, { kind: 42 }],
+      [CLEAR_BLOCK_TOOL, { kind: "coordination" }],
+    ];
+    for (const [name, args] of residuals) {
+      const result = await callRaw(name, args);
+      expect(result.isError, name).toBe(true);
+      const text = result.content[0]!.text;
+      // Observed at SDK: the McpError carrying InvalidParams (-32602) prefixes
+      // its code to the SDK's "Input validation error" text; the design's
+      // "begins with Input validation error" names that SDK text.
+      expect(text).toMatch(/^(?:MCP error -32602: )?Input validation error/);
+      expect(text).not.toContain('"reason"');
+      expect(counters().refused).toBe(0);
+    }
+
+    // (4) NV9's connected limb: a wrong kind VALUE reaches the handler and is refused and counted.
+    const wrongValue = await callRaw(REPORT_BLOCK_TOOL, { kind: "waiting" });
+    expect(wrongValue.isError).not.toBe(true);
+    expect(JSON.parse(wrongValue.content[0]!.text)).toMatchObject({ state: "refused", reason: REFUSAL_KIND });
+    expect(counters().refused).toBe(1);
+
+    await fixture.drain();
+    expect(agentEvents()).toHaveLength(1);
+    expect(fixture.events().filter((e) => e.producer === HIVE_RUNTIME_PRODUCER)).toEqual([]);
+    expect(pub().rejected).toBe(0);
   });
 });
