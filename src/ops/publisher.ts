@@ -169,6 +169,18 @@ export class OpsPublisher {
    */
   private subscriptionAnomalySignature = "";
   private reloadTimer?: ReturnType<typeof setInterval>;
+  /**
+   * The reload ordering pair (KPR-507). Every read-performing reload takes the
+   * next `reloadsStarted` number before its first await; its result replaces
+   * `subscriptions` only if no later-started load has already committed —
+   * `reloadCommitted` is the number of the last load that did. Mechanism only:
+   * never on `getSnapshot()`, never reset on a re-entrant `init()` (a reset
+   * would re-open "older finisher wins" against what this instance already
+   * committed). Deliberately NOT shared with OpsNotifier's own pair — a
+   * different projection over the same collection.
+   */
+  private reloadsStarted = 0;
+  private reloadCommitted = 0;
   private nextOpenSeq = 1;
   private readonly counters: OpsPublisherCounters = {
     published: 0,
@@ -287,20 +299,52 @@ export class OpsPublisher {
     }
   }
 
-  /** D9. A fault leaves the PREVIOUS set in place and counts — never empties it, because an empty set silently makes every event a zero-match. */
+  /**
+   * D9. A fault leaves the PREVIOUS set in place and counts — never empties it,
+   * because an empty set silently makes every event a zero-match.
+   *
+   * ⚠ ORDERED BY START, NOT BY COMPLETION, AND NOT SINGLE-FLIGHT (KPR-507). The
+   * 60 s timer, SIGUSR1 and a re-entrant `init()` overlap freely, and an
+   * unordered assignment let an earlier read that finished LAST replace a later
+   * one — restoring a subscription whose `enabled: false` had already been
+   * committed. Single-flight would be worse: a SIGUSR1 joining an in-flight
+   * timer read would return the snapshot taken BEFORE the operator's disable.
+   *
+   * The rule: a load commits only if no later-STARTED load has already
+   * committed. A `stopping`-skipped call takes no number and supersedes nothing;
+   * a faulted load commits nothing, so an older in-flight success landing after
+   * it is still fresher than the retained set and may commit. A discarded
+   * (superseded) success is not a fault and does not run the row audit — the
+   * gauge and its warn latch describe what is COMMITTED, and an older clean set
+   * must not zero a gauge a newer commit just raised.
+   */
   async reloadSubscriptions(): Promise<void> {
     if (this.stopping) return;
+    // Taken before the first await, so start order is call order.
+    const seq = ++this.reloadsStarted;
+    let next: OpsSubscription[];
     try {
-      this.subscriptions = await this.store.loadSubscriptions();
+      next = await this.store.loadSubscriptions();
     } catch (err) {
       this.counters.subscriptionReloadFaults += 1;
       log.warn("Ops subscription reload failed — keeping the previous set", { error: String(err) });
-      // The audit describes what THIS reload loaded. On a fault the previous set
-      // is kept and was already audited, so re-auditing it would only re-set the
-      // counter to the value it already holds.
+      // The audit describes what a COMMITTED reload loaded. On a fault the
+      // previous set is kept and was already audited, so re-auditing it would
+      // only re-set the counter to the value it already holds.
       return;
     }
-    this.auditSubscriptionRows(this.subscriptions);
+    // Comparison, commit and audit run with no await between them, so two
+    // completions cannot interleave here.
+    if (seq < this.reloadCommitted) {
+      log.debug("Ops subscription reload result superseded by a later reload — discarded", {
+        reload: seq,
+        committed: this.reloadCommitted,
+      });
+      return;
+    }
+    this.reloadCommitted = seq;
+    this.subscriptions = next;
+    this.auditSubscriptionRows(next);
   }
 
   /**
