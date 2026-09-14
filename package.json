@@ -104,7 +104,7 @@
     "@livekit/agents-plugin-deepgram": "1.6.4",
     "@livekit/agents-plugin-elevenlabs": "1.6.4",
     "@livekit/agents-plugin-silero": "1.6.4",
-    "@livekit/rtc-node": "0.13.33",
+    "@livekit/rtc-node": "1.0.0",
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.4.1",
     "@types/ws": "^8.18.1",
