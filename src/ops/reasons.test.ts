@@ -4,11 +4,25 @@ import {
   auditReasonRow,
   compileDetailSchema,
   HIVE_RUNTIME_REASONS,
+  OPS_REASON_TABLES,
   REASON_TOOL_FAILED,
   REASON_TOOL_RECOVERED,
 } from "./reasons.js";
 import { OPS_DETAIL_STRING_MAX, OPS_LOG_ANOMALY_VALUE_MAX, OPS_LOG_VALUE_MAX } from "./ids.js";
 import type { DetailKeySpec, OpsReason } from "./types.js";
+import { HIVE_AGENT_REASONS } from "./block-reasons.js";
+
+describe("OPS_REASON_TABLES (KPR-501 D3)", () => {
+  it("lists the runtime producer's table first, then the agent producer's", () => {
+    expect(OPS_REASON_TABLES).toHaveLength(2);
+    expect(OPS_REASON_TABLES[0]).toBe(HIVE_RUNTIME_REASONS);
+    expect(OPS_REASON_TABLES[1]).toBe(HIVE_AGENT_REASONS);
+  });
+
+  it("every listed table passes the per-table gate on its own", () => {
+    for (const table of OPS_REASON_TABLES) expect(() => assertReasonTableLegal(table)).not.toThrow();
+  });
+});
 
 describe("HIVE_RUNTIME_REASONS + assertReasonTableLegal (KPR-454 D5, AC10)", () => {
   it("the shipped table is legal", () => {

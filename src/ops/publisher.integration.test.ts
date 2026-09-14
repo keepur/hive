@@ -17,6 +17,12 @@ import { OpsPublisher, familyOf } from "./publisher.js";
 import { __resetOpsPublisherForTests, setOpsPublisher } from "./publisher-singleton.js";
 import { observeToolFailure, observeToolSuccess, type ToolFailureObservation } from "./observe.js";
 import { HIVE_RUNTIME_PRODUCER, REASON_TOOL_FAILED, REASON_TOOL_RECOVERED } from "./reasons.js";
+import {
+  HIVE_AGENT_PRODUCER,
+  REASON_BLOCK_CLEARED,
+  REASON_COORDINATION_BLOCK,
+  REASON_SEMANTIC_BLOCK,
+} from "./block-reasons.js";
 import { OPS_CLEARS_MAX_LENGTH, OPS_ID_MAX_LENGTH } from "./ids.js";
 import { OPS_EVENTS_COLLECTION, OPS_REASONS_COLLECTION, OPS_SUBSCRIPTIONS_COLLECTION } from "./types.js";
 
@@ -34,6 +40,9 @@ import { OPS_EVENTS_COLLECTION, OPS_REASONS_COLLECTION, OPS_SUBSCRIPTIONS_COLLEC
 const RETENTION_DAYS = 90;
 const RECOVERED_ID = `${HIVE_RUNTIME_PRODUCER}:${REASON_TOOL_RECOVERED}`;
 const FAILED_ID = `${HIVE_RUNTIME_PRODUCER}:${REASON_TOOL_FAILED}`;
+const BLOCK_CLEARED_ID = `${HIVE_AGENT_PRODUCER}:${REASON_BLOCK_CLEARED}`;
+const COORDINATION_BLOCK_ID = `${HIVE_AGENT_PRODUCER}:${REASON_COORDINATION_BLOCK}`;
+const SEMANTIC_BLOCK_ID = `${HIVE_AGENT_PRODUCER}:${REASON_SEMANTIC_BLOCK}`;
 
 let fakeDb: FakeDb;
 let publisher: OpsPublisher;
@@ -73,29 +82,44 @@ describe("OpsPublisher boot and registry", () => {
     expect(() => new OpsPublisher(fakeDb.db, RETENTION_DAYS)).not.toThrow();
   });
 
-  it("upserts both rows, in the shipped order, and a second init() does not overwrite an operator's enabled: false", async () => {
+  it("upserts every table's rows, in the shipped order, and a second init() does not overwrite an operator's enabled: false", async () => {
     await publisher.init();
+    // KPR-501 adjustment: D3 ships a second table (hive-agent) under the same
+    // init() upsert, so the pinned id set is the five rows of both tables.
     expect(
       reasons()
         .map((row) => row._id)
         .sort(),
-    ).toEqual([FAILED_ID, RECOVERED_ID].sort());
+    ).toEqual([FAILED_ID, RECOVERED_ID, BLOCK_CLEARED_ID, COORDINATION_BLOCK_ID, SEMANTIC_BLOCK_ID].sort());
 
     // The CALL-ORDER half of D5's load-bearing write order. reasons.test.ts
     // pins the array order and cannot see a writer that sorts or parallelises.
+    // KPR-501 adjustment: hive-runtime's two (clearing first) followed by
+    // hive-agent's three (clearing first), per OPS_REASON_TABLES' list order.
     const upserts = fakeDb.operations
       .filter((o) => o.collection === OPS_REASONS_COLLECTION && o.operation === "updateOne")
       .map((o) => o.context.filter?._id as string);
-    expect(upserts).toEqual([RECOVERED_ID, FAILED_ID]);
+    expect(upserts).toEqual([RECOVERED_ID, FAILED_ID, BLOCK_CLEARED_ID, COORDINATION_BLOCK_ID, SEMANTIC_BLOCK_ID]);
+
+    // KPR-501 AC12: loadReasons() yields all five rows into the accept path's map
+    // (the init log reports the loaded map's size).
+    const initLog = mockLog.info.mock.calls.find((call) => String(call[0]) === "Ops publisher initialized");
+    expect(initLog?.[1]).toMatchObject({ reasons: 5 });
 
     // The kill switch: an operator disables the row, and the next boot's
     // upsert leaves it disabled ($setOnInsert) while still rewriting the rest.
     const row = reasons().find((r) => r._id === FAILED_ID)!;
     row.enabled = false;
     row.remediationTemplate = "clobber me";
+    // KPR-501: the same kill switch on a hive-agent row survives a re-entrant init().
+    const blockRow = reasons().find((r) => r._id === COORDINATION_BLOCK_ID)!;
+    blockRow.enabled = false;
+    blockRow.remediationTemplate = "clobber me";
     await publisher.init();
     expect(reasons().find((r) => r._id === FAILED_ID)!.enabled).toBe(false);
     expect(reasons().find((r) => r._id === FAILED_ID)!.remediationTemplate).not.toBe("clobber me");
+    expect(reasons().find((r) => r._id === COORDINATION_BLOCK_ID)!.enabled).toBe(false);
+    expect(reasons().find((r) => r._id === COORDINATION_BLOCK_ID)!.remediationTemplate).not.toBe("clobber me");
 
     // …and a disabled row rejects at accept-path step 1 rather than publishing.
     driveFailure("Bash");

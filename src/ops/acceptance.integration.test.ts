@@ -13,6 +13,7 @@ vi.mock("../logging/logger.js", () => ({ createLogger: () => mockLog }));
 
 import type { WorkItemContext } from "../agents/agent-runner.js";
 import { __resetRegistryForTests, registerArchetype } from "../archetypes/registry.js";
+import { HIVE_AGENT_PRODUCER } from "./block-reasons.js";
 import { OPS_EVIDENCE_MAX } from "./ids.js";
 import { evaluateMatches } from "./match.js";
 import { observeToolFailure, observeToolSuccess, type ToolFailureObservation } from "./observe.js";
@@ -1727,14 +1728,21 @@ describe("AC16 (C16) — a new reason and a new producer are DATA, not an engine
     // single cheapest guard against the most likely regression in this whole
     // area: someone adding a fast-path `if (input.producer === "hive-runtime")`
     // to the accept path.
+    // KPR-501 adjustment: the loop also pins HIVE_AGENT_PRODUCER, so "never in
+    // a validator" holds for the second producer too.
     for (const f of ["src/ops/publisher.ts", "src/ops/ids.ts", "src/ops/match.ts"]) {
-      expect(readFileSync(`${root}${f}`, "utf8"), `${f} hardcodes a producer`).not.toContain(HIVE_RUNTIME_PRODUCER);
+      for (const producer of [HIVE_RUNTIME_PRODUCER, HIVE_AGENT_PRODUCER]) {
+        expect(readFileSync(`${root}${f}`, "utf8"), `${f} hardcodes a producer`).not.toContain(producer);
+      }
     }
-    // Note the exception this list encodes: publisher.ts IMPORTS
-    // HIVE_RUNTIME_REASONS (for the boot upsert and the constructor gate) but
-    // must never contain the literal string — that is the difference between
-    // registering this producer's rows and special-casing them.
-    expect(readFileSync(`${root}src/ops/publisher.ts`, "utf8")).toContain("HIVE_RUNTIME_REASONS");
+    // Note the exception this list encodes: publisher.ts registers reason rows
+    // ONLY by importing the reason-table list (OPS_REASON_TABLES, for the boot
+    // upsert and the constructor gate) and never contains a producer literal —
+    // that is the difference between registering a producer's rows and
+    // special-casing them. KPR-501 adjustment: this pinned HIVE_RUNTIME_REASONS
+    // until the constructor and init() began iterating OPS_REASON_TABLES, at
+    // which point publisher.ts correctly stopped naming the single table.
+    expect(readFileSync(`${root}src/ops/publisher.ts`, "utf8")).toContain("OPS_REASON_TABLES");
   });
 
   it("a subscriber is added by inserting a row and waiting one reload", async () => {

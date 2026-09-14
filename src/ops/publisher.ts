@@ -2,7 +2,7 @@ import type { Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import { OpsStore, type LoadedReason } from "./store.js";
 import { evaluateMatches, isAdmissibleSubscriptionRow } from "./match.js";
-import { assertReasonTableLegal, HIVE_RUNTIME_REASONS } from "./reasons.js";
+import { assertReasonTableLegal, OPS_REASON_TABLES } from "./reasons.js";
 import { OPS_SCHEMA_VERSION, type OpsEvent, type OpsPublishInput, type OpsSubscription } from "./types.js";
 import { OPS_CLEARS_MAX_LENGTH, OPS_EVIDENCE_MAX, OPS_ID_MAX_LENGTH, clipForLog, isOpsToken } from "./ids.js";
 
@@ -205,8 +205,10 @@ export class OpsPublisher {
     // OUTSIDE the try wrapping init(), so a violation is an unhandled boot
     // throw — loud, immediate, unconfusable with a Mongo outage. Inside
     // init() that catch would swallow it into "init failed", the exact
-    // degradation D10 forbids. Development-only: the shipped table passes.
-    assertReasonTableLegal(HIVE_RUNTIME_REASONS);
+    // degradation D10 forbids. Development-only: the shipped tables pass.
+    // KPR-501 D3: one assertion PER TABLE — the gate is per-table and each
+    // code-resident table is self-contained.
+    for (const table of OPS_REASON_TABLES) assertReasonTableLegal(table);
     this.store = new OpsStore(db, retentionDays);
   }
 
@@ -225,7 +227,9 @@ export class OpsPublisher {
    */
   async init(): Promise<void> {
     this.counters.indexFailures = await this.store.ensureIndexes();
-    await this.store.upsertReasons(HIVE_RUNTIME_REASONS);
+    // KPR-501 D3: one upsert per table, in list order, each table's internal
+    // clearing-first order preserved, all before the single read-back.
+    for (const table of OPS_REASON_TABLES) await this.store.upsertReasons(table);
     const loaded = await this.store.loadReasons();
     this.reasons = loaded.map;
     this.counters.reasonRowAnomalies = loaded.anomalies;
