@@ -1,6 +1,6 @@
 # KPR-463 implementation plan — registered pilot evidence and S7 completion
 
-This is chunk 4 of the [parent plan](./kpr-463-plan.md). Its approved spec, Testing Contract, S0–S12 schedule and authorization record `ac95b136` apply. This revision addresses `caught-by: implementation/2/capable`; it does not authorize pilot modifications, service actions or calls during drafting. Task/Step suffixes below extend existing IDs. They do not replace the original steps or waive T1–T9.
+This is chunk 4 of the [parent plan](./kpr-463-plan.md). Its approved spec, Testing Contract, S0–S12 schedule and authorization record `ac95b136` apply. This revision addresses `caught-by: implementation/2/capable`; it does not authorize pilot modifications, service actions or calls during drafting. Task/Step suffixes below extend existing IDs. They do not replace the original steps or waive T1–T10.
 
 ## Feasibility boundary established from source
 
@@ -399,7 +399,7 @@ export function freshObservation(
 | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `file-seal`         | `verifySeal` on the registered file, using fd identity/hash and root rules above; report match or mismatch; never read a JSON `held` field                                                                                                                     |
 | `service`           | only the snapshot's two labels; `ServiceController.inspect`, compare live PID/start/args/cwd/config/environment/plist/link; target mismatch fails                                                                                                              |
-| `process-census`    | `ServiceController.processCensus`, worker descendants, process starts and open executable/cwd/socket paths via existing OS adapter; also inventory engine descendants/MCP command paths privately; unknown ownership is a gap, never a kill target             |
+| `process-census`    | `ServiceController.processCensus`, worker descendants, process starts and open executable/cwd/socket paths via existing OS adapter; also inventory engine descendants/MCP command paths privately; unknown ownership is a gap, never a kill target; inventory observation only, never a stop, rotation or staging-settlement gate |
 | `sdk-local`         | captured `127.0.0.1` listener, GET `/` and `/worker`, exact status/agent name/nonnegative integer job count; OS socket owner before/after must match same live worker                                                                                          |
 | `livekit-inventory` | sealed `pilot-inventory` subprocess above; no arbitrary URL/method accepted; all IDs classified or reported unknown                                                                                                                                            |
 | `admission-status`  | `requestMaintenance` status to the verified capable runtime, random fresh request UUID, record's operation/boot; validate envelope and SDK/Mongo idle evidence through chunk 5’s exact own-loader observe/idle ABI and strict parsers; open health uses `freshAdmissionStatus`, closed same-owner proof uses chunk 5’s `freshClosedAdmissionStatus`; absent capability returns unavailable |
@@ -516,7 +516,7 @@ The public adapter offers `withVerifiedPilotStop(operation, selectedRecord)` wit
 
 - [ ] **Step 4c.3:** Release uses the existing terminal release acknowledgement: operation ID on envelope, same supervisor/boot, null snapshot operationId, gate open, persistence durable. A fresh open status alone is insufficient. On pre-signal timeout/error, release even if the close could have arrived late; do not forget the recorded barrier because local `barrierEstablished` is false. No detach/TTL/replayed JSON can settle the operation. Missing ack persists `unresolved`, retains lock/evidence, exit 1. A successful release records `released` in a separate immutable result record; it never edits the old hold payload.
 
-After confirmed worker/descendant exit, a native local hold terminates with that supervisor; record `supervisor-exited` rather than pretending to receive a release from a dead process. Verify the next pair's admission is open before final success. External hold release is unavailable in v1; a manual command note is not an executable release adapter. `--release-legacy-hold` invokes concrete reconciliation for a still-owned recorded operation or freshly verifies it already terminated/released; foreign/current-operation ownership returns busy. It never clears another operation's gate. Final S12 evidence includes establishment, both checks, release/exit outcome and timestamps, or explicit unavailable reasons.
+After confirmed worker supervisor exit and health-listener release, a native local hold terminates with that supervisor; record `supervisor-exited` rather than pretending to receive a release from a dead process. Verify the next pair's admission is open before final success. External hold release is unavailable in v1; a manual command note is not an executable release adapter. `--release-legacy-hold` invokes concrete reconciliation for a still-owned recorded operation or freshly verifies it already terminated/released; foreign/current-operation ownership returns busy. It never clears another operation's gate. Final S12 evidence includes establishment, both checks, release/exit outcome and timestamps, or explicit unavailable reasons.
 
 ## Task 8 Step 5a: Pilot migration, recovery and reapply adapters
 
@@ -528,7 +528,7 @@ Select and validate the registered pilot reference before constructing the lifec
 
 - [ ] **Step 5a.3:** `--pilot-recovery=<registered-snapshot>` is legal only when a resolved first-migration operation under this instance references that same snapshot/bootstrap and selected candidate. Verify that durable lineage and current candidate identity, complete retained artifacts, current configs, seals and usable pilot profile prerequisites before stopping anything. Snapshot registration alone does not authorize switching an arbitrary installed instance to some old tree.
 
-Capture the current packaged pair as this rollback operation's `priorProfile="packaged"`; its recovery route is the current candidate. Quiesce it through the concrete installed-worker `worker-maintenance` interface in [chunk 5 Task 9 Step 4b.2a, Step 2b](./kpr-463-plan-pilot-boundaries.md): this rollback operation owns C’s baseline/post-close/final status and own-loader Mongo reads, with current process/boot corroboration and the original deadline. The old random-operation `worker` subprocess is not a maintenance observation. Stop worker/descendants then engine only after C’s final fresh proof passes at actual dispatch. **Pilot rollback changes service definitions only:** retain the complete candidate at its already operation-owned `.hive` slot, with exact device/inode/release/archive lineage recorded in this operation's snapshot and `retainedPaths`. Do not rename or dispose it, and do not restore an unrelated installed old `.hive` merely because the pilot ran elsewhere. `.prev`/`.broken` positions remain exactly as captured immediately before this rollback. The pilot runs from its captured external paths; an installed candidate manifest is never reported as that pilot's running identity. On rollback failure restore candidate definitions and full packaged health from that retained `.hive`, without artifact rotation.
+Capture the current packaged pair as this rollback operation's `priorProfile="packaged"`; its recovery route is the current candidate. Quiesce it through the concrete installed-worker `worker-maintenance` interface in [chunk 5 Task 9 Step 4b.2a, Step 2b](./kpr-463-plan-pilot-boundaries.md): this rollback operation owns C’s baseline/post-close/final status and own-loader Mongo reads, with current process/boot corroboration and the original deadline. The old random-operation `worker` subprocess is not a maintenance observation. Stop the worker supervisor (exit plus listener release) then engine only after C’s final fresh proof passes at actual dispatch. **Pilot rollback changes service definitions only:** retain the complete candidate at its already operation-owned `.hive` slot, with exact device/inode/release/archive lineage recorded in this operation's snapshot and `retainedPaths`. Do not rename or dispose it, and do not restore an unrelated installed old `.hive` merely because the pilot ran elsewhere. `.prev`/`.broken` positions remain exactly as captured immediately before this rollback. The pilot runs from its captured external paths; an installed candidate manifest is never reported as that pilot's running identity. On rollback failure restore candidate definitions and full packaged health from that retained `.hive`, without artifact rotation.
 
 Deserialize `ServiceSave` only after verifying plist backup seals; provide `capturedPilotProfile` paths to `ServiceController` as the exact allowed historical targets. Restore service **files/links/enabled state first with services unloaded**, then engine bootstrap and fresh boot verification, then worker bootstrap and pilot profile. Refactor `ServiceController.restore` into `restoreFilesAndState`, `restoreEngine`, `restoreWorker` (or an ordered phase callback) rather than let its current loop bootstrap worker before the caller checks engine. Existing packaged recovery must use this ordering too. Compare effective live definitions to captures, not just written plist bytes. If an original plist lives outside the instance (including a protected pilot checkout), verify its captured seal and leave that file untouched; restore only the target instance LaunchAgent link to that exact existing target. Missing/changed external originals block preflight rather than being rewritten from backup. Instance-owned generated plist paths may be restored from their sealed backups. Capture both effective external target and instance-owned file/link state in the distinct `effectivePlist` and `instancePlist` fields defined above; chunk 5 specifies their separate seals and restoration ordering, including distinct sentinel bytes.
 
@@ -551,9 +551,9 @@ Serialize recovery contenders with exclusive `<existing-lock>/reconcile` directo
 | Adapter/phase                                | Exact action                                                                                                                                                                                                                                                                                                                                                        |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ownerIsLive`                                | existing OS census/process identity via `ServiceController`; compare PID and startTime; unavailable OS readback is unresolved, not dead                                                                                                                                                                                                                             |
-| `releaseBarrier`, no signals                 | load captured same worker PID/boot and local descriptor; issue fresh terminal `release` for recorded barrierOperationId via shared maintenance client; validate ack and process identity. If worker exited, do not fake ack: prove its exit/descendant absence and current pair/open admission through profile before resolving; unknown new owner stays unresolved |
+| `releaseBarrier`, no signals                 | load captured same worker PID/boot and local descriptor; issue fresh terminal `release` for recorded barrierOperationId via shared maintenance client; validate ack and process identity. If worker exited, do not fake ack: prove its supervisor exit/listener release and current pair/open admission through profile before resolving; unknown new owner stays unresolved |
 | `reconcileFilesystem`, no signals            | validate prior snapshot/current live pair unchanged; reconcile last intended/observed rename/disposal by exact identities; reverse only this operation's pre-signal reserved broken/previous moves; remove only the owned incomplete `.next` from recorded identity; reconcile beta migration per Step 1b; no generic `rm -rf` or inference from slot names         |
-| `recoverAfterSignals`, no durable resolution | reconstruct prior pair from durable `ServiceSave`/slot/last-move data; stop only identified candidate pair and descendants, worker before engine; restore actual identities/definitions in order; verify captured packaged/pilot/stopped profile. Unknown or duplicated identity fails; never overwrite occupied targets                                            |
+| `recoverAfterSignals`, no durable resolution | reconstruct prior pair from durable `ServiceSave`/slot/last-move data; stop only identified candidate supervisors, worker before engine, verifying supervisor exit and worker listener release; restore actual identities/definitions in order; verify captured packaged/pilot/stopped profile. Unknown or duplicated identity fails; never overwrite occupied targets                                            |
 | durable `healthy`/`recovered` resolution     | first verify the recorded final pair/profile and current retained inventory; complete only its exact pending disposal/restore fence and lock archival. Do **not** call `recoverAfterSignals` and rotate back a healthy accepted release just because signalsBegun is true                                                                                           |
 | durable `deferred` resolution                | verify release/unchanged prior pair and owned cleanup complete before removing lock                                                                                                                                                                                                                                                                                 |
 
@@ -569,136 +569,25 @@ After all renames succeed, persist `compatibility-committed` and exact after has
 
 ## Task 9 Step 4d: Final stable bootstrap handler
 
-- [ ] **Step 4d.1:** Replace the old runbook-only heredoc as the authoritative interface with `bootstrap.ts`. Entry is the candidate helper from the reviewed tarball, initially extracted into a new private preparation directory under `.hive-state/bootstrap/.prepare-<uuid>` by the host-only archive guard; its digest must be independently compared with the helper member in the reviewed archive before executing. The host extraction command remains documented, but it performs only safe member/type checks, archive SHA check and exclusive extraction; it does not execute unvalidated package code or install dependencies. It uses recorded absolute Node/npm paths, `tar` through `execFile` with literal argument arrays, and no shell evaluation. Candidate SHA/revision values remain review inputs, not inferred from the unpacked package itself.
+- [ ] **Step 4d.1:** Replace the old runbook-only heredoc as the authoritative interface with `bootstrap.ts`. Entry is the candidate helper from the reviewed tarball. `pkg/deploy.min.js` is builtin-only, so it is the first-adoption entry that loads before any `node_modules` exist; a builtin-only host recipe (Step 4d.2) authenticates the archive and places that single helper file in a new private preparation directory under `.hive-state/bootstrap/.prepare-<uuid>`. The recipe executes no candidate code and installs no dependencies; its member read is itself a confined artifact job (chunk 5 Task 8 Step 1a.3). Candidate SHA/revision values remain review inputs, not inferred from the unpacked package itself.
 
-`--bootstrap --artifact=<absolute-tgz> --sha256=<reviewed-sha> --revision=<reviewed-revision>` validates source helper identity against that archive before freezing, then follows this algorithm under the ordinary lock and chunk 5’s durable bootstrap preparation/install/registration fences: verify digest; use existing `validateArchiveMembers`/`extractAndValidateArtifact` with dirty=false; create `<home>/.hive-state/bootstrap/<sha>/package` exclusively; retain a copied archive at `<sha>/candidate.tgz`; run existing locked install/native diagnostic with recorded absolute npm/Node, sanitized environment and exact success markers; verify `readRelease` revision/lock/version; tree-seal dependencies and helpers; register `BootstrapRecord` last. Resolve/seal npm's real `npm-cli.js` path from the supplied operational PATH and invoke it as `execFile(recordedNode, [recordedNpmCli, "ci", "--omit=dev", "--no-audit", "--no-fund", "--no-progress"])`; do not let an npm shebang choose a different Node. Factor this host invocation through `artifact.ts` for stage/bootstrap/recovery consistency. No service/control/vendor operation or pilot-code mutation. Config preflight is a separate selected-instance probe during capture/update, not proof supplied by offline install.
+`--bootstrap --artifact=<absolute-tgz> --sha256=<reviewed-sha> --revision=<reviewed-revision>` validates source helper identity against that archive before freezing, then follows this contract under the ordinary lock and chunk 5’s durable bootstrap work fences:
 
-An existing digest directory is never overwritten or blindly deleted. If it has a complete registration, rerun identity/tree/offline validation and return its existing registered reference; if incomplete, report its exact path/phase and use chunk 5’s mode-aware bootstrap reconciliation. A dead install without committed registration is cleaned only by recorded identity and finishes aborted; a later invocation installs afresh. A committed registration is revalidated offline and retained. Neither route inspects a live service pair. Registry registration is the success commit, not directory existence. The host guard durably records its preparation receipt as specified in chunk 5; ambiguous pre-operation crash leftovers are retained, never inferred from a directory name. Keep the initial preparation directory until its frozen helper finishes; clean only its recorded owned identity after a resolved result. Output whitelist `{status:"BOOTSTRAP_VALIDATED",packageRoot,recordPath,archiveSha256,sourceRevision}`; missing diagnostic success markers fails even on exit 0.
+- **Outcome:** a verified durable tooling entry at `<home>/.hive-state/tooling/<sha>/`, keyed on the reviewed archive SHA-256, whose packaged CLI executes its own matching deployment implementation with explicit `HIVE_HOME`/`HIVE_CONFIG`; the retained archive copy at `<home>/.hive-state/bootstrap/<sha>/candidate.tgz` (an in-process journaled copy, never a job output); a `BootstrapRecord` registered after the rename as the sealed reference later pilot/hold records cite.
+- **Order:** run the confinement self-test and fix the promotion method → unconditionally discard every sibling under `.hive-state/tooling/.staging/` (only staging siblings; never a final-name entry) → verify archive digest and clean provenance → if `tooling/<sha>/` already exists under its final name, reuse it (below) → otherwise: confined extraction job with the existing strict member validation into its job directory → clone the extraction output into a fresh install job directory → confined locked install there → after direct-child exit 0, clone the install output into `.hive-state/tooling/.staging/<sha>.<operation-id>/` → tooling verification subset against that staging sibling → atomic rename of the staging sibling to `.hive-state/tooling/<sha>/` under the lock (the destination must be absent) → tree-seal the final entry and register `BootstrapRecord` last → deferred job-directory disposal.
+- **Tooling verification subset (spec §3.2):** required entries present (`pkg/cli.min.js`, `pkg/release.json`, `npm-shrinkwrap.json`, `package.json`, `node_modules/`); `pkg/release.json` package version and lock digest consistent with the reviewed archive digest naming the entry and with the entry's own shrinkwrap; the installed dependency tree consistent with that lock (a confined `npm ls --omit=dev`-class job); and the packaged CLI answering a validate-only invocation from the staging path, as a confined job with a dummy `HIVE_HOME` inside its job directory, that reports its `pkg/release.json` identity, under the same no-side-effect contract as the runtime-loading check. The worker diagnostic and engine validate-only check are not part of this subset. The validate-only CLI invocation parses no instance configuration, loads no secrets and binds no socket; its exact spelling is fixed in S7 and pinned by tests.
+- **Install invocation:** resolve/seal npm's real `npm-cli.js` path from the supplied operational PATH and invoke it inside the confined job as `recordedNode [recordedNpmCli, "ci", "--omit=dev", "--no-audit", "--no-fund", "--no-progress"]`; do not let an npm shebang choose a different Node. Factor this host invocation through `artifact.ts`/`confined-job.ts` for stage/bootstrap/init consistency. No service/control/vendor operation or pilot-code mutation. Config preflight is a separate selected-instance probe during capture/update, not proof supplied by offline install.
+- **Reuse and partial state:** a final-name entry is the only verification marker. When present it is reused, never reinstalled or overwritten: re-check its required entries and `pkg/release.json` consistency with the SHA naming it and its shrinkwrap, recompare its tree seal when a `BootstrapRecord` exists, and register a missing `BootstrapRecord` from that re-checked entry (the case of a crash between rename and registration). A re-check failure on a final-name entry is unresolved and retained with its path; it is never silently replaced. Anything under a staging name is partial by definition and is discarded, never invoked, reused or renamed into place. Final-name entries are outside the job sweep and are removed only by an explicit cleanup step after the instance runs a packaged release that understands this contract. Live plists never point into the tooling area.
+- **Output:** whitelist `{status:"BOOTSTRAP_VALIDATED",packageRoot,recordPath,archiveSha256,sourceRevision}` where `packageRoot` is the final-name entry; a missing validate-only success record fails even on exit 0. Keep the preparation directory until the frozen helper finishes; clean only its recorded owned identity after a resolved result.
 
-- [ ] **Step 4d.2:** Document these final runbook invocations, populating values from actual S12 inventory. These are **not** drafting commands. Initial host extraction establishes `KPR463_PREPARED_HELPER`; successful bootstrap establishes `KPR463_BOOTSTRAP` and registry paths. Capture and hold preparation do not establish migration acceptance.
+- [ ] **Step 4d.2:** Document these final runbook invocations, populating values from actual S12 inventory. These are **not** drafting commands. Initial host preparation establishes `KPR463_PREPARED_HELPER`; successful bootstrap establishes `KPR463_BOOTSTRAP` (the final-name tooling entry) and registry paths. Capture and hold preparation do not establish migration acceptance.
 
-The complete host-only initial extraction command is below. Its independently reviewed archive SHA authenticates candidate bytes before the first candidate execution. It prints one prepared path; the operator assigns that exact value to `KPR463_PREPARED_HELPER` without `eval`. Runtime helper/bootstrap validation still performs full manifest/shrinkwrap checks. Required variables are exported explicitly; no secret environment is printed.
+The host preparation recipe replaces the former inline heredoc, which extracted the whole archive with an unconfined `tar`. It is a documented builtin-only Node program (no imports outside `node:*`) taking the explicitly exported `KPR463_INSTANCE`, `KPR463_INSTANCE_ID`, `KPR463_CONFIG`, `KPR463_ARCHIVE`, `KPR463_SHA` and `KPR463_REVISION`, printing exactly one prepared helper path that the operator assigns to `KPR463_PREPARED_HELPER` without `eval`. Its required behavior:
 
-```bash
-export KPR463_INSTANCE KPR463_INSTANCE_ID KPR463_CONFIG KPR463_ARCHIVE KPR463_SHA KPR463_REVISION
-"$KPR463_NODE" --input-type=module <<'JS'
-import { execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { lstatSync, readFileSync, mkdirSync, realpathSync, openSync, closeSync, fstatSync,
-  writeFileSync, fsyncSync, renameSync, constants } from "node:fs";
-import { resolve, dirname, isAbsolute } from "node:path";
-const uid = process.getuid();
-const hash = bytes => createHash("sha256").update(bytes).digest("hex");
-const input = name => {
-  const value = process.env[name];
-  if (!value || /[\0\r\n]/.test(value)) throw new Error(`invalid ${name}`);
-  return value;
-};
-const instance = input("KPR463_INSTANCE"), archivePath = input("KPR463_ARCHIVE");
-if (!isAbsolute(instance) || !isAbsolute(archivePath)) throw new Error("absolute instance/archive required");
-const home = realpathSync(instance), archive = realpathSync(archivePath);
-const instanceId = input("KPR463_INSTANCE_ID"), configPath = resolve(home, input("KPR463_CONFIG"));
-if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(instanceId)) throw new Error("invalid instance ID");
-const expected = input("KPR463_SHA"), revision = input("KPR463_REVISION");
-if (!/^[a-f0-9]{64}$/.test(expected) || !/^[a-f0-9]{40}$/.test(revision)) throw new Error("reviewed identity required");
-const archiveStat = lstatSync(archivePath);
-if (!archiveStat.isFile() || archiveStat.isSymbolicLink() || !archive.endsWith(".tgz")) throw new Error("regular archive required");
-if (hash(readFileSync(archive)) !== expected) throw new Error("archive digest mismatch");
-const options = { encoding: "utf8", env: { PATH: "/usr/bin:/bin", LC_ALL: "C" }, maxBuffer: 20 * 1024 * 1024 };
-const members = execFileSync("/usr/bin/tar", ["-tzf", archive], options).split("\n").filter(Boolean);
-const details = execFileSync("/usr/bin/tar", ["-tvzf", archive], options).split("\n").filter(Boolean);
-const forbidden = /^(?:hive(?:-[^/]*)?\.yaml|\.env(?:-[^/]*)?|agents|plugins|skills|logs|\.hive-state)(?:\/|$)/;
-if (!members.length || details.length !== members.length || details.some(s => !["-", "d"].includes(s[0])))
-  throw new Error("archive links/special members rejected");
-for (const member of members) {
-  if (!member.startsWith("package/") || member.includes("\\") || member.split("/").includes("..") ||
-      forbidden.test(member.slice(8))) throw new Error("unsafe archive member");
-}
-function directory(p) {
-  const s = lstatSync(p);
-  if (!s.isDirectory() || s.isSymbolicLink() || s.uid !== uid || (s.mode & 0o022) !== 0)
-    throw new Error("unsafe preparation ancestor");
-}
-directory(home);
-for (const p of [resolve(home, ".hive-state"), resolve(home, ".hive-state/bootstrap")]) {
-  directory(dirname(p));
-  try { mkdirSync(p, { mode: 0o700 }); } catch (e) { if (e.code !== "EEXIST") throw e; }
-  directory(p);
-}
-function canonical(v) {
-  if (v === null || typeof v !== "object") return JSON.stringify(v);
-  if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
-  return `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(",")}}`;
-}
-function syncDirectory(p) {
-  const fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try { fsyncSync(fd); } finally { closeSync(fd); }
-}
-function identity(p) {
-  directory(p);
-  const st = lstatSync(p);
-  return { path: p, identity: { dev: st.dev, ino: st.ino, uid: st.uid } };
-}
-function seal(p) {
-  const before = lstatSync(p);
-  if (!before.isFile() || before.isSymbolicLink() || ![uid, 0].includes(before.uid) || (before.mode & 0o022))
-    throw new Error("unsafe preparation file");
-  const fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    const st = fstatSync(fd), bytes = readFileSync(fd), after = fstatSync(fd);
-    if (st.dev !== before.dev || st.ino !== before.ino || st.size !== after.size || st.mtimeMs !== after.mtimeMs)
-      throw new Error("preparation file changed");
-    return { path: p, realpath: realpathSync(p), uid: st.uid, mode: st.mode & 0o777,
-      dev: st.dev, ino: st.ino, size: st.size, sha256: hash(bytes) };
-  } finally { closeSync(fd); }
-}
-const prepId = randomUUID(), parentPath = resolve(home, ".hive-state/bootstrap");
-syncDirectory(home); syncDirectory(resolve(home, ".hive-state")); syncDirectory(parentPath);
-const prepared = resolve(parentPath, `.prepare-${prepId}`);
-const receiptPath = resolve(parentPath, `.prepare-${prepId}.json`);
-const startTime = execFileSync("/bin/ps", ["-p", String(process.pid), "-o", "lstart="], options).trim();
-if (!startTime || /[\r\n]/.test(startTime)) throw new Error("preparer identity unavailable");
-const archiveSeal = seal(archive);
-if (archiveSeal.sha256 !== expected) throw new Error("archive changed");
-const receipt = { schemaVersion: 1, id: prepId,
-  instance: { canonicalHome: home, configPath, instanceId, uid },
-  owner: { pid: process.pid, startTime }, archive: archiveSeal, reviewedRevision: revision,
-  preparedPath: prepared, parent: identity(parentPath), phase: "intended",
-  directory: null, helper: null, adoptedOperationId: null };
-let receiptIdentity = null;
-function persistReceipt() {
-  if (receiptIdentity) {
-    const s = lstatSync(receiptPath);
-    if (!s.isFile() || s.isSymbolicLink() || s.uid !== uid || s.dev !== receiptIdentity.dev || s.ino !== receiptIdentity.ino)
-      throw new Error("preparation receipt changed");
-  } else {
-    try { lstatSync(receiptPath); throw new Error("preparation receipt exists"); }
-    catch (e) { if (e.code !== "ENOENT") throw e; }
-  }
-  const tmp = `${receiptPath}.${randomUUID()}.tmp`;
-  const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-  try { writeFileSync(fd, `${canonical(receipt)}\n`); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(tmp, receiptPath);
-  syncDirectory(parentPath);
-  receiptIdentity = lstatSync(receiptPath);
-}
-persistReceipt();
-mkdirSync(prepared, { mode: 0o700 });
-syncDirectory(parentPath);
-receipt.directory = identity(prepared); receipt.phase = "created"; persistReceipt();
-execFileSync("/usr/bin/tar", ["-xzf", archive, "-C", prepared], options);
-receipt.phase = "extracted"; persistReceipt();
-const helper = resolve(prepared, "package/pkg/deploy.min.js");
-const info = lstatSync(helper);
-if (!info.isFile() || info.isSymbolicLink()) throw new Error("candidate helper missing");
-const memberBytes = execFileSync("/usr/bin/tar", ["-xOzf", archive, "package/pkg/deploy.min.js"],
-  { env: options.env, maxBuffer: options.maxBuffer });
-if (hash(readFileSync(helper)) !== hash(memberBytes)) throw new Error("helper digest mismatch");
-if (canonical(seal(archive)) !== canonical(archiveSeal)) throw new Error("archive changed during extraction");
-receipt.helper = seal(helper); receipt.phase = "validated"; persistReceipt();
-console.log(helper);
-JS
-```
+- **Input validation (retained):** absolute instance/archive, safe instance ID, reviewed 64-hex SHA and 40-hex revision, regular non-symlink `.tgz`; archive read once into memory and hashed, and every later archive use consumes those hashed bytes rather than re-reading the path; strict member listing (`package/` root, no absolute/traversal/backslash names, only regular files and directories, no archived operator-state paths); same-UID, non-group/world-writable, non-symlinked ancestors for `.hive-state` and `.hive-state/bootstrap`.
+- **Confinement:** run the same self-test the helper runs (a confined probe must be denied outside and succeed inside a scratch job directory) before any archive read, failing closed without `/usr/bin/sandbox-exec` or on a non-denying result. Listing and the helper member read run under `/usr/bin/sandbox-exec` with the production profile semantics, scoped to a fresh exclusive job directory `.hive-state/jobs/<preparation-uuid>/<job-uuid>/`, fed the hashed archive bytes on stdin and returning output on stdout only; the recipe profile and self-test must match `confined-job.ts` in effect, which S9 checks by running the documented recipe verbatim.
+- **Placement and verification:** the recipe itself writes the helper bytes received from the confined member read into the exclusive preparation directory `.hive-state/bootstrap/.prepare-<uuid>/package/pkg/deploy.min.js`; no job-directory file is promoted, executed or read back. Verify the written file's seal against the member bytes before printing the path.
+- **Durability (retained):** the chunk 5 Task 9 Step 4d.1a `HostPreparation` receipt beside the preparation directory, with its intended → created → extracted (helper written) → validated phases, exclusive temp writes, file and parent fsync, recorded preparer PID/start time and archive seal; the path is printed only after `validated` is durable.
 
 ```bash
 HIVE_HOME="$KPR463_INSTANCE" HIVE_CONFIG="$KPR463_CONFIG" "$KPR463_NODE" "$KPR463_PREPARED_HELPER" --bootstrap --artifact="$KPR463_ARCHIVE" --sha256="$KPR463_SHA" --revision="$KPR463_REVISION"
@@ -722,7 +611,7 @@ An unavailable hold returns exit 1 with `MIGRATION_PENDING`, snapshot/record pat
 | pilot capture/recovery | malformed/unrestorable plist, unavailable loader, changed external tree, listener ambiguity, occupied slots and unrelated `.hive` cannot be guessed; reconstruction preserves bytes/modes/links and ordered boot; stale/unattributable logs fail; missing new identity fields remain unavailable                                                          |
 | stale recovery         | live parent or child/reconciler busy; abandoned owner with matching records invokes original frozen helper; every rename/disposal fence before/after crash; missing metadata unresolved; same-home aliases serialize; healthy durable result cleanup never rolls back; failures return nonzero and do not start new requested operation                   |
 | beta compatibility     | absent source no-op; existing destination untouched; scoped directory and file modes retained; lock required; partial rename crash reverses safely; changed destination unresolved; committed relocation survives later deployment failure; dry-run no write                                                                                              |
-| bootstrap/routes       | exact flags/mutual exclusions/absolute selectors; reviewed digest/revision required; retained tooling registration; existing valid tree revalidated; incomplete tree retained; native marker absence fails; no old updater, service mutation, pilot mutation or notification                                                                              |
+| bootstrap/routes       | exact flags/mutual exclusions/absolute selectors; reviewed digest/revision required; staging siblings swept at start; final-name entry reused after required-entry/`release.json` re-check and never reinstalled; interrupted clone or failed verification leaves only a discarded staging sibling; rename requires an absent destination; missing `BootstrapRecord` re-registered from a re-checked final entry; validate-only success record absence fails; no old updater, service mutation, pilot mutation or notification |
 
 Commands (run only after implementing these files in the child):
 
@@ -762,8 +651,9 @@ Expected: actual S8 artifact/native markers and all automated cases pass, includ
 - Applied `plan-review/7/frontier`, pilot issue 1: production historical owner-correlated observe/idle ABI now queries its own Mongo configuration, validates current count/supervisor/heartbeat/deadlines, and supplies baseline/post-close/final proof; actual independently built H/C Mongo-boundary cases are required.
 - Applied `plan-review/7/frontier`, integration issue 1: fixed bootstrap/lifecycle extraction, lifecycle fetch/install and nested diagnostic/probe jobs now share durable guardian/go/lineage fences; actual tar/npm/install-descendant orphan tests cover before/after writer exit in bootstrap, ordinary update and reapply.
 - Applied `plan-review/8/frontier`, pilot issue 1: private installed-worker `worker-maintenance` request/parser/job binding, selected own-loader status/Mongo/SDK read, acquired-owner baseline/post-close/final phase and absolute freshness; required actual C rollback/restart executable/shared-ledger/Mongo cases are explicit.
-- Applied `plan-review/8/frontier`, integration issue 1’s fail-closed branch: removed census-to-settlement authority and require `JOB_ACCOUNTING_UNAVAILABLE` before any go. **BLOCKED:** no supported complete descendant mechanism is established within the current helper/host constraints; required positive/executed detached-writer tests and S7/S8/S9/S12 cannot be claimed. A concrete reviewed mechanism or explicit spec-lane contract decision is still required; this is not an implementation-ready correction.
-- No finding declined. The approved spec is unchanged.
+- Applied `plan-review/8/frontier`, integration issue 1’s fail-closed branch: removed census-to-settlement authority and required `JOB_ACCOUNTING_UNAVAILABLE` before any go. **Superseded by the confinement revision below:** the requirement that produced this block was withdrawn by May's architecture decision and spec r1–r3.
+- Applied the confinement revision (architecture decision `6af7e06d` → spec `320d37a1`): Step 4d.1 bootstrap now stages through confined jobs into `.hive-state/tooling/.staging/<sha>.<operation-id>/` and atomically renames to the final-name entry that is the only verification marker; the host preparation heredoc is replaced by a builtin-only recipe contract with a confined member read; stop and recovery wording now requires supervisor exit plus listener release instead of descendant absence; `process-census` stays an inventory observation only.
+- No finding declined. The approved spec at `320d37a1` is authoritative.
 - The described pilot is uninstrumented; no live readback or external fence was performed/established during drafting. Its operational migration remains pending by the approved conditional contract. A newly discovered external authority requires a reviewed concrete adapter; no assumption makes it pass.
 - Native protocol support is accepted only from an independently verified capable runtime already present. No protected-pilot retrofit is authorized or planned.
 - S0–S6 and partial S7 at `bc0d47a` are preserved. Source interfaces may be factored for reconstruction, but completed unrelated plan sections and S8/S9/S12 gates remain intact.
