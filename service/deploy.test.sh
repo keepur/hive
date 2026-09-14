@@ -331,4 +331,38 @@ else
 fi
 [[ "$status" == "23" ]] || { echo "FAIL: expected status 23, got $status" >&2; exit 1; }
 
+# --- Test 18: developer port wait reports an unexpected owner and never kills it ---
+echo "test 18: wait_ports_released reports a surviving port owner without killing it"
+grep -q 'kill_ports' "$SCRIPT_DIR/deploy.sh" && { echo "FAIL: kill_ports must be removed from deploy.sh" >&2; exit 1; }
+if grep -Eq 'xargs[[:space:]]+kill|kill[[:space:]]+-9' "$SCRIPT_DIR/deploy.sh"; then
+  echo "FAIL: deploy.sh must not signal port owners" >&2
+  exit 1
+fi
+sleep 60 &
+PORT_OWNER=$!
+LSOF_SHIM="$TESTROOT/lsof-shim"
+mkdir -p "$LSOF_SHIM"
+cat > "$LSOF_SHIM/lsof" <<LSOFEOF
+#!/usr/bin/env bash
+echo "$PORT_OWNER"
+LSOFEOF
+chmod +x "$LSOF_SHIM/lsof"
+DRY_RUN=false
+set +e
+PORT_RELEASE_ATTEMPTS=2 PORT_RELEASE_INTERVAL=0 PATH="$LSOF_SHIM:$PATH" \
+  wait_ports_released "4100" 2> "$TESTROOT/port-owner.err"
+status=$?
+set -e
+[[ "$status" != "0" ]] || { echo "FAIL: an owned port must fail the wait" >&2; exit 1; }
+grep -q "pid $PORT_OWNER" "$TESTROOT/port-owner.err" || { echo "FAIL: owner PID not reported" >&2; exit 1; }
+kill -0 "$PORT_OWNER" 2>/dev/null || { echo "FAIL: port owner was killed" >&2; exit 1; }
+kill "$PORT_OWNER" 2>/dev/null || true
+wait "$PORT_OWNER" 2>/dev/null || true
+cat > "$LSOF_SHIM/lsof" <<'LSOFEOF'
+#!/usr/bin/env bash
+exit 1
+LSOFEOF
+PORT_RELEASE_ATTEMPTS=2 PORT_RELEASE_INTERVAL=0 PATH="$LSOF_SHIM:$PATH" wait_ports_released "4100" \
+  || { echo "FAIL: released ports should pass the wait" >&2; exit 1; }
+
 echo "all tests passed."
