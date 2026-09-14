@@ -360,6 +360,57 @@ export class ArtifactRotation {
     }
   }
 
+  /**
+   * Reconstruct captured slot identities from a durable prior snapshot and the
+   * recorded promotion fence (stale reconciliation; never from slot names).
+   */
+  adoptCaptured(captured: CapturedRotation): void {
+    this.captured.current = captured.current;
+    this.captured.previous = captured.previous;
+    this.captured.next = captured.next;
+    this.captured.broken = captured.broken;
+  }
+
+  /**
+   * First migration with `.hive` absent (chunk 4 Task 8 Step 5a.2): `.broken`
+   * is already reserved, any `.prev` stays exactly where it is, and the owned
+   * verified clone moves to the absent `.hive`. No empty current package is
+   * fabricated.
+   */
+  async rotateFirstMigration(): Promise<void> {
+    if (this.captured.current) throw new Error("first migration rotation requires a captured absent .hive");
+    if (!this.captured.next) throw new Error("first migration requires an owned verified .hive.next");
+    this.#requireVerifiedNext();
+    await moveOwnedDirectory(this.operation, this.slots.next, this.slots.current);
+  }
+
+  /** Failed first migration: candidate to `.broken`, `.hive` absent again, `.prev` untouched. */
+  async recoverFirstMigration(): Promise<void> {
+    if (this.captured.current || !this.captured.next) throw new Error("first migration recovery inventory incomplete");
+    const candidate = await locateDirectoryIdentity(this.captured.next, [this.slots.current, this.slots.next]);
+    await moveOwnedDirectory(this.operation, candidate, this.slots.broken);
+    if (this.captured.previous) {
+      await locateDirectoryIdentity(this.captured.previous, [this.slots.previous]);
+    }
+  }
+
+  #requireVerifiedNext(): void {
+    const staging = this.operation.record.staging;
+    const promoted = staging.promotion;
+    if (
+      !this.captured.next ||
+      !staging.cloneVerified ||
+      !promoted ||
+      promoted.state !== "observed" ||
+      promoted.discarded ||
+      promoted.destination !== this.slots.next ||
+      promoted.destinationIdentity?.dev !== this.captured.next.device ||
+      promoted.destinationIdentity?.ino !== this.captured.next.inode
+    ) {
+      throw new Error("rotation refuses a .hive.next that is not the recorded verified clone");
+    }
+  }
+
   async rotateRollback(): Promise<void> {
     if (!this.captured.current || !this.captured.previous)
       throw new Error("rollback requires current and previous releases");

@@ -633,6 +633,8 @@ describe("durable operation and artifact ownership", () => {
         calls.push("filesystem");
       },
       recoverAfterSignals: async () => calls.push("recover"),
+      completeDurableResolution: async () => calls.push("durable"),
+      verifyDeferredResolution: async () => calls.push("deferred"),
     });
     expect(calls).toEqual(["terminal-release", "filesystem"]);
     const next = await acquireOperation({
@@ -659,8 +661,93 @@ describe("durable operation and artifact ownership", () => {
         throw new Error("pre-signal cleanup must not run");
       },
       recoverAfterSignals: recover,
+      completeDurableResolution: async () => {
+        throw new Error("unfinished activation is not a durable resolution");
+      },
+      verifyDeferredResolution: async () => {
+        throw new Error("unfinished activation is not deferred");
+      },
     });
     expect(recover).toHaveBeenCalledOnce();
+  });
+
+  it("completes a durable healthy resolution without checked recovery or rotation", async () => {
+    const { root, operation } = await operationFixture();
+    operation.record.signalsBegun = true;
+    operation.record.resolution = "healthy";
+    await persistOperation(operation);
+    const calls: string[] = [];
+    const result = await reconcileInterruptedOperation(root, {
+      ownerIsLive: async () => false,
+      releaseBarrier: async () => void calls.push("release"),
+      reconcileFilesystem: async () => void calls.push("filesystem"),
+      recoverAfterSignals: async () => void calls.push("recover"),
+      completeDurableResolution: async () => void calls.push("durable"),
+      verifyDeferredResolution: async () => void calls.push("deferred"),
+    });
+    expect(calls).toEqual(["durable"]);
+    expect(result.resolution).toBe("healthy");
+  });
+
+  it("keeps a lock busy while the recorded frozen helper lives after its parent died", async () => {
+    const { root, operation } = await operationFixture();
+    operation.record.frozenOwner = { pid: 4321, startTime: "frozen" };
+    await persistOperation(operation);
+    const noop = async () => {};
+    await expect(
+      reconcileInterruptedOperation(root, {
+        ownerIsLive: async (owner) => owner.pid === 4321,
+        releaseBarrier: noop,
+        reconcileFilesystem: noop,
+        recoverAfterSignals: noop,
+        completeDurableResolution: noop,
+        verifyDeferredResolution: noop,
+      }),
+    ).rejects.toThrow("frozen helper is still live");
+    await finishOperationLock(operation);
+  });
+
+  it("first migration moves only the verified clone into an absent .hive and recovers to captured absence", async () => {
+    const { operation } = await operationFixture();
+    const home = operation.record.canonicalHome;
+    mkdirSync(resolve(home, ".hive.prev"));
+    writeFileSync(resolve(home, ".hive.prev", "marker"), "old");
+    mkdirSync(resolve(home, ".hive.next"));
+    const next = await directoryIdentity(resolve(home, ".hive.next"));
+    operation.record.staging.promotion = {
+      method: "clone",
+      source: resolve(home, ".hive-state", "jobs", "j"),
+      destination: resolve(home, ".hive.next"),
+      state: "observed",
+      copyPid: null,
+      copyStartTime: null,
+      exitCode: 0,
+      destinationIdentity: { dev: next.device, ino: next.inode },
+      discarded: false,
+    };
+    operation.record.staging.cloneVerified = true;
+    await persistOperation(operation);
+    const rotation = new ArtifactRotation(operation, async () => false);
+    await rotation.capture();
+    expect(rotation.captured.current).toBeUndefined();
+    await expect(rotation.rotateUpdate()).rejects.toThrow("current and owned next");
+    await rotation.rotateFirstMigration();
+    expect(readFileSync(resolve(home, ".hive.prev", "marker"), "utf8")).toBe("old");
+    await rotation.recoverFirstMigration();
+    expect((await directoryIdentity(resolve(home, ".hive.broken"))).inode).toBe(next.inode);
+    expect(() => realpathSync(resolve(home, ".hive"))).toThrow();
+    expect(readFileSync(resolve(home, ".hive.prev", "marker"), "utf8")).toBe("old");
+    await finishOperationLock(operation);
+  });
+
+  it("first migration refuses an unverified clone", async () => {
+    const { root, operation } = await operationFixture();
+    mkdirSync(resolve(operation.record.canonicalHome, ".hive.next"));
+    const rotation = new ArtifactRotation(operation, async () => false);
+    await rotation.capture();
+    await expect(rotation.rotateFirstMigration()).rejects.toThrow("not the recorded verified clone");
+    expect(root).toBeTruthy();
+    await finishOperationLock(operation);
   });
 });
 
@@ -693,6 +780,24 @@ describe("helper argument and pure dry-run boundary", () => {
     );
     expect(() => parseDeploymentArguments(["--start", "--stop"])).toThrow("mutually exclusive");
     expect(() => parseDeploymentArguments(["--legacy-hold=/tmp/hold.json"])).toThrow("artifact update");
+  });
+
+  it("accepts the internal reconcile mode only with exactly its operation record and claim", () => {
+    const claim = "44444444-4444-4444-8444-444444444444";
+    expect(
+      parseDeploymentArguments([`--reconcile-operation=/state/operation.json`, `--reconcile-claim=${claim}`]),
+    ).toMatchObject({ reconcileOperation: "/state/operation.json", reconcileClaim: claim });
+    expect(() => parseDeploymentArguments([`--reconcile-operation=/state/operation.json`])).toThrow("used together");
+    expect(() =>
+      parseDeploymentArguments([
+        `--reconcile-operation=/state/operation.json`,
+        `--reconcile-claim=${claim}`,
+        "--restart",
+      ]),
+    ).toThrow("accepts only");
+    expect(() =>
+      parseDeploymentArguments([`--reconcile-operation=relative.json`, `--reconcile-claim=${claim}`]),
+    ).toThrow("accepts only");
   });
 
   it("dry-run reads selectors only and leaves the filesystem byte-for-byte unchanged", async () => {

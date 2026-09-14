@@ -12,16 +12,45 @@ import {
   OPERATION_SCHEMA_VERSION,
   operationPaths,
   persistOperation,
+  transferOwnershipToFrozen,
   type AcquiredOperation,
   type OperationRecord,
 } from "./operation.js";
-import { runNodeLifecycle, stagingRequired, type LifecycleCommand } from "./lifecycle.js";
+import {
+  resolveLifecycleContext,
+  runNodeLifecycle,
+  stagingRequired,
+  validatePromotedRelease,
+  verifyPackagedPair,
+  type LifecycleCommand,
+} from "./lifecycle.js";
 import { SANDBOX_EXEC } from "./confined-job.js";
+import {
+  inspectOrReconcile,
+  nodeReconcileHostIO,
+  PREVIOUS_OPERATION_RECONCILED,
+  runReconcileOperation,
+  type LifecycleReconcileDeps,
+} from "./reconcile.js";
+import { MigrationPendingError } from "./pilot-lifecycle.js";
 
 export interface DeploymentArguments extends LifecycleCommand {
   dryRun: boolean;
   instance?: string;
   operationRecord?: string;
+  /** Internal: original frozen helper reconciling an interrupted operation. */
+  reconcileOperation?: string;
+  reconcileClaim?: string;
+}
+
+/** Nonzero exit with a machine-readable result already printed. */
+export class DeploymentExit extends Error {
+  constructor(
+    readonly exitCode: number,
+    readonly result: Record<string, unknown>,
+  ) {
+    super(String(result.status ?? "deployment exit"));
+  }
 }
 
 function value(arg: string, name: string): string | undefined {
@@ -43,11 +72,23 @@ export function parseDeploymentArguments(argv: readonly string[]): DeploymentArg
     else if (value(arg, "artifact") !== undefined) result.artifact = value(arg, "artifact");
     else if (value(arg, "instance") !== undefined) result.instance = value(arg, "instance");
     else if (value(arg, "operation-record") !== undefined) result.operationRecord = value(arg, "operation-record");
+    else if (value(arg, "reconcile-operation") !== undefined)
+      result.reconcileOperation = value(arg, "reconcile-operation");
+    else if (value(arg, "reconcile-claim") !== undefined) result.reconcileClaim = value(arg, "reconcile-claim");
     else if (value(arg, "pilot-recovery") !== undefined) {
       result.pilotRecovery = value(arg, "pilot-recovery");
       explicitModes.add((result.mode = "pilot-rollback"));
     } else if (value(arg, "legacy-hold") !== undefined) result.legacyHold = value(arg, "legacy-hold");
     else throw new Error(`unknown deployment argument: ${arg}`);
+  }
+  if ((result.reconcileOperation === undefined) !== (result.reconcileClaim === undefined)) {
+    throw new Error("--reconcile-operation and --reconcile-claim are used together");
+  }
+  if (
+    result.reconcileOperation !== undefined &&
+    (argv.length !== 2 || !isAbsolute(result.reconcileOperation) || !/^[0-9a-f-]{36}$/i.test(result.reconcileClaim!))
+  ) {
+    throw new Error("reconcile mode accepts only its absolute operation record and claim");
   }
   if (result.artifact !== undefined && result.tag !== undefined) {
     throw new Error("--artifact and --tag are mutually exclusive");
@@ -162,6 +203,12 @@ async function loadAcquired(recordPath: string): Promise<AcquiredOperation> {
   return { paths, record: current };
 }
 
+async function processStartTime(pid: number): Promise<string> {
+  const start = await nodeReconcileHostIO.processStartTime(pid);
+  if (!start) throw new Error(`process ${pid} identity is unavailable`);
+  return start;
+}
+
 async function runFrozen(args: DeploymentArguments, env: NodeJS.ProcessEnv): Promise<void> {
   const operation = await loadAcquired(args.operationRecord!);
   const self = await realpath(process.argv[1]);
@@ -169,16 +216,59 @@ async function runFrozen(args: DeploymentArguments, env: NodeJS.ProcessEnv): Pro
   if (self !== expectedSelf || sha256(await readFile(self)) !== operation.record.toolSha256) {
     throw new Error("frozen deployment helper identity mismatch");
   }
+  // Durable ownership transfer to this frozen child before any effect.
+  await transferOwnershipToFrozen(
+    operation,
+    { pid: process.pid, startTime: await processStartTime(process.pid) },
+    { pid: process.ppid, startTime: await processStartTime(process.ppid) },
+  );
   let resolved = false;
   try {
     await runNodeLifecycle(operation, args, env);
     resolved = Boolean(operation.record.resolution);
   } catch (error) {
     resolved = Boolean(operation.record.resolution) && operation.record.phase !== "unresolved";
+    if (error instanceof MigrationPendingError) {
+      throw new DeploymentExit(1, {
+        status: "MIGRATION_PENDING",
+        gaps: [...error.gaps],
+        holdRecord: error.holdRecordPath,
+        operationId: operation.record.id,
+      });
+    }
     throw error;
   } finally {
     if (resolved) await finishOperationLock(operation);
   }
+}
+
+export function lifecycleReconcileDepsFactory(
+  env: NodeJS.ProcessEnv,
+): (record: OperationRecord) => Promise<LifecycleReconcileDeps> {
+  return async (record) => {
+    const acquired: AcquiredOperation = { paths: operationPaths(record.canonicalHome, record.id), record };
+    const context = await resolveLifecycleContext(acquired, env);
+    return {
+      controller: context.controller,
+      host: nodeReconcileHostIO,
+      verifyPackaged: async ({ minimumStartedAt }) => {
+        validatePromotedRelease(resolve(record.canonicalHome, ".hive"));
+        await verifyPackagedPair(context, { minimumStartedAt, engineLogOffset: 0, dependenciesContained: true });
+      },
+    };
+  };
+}
+
+async function runReconcileMode(args: DeploymentArguments, env: NodeJS.ProcessEnv): Promise<void> {
+  const self = await realpath(process.argv[1]);
+  const result = await runReconcileOperation({
+    operationRecordPath: args.reconcileOperation!,
+    claimId: args.reconcileClaim!,
+    selfPath: self,
+    selfSha256: sha256(await readFile(self)),
+    lifecycle: lifecycleReconcileDepsFactory(env),
+  });
+  process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
 async function freezeAndInvoke(
@@ -187,6 +277,20 @@ async function freezeAndInvoke(
   env: NodeJS.ProcessEnv,
 ): Promise<void> {
   const selected = await selectInstance(args, env);
+  // Stale-lock reconciliation precedes any new acquisition and never runs the
+  // newly requested action in the same invocation.
+  const stale = await inspectOrReconcile({
+    instanceHome: selected.home,
+    env: { ...env, HIVE_CONFIG: selected.configPath },
+  });
+  if (stale.status === "reconciled") {
+    throw new DeploymentExit(1, {
+      status: PREVIOUS_OPERATION_RECONCILED,
+      operationId: stale.operationId,
+      workKind: stale.workKind,
+      outcome: stale.outcome,
+    });
+  }
   await requireRegisteredRunbookPath(args.pilotRecovery, selected);
   await requireRegisteredRunbookPath(args.legacyHold, selected);
   const source = await realpath(process.argv[1]);
@@ -228,7 +332,8 @@ export async function runDeploymentMain(
     process.stdout.write(`${JSON.stringify(await deploymentDryRun(args, env))}\n`);
     return;
   }
-  if (args.operationRecord) await runFrozen(args, env);
+  if (args.reconcileOperation) await runReconcileMode(args, env);
+  else if (args.operationRecord) await runFrozen(args, env);
   else await freezeAndInvoke(args, argv, env);
 }
 
@@ -236,6 +341,11 @@ async function main(): Promise<void> {
   try {
     await runDeploymentMain();
   } catch (error) {
+    if (error instanceof DeploymentExit) {
+      process.stdout.write(`${JSON.stringify(error.result)}\n`);
+      process.exitCode = error.exitCode;
+      return;
+    }
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
   }

@@ -65,11 +65,31 @@ export function emptyStaging(): StagingRecord {
 
 export const OPERATION_SCHEMA_VERSION = 2;
 
+export interface ProcessOwner {
+  pid: number;
+  startTime: string;
+}
+
+/**
+ * Durable work kind. Reconciliation dispatches on it before reading any
+ * lifecycle prior/profile/slot field. Only lifecycle work is produced today;
+ * bootstrap and registry work handlers are supplied by the registry/bootstrap
+ * unit (plan chunk 5 Task 8 Step 1a.3 Step 4).
+ */
+export type OperationWorkKind = "lifecycle" | "bootstrap" | "registry";
+
 export interface OperationRecord {
   schemaVersion: typeof OPERATION_SCHEMA_VERSION;
   id: string;
+  workKind: OperationWorkKind;
+  /** Original invoking parent; remains a liveness participant. */
   ownerPid: number;
   ownerStartTime: string;
+  /**
+   * The frozen helper child that owns effects once transfer is durable
+   * (chunk 4 Task 8 Step 1a.1). Null until the frozen child records itself.
+   */
+  frozenOwner: ProcessOwner | null;
   canonicalHome: string;
   instanceId: string;
   mode: "update" | "check" | "rollback" | "start" | "stop" | "restart" | "pilot-rollback";
@@ -79,6 +99,9 @@ export interface OperationRecord {
   hostNpmPath?: string;
   startedAt: string;
   supervisor?: { pid: number; bootId: string };
+  /** Supervisor PID/start time and health listener recorded before close, for exit proof. */
+  supervisorProcess?: ProcessOwner;
+  workerHealthPort?: number;
   barrierOperationId?: string;
   signalsBegun: boolean;
   priorProfile: "packaged" | "pilot" | "stopped";
@@ -101,17 +124,33 @@ export interface OperationRecord {
 }
 
 /** Read-only decoder shape for records written before the staging revision. */
-export type LegacyOperationRecordV1 = Omit<OperationRecord, "schemaVersion" | "staging"> & { schemaVersion: 1 };
+export type LegacyOperationRecordV1 = Omit<
+  OperationRecord,
+  "schemaVersion" | "staging" | "workKind" | "frozenOwner"
+> & {
+  schemaVersion: 1;
+};
 
 /** Decode a current or legacy operation record; unknown schemas are unresolved. */
 export function decodeOperationRecord(value: unknown): OperationRecord | LegacyOperationRecordV1 {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new OperationUnresolvedError("operation record is not an object");
   }
-  const record = value as { schemaVersion?: unknown; staging?: unknown };
+  const record = value as { schemaVersion?: unknown; staging?: unknown; workKind?: unknown; frozenOwner?: unknown };
   if (record.schemaVersion === 1) return value as LegacyOperationRecordV1;
   if (record.schemaVersion !== OPERATION_SCHEMA_VERSION) {
     throw new OperationUnresolvedError("operation record schema is unsupported");
+  }
+  if (record.workKind !== "lifecycle" && record.workKind !== "bootstrap" && record.workKind !== "registry") {
+    throw new OperationUnresolvedError("operation record work kind is missing or unknown");
+  }
+  const frozen = record.frozenOwner as Partial<ProcessOwner> | null | undefined;
+  if (
+    frozen === undefined ||
+    (frozen !== null &&
+      (!Number.isSafeInteger(frozen.pid) || (frozen.pid ?? 0) < 1 || typeof frozen.startTime !== "string"))
+  ) {
+    throw new OperationUnresolvedError("operation record frozen owner is missing or invalid");
   }
   const staging = record.staging as Partial<StagingRecord> | undefined;
   if (
@@ -196,6 +235,7 @@ export interface AcquireOperationInput {
   toolSha256: string;
   ownerStartTime: string;
   priorProfile?: OperationRecord["priorProfile"];
+  workKind?: OperationWorkKind;
   operationId?: string;
   ownerPid?: number;
   startedAt?: string;
@@ -267,7 +307,9 @@ export async function acquireOperation(input: AcquireOperationInput): Promise<Ac
   const record: OperationRecord = {
     schemaVersion: OPERATION_SCHEMA_VERSION,
     id,
+    workKind: input.workKind ?? "lifecycle",
     ownerPid: input.ownerPid ?? process.pid,
+    frozenOwner: null,
     ownerStartTime: input.ownerStartTime,
     canonicalHome,
     instanceId: input.instanceId,
@@ -326,10 +368,71 @@ export async function setOperationPhase(operation: AcquiredOperation, phase: Pha
   await persistOperation(operation);
 }
 
-export async function finishOperationLock(operation: AcquiredOperation): Promise<void> {
+export const RECONCILE_CLAIM_DIRECTORY = "reconcile";
+
+/**
+ * Durably transfer effect ownership from the invoking parent to the frozen
+ * helper child before any effect (chunk 4 Task 8 Step 1a.1). The parent stays
+ * recorded as a liveness participant; either live identity keeps the lock busy.
+ */
+export async function transferOwnershipToFrozen(
+  operation: AcquiredOperation,
+  frozen: ProcessOwner,
+  parent: ProcessOwner,
+): Promise<void> {
+  if (!Number.isSafeInteger(frozen.pid) || frozen.pid < 1 || !frozen.startTime) {
+    throw new OperationUnresolvedError("frozen owner identity is invalid");
+  }
+  if (operation.record.ownerPid !== parent.pid || operation.record.ownerStartTime !== parent.startTime) {
+    throw new OperationUnresolvedError("frozen helper was not launched by the recorded operation owner");
+  }
+  if (operation.record.frozenOwner !== null) {
+    if (
+      operation.record.frozenOwner.pid !== frozen.pid ||
+      operation.record.frozenOwner.startTime !== frozen.startTime
+    ) {
+      throw new OperationUnresolvedError("operation ownership already transferred to another frozen helper");
+    }
+    return;
+  }
+  operation.record.frozenOwner = { ...frozen };
+  await persistOperation(operation);
+}
+
+/**
+ * Archive/clear the lock after the durable resolution. A reconcile claim, if
+ * present, must belong to the caller and is removed with the lock.
+ */
+export async function finishOperationLock(
+  operation: AcquiredOperation,
+  options: { reconcileClaimId?: string } = {},
+): Promise<void> {
   const ownerPath = resolve(operation.paths.lockDirectory, "owner.json");
   const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { id?: unknown };
   if (owner.id !== operation.record.id) throw new OperationUnresolvedError("deployment lock ownership changed");
+  const claimDirectory = resolve(operation.paths.lockDirectory, RECONCILE_CLAIM_DIRECTORY);
+  let claimExists = true;
+  try {
+    await lstat(claimDirectory);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+    claimExists = false;
+  }
+  if (claimExists) {
+    const claimOwner = resolve(claimDirectory, "owner.json");
+    const claim = JSON.parse(await readFile(claimOwner, "utf8")) as { claimId?: unknown; operationId?: unknown };
+    if (
+      options.reconcileClaimId === undefined ||
+      claim.claimId !== options.reconcileClaimId ||
+      claim.operationId !== operation.record.id
+    ) {
+      throw new OperationUnresolvedError("deployment lock carries a reconcile claim owned by another contender");
+    }
+    await unlink(claimOwner);
+    await rmdir(claimDirectory);
+  } else if (options.reconcileClaimId !== undefined) {
+    throw new OperationUnresolvedError("reconcile claim disappeared before lock archival");
+  }
   await unlink(ownerPath);
   await rmdir(operation.paths.lockDirectory);
   await fsyncDirectory(operation.paths.deploymentRoot);
@@ -440,18 +543,45 @@ export async function reconcileArtifactMove(record: OperationRecord): Promise<"b
 }
 
 export interface InterruptedOperationIO {
-  ownerIsLive(owner: { pid: number; startTime: string }): Promise<boolean>;
+  ownerIsLive(owner: ProcessOwner): Promise<boolean>;
+  /** Fresh terminal release for the recorded barrier, or verified supervisor exit. */
   releaseBarrier(record: OperationRecord): Promise<void>;
   reconcileFilesystem(record: OperationRecord, lastMove: "before" | "after" | null): Promise<void>;
   recoverAfterSignals(record: OperationRecord, lastMove: "before" | "after" | null): Promise<void>;
+  /**
+   * Durable healthy/recovered resolution: verify the recorded final pair and
+   * retained inventory, complete only its exact pending disposal fence. Never
+   * rotates a healthy accepted release back.
+   */
+  completeDurableResolution(record: OperationRecord, lastMove: "before" | "after" | null): Promise<void>;
+  /** Durable deferred resolution: verify release and unchanged prior pair plus owned cleanup. */
+  verifyDeferredResolution(record: OperationRecord, lastMove: "before" | "after" | null): Promise<void>;
+}
+
+export interface InterruptedOperationResult {
+  operationId: string;
+  interruptedPhase: Phase;
+  priorResolution: OperationRecord["resolution"] | null;
+  resolution: NonNullable<OperationRecord["resolution"]>;
+  signalsBegun: boolean;
+}
+
+export interface ReconcileInterruptedOptions {
+  /** The serialized reconcile claim that owns this attempt. */
+  reconcileClaimId?: string;
 }
 
 /**
- * Reconcile a stale lock under its original durable record. Callers must use
- * the recorded frozen helper/process/service adapters; this function supplies
- * the ownership and phase gates and never guesses from a slot name or PID.
+ * Reconcile a stale lifecycle lock under its original durable record. Callers
+ * must use the recorded frozen helper/process/service adapters; this function
+ * supplies the ownership and phase gates and never guesses from a slot name or
+ * PID. Non-lifecycle work never reaches this function.
  */
-export async function reconcileInterruptedOperation(instanceHome: string, io: InterruptedOperationIO): Promise<void> {
+export async function reconcileInterruptedOperation(
+  instanceHome: string,
+  io: InterruptedOperationIO,
+  options: ReconcileInterruptedOptions = {},
+): Promise<InterruptedOperationResult> {
   const canonicalHome = await realpath(instanceHome);
   const deploymentRoot = resolve(canonicalHome, ".hive-state", "deployment");
   const currentPath = resolve(deploymentRoot, "operation.json");
@@ -463,8 +593,17 @@ export async function reconcileInterruptedOperation(instanceHome: string, io: In
   // facts only so its resolution can be persisted in the current schema.
   const record: OperationRecord =
     decoded.schemaVersion === 1
-      ? { ...decoded, schemaVersion: OPERATION_SCHEMA_VERSION, staging: emptyStaging() }
+      ? {
+          ...decoded,
+          schemaVersion: OPERATION_SCHEMA_VERSION,
+          workKind: "lifecycle",
+          frozenOwner: null,
+          staging: emptyStaging(),
+        }
       : decoded;
+  if (record.workKind !== "lifecycle") {
+    throw new OperationUnresolvedError(`${record.workKind} work is not lifecycle reconciliation`);
+  }
   const paths = operationPaths(canonicalHome, record.id);
   const owner = JSON.parse(await readFile(resolve(paths.lockDirectory, "owner.json"), "utf8")) as {
     id?: unknown;
@@ -477,31 +616,54 @@ export async function reconcileInterruptedOperation(instanceHome: string, io: In
   if (await io.ownerIsLive({ pid: record.ownerPid, startTime: record.ownerStartTime })) {
     throw new OperationBusyError("recorded lifecycle owner is still live");
   }
+  if (record.frozenOwner && (await io.ownerIsLive(record.frozenOwner))) {
+    throw new OperationBusyError("recorded frozen helper is still live");
+  }
+  const interruptedPhase = record.phase;
+  const priorResolution = record.resolution ?? null;
   // Staging reconciliation applies to every interrupted operation: a live
   // recorded promotion copy is busy, an unverified promotion destination is
   // discarded, and leftover job directories are swept (failures reported).
   const staging = await reconcileStaging({
     canonicalInstanceHome: canonicalHome,
     staging: record.staging,
-    isProcessLive: (owner) => io.ownerIsLive(owner),
+    isProcessLive: (candidate) => io.ownerIsLive(candidate),
   });
   if (staging.discarded.length > 0 && record.staging.promotion) record.staging.promotion.discarded = true;
   record.staging.sweepFailures = [...record.staging.sweepFailures, ...staging.jobSweep.failures];
   const lastMove = record.artifactMove ? await reconcileArtifactMove(record) : null;
-  if (record.barrierOperationId && !record.signalsBegun) {
-    // A status observation is insufficient. The adapter must obtain the fresh,
-    // same-boot terminal release acknowledgement before returning.
-    await io.releaseBarrier(record);
-  }
-  if (record.signalsBegun) {
-    await io.recoverAfterSignals(record, lastMove);
-    record.resolution = "recovered";
+  if (record.resolution === "healthy" || record.resolution === "recovered") {
+    // Durable verified resolution: finish its own pending fence only.
+    await io.completeDurableResolution(record, lastMove);
+  } else if (record.resolution === "deferred") {
+    if (record.barrierOperationId && !record.signalsBegun) await io.releaseBarrier(record);
+    await io.verifyDeferredResolution(record, lastMove);
   } else {
-    await io.reconcileFilesystem(record, lastMove);
-    record.resolution = record.resolution ?? "deferred";
+    if (record.barrierOperationId && !record.signalsBegun) {
+      // A status observation is insufficient. The adapter must obtain the fresh,
+      // same-boot terminal release acknowledgement (or verified supervisor exit).
+      await io.releaseBarrier(record);
+    }
+    if (record.signalsBegun) {
+      await io.recoverAfterSignals(record, lastMove);
+      record.resolution = "recovered";
+    } else {
+      await io.reconcileFilesystem(record, lastMove);
+      record.resolution = "deferred";
+    }
   }
-  record.phase = record.resolution === "recovered" ? "recovering" : "deferred";
+  const resolution = record.resolution;
+  record.phase = resolution === "healthy" ? "healthy" : resolution === "recovered" ? "recovering" : "deferred";
   const acquired: AcquiredOperation = { paths, record };
   await persistOperation(acquired);
-  await finishOperationLock(acquired);
+  const result: InterruptedOperationResult = {
+    operationId: record.id,
+    interruptedPhase,
+    priorResolution,
+    resolution,
+    signalsBegun: record.signalsBegun,
+  };
+  await writeOperationJson(resolve(paths.operationDirectory, "reconciliation.json"), result);
+  await finishOperationLock(acquired, { reconcileClaimId: options.reconcileClaimId });
+  return result;
 }

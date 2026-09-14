@@ -3,11 +3,14 @@ import { promisify } from "node:util";
 import { statSync } from "node:fs";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import { performance } from "node:perf_hooks";
+import { randomUUID } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import {
   buildServiceEnvironment,
   buildServiceDefinitions,
   ServiceController,
+  type ServiceDefinition,
   type ServiceSnapshot,
 } from "./services.js";
 import { preflightStagedConfig, stageVerifiedCandidate, type ArtifactStagingContext } from "./artifact.js";
@@ -34,6 +37,7 @@ import {
 import {
   activate,
   ArtifactRotation,
+  DeferredMaintenance,
   maintenanceQuiescenceIO,
   operationPhaseAdapter,
   proveBarrierBeforeStop,
@@ -41,6 +45,32 @@ import {
   type IdleEvidence,
   type TransactionIO,
 } from "./transaction.js";
+import { capturePrior, restorePrior } from "./prior.js";
+import {
+  assessLegacyHoldRoute,
+  assessPilotRecoveryRoute,
+  assemblePilotRecoveryEvidence,
+  captureLogFence,
+  pilotRollbackTransaction,
+  stopPilotWorkerUnderHold,
+  unavailablePilotEvidence,
+  type ActivationFences,
+  type NativeHoldSession,
+  type PilotEvidenceProvider,
+  type PilotInstanceKey,
+  type RegisteredPilot,
+} from "./pilot-lifecycle.js";
+import { pilotRecovered } from "./health.js";
+import type { StopProofClock } from "./stop-proof.js";
+
+export {
+  capturePrior,
+  loadPrior,
+  restorePrior,
+  verifyPrior,
+  verifyStoppedPrior,
+  PriorSnapshotIncompleteError,
+} from "./prior.js";
 
 const execFile = promisify(nodeExecFile);
 
@@ -50,6 +80,15 @@ export interface LifecycleCommand {
   artifact?: string;
   pilotRecovery?: string;
   legacyHold?: string;
+}
+
+export interface LifecycleOptions {
+  /**
+   * Registry/hold evidence module (plan chunk 4 Task 9 Steps 4a–4c). Until it
+   * is supplied, pilot routes return the executed `MIGRATION_PENDING` result.
+   */
+  pilotEvidence?: PilotEvidenceProvider;
+  clock?: StopProofClock;
 }
 
 interface ConfigSummary {
@@ -176,37 +215,34 @@ async function fileSize(path: string): Promise<number> {
   }
 }
 
-/**
- * Concrete source lifecycle. The S9 integration harness exercises this through
- * the frozen S8 bundle; every boundary here is independently injectable in S7
- * transaction tests.
- */
-export async function runNodeLifecycle(
+/** Selected configuration, packaged service definitions and controller for one instance. */
+export interface LifecycleContext {
+  home: string;
+  configReal: string;
+  summary: ConfigSummary;
+  userHome: string;
+  pathEnv: string;
+  definitions: { engine: ServiceDefinition; worker: ServiceDefinition };
+  controller: ServiceController;
+  probeEnvironment: Record<string, string>;
+  currentProbePath: string;
+  pilotInstance: PilotInstanceKey;
+}
+
+export async function resolveLifecycleContext(
   operation: AcquiredOperation,
-  command: LifecycleCommand,
-  environment: NodeJS.ProcessEnv = process.env,
-): Promise<void> {
+  environment: NodeJS.ProcessEnv,
+  options: { capturedPilotProfile?: readonly { label: string; plistPath: string }[] } = {},
+): Promise<LifecycleContext> {
   const home = operation.record.canonicalHome;
   const selectedConfig = environment.HIVE_CONFIG ?? "hive.yaml";
-  const configPath = resolve(home, selectedConfig);
-  const configReal = await realpath(configPath);
+  const configReal = await realpath(resolve(home, selectedConfig));
   const summary = configSummary(parseYaml(await readFile(configReal, "utf8")));
   if (summary.instanceId !== operation.record.instanceId) throw new Error("selected config instance changed");
   const userHome = environment.HOME;
   const pathEnv = environment.PATH;
   if (!userHome || !resolve(userHome).startsWith("/") || !pathEnv)
     throw new Error("explicit HOME and PATH are required");
-  const npmLookup = await execFile("which", ["npm"], {
-    env: { PATH: pathEnv },
-    encoding: "utf8",
-    maxBuffer: 64 * 1024,
-  });
-  const npmPath = await realpath(npmLookup.stdout.trim());
-  const npmInfo = await lstat(npmPath);
-  if (!npmInfo.isFile() || npmInfo.isSymbolicLink()) throw new Error("host npm prerequisite is not a regular file");
-  operation.record.hostNodePath = await realpath(process.execPath);
-  operation.record.hostNpmPath = npmPath;
-  await persistOperation(operation);
   const overrides = serviceOverrides(environment);
   const definitions = buildServiceDefinitions({
     instanceId: summary.instanceId,
@@ -223,10 +259,142 @@ export async function runNodeLifecycle(
     hiveHome: home,
     home: resolve(userHome),
     operationDir: operation.paths.operationDirectory,
+    capturedPilotProfile: options.capturedPilotProfile,
   });
+  const uid = process.getuid?.();
+  if (uid === undefined) throw new Error("lifecycle requires a POSIX user ID");
+  return {
+    home,
+    configReal,
+    summary,
+    userHome: resolve(userHome),
+    pathEnv,
+    definitions,
+    controller,
+    probeEnvironment: buildServiceEnvironment(definitions.worker),
+    currentProbePath: resolve(home, ".hive", "pkg", "runtime-probe.min.js"),
+    pilotInstance: { canonicalHome: home, configPath: configReal, instanceId: summary.instanceId, uid },
+  };
+}
+
+/** Observe the running packaged worker identity through launchd plus its boot record. */
+export async function observeWorkerIdentity(context: LifecycleContext): Promise<{ pid: number; bootId: string }> {
+  const inspection = await context.controller.inspect(context.definitions.worker.label);
+  if (!inspection.process || inspection.livePID === null) throw new Error("voice worker is not running");
+  const identity = parseBootIdentity(
+    JSON.parse(await readFile(resolve(context.home, ".hive-state", "runtime", "voice-worker.json"), "utf8")),
+  );
+  if (identity.pid !== inspection.livePID || identity.component !== "voice-worker") {
+    throw new Error("voice worker identity does not match launchd");
+  }
+  return { pid: identity.pid, bootId: identity.bootId };
+}
+
+/** Full packaged-release profile of the current `.hive` pair (spec §6). */
+export async function verifyPackagedPair(
+  context: LifecycleContext,
+  options: { minimumStartedAt: number; engineLogOffset: number; dependenciesContained: boolean },
+): Promise<void> {
+  const { home, summary, definitions, controller } = context;
+  const installed = readRelease(resolve(home, ".hive"));
+  const engine = parseBootIdentity(
+    JSON.parse(await readFile(resolve(home, ".hive-state", "runtime", "engine.json"), "utf8")),
+  );
+  const engineInspection = await controller.inspect(definitions.engine.label);
+  const markerRead = readEngineMarkersAfter(definitions.engine.stdout, options.engineLogOffset);
+  let worker: BootIdentity | null = null;
+  let workerResult: WorkerProbe | null = null;
+  let bridge: Record<string, unknown> = {};
+  if (summary.voiceEnabled) {
+    workerResult = parseWorkerProbe(await probeJson(context.currentProbePath, "worker", context.probeEnvironment));
+    worker = workerResult.heartbeat.identity;
+    bridge = await probeJson(context.currentProbePath, "bridge", context.probeEnvironment);
+  }
+  const evidence = {
+    installed,
+    engine,
+    worker,
+    voiceEnabled: summary.voiceEnabled,
+    processPathsMatch:
+      engineInspection.process?.command === [definitions.engine.nodePath, definitions.engine.entrypoint].join(" "),
+    configSelectorsMatch: engineInspection.configSelection === context.configReal,
+    freshOrderedEngineMarkers: freshOrderedEngineMarkers(
+      markerRead.records,
+      engine,
+      options.minimumStartedAt,
+      Date.now(),
+      markerRead.truncatedOrMalformed,
+    ),
+    engineAlive: engineInspection.livePID === engine.pid,
+    workerAlive: workerResult?.supervisor.pid === worker?.pid,
+    heartbeatFresh: workerResult?.heartbeat.fresh === true,
+    heartbeatMatchesSupervisor:
+      workerResult !== null &&
+      worker !== null &&
+      workerResult.supervisor.pid === worker.pid &&
+      workerResult.supervisor.bootId === worker.bootId,
+    admissionSnapshot: workerResult?.status.snapshot ?? null,
+    admissionFresh:
+      workerResult !== null &&
+      freshAdmissionStatus({
+        reply: {
+          protocol: 1,
+          requestId: workerResult.status.requestId,
+          operationId: workerResult.status.operationId,
+          supervisor: workerResult.supervisor,
+          ok: true,
+          snapshot: workerResult.status.snapshot,
+          writtenAt: workerResult.status.writtenAt,
+        },
+        requestId: workerResult.status.requestId,
+        operationId: workerResult.status.operationId,
+        requestedAt: workerResult.status.requestedAt,
+        expectedSupervisor: workerResult.supervisor,
+        processCorroborated: true,
+      }),
+    sdkRootStatus: workerResult?.sdk.rootStatus ?? null,
+    sdkAgentName: workerResult?.sdk.agentName ?? null,
+    sdkSocketOwned: workerResult?.socketOwned === true,
+    bridgeAuthenticated: bridge.authenticated === true,
+    bridgeMissingDenied: bridge.missingDenied === true,
+    bridgeWrongDenied: bridge.wrongDenied === true,
+    dependenciesContained: options.dependenciesContained,
+  };
+  if (!packagedHealthy(evidence)) throw new Error("paired release health verification failed");
+}
+
+const defaultClock: StopProofClock = { now: Date.now, mono: () => performance.now() };
+
+/**
+ * Concrete source lifecycle. The S9 integration harness exercises this through
+ * the frozen S8 bundle; every boundary here is independently injectable in S7
+ * transaction tests.
+ */
+export async function runNodeLifecycle(
+  operation: AcquiredOperation,
+  command: LifecycleCommand,
+  environment: NodeJS.ProcessEnv = process.env,
+  options: LifecycleOptions = {},
+): Promise<void> {
+  const pilotEvidence = options.pilotEvidence ?? unavailablePilotEvidence;
+  const clock = options.clock ?? defaultClock;
+  let context = await resolveLifecycleContext(operation, environment);
+  const home = context.home;
+  const npmLookup = await execFile("which", ["npm"], {
+    env: { PATH: context.pathEnv },
+    encoding: "utf8",
+    maxBuffer: 64 * 1024,
+  });
+  const npmPath = await realpath(npmLookup.stdout.trim());
+  const npmInfo = await lstat(npmPath);
+  if (!npmInfo.isFile() || npmInfo.isSymbolicLink()) throw new Error("host npm prerequisite is not a regular file");
+  operation.record.hostNodePath = await realpath(process.execPath);
+  operation.record.hostNpmPath = npmPath;
+  await persistOperation(operation);
+
+  const { summary, definitions } = context;
   const desired = summary.voiceEnabled ? [definitions.engine, definitions.worker] : [definitions.engine];
-  const probeEnvironment = buildServiceEnvironment(definitions.worker);
-  const currentProbePath = resolve(home, ".hive", "pkg", "runtime-probe.min.js");
+  const probeEnvironment = context.probeEnvironment;
   let serviceSnapshot: ServiceSnapshot | undefined;
   let rotation: ArtifactRotation | undefined;
   let workerWasRunning = false;
@@ -238,22 +406,18 @@ export async function runNodeLifecycle(
   let noOpReleaseCheck = false;
   let runningWorkerEnvironment: Record<string, string> | undefined;
   let recordedWorkerHealthPort: number | undefined;
+  // Legacy-hold (first migration / reapply) route state.
+  let legacyPilot: RegisteredPilot | null = null;
+  let holdSession: NativeHoldSession | null = null;
+  let pilotStopDeferred = false;
+  let pilotFences: ActivationFences | null = null;
   const activationStartedAt = Date.now();
 
-  const observeWorker = async (): Promise<{ pid: number; bootId: string }> => {
-    const inspection = await controller.inspect(definitions.worker.label);
-    if (!inspection.process || inspection.livePID === null) throw new Error("voice worker is not running");
-    const identity = parseBootIdentity(
-      JSON.parse(await readFile(resolve(home, ".hive-state", "runtime", "voice-worker.json"), "utf8")),
-    );
-    if (identity.pid !== inspection.livePID || identity.component !== "voice-worker") {
-      throw new Error("voice worker identity does not match launchd");
-    }
-    return { pid: identity.pid, bootId: identity.bootId };
-  };
+  const controller = () => context.controller;
+  const observeWorker = () => observeWorkerIdentity(context);
   const inspectIdle = async (_deadline: number): Promise<IdleEvidence> => {
     const result = parseWorkerProbe(
-      await probeJson(currentProbePath, "worker", runningWorkerEnvironment ?? probeEnvironment),
+      await probeJson(context.currentProbePath, "worker", runningWorkerEnvironment ?? probeEnvironment),
     );
     const observed = await observeWorker();
     if (observed.pid !== result.supervisor.pid || observed.bootId !== result.supervisor.bootId) {
@@ -281,163 +445,131 @@ export async function runNodeLifecycle(
     corroborateSupervisor: async () => observeWorker(),
   });
 
-  async function artifactSlot(path: string): Promise<Record<string, unknown>> {
-    try {
-      const info = await lstat(path);
-      if (!info.isDirectory() || info.isSymbolicLink())
-        throw new Error(`artifact slot is not a real directory: ${path}`);
-      if (process.getuid?.() !== info.uid) throw new Error(`artifact slot has a foreign owner: ${path}`);
-      return {
-        present: true,
-        path,
-        canonicalPath: await realpath(path),
-        device: info.dev,
-        inode: info.ino,
-        mode: info.mode & 0o777,
-        uid: info.uid,
-      };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { present: false, path };
-      throw error;
-    }
-  }
-
-  async function verifyCurrentPair(minimumStartedAt = activationStartedAt): Promise<void> {
-    const installed = readRelease(resolve(home, ".hive"));
-    const engine = parseBootIdentity(
-      JSON.parse(await readFile(resolve(home, ".hive-state", "runtime", "engine.json"), "utf8")),
-    );
-    const engineInspection = await controller.inspect(definitions.engine.label);
-    const markerRead = readEngineMarkersAfter(definitions.engine.stdout, engineLogOffset);
-    let worker: BootIdentity | null = null;
-    let workerResult: WorkerProbe | null = null;
-    let bridge: Record<string, unknown> = {};
-    if (summary.voiceEnabled) {
-      workerResult = parseWorkerProbe(await probeJson(currentProbePath, "worker", probeEnvironment));
-      worker = workerResult.heartbeat.identity;
-      bridge = await probeJson(currentProbePath, "bridge", probeEnvironment);
-    }
-    const evidence = {
-      installed,
-      engine,
-      worker,
-      voiceEnabled: summary.voiceEnabled,
-      processPathsMatch:
-        engineInspection.process?.command === [definitions.engine.nodePath, definitions.engine.entrypoint].join(" "),
-      configSelectorsMatch: engineInspection.configSelection === configReal,
-      freshOrderedEngineMarkers: freshOrderedEngineMarkers(
-        markerRead.records,
-        engine,
-        minimumStartedAt,
-        Date.now(),
-        markerRead.truncatedOrMalformed,
-      ),
-      engineAlive: engineInspection.livePID === engine.pid,
-      workerAlive: workerResult?.supervisor.pid === worker?.pid,
-      heartbeatFresh: workerResult?.heartbeat.fresh === true,
-      heartbeatMatchesSupervisor:
-        workerResult !== null &&
-        worker !== null &&
-        workerResult.supervisor.pid === worker.pid &&
-        workerResult.supervisor.bootId === worker.bootId,
-      admissionSnapshot: workerResult?.status.snapshot ?? null,
-      admissionFresh:
-        workerResult !== null &&
-        freshAdmissionStatus({
-          reply: {
-            protocol: 1,
-            requestId: workerResult.status.requestId,
-            operationId: workerResult.status.operationId,
-            supervisor: workerResult.supervisor,
-            ok: true,
-            snapshot: workerResult.status.snapshot,
-            writtenAt: workerResult.status.writtenAt,
-          },
-          requestId: workerResult.status.requestId,
-          operationId: workerResult.status.operationId,
-          requestedAt: workerResult.status.requestedAt,
-          expectedSupervisor: workerResult.supervisor,
-          processCorroborated: true,
-        }),
-      sdkRootStatus: workerResult?.sdk.rootStatus ?? null,
-      sdkAgentName: workerResult?.sdk.agentName ?? null,
-      sdkSocketOwned: workerResult?.socketOwned === true,
-      bridgeAuthenticated: bridge.authenticated === true,
-      bridgeMissingDenied: bridge.missingDenied === true,
-      bridgeWrongDenied: bridge.wrongDenied === true,
+  const verifyCurrentPair = (minimumStartedAt = activationStartedAt) =>
+    verifyPackagedPair(context, {
+      minimumStartedAt,
+      engineLogOffset,
       dependenciesContained: candidateRuntimeValidated,
-    };
-    if (!packagedHealthy(evidence)) throw new Error("paired release health verification failed");
+    });
+
+  const ownedBrokenValidator = async (path: string): Promise<boolean> => {
+    // Ownership is established by a retained resolved operation record, never
+    // by package contents alone.
+    try {
+      const prior = JSON.parse(
+        await readFile(resolve(operation.paths.operationDirectory, "previous-operation.json"), "utf8"),
+      ) as { resolution?: unknown; retainedPaths?: unknown };
+      return (
+        typeof prior.resolution === "string" && Array.isArray(prior.retainedPaths) && prior.retainedPaths.includes(path)
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  /** Record supervisor PID/start time and listener before any close, for exit proof on re-entry. */
+  const recordSupervisorProcess = async (pid: number, startTime: string, port: number | undefined) => {
+    operation.record.supervisorProcess = { pid, startTime };
+    if (port !== undefined) operation.record.workerHealthPort = port;
+    await persistOperation(operation);
+  };
+
+  const pilotActivationFences = (stopped: ActivationFences["stopped"]): ActivationFences => ({
+    engineLog: captureLogFence(legacyPilot!.services.services[0].definition.stdout),
+    workerLog: captureLogFence(legacyPilot!.services.services[1].definition.stdout),
+    wallStartedAt: Date.now(),
+    stopped,
+  });
+
+  if (command.mode === "pilot-rollback") {
+    await runPilotRollback();
+    return;
   }
 
   const io: TransactionIO = {
     phase: operationPhaseAdapter(operation),
     async preflightAndStage() {
-      // The approved plan intentionally leaves the inventory-specific pilot
-      // snapshot and dispatch-hold record shapes to the later adoption work.
-      // Until those records have a concrete parser and current read-back
-      // adapter, accepting their mere presence would turn evidence into an
-      // authorization bypass. Keep both one-time routes deferred before any
-      // service inspection, admission change, or artifact mutation.
-      if (command.mode === "pilot-rollback") {
-        throw new Error("pilot recovery evidence has no validated inventory adapter; lifecycle deferred");
-      }
       if (command.legacyHold !== undefined) {
-        throw new Error("legacy dispatch hold has no validated read-back adapter; lifecycle deferred");
+        // Route assessment performs no mutation; any gap is MIGRATION_PENDING
+        // before capture, staging, close or signal.
+        legacyPilot = await assessLegacyHoldRoute({
+          holdSelector: command.legacyHold,
+          instance: context.pilotInstance,
+          provider: pilotEvidence,
+        });
+        context = await resolveLifecycleContext(operation, environment, {
+          capturedPilotProfile: legacyPilot.capturedPilotProfile,
+        });
       }
-      const [engine, worker] = await Promise.all([
-        controller.inspect(definitions.engine.label),
-        controller.inspect(definitions.worker.label),
-      ]);
-      engineWasRunning = engine.livePID !== null;
-      workerWasRunning = worker.livePID !== null;
-      if (workerWasRunning) {
-        if (!worker.serviceEnvironment) throw new Error("running worker service environment is unavailable");
-        runningWorkerEnvironment = { ...worker.serviceEnvironment };
+      if (legacyPilot) {
+        const [engine, worker] = await Promise.all(
+          legacyPilot.services.services.map((item) => controller().inspect(item.definition.label)),
+        );
+        if (
+          engine.process?.pid !== legacyPilot.generation.engine.pid ||
+          engine.process?.startTime !== legacyPilot.generation.engine.startTime ||
+          worker.process?.pid !== legacyPilot.generation.worker.pid ||
+          worker.process?.startTime !== legacyPilot.generation.worker.startTime
+        ) {
+          throw new DeferredMaintenance("live pilot generation differs from the registered snapshot lineage");
+        }
+        engineWasRunning = true;
+        workerWasRunning = true;
+        serviceSnapshot = legacyPilot.services;
+        recordedWorkerHealthPort = legacyPilot.sdkListenerPort;
+        operation.record.priorProfile = "pilot";
+      } else {
+        const [engine, worker] = await Promise.all([
+          controller().inspect(definitions.engine.label),
+          controller().inspect(definitions.worker.label),
+        ]);
+        engineWasRunning = engine.livePID !== null;
+        workerWasRunning = worker.livePID !== null;
+        if (workerWasRunning) {
+          if (!worker.serviceEnvironment) throw new Error("running worker service environment is unavailable");
+          runningWorkerEnvironment = { ...worker.serviceEnvironment };
+        }
+        serviceSnapshot = await controller().capture(
+          workerWasRunning || summary.voiceEnabled ? [definitions.engine, definitions.worker] : desired,
+        );
+        operation.record.priorProfile = engineWasRunning ? "packaged" : "stopped";
       }
-      serviceSnapshot = await controller.capture(
-        workerWasRunning || summary.voiceEnabled ? [definitions.engine, definitions.worker] : desired,
-      );
-      await writeOperationJson(operation.paths.priorSnapshot, {
-        schemaVersion: 1,
-        toolSha256: operation.record.toolSha256,
-        artifactSlots: await Promise.all(
-          [".hive", ".hive.prev", ".hive.next", ".hive.broken"].map((name) => artifactSlot(resolve(home, name))),
-        ),
-        reservedSlots: await Promise.all(
-          ["prior-prev", "prior-broken", "rollback-current", "failed-prev"].map((name) =>
-            artifactSlot(resolve(operation.paths.operationDirectory, name)),
-          ),
-        ),
-        services: serviceSnapshot.services.map((item) => ({
-          label: item.definition.label,
-          loaded: item.loaded,
-          enabled: item.enabled,
-          livePID: item.inspection.livePID,
-          startTime: item.inspection.startTime,
-          arguments: item.inspection.args,
-          workingDirectory: item.inspection.cwd,
-          configSelection: item.inspection.configSelection,
-          serviceEnvironment: item.inspection.serviceEnvironment,
-          plistIdentity: item.inspection.plist,
-          linkIdentity: item.inspection.link,
-          originalPlistRecord: item.plist.existed
-            ? resolve(operation.paths.operationDirectory, `${item.definition.label}.plist.original`)
-            : null,
-        })),
-      });
-      operation.record.priorProfile = engineWasRunning ? "packaged" : "stopped";
       await persistOperation(operation);
+      await capturePrior({
+        operation,
+        services: serviceSnapshot,
+        configPath: context.configReal,
+        workerHealthPort: recordedWorkerHealthPort ?? (workerWasRunning ? summary.workerHealthPort : null),
+        pilot: legacyPilot
+          ? {
+              snapshotPath: legacyPilot.selector,
+              snapshotSha256: legacyPilot.sha256,
+              bootstrapPath: legacyPilot.bootstrap.selector,
+              bootstrapSha256: legacyPilot.bootstrap.sha256,
+            }
+          : null,
+      });
       // Deferred disposal of earlier operations' job trees; a failed removal
       // (for example a straggler still writing) is reported, never fatal.
       const sweep = await sweepLeftoverJobs({ canonicalInstanceHome: home, keepOperationIds: [operation.record.id] });
       operation.record.staging.sweepFailures.push(...sweep.failures);
       await persistOperation(operation);
-      if (command.mode === "update" || command.mode === "check" || command.mode === "rollback") {
+      const currentPresent = await lstat(resolve(home, ".hive")).then(
+        () => true,
+        (error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return false;
+          throw error;
+        },
+      );
+      // A first migration may have no packaged `.hive`; the pilot runs elsewhere.
+      if (
+        (command.mode === "update" || command.mode === "check" || command.mode === "rollback") &&
+        (currentPresent || !legacyPilot)
+      ) {
         validatePromotedRelease(resolve(home, ".hive"));
       }
       if (stagingRequired(command.mode)) {
-        const currentRelease = readRelease(resolve(home, ".hive"));
+        const currentRelease = currentPresent ? readRelease(resolve(home, ".hive")) : null;
         const nextPath = resolve(home, ".hive.next");
         try {
           await lstat(nextPath);
@@ -469,8 +601,8 @@ export async function runNodeLifecycle(
           }),
           nodePath: operation.record.hostNodePath!,
           npmCliPath: npmPath,
-          invokingHome: resolve(userHome),
-          pathEnv,
+          invokingHome: context.userHome,
+          pathEnv: context.pathEnv,
           archiveDirectory: resolve(operation.paths.operationDirectory, "archive"),
           promotionMethod: promotionMethod.method,
         };
@@ -493,20 +625,7 @@ export async function runNodeLifecycle(
         });
         operation.record.staging.cloneVerified = true;
         await persistOperation(operation);
-        rotation = new ArtifactRotation(operation, async (path) => {
-          try {
-            const prior = JSON.parse(
-              await readFile(resolve(operation.paths.operationDirectory, "previous-operation.json"), "utf8"),
-            ) as { resolution?: unknown; retainedPaths?: unknown };
-            return (
-              typeof prior.resolution === "string" &&
-              Array.isArray(prior.retainedPaths) &&
-              prior.retainedPaths.includes(path)
-            );
-          } catch {
-            return false;
-          }
-        });
+        rotation = new ArtifactRotation(operation, ownedBrokenValidator);
         await rotation.capture();
         await preflightStagedConfig({
           clone: nextPath,
@@ -519,6 +638,7 @@ export async function runNodeLifecycle(
         candidateRuntimeValidated = true;
         noOpReleaseCheck =
           command.mode === "check" &&
+          currentRelease !== null &&
           candidate.verification.release.packageVersion === currentRelease.packageVersion &&
           candidate.verification.release.sourceRevision === currentRelease.sourceRevision &&
           candidate.verification.release.dependencyLockSha256 === currentRelease.dependencyLockSha256;
@@ -528,7 +648,7 @@ export async function runNodeLifecycle(
         candidateRuntimeValidated = true;
       } else {
         validatePromotedRelease(resolve(home, ".hive"));
-        await probeJson(currentProbePath, "config", probeEnvironment);
+        await probeJson(context.currentProbePath, "config", probeEnvironment);
         candidateRuntimeValidated = true;
         if (command.mode === "start" && engineWasRunning && (!summary.voiceEnabled || workerWasRunning)) {
           engineLogOffset = 0;
@@ -537,25 +657,7 @@ export async function runNodeLifecycle(
         }
       }
       if (command.mode === "rollback") {
-        rotation = new ArtifactRotation(operation, async (path) => {
-          // Ownership is established by a retained resolved operation record,
-          // never by package contents alone.
-          try {
-            const prior = JSON.parse(
-              await readFile(resolve(operation.paths.operationDirectory, "previous-operation.json"), "utf8"),
-            ) as {
-              resolution?: unknown;
-              retainedPaths?: unknown;
-            };
-            return (
-              typeof prior.resolution === "string" &&
-              Array.isArray(prior.retainedPaths) &&
-              prior.retainedPaths.includes(path)
-            );
-          } catch {
-            return false;
-          }
-        });
+        rotation = new ArtifactRotation(operation, ownedBrokenValidator);
         await rotation.capture();
         if (rotation.captured.next) {
           rotation = undefined;
@@ -569,14 +671,36 @@ export async function runNodeLifecycle(
     async establishQuiescence() {
       if (noOpHealthyStart || noOpReleaseCheck) return;
       if (!workerWasRunning) return;
+      if (legacyPilot) {
+        // A NEW close under this operation; an earlier record never holds.
+        holdSession = await pilotEvidence.establishHold(legacyPilot, operation, async ({ seal, bootId }) => {
+          operation.record.phase = "barrier-requested";
+          operation.record.supervisor = { pid: seal.pid, bootId };
+          operation.record.barrierOperationId = operation.record.id;
+          await recordSupervisorProcess(seal.pid, seal.startTime, legacyPilot!.sdkListenerPort);
+        });
+        barrierEstablished = true;
+        return;
+      }
+      const worker = await controller().inspect(definitions.worker.label);
+      if (worker.process) {
+        await recordSupervisorProcess(
+          worker.process.pid,
+          worker.process.startTime,
+          recordedWorkerHealthPort ?? summary.workerHealthPort,
+        );
+      }
       await quiesce(maintenance, operation.record.id);
       barrierEstablished = true;
     },
     async releaseAdmission() {
-      if (barrierEstablished) await maintenance.release(operation.record.id, Date.now() + 2_000);
+      if (!barrierEstablished) return;
+      if (holdSession) await holdSession.release();
+      else await maintenance.release(operation.record.id, Date.now() + 2_000);
     },
     async markSignalsBegun() {
       if (noOpHealthyStart || noOpReleaseCheck) return;
+      if (holdSession) return; // Persisted by the proof-fenced stop itself, immediately before dispatch.
       if (barrierEstablished && operation.record.supervisor) {
         await proveBarrierBeforeStop({
           operation,
@@ -591,8 +715,33 @@ export async function runNodeLifecycle(
     },
     async stopWorkerAndChildren() {
       if (noOpHealthyStart || noOpReleaseCheck) return;
+      if (legacyPilot && holdSession) {
+        const workerDefinition = legacyPilot.services.services[1].definition;
+        const outcome = await stopPilotWorkerUnderHold({
+          session: holdSession,
+          operationId: operation.record.id,
+          clock,
+          randomId: randomUUID,
+          persistSignalsBegun: async () => {
+            operation.record.signalsBegun = true;
+            await persistOperation(operation);
+          },
+          controller: controller(),
+          workerDefinition,
+          healthListenerPort: legacyPilot.sdkListenerPort,
+        });
+        if (outcome.kind === "deferred") {
+          // Verified: no signal issued and the same owner released admission.
+          pilotStopDeferred = true;
+          barrierEstablished = false;
+          operation.record.signalsBegun = false;
+          await persistOperation(operation);
+          throw new DeferredMaintenance(`legacy hold stop deferred: ${outcome.reason}`);
+        }
+        return;
+      }
       if (workerWasRunning) {
-        await controller.bootout(definitions.worker, {
+        await controller().bootout(definitions.worker, {
           markIrreversible: async () => {},
           healthListenerPort: recordedWorkerHealthPort ?? summary.workerHealthPort,
         });
@@ -600,32 +749,40 @@ export async function runNodeLifecycle(
     },
     async stopEngine() {
       if (noOpHealthyStart || noOpReleaseCheck) return;
-      if (engineWasRunning) await controller.bootout(definitions.engine, { markIrreversible: async () => {} });
+      if (legacyPilot) {
+        await controller().bootout(legacyPilot.services.services[0].definition, { markIrreversible: async () => {} });
+        return;
+      }
+      if (engineWasRunning) await controller().bootout(definitions.engine, { markIrreversible: async () => {} });
     },
     async rotate() {
       if (noOpHealthyStart || noOpReleaseCheck) return;
-      if (command.mode === "update" || command.mode === "check") await rotation!.rotateUpdate();
+      if (command.mode === "update" || command.mode === "check") {
+        if (rotation!.captured.current) await rotation!.rotateUpdate();
+        else if (legacyPilot) await rotation!.rotateFirstMigration();
+        else throw new Error("update requires a current release");
+      }
       if (command.mode === "rollback") await rotation!.rotateRollback();
     },
     async installCandidateDefinitions() {
       if (noOpHealthyStart || noOpReleaseCheck) return;
       if (command.mode === "stop") {
-        await controller.removeServiceLink(definitions.worker);
-        await controller.removeServiceLink(definitions.engine);
+        await controller().removeServiceLink(definitions.worker);
+        await controller().removeServiceLink(definitions.engine);
         return;
       }
-      await controller.write(desired);
-      if (!summary.voiceEnabled) await controller.removeWorkerLink(definitions.worker);
+      await controller().write(desired);
+      if (!summary.voiceEnabled) await controller().removeWorkerLink(definitions.worker);
     },
     async startEngineAndVerifyBoot() {
       if (noOpHealthyStart || noOpReleaseCheck) return;
       if (command.mode === "stop") return;
       engineLogOffset = await fileSize(definitions.engine.stdout);
-      await controller.bootstrap(definitions.engine);
+      await controller().bootstrap(definitions.engine);
     },
     async startWorker() {
       if (noOpHealthyStart || noOpReleaseCheck) return;
-      if (command.mode !== "stop" && summary.voiceEnabled) await controller.bootstrap(definitions.worker);
+      if (command.mode !== "stop" && summary.voiceEnabled) await controller().bootstrap(definitions.worker);
     },
     async verifyCandidatePair() {
       if (noOpHealthyStart || noOpReleaseCheck) {
@@ -634,8 +791,8 @@ export async function runNodeLifecycle(
       }
       if (command.mode === "stop") {
         const [engine, worker] = await Promise.all([
-          controller.inspect(definitions.engine.label),
-          controller.inspect(definitions.worker.label),
+          controller().inspect(definitions.engine.label),
+          controller().inspect(definitions.worker.label),
         ]);
         if (engine.loaded || worker.loaded) throw new Error("service pair did not stop completely");
         return;
@@ -657,24 +814,78 @@ export async function runNodeLifecycle(
       }
     },
     async recoverPriorPair() {
-      const worker = await controller.inspect(definitions.worker.label);
+      if (pilotStopDeferred && legacyPilot) {
+        // No signal was issued: verify the pilot pair is the same live generation.
+        for (const item of legacyPilot.services.services) {
+          const live = await controller().inspect(item.definition.label);
+          if (
+            live.process?.pid !== item.inspection.process?.pid ||
+            live.process?.startTime !== item.inspection.process?.startTime
+          ) {
+            throw new Error("pilot generation changed although no stop signal was issued");
+          }
+        }
+        operation.record.resolution = "deferred";
+        await persistOperation(operation);
+        await finishDeferredPrePromotion();
+        return;
+      }
+      const worker = await controller().inspect(definitions.worker.label);
       if (worker.loaded) {
-        await controller.bootout(definitions.worker, {
+        await controller().bootout(definitions.worker, {
           markIrreversible: async () => {},
-          healthListenerPort: summary.workerHealthPort,
+          healthListenerPort:
+            legacyPilot &&
+            JSON.stringify(worker.args) === JSON.stringify(legacyPilot.services.services[1].inspection.args)
+              ? legacyPilot.sdkListenerPort
+              : (recordedWorkerHealthPort ?? summary.workerHealthPort),
         });
       }
-      const engine = await controller.inspect(definitions.engine.label);
-      if (engine.loaded) await controller.bootout(definitions.engine, { markIrreversible: async () => {} });
-      if (command.mode === "update" || command.mode === "check") await rotation!.recoverUpdate();
+      const engine = await controller().inspect(definitions.engine.label);
+      if (engine.loaded) await controller().bootout(definitions.engine, { markIrreversible: async () => {} });
+      if (command.mode === "update" || command.mode === "check") {
+        if (rotation!.captured.current) await rotation!.recoverUpdate();
+        else if (legacyPilot) await rotation!.recoverFirstMigration();
+      }
       if (command.mode === "rollback") await rotation!.recoverRollback();
       if (!serviceSnapshot) throw new Error("prior service snapshot missing");
-      await controller.restore(serviceSnapshot);
-      operation.record.resolution = "recovered";
-      await persistOperation(operation);
-      if (engineWasRunning) {
-        engineLogOffset = 0;
-        await verifyCurrentPair();
+      if (legacyPilot) {
+        await pilotEvidence.verifyRecoveryPrerequisites(legacyPilot);
+        pilotFences = pilotActivationFences({
+          engine: legacyPilot.generation.engine,
+          worker: legacyPilot.generation.worker,
+        });
+        await controller().restoreFilesAndState(serviceSnapshot);
+        await controller().restoreService(serviceSnapshot, legacyPilot.services.services[0].definition.label, {
+          requireNewGeneration: true,
+        });
+        await controller().restoreService(serviceSnapshot, legacyPilot.services.services[1].definition.label, {
+          requireNewGeneration: true,
+        });
+        const observations = await pilotEvidence.observePilotRecovery(legacyPilot, pilotFences);
+        operation.record.resolution = "recovered";
+        await persistOperation(operation);
+        if (!pilotRecovered(assemblePilotRecoveryEvidence(observations))) {
+          throw new Error("pilot recovery profile verification failed");
+        }
+      } else {
+        engineLogOffset = await fileSize(definitions.engine.stdout);
+        await restorePrior(
+          controller(),
+          { services: serviceSnapshot },
+          {
+            verifyEngine: async (restoredEngine) => {
+              if (engineWasRunning && (!restoredEngine || restoredEngine.livePID === null)) {
+                throw new Error("prior engine did not restart before the worker");
+              }
+            },
+          },
+        );
+        operation.record.resolution = "recovered";
+        await persistOperation(operation);
+        if (engineWasRunning) {
+          await verifyCurrentPair();
+        }
       }
       if (command.mode === "update" || command.mode === "check") await rotation!.disposeSupersededBroken();
     },
@@ -682,33 +893,171 @@ export async function runNodeLifecycle(
       if (!operation.record.resolution) operation.record.resolution = "deferred";
       if (!operation.record.phase || operation.record.phase === "unresolved") return;
       await persistOperation(operation);
-      if (!operation.record.signalsBegun && rotation) await rotation.abortBeforeSignals();
-      else if (!operation.record.signalsBegun && (command.mode === "update" || command.mode === "check")) {
-        const next = resolve(home, ".hive.next");
-        if (operation.record.retainedPaths.includes(next)) {
-          try {
-            await disposeOwnedDirectory(operation, next, await directoryIdentity(next));
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          }
+      if (!operation.record.signalsBegun) await finishDeferredPrePromotion();
+    },
+    retainUnresolved,
+  };
+
+  async function finishDeferredPrePromotion(): Promise<void> {
+    if (rotation) {
+      await rotation.abortBeforeSignals();
+      rotation = undefined;
+    } else if (command.mode === "update" || command.mode === "check") {
+      const next = resolve(home, ".hive.next");
+      if (operation.record.retainedPaths.includes(next)) {
+        try {
+          await disposeOwnedDirectory(operation, next, await directoryIdentity(next));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
       }
-    },
-    async retainUnresolved(error) {
-      operation.record.phase = "unresolved";
-      operation.record.retainedPaths = [
-        ...new Set([
-          ...operation.record.retainedPaths,
-          operation.paths.operationDirectory,
-          ...[".hive", ".hive.prev", ".hive.next", ".hive.broken"].map((name) => resolve(home, name)),
-        ]),
-      ];
-      await persistOperation(operation).catch(() => {});
-      await writeOperationJson(resolve(operation.paths.operationDirectory, "failure.json"), {
-        message: error instanceof Error ? error.message : String(error),
-      }).catch(() => {});
-    },
-  };
+    }
+  }
+
+  async function retainUnresolved(error: unknown): Promise<void> {
+    operation.record.phase = "unresolved";
+    operation.record.retainedPaths = [
+      ...new Set([
+        ...operation.record.retainedPaths,
+        operation.paths.operationDirectory,
+        ...[".hive", ".hive.prev", ".hive.next", ".hive.broken"].map((name) => resolve(home, name)),
+      ]),
+    ];
+    await persistOperation(operation).catch(() => {});
+    await writeOperationJson(resolve(operation.paths.operationDirectory, "failure.json"), {
+      message: error instanceof Error ? error.message : String(error),
+      ...(error instanceof DeferredMaintenance && "code" in error ? { code: (error as { code: string }).code } : {}),
+    }).catch(() => {});
+  }
+
+  async function runPilotRollback(): Promise<void> {
+    let pilotIO: TransactionIO | null = null;
+    const phase = operationPhaseAdapter(operation);
+    const finish = async (resolution: "healthy" | "recovered" | "deferred") => {
+      if (!operation.record.resolution) operation.record.resolution = resolution;
+      if (operation.record.phase === "unresolved") return;
+      await persistOperation(operation);
+    };
+    const delegate: TransactionIO = {
+      phase,
+      async preflightAndStage() {
+        const currentPath = resolve(home, ".hive");
+        let identity: { device: number; inode: number } | null = null;
+        let release: Release | null = null;
+        try {
+          identity = await directoryIdentity(currentPath);
+          release = validatePromotedRelease(currentPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        const { pilot } = await assessPilotRecoveryRoute({
+          snapshotSelector: command.pilotRecovery!,
+          instance: context.pilotInstance,
+          provider: pilotEvidence,
+          currentCandidate: { identity, release },
+        });
+        legacyPilot = pilot;
+        context = await resolveLifecycleContext(operation, environment, {
+          capturedPilotProfile: pilot.capturedPilotProfile,
+        });
+        const [engine, worker] = await Promise.all([
+          controller().inspect(definitions.engine.label),
+          controller().inspect(definitions.worker.label),
+        ]);
+        if (engine.livePID === null || worker.livePID === null) {
+          throw new DeferredMaintenance("pilot recovery requires the running packaged candidate pair");
+        }
+        runningWorkerEnvironment = worker.serviceEnvironment ? { ...worker.serviceEnvironment } : undefined;
+        serviceSnapshot = await controller().capture([definitions.engine, definitions.worker]);
+        operation.record.priorProfile = "packaged";
+        await persistOperation(operation);
+        await capturePrior({
+          operation,
+          services: serviceSnapshot,
+          configPath: context.configReal,
+          workerHealthPort: summary.workerHealthPort,
+          pilot: {
+            snapshotPath: pilot.selector,
+            snapshotSha256: pilot.sha256,
+            bootstrapPath: pilot.bootstrap.selector,
+            bootstrapSha256: pilot.bootstrap.sha256,
+          },
+        });
+        candidateRuntimeValidated = true;
+        const candidateServices = serviceSnapshot;
+        pilotIO = pilotRollbackTransaction({
+          controller: controller(),
+          provider: pilotEvidence,
+          pilot,
+          candidate: candidateServices,
+          candidateDefinitions: definitions,
+          candidateWorkerHealthPort: recordedWorkerHealthPort ?? summary.workerHealthPort,
+          phase,
+          async quiesceCandidate() {
+            if (worker.process) {
+              await recordSupervisorProcess(worker.process.pid, worker.process.startTime, summary.workerHealthPort);
+            }
+            await quiesce(maintenance, operation.record.id);
+            return true;
+          },
+          releaseCandidate: () => maintenance.release(operation.record.id, Date.now() + 2_000),
+          async markSignalsBegun() {
+            if (operation.record.supervisor) {
+              await proveBarrierBeforeStop({
+                operation,
+                instanceHome: home,
+                instanceId: summary.instanceId,
+                supervisor: operation.record.supervisor,
+                corroborateSupervisor: async () => observeWorker(),
+              });
+            }
+            operation.record.signalsBegun = true;
+            await persistOperation(operation);
+          },
+          async stopCandidateWorker() {
+            await controller().bootout(definitions.worker, {
+              markIrreversible: async () => {},
+              healthListenerPort: recordedWorkerHealthPort ?? summary.workerHealthPort,
+            });
+          },
+          async verifyCandidatePacked() {
+            engineLogOffset = 0;
+            await verifyCurrentPair();
+          },
+          captureFences: () =>
+            pilotActivationFences({
+              engine: engine.process ? { pid: engine.process.pid, startTime: engine.process.startTime } : null,
+              worker: worker.process ? { pid: worker.process.pid, startTime: worker.process.startTime } : null,
+            }),
+          finishResolved: finish,
+          retainUnresolved,
+        });
+      },
+      establishQuiescence: () => pilotIO!.establishQuiescence(),
+      releaseAdmission: async () => pilotIO?.releaseAdmission(),
+      markSignalsBegun: () => pilotIO!.markSignalsBegun(),
+      stopWorkerAndChildren: () => pilotIO!.stopWorkerAndChildren(),
+      stopEngine: () => pilotIO!.stopEngine(),
+      rotate: () => pilotIO!.rotate(),
+      installCandidateDefinitions: () => pilotIO!.installCandidateDefinitions(),
+      startEngineAndVerifyBoot: () => pilotIO!.startEngineAndVerifyBoot(),
+      startWorker: () => pilotIO!.startWorker(),
+      verifyCandidatePair: () => pilotIO!.verifyCandidatePair(),
+      finalizeHealthy: async () => {
+        await pilotIO!.finalizeHealthy();
+        operation.record.resolution = "healthy";
+        await persistOperation(operation);
+      },
+      recoverPriorPair: async () => {
+        await pilotIO!.recoverPriorPair();
+        operation.record.resolution = "recovered";
+        await persistOperation(operation);
+      },
+      finishResolved: async () => (pilotIO ? pilotIO.finishResolved() : finish("deferred")),
+      retainUnresolved,
+    };
+    await activate(delegate);
+  }
 
   try {
     await activate(io);
