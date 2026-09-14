@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { DetailKeySpec, OpsReason } from "./types.js";
+import { HIVE_AGENT_REASONS } from "./block-reasons.js";
 import {
   OPS_DETAIL_STRING_MAX,
   OPS_LOG_ANOMALY_VALUE_MAX,
@@ -79,6 +80,18 @@ export const HIVE_RUNTIME_REASONS: readonly OpsReason[] = [
     enabled: true,
   },
 ];
+
+/**
+ * KPR-501 D3: every code-resident reason table, in UPSERT ORDER. The
+ * constructor asserts each table on its own (the gate is per-table, and each
+ * table is self-contained); `init()` upserts them in this order with each
+ * table's internal clearing-first order preserved. This producer's table comes
+ * first so its rows and write order are exactly what they were with one table.
+ *
+ * The import direction is one-way: `block-reasons.ts` never imports this
+ * module, so no cycle forms.
+ */
+export const OPS_REASON_TABLES: readonly (readonly OpsReason[])[] = [HIVE_RUNTIME_REASONS, HIVE_AGENT_REASONS];
 
 /**
  * D4: the bound on a detail KEY NAME. Deliberately NOT `OPS_TOKEN_RE` — that

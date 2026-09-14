@@ -2,7 +2,7 @@ import type { Db } from "mongodb";
 import { createLogger } from "../logging/logger.js";
 import { OpsStore, type LoadedReason } from "./store.js";
 import { evaluateMatches, isAdmissibleSubscriptionRow } from "./match.js";
-import { assertReasonTableLegal, HIVE_RUNTIME_REASONS } from "./reasons.js";
+import { assertReasonTableLegal, OPS_REASON_TABLES } from "./reasons.js";
 import { OPS_SCHEMA_VERSION, type OpsEvent, type OpsPublishInput, type OpsSubscription } from "./types.js";
 import { OPS_CLEARS_MAX_LENGTH, OPS_EVIDENCE_MAX, OPS_ID_MAX_LENGTH, clipForLog, isOpsToken } from "./ids.js";
 
@@ -106,7 +106,13 @@ export interface OpenCondition {
 
 type Job =
   | { kind: "failure"; input: OpsPublishInput }
-  | { kind: "recovery"; input: OpsPublishInput; family: string; openSeq: number };
+  | { kind: "recovery"; input: OpsPublishInput; family: string; openSeq: number }
+  /**
+   * KPR-501 D8: an accept-only job. It rides the same FIFO as the other two
+   * kinds, so stored `(publishedAt, _id)` order is enqueue order across kinds,
+   * and it never touches the open-condition map.
+   */
+  | { kind: "publish"; input: OpsPublishInput };
 
 export interface OpsPublisherCounters {
   published: number;
@@ -205,8 +211,10 @@ export class OpsPublisher {
     // OUTSIDE the try wrapping init(), so a violation is an unhandled boot
     // throw — loud, immediate, unconfusable with a Mongo outage. Inside
     // init() that catch would swallow it into "init failed", the exact
-    // degradation D10 forbids. Development-only: the shipped table passes.
-    assertReasonTableLegal(HIVE_RUNTIME_REASONS);
+    // degradation D10 forbids. Development-only: the shipped tables pass.
+    // KPR-501 D3: one assertion PER TABLE — the gate is per-table and each
+    // code-resident table is self-contained.
+    for (const table of OPS_REASON_TABLES) assertReasonTableLegal(table);
     this.store = new OpsStore(db, retentionDays);
   }
 
@@ -225,7 +233,9 @@ export class OpsPublisher {
    */
   async init(): Promise<void> {
     this.counters.indexFailures = await this.store.ensureIndexes();
-    await this.store.upsertReasons(HIVE_RUNTIME_REASONS);
+    // KPR-501 D3: one upsert per table, in list order, each table's internal
+    // clearing-first order preserved, all before the single read-back.
+    for (const table of OPS_REASON_TABLES) await this.store.upsertReasons(table);
     const loaded = await this.store.loadReasons();
     this.reasons = loaded.map;
     this.counters.reasonRowAnomalies = loaded.anomalies;
@@ -522,6 +532,63 @@ export class OpsPublisher {
     this.enqueue({ kind: "recovery", input: build(entry.dedupeKey), family, openSeq: entry.openSeq });
   }
 
+  /**
+   * KPR-501 D8: enqueue an accept-only publish. Synchronous and non-throwing,
+   * through the same `enqueue` as the other kinds — the same depth, drop-oldest,
+   * `stopping` latch and overflow counter. Returns before any insert: the
+   * caller cannot see acceptance, only that the job was handed to the drainer.
+   */
+  enqueuePublish(input: OpsPublishInput): void {
+    this.enqueue({ kind: "publish", input });
+  }
+
+  /**
+   * KPR-501 D7 step 4: the drain barrier with a deadline. Waits while the queue
+   * holds jobs or the drainer is mid-job, for at most `deadlineMs` (plus one poll
+   * tick). Never rejects and never sets `stopping`. Resolves `true` iff the
+   * queue reached idle before the deadline — a caller reports that as whether a
+   * following log read could have missed a queued publish.
+   */
+  async flush(deadlineMs: number): Promise<boolean> {
+    const deadline = Date.now() + deadlineMs;
+    while (this.queue.length > 0 || this.draining) {
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    return true;
+  }
+
+  /**
+   * KPR-501 D7 step 5: whether a condition family is open, resolved FROM THE LOG
+   * rather than from the open-condition map. Returns the latest condition's
+   * `dedupeKey` iff one exists and no clearing fact for the family is more recent
+   * under the compound `(publishedAt, _id)` order — the order KPR-468's cursor
+   * consumes — and `undefined` otherwise.
+   *
+   * The same comparison `resolveGeneration` makes, through the same private
+   * helper, so the key a clear names is always the key the next report's
+   * generation is computed against. No class-legality test, no fallback and no
+   * catch: a read fault rejects to the caller, whose fault it is to count. No
+   * publisher counter moves here.
+   */
+  async findOpenCondition(
+    key: Pick<OpsPublishInput, "producer" | "subject" | "reasonId">,
+  ): Promise<string | undefined> {
+    const { latestCondition, clearedSince } = await this.readEpoch(familyOf(key), key);
+    if (!latestCondition || clearedSince) return undefined;
+    return latestCondition.dedupeKey;
+  }
+
+  /**
+   * KPR-501 D9: whether a registry row is loaded AND enabled, read off the map
+   * `init()` loaded. `false` for an absent row, a disabled row, and every row
+   * before `init()`.
+   */
+  isReasonEnabled(producer: string, reasonId: string): boolean {
+    const loaded = this.reasons.get(`${producer}:${reasonId}`);
+    return loaded !== undefined && loaded.row.enabled === true;
+  }
+
   countIdOmitted(): void {
     this.counters.idOmitted += 1;
   }
@@ -612,6 +679,14 @@ export class OpsPublisher {
   }
 
   private async runJob(job: Job): Promise<void> {
+    if (job.kind === "publish") {
+      // KPR-501 D8: accept and nothing else. No open-condition entry is created
+      // or removed — that map is the recovery bookkeeping of the tool-failure
+      // capture points, and an entry here would spend a slot of a cap sized for
+      // tools. An insert fault lands in drain()'s per-job catch.
+      await this.accept(job.input);
+      return;
+    }
     if (job.kind === "recovery") {
       // D8: the pre-publish test is IDENTITY, evaluated before any I/O.
       // Membership (`has(family)`) is NOT sufficient and specifying one is
@@ -878,20 +953,9 @@ export class OpsPublisher {
    */
   private async resolveGeneration(family: string, input: OpsPublishInput): Promise<number> {
     try {
-      const [latestCondition, latestClearing] = await Promise.all([
-        this.store.events.findOne(
-          {
-            producer: input.producer,
-            "subject.kind": input.subject.kind,
-            "subject.id": input.subject.id,
-            reasonId: input.reasonId,
-          },
-          { sort: { publishedAt: -1, _id: -1 } },
-        ),
-        this.store.events.findOne({ clearsFamily: family }, { sort: { publishedAt: -1, _id: -1 } }),
-      ]);
+      const { latestCondition, clearedSince } = await this.readEpoch(family, input);
       if (!latestCondition) return 0;
-      if (latestClearing && isMoreRecent(latestClearing, latestCondition)) return latestCondition.generation + 1;
+      if (clearedSince) return latestCondition.generation + 1;
       return latestCondition.generation;
     } catch (err) {
       // D2/D10: the publish still proceeds, contained, at the producer's last
@@ -909,6 +973,36 @@ export class OpsPublisher {
       const entry = this.open.get(family);
       return entry ? generationOfDedupeKey(entry.dedupeKey) : 0;
     }
+  }
+
+  /**
+   * THE ONE "latest condition vs latest clearing" comparison (KPR-501 D7), shared
+   * by `resolveGeneration` and `findOpenCondition` so the two cannot drift. The
+   * two indexed reads run CONCURRENTLY; the first filters on the four
+   * components (not the family string), the second on `clearsFamily`, both
+   * sorted by the compound `(publishedAt, _id)` order the epoch-read indexes
+   * cover. `clearedSince` is true iff a clearing fact exists that is more recent
+   * than the latest condition. No catch: each caller owns its fault posture.
+   */
+  private async readEpoch(
+    family: string,
+    key: Pick<OpsPublishInput, "producer" | "subject" | "reasonId">,
+  ): Promise<{ latestCondition: OpsEvent | null; clearedSince: boolean }> {
+    const [latestCondition, latestClearing] = await Promise.all([
+      this.store.events.findOne(
+        {
+          producer: key.producer,
+          "subject.kind": key.subject.kind,
+          "subject.id": key.subject.id,
+          reasonId: key.reasonId,
+        },
+        { sort: { publishedAt: -1, _id: -1 } },
+      ),
+      this.store.events.findOne({ clearsFamily: family }, { sort: { publishedAt: -1, _id: -1 } }),
+    ]);
+    const clearedSince =
+      latestCondition !== null && latestClearing !== null && isMoreRecent(latestClearing, latestCondition);
+    return { latestCondition, clearedSince };
   }
 }
 
