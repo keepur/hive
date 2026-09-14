@@ -7,7 +7,7 @@ On the KPR-463 packaged dodi release, after KPR-465 has either applied a configu
 ## Key Points
 
 - Consume KPR-463's packaged-release evidence (`docs/epics/kpr-462/kpr-463-deployment-evidence.md`, spec §6/§7/T9) and **rerun** its no-call preflight on the identity that will actually place the calls, including the §6 Dependencies check (loaded Hive / LiveKit job helpers / RTC-native / Silero realpaths inside the selected release — P7). Do not re-execute restart/rollback as a 466 experiment.
-- Repeat KPR-464 L1–L4 on this deployment (canon R5). Frozen 464 live rows are `pending` and are not a 466 pass. KPR-465's offline snapshot is not L1–L4 (R12).
+- Repeat KPR-464 L1–L4 on this deployment (canon R5). Frozen 464 live rows are `pending` and are not a 466 pass. KPR-465's offline snapshot is not L1–L4 (R12). L2 requires opening suppression only when nonempty final or accepted-turn is observed before the opening request; a late-final greeting that yields one opening then replacement is L2 `pass` (R6; 464 §3). Copying the frozen 464 “no optional opening” cell does not override that.
 - Sequence after KPR-465's §6.4 register entry when one exists; otherwise run **keep-cold by absence**. Capture warm/cold as a consistency check on the setting that actually ran. I1 pause verdict and any 465-written p50/p95 are observations, not a 466 SLO or ticket-complete gate (465 §6.4 / E6: proceed on cold with a recorded gap). Do not duplicate 465's arms, sample plan, bootstrap, or blinded target selection. Split warm-opener `initToFirstTokenMs` at the KPR-465 boundary (R8 CORRECTION).
 - Honest grammar: a scenario that needs a heard conversation is `unknown` without caller-audio proof. Dispatch created, bridge 200, `sip_answered`, playout-complete, and `engine_first_text` are not a successful phone conversation.
 - Smallest live set: one initiation call that also covers quiet opening, exchange, barge-in, tool-ack, and hangup (I1), plus L2, L3, L4. Voicemail is classified when observed, not manufactured; a classified `answered_voicemail` / `no_sip_answer` on any required call is retried once under the same go so L2–L4 remain completable. No AMD, no vendor API probes, no numeric SLO, no CNAM, no inbound.
@@ -102,7 +102,7 @@ KPR-463 spec §7: 466 may consume 463 as passed only when **actual dodi migratio
 
 Canon R5: 466 repeats L1–L4 on the final integrated deployment. 464 live Task 9 was not executed; every live prerequisite is still unavailable. Offline S1–S5 stay prerequisite evidence (R7), not handset proof.
 
-The four caller actions, machine expectations, and caller observations are those in `kpr-464-startup-evidence.md` §Live status (quiet answer; immediate hello; greeting as the opening starts; hangup during startup). 466 does not change them. It runs them on the 463 identity under the 465 setting, and combines them with I1's extra scenarios.
+The four caller actions remain those in `kpr-464-startup-evidence.md` §Live status (quiet answer; immediate hello; greeting as the opening starts; hangup during startup). L1, L3, and L4 machine expectations and caller observations are those of that table. L2's frozen cell (“exactly one caller response and no optional opening”) is not copied: a physical greeting before or at answer cannot guarantee opening suppression (464 §3; R6). Opening suppression is required only when nonempty final or accepted-turn is observed before the opening request; the late-final case is scored in §6.1. 466 runs these on the 463 identity under the 465 setting, and combines them with I1's extra scenarios.
 
 F2 (refresh 464 evidence-doc command rows at the merged head) is an epic-docs follow-up, not a 466 edit. 466 records its own running identity and does not treat the frozen `6027b2c` Vitest snapshot as that identity.
 
@@ -159,7 +159,7 @@ Keepur must remain untouched (463). Pilot worktrees must not be the live Program
 | I1 | Mokie initiates from a user request and resolves the known contact | May messages Mokie (Slack) to call her **without digits**. Mokie resolves via contacts or memory and invokes LiveKit `voice_call` | `voice_call` dispatch id + room/call id; agent is Mokie; destination **not** copied into the record; tool-name counts only (no args). Not `lk dispatch create`, not Vapi `voice` | The handset that rang is May's known line. Mokie did not ask for the number | `unknown` (initiation without a heard ring/answer cannot pass) |
 | V | Ring/answer vs voicemail distinguished | Natural outcome of any authorized call, or one optional “let it go to voicemail” attempt under the same go | Classification table §6.2. `sip_answered` ≠ human | May states: no ring, voicemail, or human answer | `unknown` if unclassified; `unobserved` if no voicemail attempt and none occurred |
 | L1 | Audible opening (quiet answer) | Answer and remain quiet through startup | Exactly one relevant opening; complete attempt accounting; generated-audio and worker-playout kept distinct from handset receipt (464 L1) | First audible words; no prolonged unexplained silence (464/R5 startup-audibility bar; this can fail L1, and is not the I1 pause three-way in §4.3); no duplicate/stale speech | `unknown` |
-| L2 | Early “hello” | Say hello immediately before or at answer | Caller input owns startup; exactly one caller response; no optional opening (464 L2) | First audible words; no opening or stale replay | `unknown` |
+| L2 | Early “hello” | Say hello immediately before or at answer | Observed-ordering class in the L2 paragraph below (`l2_suppressed` or `l2_late_final_replaced`); complete attempt accounting. Not the frozen 464 “no optional opening” cell | Sanitized first-audible class (§7.2); no stale replay after replacement. A brief opening on `l2_late_final_replaced` is not fail | `unknown` |
 | L3 | Opening-start replacement | Begin a greeting as the opening starts | Obsolete opening interrupted; one replacement proceeds; no later stale opening (464 L3) | Interruption felt normal; response arrived; old speech did not replay | `unknown` |
 | X | Normal exchange | Two short factual turns after a human answer (on I1) | ≥ 2 completed non-interrupted `sdk_response` speeches bound to turn ids; `warm` flag matches the chosen setting | Answers were audible and on-topic (May's per-turn mark: correct / wrong / missing) | `unknown` |
 | B | Barge-in | One mid-sentence interruption on I1 | Interrupted speech terminal `interrupted`; replacement progresses; no duplicate | Interruption behaved naturally; nothing replayed | `unknown` |
@@ -168,6 +168,17 @@ Keepur must remain untouched (463). Pilot worktrees must not be the live Program
 | L4 | Hangup during startup | Hang up while startup is pending or beginning | 464 L4: disconnect terminalizes or leaves incomplete; no post-disconnect successor audio attributed as successful | What, if anything, was audible; recollection is qualitative | `unknown` for audibility; machine cleanup may still `pass` |
 | C | Warm/cold capture | None beyond running on the 465 setting | §4.3 consistency check + confirmatory compare CLI on I1 call ids, R8 split honored | Record the I1 pause verdict (acceptable / borderline / annoying). The three-way verdict is **not** a C `pass`/`fail` input (§4.3 mapping); C `pass`/`fail` is machine consistency only. L1's "no prolonged unexplained silence" is the 464/R5 startup-audibility bar and can fail L1; it is not this three-way | Pause row `unknown`; machine consistency may still `pass`/`fail` |
 | R | Restart/rollback | None in 466 | `consumed` from 463 T9 | — | If 463 T9 pending, 466 cannot complete |
+
+**L2 observed ordering (R6; 464 §3; `startup-arbiter.ts`).** Classify Call 2 from content-free JSONL only: `caller_final_input.hasFinalInput`, `opening_decision` `decision`/`reason`, `caller_turn_accepted`, speech `origin: "opening"`, cancel cause `startup_superseded`. Do not read transcript or prompt text. `callerState("listening")` reevaluates startup without waiting for final; `finalInput` latches nonempty final only; `acceptedCallerTurn` consumes and interrupts only the retained opening handle.
+
+| Class | Observed final-input / acceptance vs opening request | L2 result |
+| --- | --- | --- |
+| `l2_suppressed` | Nonempty final (`hasFinalInput: true`) and/or `caller_turn_accepted` / `opening_decision` `consumed` + `accepted_caller_turn` occurs **before** any `opening_decision` `request` / `quiet_answer` | `pass` when no optional opening was requested, exactly one caller-owned response proceeds, and attempt accounting is complete. Caller sanitized class is greeting-response, not an opening, with no stale replay |
+| `l2_late_final_replaced` | Listening reevaluated with no final pending, so one `quiet_answer` opening was requested; nonempty final then arrived; accepted-turn interrupted only that retained opening (`startup_superseded`) | `pass` when exactly one opening is requested then superseded, exactly one caller-owned replacement proceeds, that opening is not queued behind the replacement, and no extra utterance is required to progress. Caller may hear a brief opening then the hello-response (`heard_both`); that is not L2 `fail` and is not a §3.1 duplicate/stale opening |
+| `l2_ordering_unknown` | Decision events missing, or the hello produced neither a pre-request final/accept nor an accepted replacement after a request (no-final / interim-only / empty-final — S4-shaped quiet opening) | `unknown` — never `fail`. Canon-compliant no-final listening must not be scored as an L2 opening defect. Required L2 coverage is not complete on this attempt |
+| (defect) | Suppression was required (final or accept before request) but an opening was still requested; or a late-final opening remained queued behind the replacement; or replacement required another utterance; or a later stale opening replayed | `fail` |
+
+Either `l2_suppressed` or `l2_late_final_replaced` completes required L2 coverage. Call 2 remains required; a late-final pass does not absorb L3.
 
 ### 6.2 Voicemail / answer classification
 
@@ -196,7 +207,7 @@ Four required calls, one optional:
 
 Repeats and failed attempts stay in the denominator; they are not dropped. If Call 2, 3, or 4 classifies as `no_sip_answer` or `answered_voicemail`, do not fail L2/L3/L4 on that attempt; retry that scenario once under the same go (§6.2). Call 1 already has that retry for I1. Do not import the KPR-465 10-turn bench script onto the handset — it is an experiment instrument (powered n, `mokie-bench` clone, “bench marker”). I1 is short on purpose.
 
-I1 caller lines (fixed, no personal data), checked into the evidence record at execution, not into product code:
+I1 caller lines (fixed, no personal data) are controlled script text (§7.2), not prompt bytes or harvested transcript. They may be checked into the git evidence record at execution, not into product code:
 
 1. Quiet through the opening (L1).
 2. One short factual question with a go-time expected keyword (X).
@@ -205,7 +216,7 @@ I1 caller lines (fixed, no personal data), checked into the evidence record at e
 5. One lookup prompt that names the chosen read-only tool’s job without personal data (T). If `conversation_search`, a go-time non-personal marker phrase; if `contacts_search`, a name already on the request path (May), never a number.
 6. Goodbye and hangup (H).
 
-L2–L4 follow the 464 live table verbatim.
+L3–L4 follow the 464 live table. L2's caller action follows that table (hello immediately before or at answer; that instructed “hello” is also controlled script text). L2 machine and caller scoring follow §6.1, not the frozen “no optional opening” cell. Copying that cell does not override R6.
 
 ## 7. Live execution protocol
 
@@ -225,6 +236,12 @@ Every live call requires all of:
 
 Reuse 464/465 posture. The evidence record and any harvested JSONL slice must not contain transcript text, phone numbers, destination, tokens, tool arguments, ack phrase text, prompt bytes, or audio. Call id, dispatch id, speech id, turn id, workerBootId, outcomes, measures, tool **counts**, and boolean flags are allowed. Public-safe path patterns replace account-specific absolute paths; exact local read-back stays in the operator record outside git if needed.
 
+Three evidence classes, all compatible with that prohibition:
+
+1. **Controlled script text** — I1 caller lines and the L2 instructed “hello” (and L3/L4 caller actions). Pre-agreed, no personal data, not harvested from the model or STT. May be checked into the git evidence record as the script that was used.
+2. **Sanitized human observations** — first-audible **class** (`heard_opening` / `heard_greeting_response` / `heard_both` / `heard_none` / `heard_other`), pause three-way, barge-in/stale/late-speech booleans, per-turn correct/wrong/missing. These go in the git evidence record. They are not transcript text.
+3. **Operator-only observations** — verbatim first-audible wording and unparaphrased free text that is not the controlled script. Retained only outside git (same operator record as exact local paths), even when May okays keeping them for her own notes.
+
 Harvest commands (operator, after the call, bounded 32 MiB):
 
 ```text
@@ -238,7 +255,7 @@ No Mongo content dump. No `voice-latency-baseline.ts` as a comparand (R4). Docto
 
 ### 7.3 Caller verdict (not blinded)
 
-466 is not an A/B. After each human-answered call, May records: first audible words; pauses (acceptable / borderline / annoying) on I1 — recorded, not a 466 fail (§4.3); cut-off or talked-over; barge-in quality; duplicate/stale speech; tool acknowledgement heard; late speech after hangup; per-turn correctness for X and T; free text (verbatim only with her ok). Observation time is stored with the call id. Disagreement between machine rows and the verdict is reported, not reconciled away.
+466 is not an A/B. After each human-answered call, May records: sanitized first-audible class (§7.2) — not quoted wording; pauses (acceptable / borderline / annoying) on I1 — recorded, not a 466 fail (§4.3); cut-off or talked-over; barge-in quality; duplicate/stale speech; tool acknowledgement heard; late speech after hangup; per-turn correctness for X and T; free text (paraphrased in git; verbatim only in the operator record outside git, and only with her ok). Observation time is stored with the call id. Disagreement between machine rows and the verdict is reported, not reconciled away.
 
 ## 8. Evidence record
 
