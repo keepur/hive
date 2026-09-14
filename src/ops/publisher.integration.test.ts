@@ -798,6 +798,285 @@ describe("matchedSubscriptions IS matchedSubscriptionIds.length — no stored-li
   });
 });
 
+// ───────────────────────────────────────────────────────────────────────────
+// KPR-507 — overlapping subscription reloads commit by START order, not by
+// completion order. Both blast radii live on the IMMUTABLE `ops_events` insert
+// (KPR-458: never re-evaluated downstream), so every direction case below reads
+// the inserted document's stamp, not just the snapshot length.
+//
+// The race construction is `pause(OPS_SUBSCRIPTIONS_COLLECTION, "find", …, true)`.
+// `after=true` is LOAD-BEARING: `FakeDb.operation()` copies the find result
+// BEFORE the after-hook, so a held reload keeps a genuinely older captured array
+// while a later reload runs against the mutated collection and commits.
+// `after=false` holds before the copy and reproduces nothing. A pause hook is
+// one-shot, so the later reload's find runs unhooked; arm one per held call.
+// Start order is the order the `reloadSubscriptions()` calls are ISSUED.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("overlapping subscription reloads commit by start order, not completion order (KPR-507)", () => {
+  const ANOMALY_WARN = "Ops subscription rows unusable";
+  const RELOAD_FAILED_WARN = "Ops subscription reload failed";
+  const SUPERSEDED_DEBUG = "superseded by a later reload";
+  // The admissible-row shape of the C2 describe's block-local `row(over)` helper.
+  const row = (over: Record<string, unknown>) => ({
+    _id: "s1",
+    subscriberId: "ops-team",
+    subscriberKind: "human",
+    enabled: true,
+    filter: {},
+    transport: { adapterId: "slack", target: "C1" },
+    ...over,
+  });
+  const insert = async (over: Record<string, unknown> = {}) =>
+    fakeDb.collection(OPS_SUBSCRIPTIONS_COLLECTION).insertOne(row(over) as never);
+  /** Direct fixture access, like `events()` — adds no `operations` entry. */
+  const subscriptionRows = () => fakeDb.collection(OPS_SUBSCRIPTIONS_COLLECTION).rows;
+  const holdNextSubscriptionFind = () => fakeDb.pause(OPS_SUBSCRIPTIONS_COLLECTION, "find", () => true, true);
+  const subscriptionFinds = () =>
+    fakeDb.operations.filter((o) => o.collection === OPS_SUBSCRIPTIONS_COLLECTION && o.operation === "find").length;
+  const debugsMatching = (fragment: string) =>
+    mockLog.debug.mock.calls.filter((call) => String(call[0]).includes(fragment)).length;
+  /** Publish one failure through observe → enqueue → drain → accept → insertOne and return THAT document. */
+  const publishAndReadStamp = async (tool = "Bash") => {
+    const before = events().length;
+    driveFailure(tool);
+    await publisher.__drainForTests();
+    expect(events()).toHaveLength(before + 1);
+    return events().at(-1)!;
+  };
+
+  it("AC1 disable direction: an older reload that captured the enabled row cannot restore it over a later commit", async () => {
+    await insert({ _id: "s1" });
+    await publisher.init();
+    expect(publisher.getSnapshot().subscriptions).toBe(1);
+
+    // Timer-shaped reload A captures {s1} and is held after the copy.
+    const gateA = holdNextSubscriptionFind();
+    const reloadA = publisher.reloadSubscriptions();
+    await gateA.reached;
+
+    // The operator disables s1; SIGUSR1-shaped reload B commits [].
+    subscriptionRows().find((r) => r._id === "s1")!.enabled = false;
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptions).toBe(0);
+
+    // A finishes last and is discarded.
+    gateA.release();
+    await reloadA;
+
+    // The stamp FIRST — it is the immutable blast radius, and asserting it
+    // before the snapshot makes a regression fail on the stored document.
+    const doc = await publishAndReadStamp();
+    expect(doc.matchedSubscriptionIds).toEqual([]);
+    expect(doc.matchedSubscriptions).toBe(0);
+    expect(publisher.getSnapshot().subscriptions).toBe(0);
+    expect(debugsMatching(SUPERSEDED_DEBUG)).toBe(1);
+    expect(publisher.getSnapshot().subscriptionReloadFaults).toBe(0);
+  });
+
+  it("AC2 enable direction: an older reload that captured the empty set cannot wipe a later commit (the permanent-loss direction)", async () => {
+    await publisher.init();
+    expect(publisher.getSnapshot().subscriptions).toBe(0);
+
+    // Reload A captures [] and is held after the copy.
+    const gateA = holdNextSubscriptionFind();
+    const reloadA = publisher.reloadSubscriptions();
+    await gateA.reached;
+
+    // The operator enables s1; reload B commits {s1}.
+    await insert({ _id: "s1" });
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptions).toBe(1);
+
+    gateA.release();
+    await reloadA;
+
+    const doc = await publishAndReadStamp();
+    expect(doc.matchedSubscriptionIds).toEqual(["s1"]);
+    expect(doc.matchedSubscriptions).toBe(1);
+    expect(publisher.getSnapshot().subscriptions).toBe(1);
+    expect(debugsMatching(SUPERSEDED_DEBUG)).toBe(1);
+  });
+
+  it("AC3: a later reload that FAILS does not block the one after it, and that one still beats the earlier read", async () => {
+    await insert({ _id: "s0" });
+    await publisher.init();
+    expect(publisher.getSnapshot().subscriptions).toBe(1);
+
+    // A captures {s0} and is held.
+    const gateA = holdNextSubscriptionFind();
+    const reloadA = publisher.reloadSubscriptions();
+    await gateA.reached;
+
+    await insert({ _id: "s1" });
+
+    // B throws. Its call is the 1st find issued after arming, so the counter
+    // pins the fault to B alone (A's find already passed the fault check).
+    let findsAfterArming = 0;
+    fakeDb.failNext(OPS_SUBSCRIPTIONS_COLLECTION, "find", undefined, () => ++findsAfterArming === 1);
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptionReloadFaults).toBe(1);
+    expect(publisher.getSnapshot().subscriptions).toBe(1); // retained {s0}, unchanged
+    expect(warnsMatching(RELOAD_FAILED_WARN)).toBe(1);
+
+    // C commits the post-fault collection state {s0, s1}.
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptions).toBe(2);
+
+    // A lands last and is discarded — it does not restore {s0}.
+    gateA.release();
+    await reloadA;
+    expect(publisher.getSnapshot().subscriptions).toBe(2);
+    expect(publisher.getSnapshot().subscriptionReloadFaults).toBe(1);
+    expect(debugsMatching(SUPERSEDED_DEBUG)).toBe(1);
+
+    const doc = await publishAndReadStamp();
+    expect(doc.matchedSubscriptionIds).toEqual(["s0", "s1"]);
+    expect(doc.matchedSubscriptions).toBe(2);
+  });
+
+  it("AC4: an earlier read finishing after ONLY a failed later reload still commits — a fault supersedes nothing", async () => {
+    await publisher.init();
+    expect(publisher.getSnapshot().subscriptions).toBe(0); // retained []
+
+    // A captures {s1} — older than B, but fresher than the retained [].
+    await insert({ _id: "s1" });
+    const gateA = holdNextSubscriptionFind();
+    const reloadA = publisher.reloadSubscriptions();
+    await gateA.reached;
+
+    let findsAfterArming = 0;
+    fakeDb.failNext(OPS_SUBSCRIPTIONS_COLLECTION, "find", undefined, () => ++findsAfterArming === 1);
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptionReloadFaults).toBe(1);
+    expect(publisher.getSnapshot().subscriptions).toBe(0); // retained [], unchanged
+
+    gateA.release();
+    await reloadA;
+
+    const doc = await publishAndReadStamp();
+    expect(doc.matchedSubscriptionIds).toEqual(["s1"]);
+    expect(doc.matchedSubscriptions).toBe(1);
+    expect(publisher.getSnapshot().subscriptions).toBe(1);
+    expect(publisher.getSnapshot().subscriptionReloadFaults).toBe(1);
+    expect(debugsMatching(SUPERSEDED_DEBUG)).toBe(0);
+  });
+
+  it("AC5: init()'s own first load, held and then superseded, is discarded and init() still resolves", async () => {
+    // `beforeEach` does not call init(); this case owns the first load.
+    const gateFirst = holdNextSubscriptionFind();
+    const initDone = publisher.init();
+    await gateFirst.reached; // init()'s first reload captured [] and is held
+
+    await insert({ _id: "s1" });
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptions).toBe(1);
+
+    gateFirst.release();
+    await expect(initDone).resolves.toBeUndefined();
+    expect(publisher.getSnapshot().subscriptions).toBe(1);
+    expect(debugsMatching(SUPERSEDED_DEBUG)).toBe(1);
+
+    // Public observable only: the init line, emitted after the timer is armed
+    // and the enable-gate audit ran, reports the LATER set's count.
+    const initLines = mockLog.info.mock.calls.filter((call) => String(call[0]).includes("Ops publisher initialized"));
+    expect(initLines).toHaveLength(1);
+    expect(initLines[0]![1]).toMatchObject({ subscriptions: 1 });
+    expect(mockLog.error).not.toHaveBeenCalled(); // the healthy registry's enable gate says nothing
+
+    const doc = await publishAndReadStamp();
+    expect(doc.matchedSubscriptionIds).toEqual(["s1"]);
+    expect(doc.matchedSubscriptions).toBe(1);
+  });
+
+  it("AC6: a discarded older CLEAN capture is not a fault and does not zero a gauge a newer commit raised", async () => {
+    await insert({ _id: "s1" });
+    await publisher.init();
+    expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(0);
+
+    // A captures the clean {s1} and is held.
+    const gateA = holdNextSubscriptionFind();
+    const reloadA = publisher.reloadSubscriptions();
+    await gateA.reached;
+
+    // A bad row appears (non-plain-object filter); B commits and raises the gauge.
+    await insert({ _id: "sub-bad", filter: "producer" });
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(1);
+    expect(warnsMatching(ANOMALY_WARN)).toBe(1);
+
+    gateA.release();
+    await reloadA;
+
+    const snapshot = publisher.getSnapshot();
+    expect(snapshot.subscriptionRowAnomalies).toBe(1);
+    expect(snapshot.subscriptions).toBe(2);
+    expect(snapshot.subscriptionReloadFaults).toBe(0);
+    expect(warnsMatching(ANOMALY_WARN)).toBe(1);
+    expect(warnsMatching(RELOAD_FAILED_WARN)).toBe(0);
+    expect(debugsMatching(SUPERSEDED_DEBUG)).toBe(1);
+  });
+
+  it("AC6 converse: a discarded older BROKEN capture does not re-raise a gauge a newer commit repaired", async () => {
+    await insert({ _id: "s1" });
+    await insert({ _id: "sub-bad", filter: "producer" });
+    await publisher.init();
+    expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(1);
+    expect(warnsMatching(ANOMALY_WARN)).toBe(1);
+
+    // A captures the broken {s1, sub-bad} and is held.
+    const gateA = holdNextSubscriptionFind();
+    const reloadA = publisher.reloadSubscriptions();
+    await gateA.reached;
+
+    // Repair (no deleteOne on the double; direct fixture edit) and B commits.
+    const rows = subscriptionRows();
+    rows.splice(
+      rows.findIndex((r) => r._id === "sub-bad"),
+      1,
+    );
+    await publisher.reloadSubscriptions();
+    expect(publisher.getSnapshot().subscriptionRowAnomalies).toBe(0);
+
+    gateA.release();
+    await reloadA;
+
+    const snapshot = publisher.getSnapshot();
+    expect(snapshot.subscriptionRowAnomalies).toBe(0);
+    expect(snapshot.subscriptions).toBe(1);
+    expect(snapshot.subscriptionReloadFaults).toBe(0);
+    expect(warnsMatching(ANOMALY_WARN)).toBe(1); // still only init()'s line
+    expect(warnsMatching(RELOAD_FAILED_WARN)).toBe(0);
+    expect(debugsMatching(SUPERSEDED_DEBUG)).toBe(1);
+  });
+
+  it("AC7: a stopping-skipped reload performs no find and supersedes nothing — a reload held before stop() still commits", async () => {
+    await publisher.init();
+    expect(publisher.getSnapshot().subscriptions).toBe(0);
+
+    // A starts BEFORE stop(), captures {s1}, and is held.
+    await insert({ _id: "s1" });
+    const gateA = holdNextSubscriptionFind();
+    const reloadA = publisher.reloadSubscriptions();
+    await gateA.reached;
+
+    await publisher.stop();
+
+    // The skipped call: no find attempted, no fault counted.
+    const findsBefore = subscriptionFinds();
+    await publisher.reloadSubscriptions();
+    expect(subscriptionFinds()).toBe(findsBefore);
+    expect(publisher.getSnapshot().subscriptionReloadFaults).toBe(0);
+
+    // …and it superseded nothing: A, already numbered, commits when released.
+    // (No publish here — enqueue refuses while stopping; the snapshot is the observable.)
+    gateA.release();
+    await reloadA;
+    expect(publisher.getSnapshot().subscriptions).toBe(1);
+    expect(debugsMatching(SUPERSEDED_DEBUG)).toBe(0);
+  });
+});
+
 describe("OpsPublisher recovery and the openSeq identity", () => {
   it("publishes one clearing fact and removes the entry AFTER the accept, not before", async () => {
     await publisher.init();
