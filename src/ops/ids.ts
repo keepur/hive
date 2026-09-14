@@ -61,6 +61,10 @@ export const OPS_TOKEN_RE = /^[a-z][a-z0-9-]{0,39}$/;
  * behaviour: there a breach SKIPS the row from the match list rather than
  * rejecting the publish, because a malformed subscription row must not be able
  * to suppress a real failure record. Either use may move without the other.
+ *
+ * ⚠ AND the bound on an acknowledgement's `actorId` at KPR-468's intake seam
+ * (intake.ts, step 2) — adjacency again, with a THIRD breach behaviour: the
+ * act is refused `unattributed`, never truncated.
  */
 export const OPS_ID_MAX_LENGTH = 200;
 
