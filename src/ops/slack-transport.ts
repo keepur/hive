@@ -128,9 +128,17 @@ export class SlackOpsTransport implements OpsTransport {
     if (e.evidence.length > 0) {
       lines.push(`evidence: ${e.evidence.map((r) => `${escapeSlack(r.kind)}:${escapeSlack(r.id)}`).join(", ")}`);
     }
-    lines.push(`ref: ${escapeSlack(n.handle)}`);
+    // ⚠ THE `ref:` LINE IS RESERVED, NEVER TRUNCATED. It carries the handle an
+    // acknowledgement resolves against, so it is kept whole and the bound is
+    // spent on everything above it. Appended to the body and cut with it, a
+    // valid long remediation (a repeated placeholder over a max-length
+    // parameter renders to thousands of chars) cut the handle off entirely,
+    // and an ACCEPTED post reached a human with nothing to acknowledge by.
+    const ref = `ref: ${escapeSlack(n.handle)}`;
+    const room = Math.max(0, MAX_BODY - ref.length - 1);
     const body = lines.join("\n");
-    return body.length <= MAX_BODY ? body : body.slice(0, MAX_BODY - 1) + "…";
+    const head = body.length <= room ? body : body.slice(0, Math.max(0, room - 1)) + "…";
+    return `${head}\n${ref}`;
   }
 
   async deliver(n: NotificationView): Promise<DeliveryOutcome> {

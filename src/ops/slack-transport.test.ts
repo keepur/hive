@@ -192,6 +192,31 @@ describe("SlackOpsTransport.deliver (D6, C8, C14)", () => {
     expect(String(body.text).length).toBeLessThanOrEqual(2_000);
   });
 
+  it("truncation never cuts the ack handle — a long valid remediation and long evidence keep the full `ref:` line", async () => {
+    // ⚠ THE ABLE-TO-FAIL CASE. A 240-char template (within OPS_REMEDIATION_MAX)
+    // repeating a placeholder whose value is 200 chars (OPS_DETAIL_STRING_MAX)
+    // renders to 4,800 chars; appended LAST and cut with the whole body, the
+    // `ref:` line — the one thing an acknowledgement needs — was lost.
+    let text = "";
+    const t = new SlackOpsTransport(
+      "xoxb-test",
+      () => {},
+      () => new Date(0),
+      async (_url, init) => {
+        text = String(new URLSearchParams(String(init?.body)).get("text"));
+        return slackResponse({ ok: true, channel: "C0123456", ts: "1.1" });
+      },
+    );
+    const v = view({
+      remediation: { template: "{toolName}".repeat(24), parameters: { toolName: "x".repeat(200) } },
+    });
+    v.event.evidence = Array.from({ length: 20 }, (_, i) => ({ kind: "workItem", id: `${"e".repeat(190)}${i}` }));
+    expect((await t.deliver(v)).status).toBe("accepted");
+    expect(text.length).toBeLessThanOrEqual(2_000);
+    expect(text.endsWith(`\nref: ${v.handle}`)).toBe(true);
+    expect(text).toContain("…");
+  });
+
   it("refuses an unvalidatable target before making any request", async () => {
     const fetcher = vi.fn();
     const t = new SlackOpsTransport(
