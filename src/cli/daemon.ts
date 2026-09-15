@@ -1,33 +1,38 @@
-import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
+import {
+  buildServicePlist,
+  getServiceLabel,
+  getServiceLaunchAgentLink,
+  getServicePlistPath,
+  validateInstanceId,
+} from "../deployment/services.js";
+import { invokeDeploymentHelper } from "./deployment-helper.js";
 
-// `hiveHome` is passed explicitly into every helper here — see KPR-69. The
-// previous module-level import from ../paths.js froze hiveHome at import time
-// against process.cwd(), which broke any caller (wizard, future tools) that
-// dynamic-imported this module from a directory without a hive.yaml.
 export function getInstanceId(hiveHome: string): string {
   const configPath = resolve(hiveHome, process.env.HIVE_CONFIG ?? "hive.yaml");
   if (!existsSync(configPath)) return "hive";
-  const config = parseYaml(readFileSync(configPath, "utf-8")) ?? {};
-  return (config.instance?.id as string) ?? "hive";
+  const config = parseYaml(readFileSync(configPath, "utf8")) as { instance?: { id?: unknown } } | null;
+  const id = config?.instance?.id ?? "hive";
+  if (typeof id !== "string") throw new Error("invalid configured instance ID");
+  return validateInstanceId(id);
 }
 
 export function getLabel(hiveHome: string): string {
-  return `com.hive.${getInstanceId(hiveHome)}.agent`;
+  return getServiceLabel(getInstanceId(hiveHome), "engine");
 }
 
 export function getPlistPath(hiveHome: string): string {
-  return resolve(hiveHome, "service", `${getLabel(hiveHome)}.plist`);
+  return getServicePlistPath(hiveHome, getInstanceId(hiveHome), "engine");
 }
 
 export function getLaunchAgentLink(hiveHome: string): string {
-  const home = process.env.HOME ?? "/tmp";
-  return resolve(home, "Library", "LaunchAgents", `${getLabel(hiveHome)}.plist`);
+  return getServiceLaunchAgentLink(process.env.HOME ?? "/tmp", getInstanceId(hiveHome), "engine");
 }
 
-export function buildPlist(opts: {
+/** Compatibility wrapper for callers that still construct an engine plist. */
+export function buildPlist(options: {
   label: string;
   nodePath: string;
   serverPath: string;
@@ -36,120 +41,25 @@ export function buildPlist(opts: {
   pathEnv: string;
   logsDir: string;
 }): string {
-  const { label, nodePath, serverPath, hiveHome, home, pathEnv, logsDir } = opts;
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${label}</string>
-
-  <key>ProgramArguments</key>
-  <array>
-    <string>${nodePath}</string>
-    <string>${serverPath}</string>
-  </array>
-
-  <key>WorkingDirectory</key>
-  <string>${hiveHome}</string>
-
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HIVE_HOME</key>
-    <string>${hiveHome}</string>
-    <key>PATH</key>
-    <string>${pathEnv}</string>
-    <key>HOME</key>
-    <string>${home}</string>
-  </dict>
-
-  <key>RunAtLoad</key>
-  <true/>
-
-  <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
-
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
-
-  <key>StandardOutPath</key>
-  <string>${logsDir}/hive.log</string>
-  <key>StandardErrorPath</key>
-  <string>${logsDir}/hive.err</string>
-</dict>
-</plist>
-`;
+  return buildServicePlist({
+    label: options.label,
+    nodePath: options.nodePath,
+    entrypoint: options.serverPath,
+    args: [],
+    hiveHome: options.hiveHome,
+    configPath: resolve(options.hiveHome, process.env.HIVE_CONFIG ?? "hive.yaml"),
+    home: options.home,
+    pathEnv: options.pathEnv,
+    overrides: {},
+    stdout: resolve(options.logsDir, "hive.log"),
+    stderr: resolve(options.logsDir, "hive.err"),
+  });
 }
 
 export async function startDaemon(hiveHome: string): Promise<void> {
-  const label = getLabel(hiveHome);
-  const plistPath = getPlistPath(hiveHome);
-  const linkPath = getLaunchAgentLink(hiveHome);
-  const serviceDir = resolve(hiveHome, "service");
-  const logsDir = resolve(hiveHome, "logs");
-  const engineDir = resolve(hiveHome, ".hive");
-
-  mkdirSync(serviceDir, { recursive: true });
-  mkdirSync(logsDir, { recursive: true });
-
-  const nodePath = execFileSync("which", ["node"], { encoding: "utf-8" }).trim();
-  const serverPath = existsSync(resolve(engineDir, "pkg", "server.min.js"))
-    ? resolve(engineDir, "pkg", "server.min.js")
-    : resolve(engineDir, "dist", "index.js");
-
-  const home = process.env.HOME ?? "/tmp";
-  const pathEnv = process.env.PATH ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
-
-  const plist = buildPlist({ label, nodePath, serverPath, hiveHome, home, pathEnv, logsDir });
-
-  writeFileSync(plistPath, plist);
-  console.log(`Generated plist: ${plistPath}`);
-
-  // Ensure ~/Library/LaunchAgents/ exists and create symlink
-  const launchAgentsDir = resolve(linkPath, "..");
-  mkdirSync(launchAgentsDir, { recursive: true });
-  if (existsSync(linkPath)) unlinkSync(linkPath);
-  symlinkSync(plistPath, linkPath);
-
-  // Unload first if already loaded (idempotent restart)
-  try {
-    execFileSync("launchctl", ["unload", linkPath], { stdio: "pipe" });
-  } catch {
-    // Not loaded — fine
-  }
-
-  try {
-    execFileSync("launchctl", ["load", linkPath], { stdio: "inherit" });
-    console.log(`Started ${label}`);
-  } catch {
-    throw new Error(`Failed to start ${label}. Check: launchctl list | grep hive`);
-  }
+  invokeDeploymentHelper(import.meta.url, hiveHome, ["--start", `--instance=${getInstanceId(hiveHome)}`]);
 }
 
 export async function stopDaemon(hiveHome: string): Promise<void> {
-  const linkPath = getLaunchAgentLink(hiveHome);
-  const label = getLabel(hiveHome);
-
-  if (!existsSync(linkPath)) {
-    console.log(`No LaunchAgent found for ${label}`);
-    return;
-  }
-
-  try {
-    execFileSync("launchctl", ["unload", linkPath], { stdio: "inherit" });
-    console.log(`Stopped ${label}`);
-  } catch {
-    console.error(`Failed to stop ${label}`);
-  }
-
-  // Clean up symlink
-  try {
-    if (existsSync(linkPath)) unlinkSync(linkPath);
-    console.log(`Removed ${linkPath}`);
-  } catch {
-    // Non-critical — stale symlink won't cause harm
-  }
+  invokeDeploymentHelper(import.meta.url, hiveHome, ["--stop", `--instance=${getInstanceId(hiveHome)}`]);
 }

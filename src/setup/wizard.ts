@@ -16,7 +16,7 @@ import { execFileSync } from "node:child_process";
 import { resolve, join } from "node:path";
 import { stringify as toYaml, parse as parseYaml } from "yaml";
 import { MongoClient } from "mongodb";
-import { populateEngine, ensureEngineDeps } from "./populate-engine.js";
+import { populateEngine } from "./populate-engine.js";
 import { render as renderTemplate } from "./template-renderer.js";
 import { runCredentialsStage, defaultSetSecret, defaultHasSecret } from "./credentials-wizard.js";
 import { seedsDir } from "../paths.js";
@@ -510,15 +510,20 @@ export async function runWizard(targetDir: string, templatesDir: string, pkgRoot
   if (isBundled) {
     section("Engine");
     const engineDir = resolve(targetDir, ".hive");
-    if (existsSync(engineDir)) {
-      // Resume path: a prior run got this far. Finish the install step if
-      // it was interrupted (node_modules missing). ensureEngineDeps is a
-      // no-op when the tree is already complete.
-      ensureEngineDeps(engineDir);
-      console.log(`  ✓ Engine already populated at ${engineDir} (deps verified)`);
-    } else {
-      populateEngine(pkgRoot, targetDir);
-      console.log(`  ✓ Engine populated at ${engineDir}`);
+    const resumed = existsSync(engineDir);
+    if (resumed) {
+      // Resume path: a prior run left staging that was never verified. It is
+      // discarded and the whole confined job and clone run again — an existing
+      // `node_modules` or partial `.hive` is never trusted.
+      console.log(`  · Discarding unverified engine staging at ${engineDir} and re-running`);
+    }
+    const populated = await populateEngine(pkgRoot, targetDir);
+    console.log(`  ✓ Engine populated at ${engineDir}`);
+    if (populated) {
+      console.log(
+        `    node ${populated.runtime.node}, npm ${populated.runtime.npm ?? "unknown"}, ` +
+          `confinement ${populated.selfTest.outcome}, promotion ${populated.promotionMethod}`,
+      );
     }
   }
 

@@ -1,0 +1,733 @@
+import { execFile as nodeExecFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { constants, readFileSync, realpathSync } from "node:fs";
+import { mkdir, open, readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { parseBootIdentity } from "./health.js";
+import { buildServiceEnvironment, servicePortKeys, ServiceController } from "./services.js";
+import { requestMaintenance, type MaintenanceReply } from "../voice-worker/maintenance-ipc.js";
+import { canonical } from "./canonical.js";
+import { ProbeFailure } from "./pilot-probe.js";
+import { readRelease } from "./release.js";
+import {
+  readOwnLoaderTelemetry,
+  runWorkerMaintenanceProbe,
+  workerMaintenanceFailure,
+  type WorkerMaintenanceProbeDeps,
+} from "./worker-maintenance-probe.js";
+import {
+  classificationOf,
+  HISTORICAL_PROBE_ABI,
+  MAX_PROBE_OUTPUT_BYTES,
+  resolveRequiredDependencies,
+} from "./pilot-probe.js";
+import {
+  probeFailureEnvelope,
+  runHistoricalProbe,
+  runPilotAbiHandshake,
+  type HistoricalLoaderConfig,
+  type HistoricalProbeDeps,
+  type LivekitReader,
+  type PilotProbeBoundaries,
+} from "./historical-probe.js";
+import { runPilotProfileProbe, type OuterProbeDeps } from "./pilot-profile-probe.js";
+
+export { readOwnLoaderTelemetry } from "./worker-maintenance-probe.js";
+
+export type RuntimeProbeMode =
+  | "config"
+  | "bridge"
+  | "worker"
+  | "outbound"
+  | "worker-maintenance"
+  | "pilot"
+  | "pilot-inventory"
+  | "pilot-abi"
+  | "pilot-abi-v1";
+
+/** Private modes that take exactly one absolute sealed input path. */
+export const PRIVATE_INPUT_MODES = ["worker-maintenance", "pilot", "pilot-inventory", "pilot-abi-v1"] as const;
+
+export interface BridgeProbeResult {
+  authenticated: boolean;
+  missingDenied: boolean;
+  wrongDenied: boolean;
+  correctStatus: number | null;
+  missingStatus: number | null;
+  wrongStatus: number | null;
+  classification: string;
+}
+
+type FetchLike = typeof fetch;
+
+async function bridgeRequest(url: string, token: string | null, fetchImpl: FetchLike): Promise<Response> {
+  return fetchImpl(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token === null ? {} : { Authorization: `Bearer ${token}` }),
+    },
+    body: "{}",
+    signal: AbortSignal.timeout(2_000),
+  });
+}
+
+async function exactMissingAgent(response: Response): Promise<boolean> {
+  if (response.status !== 400) return false;
+  try {
+    const body = (await response.json()) as { error?: unknown };
+    return body.error === "call.metadata.hive_agent_id required" && Object.keys(body).length === 1;
+  } catch {
+    return false;
+  }
+}
+
+export async function probeBridge(
+  url: string,
+  token: string,
+  fetchImpl: FetchLike = fetch,
+  randomToken: () => string = randomUUID,
+): Promise<BridgeProbeResult> {
+  if (!token) throw new Error("bridge probe missing configured token");
+  const wrong = randomToken();
+  if (!wrong || wrong === token) throw new Error("bridge probe could not generate independent wrong token");
+  try {
+    const [correct, missing, incorrect] = await Promise.all([
+      bridgeRequest(url, token, fetchImpl),
+      bridgeRequest(url, null, fetchImpl),
+      bridgeRequest(url, wrong, fetchImpl),
+    ]);
+    const authenticated = await exactMissingAgent(correct);
+    const missingDenied = missing.status === 401 || missing.status === 403;
+    const wrongDenied = incorrect.status === 401 || incorrect.status === 403;
+    return {
+      authenticated,
+      missingDenied,
+      wrongDenied,
+      correctStatus: correct.status,
+      missingStatus: missing.status,
+      wrongStatus: incorrect.status,
+      classification:
+        authenticated && missingDenied && wrongDenied ? "bridge-authenticated" : "bridge-authentication-failed",
+    };
+  } catch {
+    return {
+      authenticated: false,
+      missingDenied: false,
+      wrongDenied: false,
+      correctStatus: null,
+      missingStatus: null,
+      wrongStatus: null,
+      classification: "bridge-unreachable",
+    };
+  }
+}
+
+const CONFINED_PROBE_OVERLAY_KEYS = new Set([
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "XDG_CACHE_HOME",
+  "npm_config_cache",
+  "npm_config_logs_dir",
+  "npm_config_devdir",
+  "npm_config_update_notifier",
+  "npm_config_fund",
+  "npm_config_audit",
+]);
+
+function selectedEnvironment(environment: NodeJS.ProcessEnv): Record<string, string> {
+  const selected: Record<string, string> = {};
+  for (const [key, value] of Object.entries(environment)) {
+    // Darwin injects this on every exec, including sanitized probe spawns.
+    if (key === "__CF_USER_TEXT_ENCODING") continue;
+    // Confined config-probe jobs overlay installer write locations inside the job.
+    if (CONFINED_PROBE_OVERLAY_KEYS.has(key)) continue;
+    if (value !== undefined) selected[key] = value;
+  }
+  return selected;
+}
+
+export function assertRuntimeProbeEnvironment(environment: NodeJS.ProcessEnv): Record<string, string> {
+  const hiveHome = environment.HIVE_HOME;
+  const configPath = environment.HIVE_CONFIG;
+  const home = environment.HOME;
+  const pathEnv = environment.PATH;
+  if (!hiveHome || !configPath || !home || !pathEnv) throw new Error("runtime probe service environment incomplete");
+  const overrides = Object.fromEntries(
+    servicePortKeys.flatMap((key) => (environment[key] === undefined ? [] : [[key, environment[key]!]])),
+  );
+  const expected = buildServiceEnvironment({ hiveHome, configPath, home, pathEnv, overrides });
+  if (!isDeepStrictEqual(selectedEnvironment(environment), expected)) {
+    throw new Error("runtime probe environment differs from service environment");
+  }
+  return expected;
+}
+
+export interface OutboundTrunkEvidenceInput {
+  sipTrunkId: string;
+  twilioNumber: string;
+  twilioTrunkDomain: string;
+}
+
+export interface ReadOnlyOutboundTrunk {
+  sipTrunkId: string;
+  numbers: string[];
+  address: string;
+}
+
+export async function probeOutboundSetup(
+  input: OutboundTrunkEvidenceInput,
+  listTrunks: () => Promise<readonly ReadOnlyOutboundTrunk[]>,
+): Promise<Record<string, unknown>> {
+  if (!input.sipTrunkId) throw new Error("outbound trunk ID missing");
+  const trunks = await listTrunks();
+  const trunk = trunks.find((candidate) => candidate.sipTrunkId === input.sipTrunkId);
+  const numberMatches = Boolean(input.twilioNumber) && Boolean(trunk?.numbers.includes(input.twilioNumber));
+  const domain = input.twilioTrunkDomain.replace(/^sip:/, "").replace(/\/$/, "");
+  const domainMatches = Boolean(domain) && trunk?.address === domain;
+  return {
+    ok: Boolean(trunk) && numberMatches && domainMatches,
+    classification: !trunk
+      ? "outbound-trunk-missing"
+      : numberMatches && domainMatches
+        ? "outbound-read-only-match"
+        : "outbound-relationship-mismatch",
+    configuredTrunkId: input.sipTrunkId,
+    trunkExists: Boolean(trunk),
+    numberMatches,
+    domainMatches,
+  };
+}
+
+export interface WorkerHttpEvidence {
+  rootStatus: number | null;
+  agentName: string | null;
+  activeJobs: number | null;
+}
+
+export interface WorkerHeartbeatEvidence {
+  identity: ReturnType<typeof parseBootIdentity> | null;
+  ageMs: number | null;
+  fresh: boolean;
+  activeCalls: number | null;
+}
+
+export function classifyWorkerHeartbeatDocument(value: unknown, now = Date.now()): WorkerHeartbeatEvidence {
+  if (!value || typeof value !== "object") return { identity: null, ageMs: null, fresh: false, activeCalls: null };
+  const document = value as { supervisorIdentity?: unknown; supervisorUpdatedAt?: unknown };
+  let identity: ReturnType<typeof parseBootIdentity>;
+  try {
+    identity = parseBootIdentity(document.supervisorIdentity);
+  } catch {
+    return { identity: null, ageMs: null, fresh: false, activeCalls: null };
+  }
+  const updatedAt =
+    document.supervisorUpdatedAt instanceof Date
+      ? document.supervisorUpdatedAt.getTime()
+      : typeof document.supervisorUpdatedAt === "string"
+        ? Date.parse(document.supervisorUpdatedAt)
+        : Number.NaN;
+  const ageMs = Number.isFinite(updatedAt) ? now - updatedAt : null;
+  return {
+    identity,
+    ageMs,
+    fresh: ageMs !== null && ageMs >= -5_000 && ageMs <= 60_000,
+    activeCalls:
+      Number.isSafeInteger((document as { activeCalls?: unknown }).activeCalls) &&
+      ((document as { activeCalls?: number }).activeCalls ?? -1) >= 0
+        ? (document as { activeCalls: number }).activeCalls
+        : null,
+  };
+}
+
+export function workerHttpRegistered(evidence: WorkerHttpEvidence): boolean {
+  return evidence.rootStatus === 200 && evidence.agentName === "hive-voice" && evidence.activeJobs !== null;
+}
+
+export async function probeWorkerHttp(port: number, fetchImpl: FetchLike = fetch): Promise<WorkerHttpEvidence> {
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error("invalid worker health port");
+  try {
+    const [root, worker] = await Promise.all([
+      fetchImpl(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(2_000) }),
+      fetchImpl(`http://127.0.0.1:${port}/worker`, { signal: AbortSignal.timeout(2_000) }),
+    ]);
+    let agentName: string | null = null;
+    let activeJobs: number | null = null;
+    if (worker.status === 200) {
+      try {
+        const body = (await worker.json()) as { agent_name?: unknown; active_jobs?: unknown };
+        agentName = typeof body.agent_name === "string" ? body.agent_name : null;
+        activeJobs =
+          typeof body.active_jobs === "number" && Number.isSafeInteger(body.active_jobs) ? body.active_jobs : null;
+      } catch {
+        // Malformed worker evidence remains unavailable.
+      }
+    }
+    return { rootStatus: root.status, agentName, activeJobs };
+  } catch {
+    return { rootStatus: null, agentName: null, activeJobs: null };
+  }
+}
+
+function safeConfigResult(config: typeof import("../config.js").config) {
+  const requiredNames = ["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"];
+  if (config.voice.livekit.enabled) {
+    requiredNames.push("LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "HIVE_VOICE_BRIDGE_TOKEN", "DEEPGRAM_API_KEY");
+  }
+  return {
+    ok: true,
+    classification: "config-compatible",
+    instanceId: config.instance.id,
+    database: { name: config.mongo.dbName },
+    listeners: {
+      background: config.background.port,
+      recall: config.recall.monitorPort,
+      codeTask: config.codeTask.port,
+      ws: config.ws.port,
+      adminApi: config.adminApi.port,
+      voice: config.voice.port,
+      voiceWorker: config.voice.workerPort,
+      slackInternal: config.slackInternal.port,
+      beekeeper: config.beekeeper.port,
+    },
+    voice: {
+      enabled: config.voice.enabled,
+      livekitEnabled: config.voice.livekit.enabled,
+      workerPort: config.voice.workerPort,
+      hasOutboundTrunkId: Boolean(config.voice.livekit.sipTrunkId),
+    },
+    requiredSecretNames: requiredNames,
+    missingSecretNames: [] as string[],
+  };
+}
+
+export function runtimeProbeErrorResult(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  const directMissing = message.match(/Missing required env var:\s*([A-Z0-9_]+)/)?.[1];
+  const workerMissing = message.match(/voice worker missing required config:\s*([a-zA-Z0-9]+)/)?.[1];
+  const workerNames: Record<string, string> = {
+    livekitUrl: "voice.livekit.url",
+    livekitApiKey: "LIVEKIT_API_KEY",
+    livekitApiSecret: "LIVEKIT_API_SECRET",
+    deepgramApiKey: "DEEPGRAM_API_KEY",
+    bridgeToken: "HIVE_VOICE_BRIDGE_TOKEN",
+  };
+  const vendorMissing = message.match(/^(CARTESIA_API_KEY|ELEVENLABS_API_KEY) missing/)?.[1];
+  const missing = directMissing ?? (workerMissing ? workerNames[workerMissing] : undefined) ?? vendorMissing;
+  const knownClassification = [
+    "persistence-fault",
+    "maintenance-unresolved",
+    "maintenance request timed out",
+    "stale or mismatched maintenance reply",
+  ].find((candidate) => message.includes(candidate));
+  return {
+    ok: false,
+    classification: missing ? "missing-required-key" : (knownClassification ?? "probe-failed"),
+    missingSecretNames: missing ? [missing] : [],
+  };
+}
+
+async function configMode() {
+  assertRuntimeProbeEnvironment(process.env);
+  const { config } = await import("../config.js");
+  return safeConfigResult(config);
+}
+
+async function bridgeMode() {
+  assertRuntimeProbeEnvironment(process.env);
+  const { loadWorkerConfig } = await import("../voice-worker/worker-config.js");
+  const config = loadWorkerConfig();
+  return { ok: true, ...(await probeBridge(config.bridgeUrl, config.bridgeToken)) };
+}
+
+async function workerMode() {
+  assertRuntimeProbeEnvironment(process.env);
+  const { loadWorkerConfig } = await import("../voice-worker/worker-config.js");
+  const config = loadWorkerConfig();
+  const identityPath = resolve(config.instanceHome, ".hive-state", "runtime", "voice-worker.json");
+  const identity = parseBootIdentity(JSON.parse(readFileSync(identityPath, "utf8")) as unknown);
+  if (identity.component !== "voice-worker") throw new Error("worker runtime identity component mismatch");
+  const controller = new ServiceController({
+    instanceId: config.instanceId,
+    hiveHome: config.instanceHome,
+    home: process.env.HOME!,
+    operationDir: resolve(config.instanceHome, ".hive-state", "deployment", "operations", randomUUID()),
+  });
+  const observe = async () => {
+    const processIdentity = await controller.process(identity.pid);
+    if (!processIdentity) throw new Error("voice supervisor is not live");
+    return { pid: identity.pid, bootId: identity.bootId };
+  };
+  const requestedAt = Date.now();
+  const operationId = randomUUID();
+  const status: MaintenanceReply = await requestMaintenance({
+    instanceHome: config.instanceHome,
+    instanceId: config.instanceId,
+    operationId,
+    kind: "status",
+    expectedAdmission: "any",
+    deadline: requestedAt + 2_000,
+    corroborateSupervisor: async () => observe(),
+  });
+  const http = await probeWorkerHttp(config.healthPort);
+  const listener = await controller.listener(config.healthPort, identity.pid);
+  const { MongoClient } = await import("mongodb");
+  const mongo = new MongoClient(config.mongoUri, { serverSelectionTimeoutMS: 2_000 });
+  let heartbeat: WorkerHeartbeatEvidence;
+  try {
+    await mongo.connect();
+    const document = await mongo.db(config.mongoDbName).collection("telemetry").findOne({ kind: "voice_worker_stats" });
+    heartbeat = classifyWorkerHeartbeatDocument(document);
+  } finally {
+    await mongo.close().catch(() => {});
+  }
+  const maintenanceClassification = status.snapshot.persistenceFault
+    ? "persistence-fault"
+    : status.snapshot.admission === "closed"
+      ? "maintenance-owned"
+      : "admission-open";
+  return {
+    ok: true,
+    classification:
+      status.ok &&
+      workerHttpRegistered(http) &&
+      listener.pid === identity.pid &&
+      heartbeat.fresh &&
+      heartbeat.identity?.pid === identity.pid &&
+      heartbeat.identity.bootId === identity.bootId
+        ? "worker-registered"
+        : "worker-unhealthy",
+    supervisor: { pid: identity.pid, bootId: identity.bootId },
+    status: {
+      requestId: status.requestId,
+      operationId: status.operationId,
+      requestedAt,
+      writtenAt: status.writtenAt,
+      snapshot: status.snapshot,
+    },
+    sdk: http,
+    heartbeat,
+    socketOwned: listener.pid === identity.pid,
+    healthPort: config.healthPort,
+    maintenanceClassification,
+  };
+}
+
+async function outboundMode() {
+  assertRuntimeProbeEnvironment(process.env);
+  const { config } = await import("../config.js");
+  if (!config.voice.livekit.enabled) throw new Error("voice.livekit.enabled is false");
+  if (!config.voice.livekit.sipTrunkId) throw new Error("outbound trunk ID missing");
+  const { SipClient } = await import("livekit-server-sdk");
+  const client = new SipClient(config.voice.livekit.url, config.voice.livekitApiKey, config.voice.livekitApiSecret);
+  return probeOutboundSetup(
+    {
+      sipTrunkId: config.voice.livekit.sipTrunkId,
+      twilioNumber: config.telephony.twilio.number,
+      twilioTrunkDomain: config.telephony.twilio.trunkDomain,
+    },
+    () => client.listSipOutboundTrunk(),
+  );
+}
+
+export async function runRuntimeProbe(mode: string, inputPath?: string): Promise<Record<string, unknown>> {
+  const privateInput = (PRIVATE_INPUT_MODES as readonly string[]).includes(mode);
+  if (privateInput && (inputPath === undefined || !isAbsolute(inputPath))) {
+    throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  }
+  if (mode === "worker-maintenance") {
+    return (await runWorkerMaintenanceProbe(inputPath!, installedWorkerMaintenanceDeps())) as unknown as Record<
+      string,
+      unknown
+    >;
+  }
+  if (mode === "pilot" || mode === "pilot-inventory") {
+    return (await runPilotProfileProbe(mode, inputPath!, outerPilotProbeDeps())) as unknown as Record<string, unknown>;
+  }
+  if (mode === "pilot-abi-v1") {
+    return (await runHistoricalProbe(inputPath!, historicalProbeDeps())) as unknown as Record<string, unknown>;
+  }
+  if (inputPath !== undefined) throw new Error("runtime probe mode accepts no private input path");
+  if (mode === "pilot-abi") {
+    return (await runPilotAbiHandshake(historicalProbeDeps())) as unknown as Record<string, unknown>;
+  }
+  if (mode !== "config" && mode !== "bridge" && mode !== "worker" && mode !== "outbound") {
+    throw new Error("runtime probe mode must be config, bridge, worker, outbound, or worker-maintenance");
+  }
+  switch (mode) {
+    case "config":
+      return configMode();
+    case "bridge":
+      return bridgeMode();
+    case "worker":
+      return workerMode();
+    case "outbound":
+      return outboundMode();
+  }
+}
+
+/** Concrete in-process boundaries for the installed `worker-maintenance` mode. */
+function installedWorkerMaintenanceDeps(): WorkerMaintenanceProbeDeps {
+  const controllerFor = (operationDirectory: string, instanceId: string, hiveHome: string) =>
+    new ServiceController({ instanceId, hiveHome, home: process.env.HOME!, operationDir: operationDirectory });
+  // `<home>/.hive-state/deployment/operations/<id>`; association was validated first.
+  const instanceOf = (operationDirectory: string) => resolve(operationDirectory, "..", "..", "..", "..");
+  let loaded: Awaited<ReturnType<WorkerMaintenanceProbeDeps["loadWorkerConfig"]>> | null = null;
+  return {
+    now: Date.now,
+    uid: () => process.getuid!(),
+    selfPath: fileURLToPath(import.meta.url),
+    execPath: process.execPath,
+    env: process.env,
+    serviceEnvironment: (env) => assertRuntimeProbeEnvironment(env),
+    readRelease: (root) => readRelease(root),
+    async loadWorkerConfig() {
+      const { loadWorkerConfig } = await import("../voice-worker/worker-config.js");
+      const wc = loadWorkerConfig();
+      loaded = {
+        instanceHome: wc.instanceHome,
+        instanceId: wc.instanceId,
+        healthPort: wc.healthPort,
+        mongoUri: wc.mongoUri,
+        mongoDbName: wc.mongoDbName,
+      };
+      return loaded;
+    },
+    async inspectWorker(label, operationDirectory) {
+      if (!loaded) throw new ProbeFailure("PILOT_LOADER_UNAVAILABLE");
+      return (await controllerFor(operationDirectory, loaded.instanceId, instanceOf(operationDirectory)).inspect(label))
+        .process;
+    },
+    async processStartTime(pid, operationDirectory) {
+      if (!loaded) throw new ProbeFailure("PILOT_LOADER_UNAVAILABLE");
+      const identity = await controllerFor(
+        operationDirectory,
+        loaded.instanceId,
+        instanceOf(operationDirectory),
+      ).process(pid);
+      return identity?.startTime ?? null;
+    },
+    async listenerPid(port, supervisorPid, operationDirectory) {
+      if (!loaded) throw new ProbeFailure("PILOT_LOADER_UNAVAILABLE");
+      return (
+        await controllerFor(operationDirectory, loaded.instanceId, instanceOf(operationDirectory)).listener(
+          port,
+          supervisorPid,
+        )
+      ).pid;
+    },
+    probeWorkerHttp: (port) => probeWorkerHttp(port),
+    readTelemetry: (wc, request) => readOwnLoaderTelemetry(wc, request),
+    requestMaintenance: (options) => requestMaintenance(options),
+  };
+}
+
+/** Shared concrete OS/probe boundaries for the pilot probe modes. */
+function pilotProbeBoundaries(): PilotProbeBoundaries {
+  const controllerFor = (operationDirectory: string) => {
+    const home = resolve(operationDirectory, "..", "..", "..", "..");
+    return new ServiceController({
+      instanceId: instanceIdOf(operationDirectory),
+      hiveHome: home,
+      home: process.env.HOME!,
+      operationDir: operationDirectory,
+    });
+  };
+  return {
+    now: Date.now,
+    uid: () => process.getuid!(),
+    selfPath: fileURLToPath(import.meta.url),
+    env: process.env,
+    serviceEnvironment: (env) => assertRuntimeProbeEnvironment(env),
+    readRelease: (root) => readRelease(root),
+    processIdentity: (pid, operationDirectory) => controllerFor(operationDirectory).process(pid),
+    listenerOwners: (port, operationDirectory) => controllerFor(operationDirectory).listenerOwners(port),
+    probeBridge: (url, token) => probeBridge(url, token),
+    probeWorkerHttp: (port) => probeWorkerHttp(port),
+    readTelemetry: (wc, request) => readOwnLoaderTelemetry(wc, request),
+    requestMaintenance: (options) => requestMaintenance(options),
+    livekit: async (wc) => livekitReader(await import("livekit-server-sdk"), wc),
+    resolveDependencies: (entry, roots) => resolveRequiredDependencies(entry, roots),
+    sha256File: async (path) =>
+      createHash("sha256")
+        .update(await readFile(path))
+        .digest("hex"),
+  };
+}
+
+/** Instance ID recorded by the acquired operation that owns this probe directory. */
+function instanceIdOf(operationDirectory: string): string {
+  const record = JSON.parse(readFileSync(resolve(operationDirectory, "operation.json"), "utf8")) as {
+    instanceId?: unknown;
+  };
+  if (typeof record.instanceId !== "string") throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+  return record.instanceId;
+}
+
+interface LivekitSdk {
+  RoomServiceClient: new (
+    url: string,
+    key: string,
+    secret: string,
+  ) => {
+    listRooms(): Promise<unknown[]>;
+    listParticipants(room: string): Promise<unknown[]>;
+  };
+  AgentDispatchClient: new (
+    url: string,
+    key: string,
+    secret: string,
+  ) => { listDispatch(room: string): Promise<unknown[]> };
+  SipClient: new (
+    url: string,
+    key: string,
+    secret: string,
+  ) => {
+    listSipDispatchRule(options: { page: { limit: number; afterId: string } }): Promise<unknown[]>;
+    listSipInboundTrunk(options: { page: { limit: number; afterId: string } }): Promise<unknown[]>;
+  };
+}
+
+/** Read-only pinned 2.14.1 client surface; credentials stay in this probe process. */
+function livekitReader(sdk: unknown, wc: HistoricalLoaderConfig): LivekitReader {
+  const { RoomServiceClient, AgentDispatchClient, SipClient } = sdk as LivekitSdk;
+  const rooms = new RoomServiceClient(wc.livekitUrl, wc.livekitApiKey, wc.livekitApiSecret);
+  const dispatch = new AgentDispatchClient(wc.livekitUrl, wc.livekitApiKey, wc.livekitApiSecret);
+  const sip = new SipClient(wc.livekitUrl, wc.livekitApiKey, wc.livekitApiSecret);
+  return {
+    listRooms: () => rooms.listRooms() as ReturnType<LivekitReader["listRooms"]>,
+    listParticipants: (room) => rooms.listParticipants(room) as ReturnType<LivekitReader["listParticipants"]>,
+    listDispatch: (room) => dispatch.listDispatch(room) as ReturnType<LivekitReader["listDispatch"]>,
+    listSipDispatchRule: (page) =>
+      sip.listSipDispatchRule({ page }) as ReturnType<LivekitReader["listSipDispatchRule"]>,
+    listSipInboundTrunk: (page) =>
+      sip.listSipInboundTrunk({ page }) as ReturnType<LivekitReader["listSipInboundTrunk"]>,
+  };
+}
+
+/** `pilot-abi` / `pilot-abi-v1` inside this (historical) release: its own loader only. */
+function historicalProbeDeps(): HistoricalProbeDeps {
+  const self = fileURLToPath(import.meta.url);
+  return {
+    ...pilotProbeBoundaries(),
+    async loadWorkerConfig() {
+      const { loadWorkerConfig } = await import("../voice-worker/worker-config.js");
+      return loadWorkerConfig();
+    },
+    serverSdkVersion() {
+      try {
+        const require = createRequire(self);
+        let directory = dirname(realpathSync(require.resolve("livekit-server-sdk")));
+        while (dirname(directory) !== directory) {
+          try {
+            const manifest = JSON.parse(readFileSync(resolve(directory, "package.json"), "utf8")) as {
+              name?: unknown;
+              version?: unknown;
+            };
+            if (manifest.name === "livekit-server-sdk")
+              return typeof manifest.version === "string" ? manifest.version : null;
+          } catch {
+            // keep walking
+          }
+          directory = dirname(directory);
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+/** Outer `pilot` / `pilot-inventory` in the registered bootstrap probe. */
+function outerPilotProbeDeps(): OuterProbeDeps {
+  return {
+    ...pilotProbeBoundaries(),
+    run(node, args, env, timeoutMs) {
+      return new Promise((done) => {
+        nodeExecFile(
+          node,
+          [...args],
+          {
+            env,
+            timeout: Math.max(1, timeoutMs),
+            killSignal: "SIGKILL",
+            encoding: "utf8",
+            maxBuffer: MAX_PROBE_OUTPUT_BYTES,
+          },
+          (error, stdout) => {
+            const code = error
+              ? typeof (error as { code?: unknown }).code === "number"
+                ? (error as { code: number }).code
+                : 1
+              : 0;
+            done({ exitCode: code, stdout: String(stdout ?? "") });
+          },
+        );
+      });
+    },
+    async writeRequest(path, bytes) {
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      const handle = await open(
+        path,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        await handle.writeFile(bytes);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+    },
+    async importLegacyLoader(realpath) {
+      const module = (await import(pathToFileURL(realpath).href)) as { loadWorkerConfig?: unknown };
+      if (typeof module.loadWorkerConfig !== "function") throw new ProbeFailure("PILOT_LOADER_UNAVAILABLE");
+      return module.loadWorkerConfig as () => unknown;
+    },
+    async livekitFrom(loaderRealpath, wc) {
+      const resolved = createRequire(loaderRealpath).resolve("livekit-server-sdk");
+      return livekitReader(await import(pathToFileURL(resolved).href), wc);
+    },
+  };
+}
+
+async function main(): Promise<void> {
+  const stdoutWrite = process.stdout.write;
+  const stderrWrite = process.stderr.write;
+  process.stdout.write = (() => true) as typeof process.stdout.write;
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  const mode = process.argv[2] ?? "";
+  const inputMode = (PRIVATE_INPUT_MODES as readonly string[]).includes(mode);
+  const privateMode = inputMode || mode === "pilot-abi";
+  const inputPath = process.argv[3];
+  let output: Record<string, unknown>;
+  try {
+    if (inputMode ? process.argv.length !== 4 : process.argv.length !== 3) {
+      throw new ProbeFailure("PILOT_PROBE_INPUT_INVALID");
+    }
+    output = await runRuntimeProbe(mode, inputMode ? inputPath : undefined);
+    if (output.ok === false) process.exitCode = 1;
+  } catch (error) {
+    output =
+      mode === "worker-maintenance"
+        ? await workerMaintenanceFailure(inputPath, error)
+        : mode === "pilot-abi" || mode === "pilot-abi-v1"
+          ? await probeFailureEnvelope(inputPath, classificationOf(error), HISTORICAL_PROBE_ABI)
+          : mode === "pilot" || mode === "pilot-inventory"
+            ? await probeFailureEnvelope(inputPath, classificationOf(error), null)
+            : runtimeProbeErrorResult(error);
+    process.exitCode = 1;
+  } finally {
+    process.stdout.write = stdoutWrite;
+    process.stderr.write = stderrWrite;
+  }
+  stdoutWrite.call(process.stdout, `${privateMode ? canonical(output) : JSON.stringify(output)}\n`);
+}
+
+const invokedPath = process.argv[1] ? realpathSync(process.argv[1]) : "";
+if (invokedPath === realpathSync(fileURLToPath(import.meta.url))) void main();

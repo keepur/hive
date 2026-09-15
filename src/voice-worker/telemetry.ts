@@ -8,6 +8,7 @@
  */
 import { MongoClient, type Collection } from "mongodb";
 import { createLogger } from "../logging/logger.js";
+import type { BootIdentity } from "../deployment/release.js";
 import { nearestRankPercentile } from "../voice/percentile.js";
 import type { VendorCell } from "./cells.js";
 import type { BridgeFailureClass } from "./error-map.js";
@@ -41,6 +42,7 @@ export class VoiceWorkerHeartbeat {
     private readonly telemetry: Collection,
     private readonly cellDefaults: { defaultStt: string; defaultTts: string },
     private readonly intervalMs = VoiceWorkerHeartbeat.INTERVAL_MS,
+    private readonly supervisorIdentity?: BootIdentity,
   ) {}
 
   /**
@@ -56,6 +58,9 @@ export class VoiceWorkerHeartbeat {
       $set: {
         cellDefaults: this.cellDefaults,
         updatedAt: new Date(),
+        ...(this.supervisorIdentity
+          ? { supervisorIdentity: this.supervisorIdentity, supervisorUpdatedAt: new Date() }
+          : {}),
       },
       $setOnInsert: {
         lastError: null,
@@ -81,6 +86,9 @@ export class VoiceWorkerHeartbeat {
         cellDefaults: this.cellDefaults,
         updatedAt: new Date(),
         activeCalls: 0,
+        ...(this.supervisorIdentity
+          ? { supervisorIdentity: this.supervisorIdentity, supervisorUpdatedAt: new Date() }
+          : {}),
       },
       $setOnInsert: {
         lastError: null,

@@ -8,6 +8,8 @@ import {
   type PrefixCacheStatsRow,
   type SpawnCoordinatorRow,
   type VoiceWorkerStatsRow,
+  type DoctorRuntimeIdentities,
+  type DoctorVoiceRuntimeProbe,
   type CircuitBreakerRow,
   type OutageQueueStats,
   type MemoryLifecycleRow,
@@ -34,6 +36,10 @@ import {
   slackAuthOk,
   spawnCoordinatorStatsForDoctor,
   voiceWorkerStatsForDoctor,
+  runtimeIdentitiesForDoctor,
+  localVoiceRuntimeForDoctor,
+  latestRegistryOutcomeForDoctor,
+  type DoctorRegistryOutcome,
   resourceEnvelopesForDoctor,
   memoryLifecycleStatsForDoctor,
   modelRouterModeLine,
@@ -42,7 +48,9 @@ import {
   renderProviderPluginsSection,
 } from "./doctor-checks.js";
 import { describeLimitSource } from "../agents/resource-tiers.js";
-import { engineDir, hiveHome } from "../paths.js";
+import { describeRegistryResult } from "../deployment/pilot.js";
+import { engineDir, hiveHome, hiveStateDir, resolveConfigFile } from "../paths.js";
+import type { BootIdentity, Release } from "../deployment/release.js";
 
 type HiveConfig = typeof import("../config.js").config;
 
@@ -157,6 +165,29 @@ export function renderSpawnCoordinatorSection(
 }
 
 /**
+ * KPR-463: the pilot hold family, in words. The frozen helper's stdout stays
+ * machine-readable JSON; this renders the same recorded outcome so an operator
+ * can read `PILOT_SNAPSHOT_REGISTERED`, `NATIVE_HOLD_AVAILABLE`,
+ * `LEGACY_HOLD_EXERCISED_AND_RELEASED` and `PILOT_CAPTURE_BLOCKED` — with
+ * their snapshot, hold-record and selector identifiers — without parsing.
+ * Informational only: it never affects the doctor's exit code, and it reports
+ * what a command recorded rather than a live held state.
+ */
+export function renderPilotRegistrySection(
+  outcome: DoctorRegistryOutcome | null,
+  emit: (line: string) => void = console.log,
+): void {
+  emit("\nPilot registry (KPR-463)");
+  if (!outcome) {
+    emit("  ○ no registry command has been recorded on this instance");
+    return;
+  }
+  emit(`  last recorded ${outcome.recordedAt} (operation ${outcome.operationId})`);
+  for (const line of describeRegistryResult(outcome.result)) emit(line);
+  emit("  · a recorded outcome is history, not a live hold; --verify-legacy-hold re-derives its verdict");
+}
+
+/**
  * KPR-322: render the LiveKit voice-worker heartbeat section. Reads the
  * engine's `telemetry.voice_worker_stats` doc (written every 30s).
  * Informational — does not affect exit code. Staleness threshold is 90s
@@ -168,8 +199,49 @@ export function renderVoiceWorkerSection(
   emit: (line: string) => void = console.log,
   instanceId = "<id>",
   sipTrunkId?: string,
+  identities?: DoctorRuntimeIdentities,
+  localProbe?: DoctorVoiceRuntimeProbe,
 ): void {
   emit("\nVoice worker (LiveKit)");
+  const releaseLine = (release: Release | null | undefined): string =>
+    release
+      ? `packaged ${release.packageVersion} revision=${release.sourceRevision} lock=${release.dependencyLockSha256}`
+      : "legacy/unavailable";
+  const observedLine = (identity: BootIdentity | null | undefined): string => {
+    if (!identity) return "legacy/unavailable";
+    if ("classification" in identity.release) return identity.release.classification;
+    return `packaged ${identity.release.packageVersion} revision=${identity.release.sourceRevision} pid=${identity.pid} boot=${identity.bootId}`;
+  };
+  emit(`  installed: ${releaseLine(identities?.installed)}`);
+  emit(`  observed engine: ${observedLine(identities?.engine)}`);
+  emit(`  observed worker: ${observedLine(identities?.worker ?? row?.supervisorIdentity)}`);
+  emit(
+    `  registration=${localProbe?.registration ?? "unavailable"} health=${localProbe?.health ?? "unavailable"} maintenance=${localProbe?.maintenanceClassification ?? "legacy/unavailable"}`,
+  );
+  const unresolvedJobs = localProbe?.unresolved ?? [];
+  if (unresolvedJobs.length > 0) {
+    const supervisor = localProbe?.supervisor;
+    emit(
+      `  unresolved admissions: ${unresolvedJobs.length} (supervisor ${
+        supervisor ? `pid=${supervisor.pid} boot=${supervisor.bootId}` : "unreported"
+      })`,
+    );
+    const now = Date.now();
+    for (const unresolved of unresolvedJobs) {
+      const child = unresolved.childPid === undefined ? "child=unassigned" : `child=${unresolved.childPid}`;
+      const age = Math.max(0, now - unresolved.acceptedAt);
+      emit(
+        `    unresolved job=${unresolved.jobId} phase=${unresolved.phase} ` +
+          `accepted=${new Date(unresolved.acceptedAt).toISOString()} age=${Math.round(age / 1000)}s ${child}`,
+      );
+    }
+    // KPR-463 plan Task 4 Step 4: these are diagnostics, not a work queue.
+    // `accepted-awaiting-entry` after an assignment, prewarm or import
+    // failure and `entered-awaiting-completion` after a lost acknowledgement
+    // stay listed until the genuine completion path settles them.
+    emit("    · only the genuine completion path clears these; job-count zero, assignment timeout,");
+    emit("      a dead child, a stale heartbeat and elapsed time never do, and no flag clears them");
+  }
   // Epic-integration review round 1 (mechanical): warn when livekit is
   // enabled but no outbound SIP trunk id is configured — outbound calls
   // will fail at dispatch. Informational only, never affects allPassed
@@ -189,6 +261,9 @@ export function renderVoiceWorkerSection(
   emit(
     `  active=${row.activeCalls} started=${row.callsStarted} completed=${row.callsCompleted} cell-defaults=${defaults} (heartbeat ${stale})`,
   );
+  emit(
+    `  supervisor-heartbeat=${row.supervisorStaleSeconds === undefined || row.supervisorStaleSeconds === null ? "legacy/unavailable" : `${row.supervisorStaleSeconds}s ago`}`,
+  );
   if (row.lastError) {
     emit(`    last error: ${row.lastError}`);
   }
@@ -196,6 +271,13 @@ export function renderVoiceWorkerSection(
     emit(
       `  ⚠ heartbeat stale — worker down or wedged (launchctl kickstart -k gui/$(id -u)/com.hive.${instanceId}.voice-worker)`,
     );
+  }
+  if (
+    row.supervisorStaleSeconds !== undefined &&
+    row.supervisorStaleSeconds !== null &&
+    row.supervisorStaleSeconds > 60
+  ) {
+    emit("  ⚠ packaged supervisor heartbeat stale");
   }
 }
 
@@ -801,8 +883,27 @@ export async function runDoctor(opts: { verbose?: boolean } = {}): Promise<void>
     // (the worker isn't expected to run).
     if (config.voice.livekit.enabled) {
       const voiceWorkerStats = await voiceWorkerStatsForDoctor(config.mongo.uri, config.mongo.dbName);
-      renderVoiceWorkerSection(voiceWorkerStats, console.log, config.instance.id, config.voice.livekit.sipTrunkId);
+      const runtimeIdentities = runtimeIdentitiesForDoctor(engineDir, hiveStateDir);
+      const localVoiceProbe = localVoiceRuntimeForDoctor({
+        engineRoot: engineDir,
+        hiveHome,
+        configPath: resolveConfigFile(hiveHome),
+        home: process.env.HOME ?? hiveHome,
+        pathEnv: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+      });
+      renderVoiceWorkerSection(
+        voiceWorkerStats,
+        console.log,
+        config.instance.id,
+        config.voice.livekit.sipTrunkId,
+        runtimeIdentities,
+        localVoiceProbe,
+      );
     }
+    // KPR-463: last recorded pilot registry-command outcome. Informational —
+    // NEVER contributes to allPassed (KPR-296 canon), and deliberately a
+    // reading of what a command recorded, never a claim about a live hold.
+    renderPilotRegistrySection(latestRegistryOutcomeForDoctor(hiveHome), console.log);
     // KPR-433 D5 (N1 review fix): effective Claude-lane envelopes —
     // informational only, NEVER contributes to allPassed (KPR-296 canon).
     // Only fetch when the router is on: under router-off the renderer prints

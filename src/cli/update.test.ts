@@ -1,202 +1,89 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { resolve } from "node:path";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// Hoisted mocks — must be declared with vi.hoisted so they're available
-// at vi.mock factory evaluation time.
-const { mockExecFileSync, mockReadFileSync, mockExistsSync } = vi.hoisted(() => ({
-  mockExecFileSync: vi.fn(),
-  mockReadFileSync: vi.fn(),
-  mockExistsSync: vi.fn().mockReturnValue(true),
-}));
-
-vi.mock("node:child_process", () => ({
-  execFileSync: (...args: unknown[]) => mockExecFileSync(...args),
+const mocks = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  readFile: vi.fn(),
+  lstat: vi.fn(() => ({ isFile: () => true, isSymbolicLink: () => false })),
 }));
 
 vi.mock("node:fs", () => ({
-  readFileSync: (...args: unknown[]) => mockReadFileSync(...args),
-  existsSync: (...args: unknown[]) => mockExistsSync(...args),
+  readFileSync: (...args: unknown[]) => mocks.readFile(...args),
+  lstatSync: (...args: unknown[]) => mocks.lstat(...args),
+  existsSync: () => true,
 }));
-
 vi.mock("../paths.js", () => ({
   resolveHiveHome: () => "/tmp/test-hive",
-  resolveConfigFile: (home: string) => `${home}/hive.yaml`,
+  resolveConfigFile: () => "/tmp/test-hive/hive.yaml",
+}));
+vi.mock("./deployment-helper.js", () => ({
+  invokeDeploymentHelper: (...args: unknown[]) => mocks.invoke(...args),
+}));
+vi.mock("./single-instance-env.js", () => ({
+  deriveSingleInstanceEnv: (_home: string, tag?: string) => ({
+    HIVE_SINGLE_INSTANCE: "1",
+    HIVE_SINGLE_ID: "catalyst",
+    HIVE_SINGLE_CONFIG: "/tmp/test-hive/hive.yaml",
+    HIVE_SINGLE_ROOT: "/tmp/test-hive",
+    ...(tag ? { HIVE_SINGLE_TAG: tag } : {}),
+  }),
 }));
 
-vi.mock("./update-preflight.js", () => ({
-  relocateBetaPlugins: () => ({ moved: [], skipped: true }),
-}));
-
-describe("runUpdate", () => {
+describe("packaged update CLI", () => {
   beforeEach(() => {
-    mockExecFileSync.mockReset();
-    mockReadFileSync.mockReset();
-    mockExistsSync.mockReset();
-    mockExistsSync.mockReturnValue(true);
-    mockReadFileSync.mockImplementation((path: string) => {
-      if (path.includes(".hive/package.json")) return JSON.stringify({ version: "0.2.0" });
-      return "";
-    });
+    mocks.invoke.mockReset();
+    mocks.readFile.mockReturnValue(JSON.stringify({ version: "0.15.3" }));
+    mocks.lstat.mockReturnValue({ isFile: () => true, isSymbolicLink: () => false });
   });
 
-  it("shells out to deploy.sh with --tag=latest by default", async () => {
+  it("routes tag update to this CLI package's helper", async () => {
     const { runUpdate } = await import("./update.js");
-    await runUpdate();
-    expect(mockExecFileSync).toHaveBeenCalledOnce();
-    const [script, args] = mockExecFileSync.mock.calls[0];
-    expect(String(script)).toBe(resolve("/tmp/test-hive/.hive/service/deploy.sh"));
-    expect(args).toContain("--tag=latest");
+    await runUpdate({ tag: "v0.16.0", instance: "catalyst" });
+    expect(mocks.invoke).toHaveBeenCalledOnce();
+    expect(mocks.invoke.mock.calls[0][2]).toEqual(["--tag=v0.16.0", "--instance=catalyst"]);
   });
 
-  it("passes --tag=<tag> when specified", async () => {
+  it("routes an absolute regular artifact and preserves dry-run", async () => {
     const { runUpdate } = await import("./update.js");
-    await runUpdate({ tag: "0.2.1" });
-    const [, args] = mockExecFileSync.mock.calls[0];
-    expect(args).toContain("--tag=0.2.1");
+    await runUpdate({ artifact: "/tmp/candidate.tgz", dryRun: true });
+    expect(mocks.lstat).toHaveBeenCalledWith("/tmp/candidate.tgz");
+    expect(mocks.invoke.mock.calls[0][2]).toEqual([
+      "--artifact=/tmp/candidate.tgz",
+      "--instance=catalyst",
+      "--dry-run",
+    ]);
   });
 
-  it("passes --instance=<id> when specified", async () => {
+  it("rejects tag plus artifact before invoking the helper", async () => {
     const { runUpdate } = await import("./update.js");
-    await runUpdate({ tag: "0.2.1", instance: "dodi" });
-    const [, args] = mockExecFileSync.mock.calls[0];
-    expect(args).toContain("--tag=0.2.1");
-    expect(args).toContain("--instance=dodi");
+    await expect(runUpdate({ tag: "latest", artifact: "/tmp/candidate.tgz" })).rejects.toThrow("mutually exclusive");
+    expect(mocks.invoke).not.toHaveBeenCalled();
   });
 
-  it("passes single-instance env vars to deploy.sh (KPR-70)", async () => {
-    mockReadFileSync.mockImplementation((path: string) => {
-      if (path.includes(".hive/package.json")) return JSON.stringify({ version: "0.2.0" });
-      if (path.endsWith("hive.yaml")) {
-        return `instance:\n  id: catalyst\n  portBase: 3500\n`;
-      }
-      return "";
-    });
+  it.each(["candidate.tgz", "/tmp/candidate.zip"])("rejects invalid artifact %s before effects", async (artifact) => {
     const { runUpdate } = await import("./update.js");
-    await runUpdate({ tag: "0.2.7" });
-    const callOpts = mockExecFileSync.mock.calls[0][2] as { env: Record<string, string> };
-    expect(callOpts.env.HIVE_SINGLE_INSTANCE).toBe("1");
-    expect(callOpts.env.HIVE_SINGLE_ID).toBe("catalyst");
-    expect(callOpts.env.HIVE_SINGLE_CONFIG).toBe("hive.yaml");
-    expect(callOpts.env.HIVE_SINGLE_LOGS).toBe("logs");
-    expect(callOpts.env.HIVE_SINGLE_ROOT).toBe("/tmp/test-hive");
-    expect(callOpts.env.HIVE_SINGLE_TAG).toBe("0.2.7");
-    // Default port range = portBase..portBase+6 = 3500..3506
-    expect(callOpts.env.HIVE_SINGLE_PORTS).toBe("3500 3501 3502 3503 3504 3505 3506");
+    await expect(runUpdate({ artifact })).rejects.toThrow("absolute .tgz");
+    expect(mocks.invoke).not.toHaveBeenCalled();
   });
 
-  it("defaults instance id to 'hive' when hive.yaml missing instance.id", async () => {
-    mockReadFileSync.mockImplementation((path: string) => {
-      if (path.includes(".hive/package.json")) return JSON.stringify({ version: "0.2.0" });
-      return "";
-    });
+  it("rejects an instance that differs from the selected config", async () => {
     const { runUpdate } = await import("./update.js");
-    await runUpdate();
-    const callOpts = mockExecFileSync.mock.calls[0][2] as { env: Record<string, string> };
-    expect(callOpts.env.HIVE_SINGLE_ID).toBe("hive");
-    expect(callOpts.env.HIVE_SINGLE_PORTS).toBe("3100 3101 3102 3103 3104 3105 3106");
-  });
-
-  it("HIVE_SINGLE_LOGS is always 'logs' even with non-default HIVE_CONFIG", async () => {
-    // daemon.ts hardcodes logs/ regardless of HIVE_CONFIG, so single-instance
-    // mode must too — otherwise health_check reads from a path the service
-    // never writes to and auto-rollback fires.
-    process.env.HIVE_CONFIG = "hive-personal.yaml";
-    try {
-      const { runUpdate } = await import("./update.js");
-      await runUpdate();
-      const callOpts = mockExecFileSync.mock.calls[0][2] as { env: Record<string, string> };
-      expect(callOpts.env.HIVE_SINGLE_LOGS).toBe("logs");
-      expect(callOpts.env.HIVE_SINGLE_CONFIG).toBe("hive-personal.yaml");
-    } finally {
-      delete process.env.HIVE_CONFIG;
-    }
-  });
-
-  it("exits 1 when deploy.sh is missing", async () => {
-    mockExistsSync.mockReturnValue(false);
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
-      throw new Error("exit");
-    });
-    const { runUpdate } = await import("./update.js");
-    await expect(runUpdate()).rejects.toThrow("exit");
-    expect(exitSpy).toHaveBeenCalledWith(1);
-    exitSpy.mockRestore();
-  });
-
-  it("exits 1 when deploy.sh fails", async () => {
-    mockExecFileSync.mockImplementation(() => {
-      throw new Error("deploy failed");
-    });
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
-      throw new Error("exit");
-    });
-    const { runUpdate } = await import("./update.js");
-    await expect(runUpdate()).rejects.toThrow("exit");
-    expect(exitSpy).toHaveBeenCalledWith(1);
-    exitSpy.mockRestore();
+    await expect(runUpdate({ instance: "other" })).rejects.toThrow("does not match");
+    expect(mocks.invoke).not.toHaveBeenCalled();
   });
 });
 
-describe("runRollback", () => {
-  beforeEach(() => {
-    mockExecFileSync.mockReset();
-    mockReadFileSync.mockReset();
-    mockExistsSync.mockReset();
-    mockExistsSync.mockReturnValue(true);
-    mockReadFileSync.mockImplementation((path: string) => {
-      if (path.includes(".hive/package.json")) return JSON.stringify({ version: "0.2.1" });
-      if (path.includes(".hive.prev/package.json")) return JSON.stringify({ version: "0.2.0" });
-      return "";
-    });
+describe("packaged rollback CLI", () => {
+  beforeEach(() => mocks.invoke.mockReset());
+
+  it("routes rollback and dry-run through the same helper", async () => {
+    const { runRollback } = await import("./rollback.js");
+    await runRollback({ instance: "catalyst", dryRun: true });
+    expect(mocks.invoke.mock.calls[0][2]).toEqual(["--rollback", "--instance=catalyst", "--dry-run"]);
   });
 
-  it("shells out to deploy.sh --rollback --instance=<derived>", async () => {
+  it("rejects an instance mismatch before helper execution", async () => {
     const { runRollback } = await import("./rollback.js");
-    await runRollback();
-    const [script, args] = mockExecFileSync.mock.calls[0];
-    expect(String(script)).toBe(resolve("/tmp/test-hive/.hive/service/deploy.sh"));
-    expect(args).toContain("--rollback");
-    // default instance comes from HIVE_SINGLE_ID (= "hive" when hive.yaml has no instance.id)
-    expect(args).toContain("--instance=hive");
-  });
-
-  it("uses explicit --instance when specified", async () => {
-    const { runRollback } = await import("./rollback.js");
-    await runRollback({ instance: "keepur" });
-    const [, args] = mockExecFileSync.mock.calls[0];
-    expect(args).toContain("--instance=keepur");
-  });
-
-  it("passes single-instance env vars AND --instance matching HIVE_SINGLE_ID (KPR-70)", async () => {
-    // The --instance arg must agree with HIVE_SINGLE_ID — otherwise deploy.sh's
-    // rollback short-circuit can't find the row in single-instance mode.
-    mockReadFileSync.mockImplementation((path: string) => {
-      if (path.includes(".hive/package.json")) return JSON.stringify({ version: "0.2.1" });
-      if (path.includes(".hive.prev/package.json")) return JSON.stringify({ version: "0.2.0" });
-      if (path.endsWith("hive.yaml")) return `instance:\n  id: catalyst\n  portBase: 3500\n`;
-      return "";
-    });
-    const { runRollback } = await import("./rollback.js");
-    await runRollback();
-    const [, args, callOpts] = mockExecFileSync.mock.calls[0] as [unknown, string[], { env: Record<string, string> }];
-    expect(callOpts.env.HIVE_SINGLE_INSTANCE).toBe("1");
-    expect(callOpts.env.HIVE_SINGLE_ID).toBe("catalyst");
-    expect(callOpts.env.HIVE_SINGLE_LOGS).toBe("logs");
-    expect(callOpts.env.HIVE_SINGLE_PORTS).toBe("3500 3501 3502 3503 3504 3505 3506");
-    // Critical: --instance must match HIVE_SINGLE_ID, NOT the hiveHome basename.
-    // Custom install path /tmp/test-hive (basename "test-hive") with instance.id
-    // "catalyst" must still pass --instance=catalyst.
-    expect(args).toContain("--instance=catalyst");
-  });
-
-  it("exits 1 when .hive.prev does not exist", async () => {
-    mockExistsSync.mockImplementation((p: string) => !p.endsWith(".hive.prev"));
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
-      throw new Error("exit");
-    });
-    const { runRollback } = await import("./rollback.js");
-    await expect(runRollback()).rejects.toThrow("exit");
-    expect(exitSpy).toHaveBeenCalledWith(1);
-    exitSpy.mockRestore();
+    await expect(runRollback({ instance: "keepur" })).rejects.toThrow("does not match");
+    expect(mocks.invoke).not.toHaveBeenCalled();
   });
 });

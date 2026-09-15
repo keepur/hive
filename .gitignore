@@ -2,6 +2,10 @@ node_modules
 dist/
 .env
 .npmrc
+# Generated only inside a disposable packaging directory (KPR-463 Task 2).
+# Bundling hashes package-lock.json; a root shrinkwrap would steal lock
+# selection from npm and is never a supported development artifact.
+/npm-shrinkwrap.json
 *.tsbuildinfo
 .DS_Store
 

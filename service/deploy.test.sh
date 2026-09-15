@@ -293,4 +293,76 @@ if ! health_check "$LOG_FILE" "$OFFSET" >/dev/null; then
   exit 1
 fi
 
+# --- Test 15: supported single-instance branch bypasses developer state ---
+echo "test 15: supported branch invokes sibling packaged helper before developer reads"
+SUPPORTED="$TESTROOT/supported"
+mkdir -p "$SUPPORTED/service" "$SUPPORTED/pkg"
+cp "$SCRIPT_DIR/deploy.sh" "$SCRIPT_DIR/deploy-check.sh" "$SUPPORTED/service/"
+: > "$SUPPORTED/pkg/deploy.min.js"
+cat > "$SUPPORTED/node-shim" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$SUPPORTED_OUTPUT"
+exit "${SUPPORTED_EXIT:-0}"
+SHIM
+chmod +x "$SUPPORTED/node-shim" "$SUPPORTED/service/deploy.sh" "$SUPPORTED/service/deploy-check.sh"
+export SUPPORTED_OUTPUT="$SUPPORTED/output"
+HIVE_SINGLE_INSTANCE=1 HIVE_NODE_PATH="$SUPPORTED/node-shim" \
+  BUILD_DIR="$TESTROOT/MUST_NOT_READ" HIVE_INSTANCES_CONF="$TESTROOT/MUST_NOT_READ.conf" \
+  "$SUPPORTED/service/deploy.sh" --artifact=/tmp/reviewed.tgz --instance=dodi
+grep -Fxq "$SUPPORTED/service/../pkg/deploy.min.js" "$SUPPORTED_OUTPUT"
+grep -Fxq -- "--artifact=/tmp/reviewed.tgz" "$SUPPORTED_OUTPUT"
+
+# --- Test 16: deploy-check uses the same helper and selected pin ---
+echo "test 16: supported deploy-check routes through paired helper"
+HIVE_SINGLE_INSTANCE=1 HIVE_SINGLE_TAG=v0.16.0 HIVE_NODE_PATH="$SUPPORTED/node-shim" \
+  BUILD_DIR="$TESTROOT/MUST_NOT_READ" HIVE_INSTANCES_CONF="$TESTROOT/MUST_NOT_READ.conf" \
+  "$SUPPORTED/service/deploy-check.sh"
+grep -Fxq -- "--check" "$SUPPORTED_OUTPUT"
+grep -Fxq -- "--tag=v0.16.0" "$SUPPORTED_OUTPUT"
+
+# --- Test 17: helper nonzero is propagated and never falls through ---
+echo "test 17: supported helper failure status is preserved"
+if HIVE_SINGLE_INSTANCE=1 HIVE_NODE_PATH="$SUPPORTED/node-shim" SUPPORTED_EXIT=23 \
+  "$SUPPORTED/service/deploy.sh" --dry-run; then
+  echo "FAIL: deploy wrapper swallowed helper failure" >&2
+  exit 1
+else
+  status=$?
+fi
+[[ "$status" == "23" ]] || { echo "FAIL: expected status 23, got $status" >&2; exit 1; }
+
+# --- Test 18: developer port wait reports an unexpected owner and never kills it ---
+echo "test 18: wait_ports_released reports a surviving port owner without killing it"
+grep -q 'kill_ports' "$SCRIPT_DIR/deploy.sh" && { echo "FAIL: kill_ports must be removed from deploy.sh" >&2; exit 1; }
+if grep -Eq 'xargs[[:space:]]+kill|kill[[:space:]]+-9' "$SCRIPT_DIR/deploy.sh"; then
+  echo "FAIL: deploy.sh must not signal port owners" >&2
+  exit 1
+fi
+sleep 60 &
+PORT_OWNER=$!
+LSOF_SHIM="$TESTROOT/lsof-shim"
+mkdir -p "$LSOF_SHIM"
+cat > "$LSOF_SHIM/lsof" <<LSOFEOF
+#!/usr/bin/env bash
+echo "$PORT_OWNER"
+LSOFEOF
+chmod +x "$LSOF_SHIM/lsof"
+DRY_RUN=false
+set +e
+PORT_RELEASE_ATTEMPTS=2 PORT_RELEASE_INTERVAL=0 PATH="$LSOF_SHIM:$PATH" \
+  wait_ports_released "4100" 2> "$TESTROOT/port-owner.err"
+status=$?
+set -e
+[[ "$status" != "0" ]] || { echo "FAIL: an owned port must fail the wait" >&2; exit 1; }
+grep -q "pid $PORT_OWNER" "$TESTROOT/port-owner.err" || { echo "FAIL: owner PID not reported" >&2; exit 1; }
+kill -0 "$PORT_OWNER" 2>/dev/null || { echo "FAIL: port owner was killed" >&2; exit 1; }
+kill "$PORT_OWNER" 2>/dev/null || true
+wait "$PORT_OWNER" 2>/dev/null || true
+cat > "$LSOF_SHIM/lsof" <<'LSOFEOF'
+#!/usr/bin/env bash
+exit 1
+LSOFEOF
+PORT_RELEASE_ATTEMPTS=2 PORT_RELEASE_INTERVAL=0 PATH="$LSOF_SHIM:$PATH" wait_ports_released "4100" \
+  || { echo "FAIL: released ports should pass the wait" >&2; exit 1; }
+
 echo "all tests passed."

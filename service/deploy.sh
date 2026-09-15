@@ -7,6 +7,15 @@ set -euo pipefail
 
 # --- Configuration ---
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ "${HIVE_SINGLE_INSTANCE:-}" == "1" ]]; then
+  DEPLOY_HELPER="$SCRIPT_DIR/../pkg/deploy.min.js"
+  if [[ ! -f "$DEPLOY_HELPER" ]]; then
+    echo "ERROR: packaged deployment helper missing" >&2
+    exit 1
+  fi
+  exec "${HIVE_NODE_PATH:-node}" "$DEPLOY_HELPER" "$@"
+fi
+
 BUILD_DIR="${BUILD_DIR:-$HOME/build/hive}"
 DEPLOY_DIR="${DEPLOY_DIR:-$HOME/services/hive}"
 INSTANCES_CONF="${HIVE_INSTANCES_CONF:-$SCRIPT_DIR/instances.conf}"
@@ -25,9 +34,6 @@ HEALTH_CHECK_WAIT_BETWEEN=10
 # build-from-source phase + the shipped instances.conf entirely. The instance
 # running the update is the only instance to update — no global registry read.
 SINGLE_INSTANCE_MODE=false
-if [[ "${HIVE_SINGLE_INSTANCE:-}" == "1" ]]; then
-  SINGLE_INSTANCE_MODE=true
-fi
 
 # --- Flags ---
 DRY_RUN=false
@@ -185,21 +191,34 @@ _scan_new_boot() {
   '
 }
 
-kill_ports() {
+# wait_ports_released <ports>
+# Waits (bounded) for every port to have no listener. It never signals a port
+# owner: a port still owned after the wait is reported (PID and command) and
+# the function returns 1 so the caller fails that developer deploy instead.
+# KPR-463 spec §5.1: never kill arbitrary port owners.
+PORT_RELEASE_ATTEMPTS="${PORT_RELEASE_ATTEMPTS:-10}"
+PORT_RELEASE_INTERVAL="${PORT_RELEASE_INTERVAL:-0.5}"
+wait_ports_released() {
   local ports_str="$1"
   if $DRY_RUN; then
-    echo "[DRY RUN] kill_ports: would scan $ports_str"
-    return
+    echo "[DRY RUN] wait_ports_released: would wait for $ports_str"
+    return 0
   fi
+  local port pids pid owned=0
   for port in $ports_str; do
-    local pids
-    pids=$(lsof -i :"$port" -t 2>/dev/null || true)
+    for _ in $(seq 1 "$PORT_RELEASE_ATTEMPTS"); do
+      if ! lsof -nP -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; then break; fi
+      sleep "$PORT_RELEASE_INTERVAL"
+    done
+    pids=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
     if [[ -n "$pids" ]]; then
-      echo "  Killing stale process(es) on port $port: $pids"
-      echo "$pids" | xargs kill -9 2>/dev/null || true
+      owned=1
+      for pid in $pids; do
+        echo "  ERROR: port $port is still owned by pid $pid ($(ps -p "$pid" -o comm= 2>/dev/null || echo unknown)); not killing it" >&2
+      done
     fi
   done
-  sleep 1
+  return "$owned"
 }
 
 # --- Engine fetch/swap/rollback (KPR-53 / Phase 3) ---
@@ -283,6 +302,10 @@ fetch_engine() {
     mkdir -p "$instance_dir/.hive.next/scripts"
     [[ -f "$src/scripts/honeypot" ]] && cp "$src/scripts/honeypot" "$instance_dir/.hive.next/scripts/honeypot"
     cp "$src/package.json" "$instance_dir/.hive.next/"
+    # npm always packs npm-shrinkwrap.json without listing it in `files`; the
+    # rsync fallback must carry it too or the engine tree has no dependency
+    # lock for readRelease to hash.
+    [[ -f "$src/npm-shrinkwrap.json" ]] && cp "$src/npm-shrinkwrap.json" "$instance_dir/.hive.next/"
   fi
 
   # Sanity check — if the tarball/rsync was broken, catch it before the swap.
@@ -396,15 +419,11 @@ if $ROLLBACK; then
   echo "  Stopping $label..."
   run_cmd launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
   # Wait for ports to release (KeepAlive can't fire — service is unloaded).
-  if ! $DRY_RUN; then
-    for port in $ports; do
-      for _ in $(seq 1 10); do
-        if ! lsof -i :"$port" -t >/dev/null 2>&1; then break; fi
-        sleep 0.5
-      done
-    done
+  # An unexpected owner is reported and fails the rollback; it is never killed.
+  if ! wait_ports_released "$ports"; then
+    notify "Rollback FAILED for \`$id\`: ports still owned by another process after stop."
+    exit 1
   fi
-  kill_ports "$ports"  # defensive — catches anything bound elsewhere
   if ! rollback_engine "$instance_root"; then
     notify "Rollback FAILED for \`$id\`: no previous engine (.hive.prev missing)."
     exit 1
@@ -537,15 +556,12 @@ for inst in "${INSTANCES[@]}"; do
   # `-k` flag merely kills-then-restarts, leaving the plist loaded.
   echo "  Stopping $label..."
   run_cmd launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-  if ! $DRY_RUN; then
-    for port in $ports; do
-      for _ in $(seq 1 10); do
-        if ! lsof -i :"$port" -t >/dev/null 2>&1; then break; fi
-        sleep 0.5
-      done
-    done
+  if ! wait_ports_released "$ports"; then
+    notify "Deploy FAILED for \`$id\`: ports still owned by another process after stop."
+    FAILED_INSTANCES+=("$id")
+    run_cmd launchctl bootstrap "gui/$(id -u)" "$plist_path" || true  # bring old engine back up
+    continue
   fi
-  kill_ports "$ports"  # defensive — catches anything bound elsewhere
 
   echo "  Fetching engine..."
   if ! fetch_engine "$instance_root" "$tag"; then
@@ -577,16 +593,9 @@ for inst in "${INSTANCES[@]}"; do
     echo "  Health check FAILED for $id — rolling back"
     # New engine bound the port and failed health check — bootout it before swap.
     run_cmd launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-    if ! $DRY_RUN; then
-      for port in $ports; do
-        for _ in $(seq 1 10); do
-          if ! lsof -i :"$port" -t >/dev/null 2>&1; then break; fi
-          sleep 0.5
-        done
-      done
-    fi
-    kill_ports "$ports"
-    if rollback_engine "$instance_root"; then
+    if ! wait_ports_released "$ports"; then
+      notify "Deploy FAILED for \`$id\` and auto-rollback skipped: ports still owned by another process. Manual intervention required."
+    elif rollback_engine "$instance_root"; then
       run_cmd launchctl bootstrap "gui/$(id -u)" "$plist_path"
       notify "Deploy rolled back for \`$id\`: \`$tag\` failed health check, restored previous version."
     else

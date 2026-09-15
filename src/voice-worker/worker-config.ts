@@ -6,10 +6,14 @@
  */
 import { config, resolveSecretEnv } from "../config.js";
 import { createLogger } from "../logging/logger.js";
+import { hiveHome } from "../paths.js";
 
 const log = createLogger("voice-worker-config");
 
 export interface WorkerConfig {
+  instanceHome: string;
+  instanceId: string;
+  healthPort: number;
   livekitUrl: string;
   livekitApiKey: string;
   livekitApiSecret: string;
@@ -40,6 +44,9 @@ export function loadWorkerConfig(): WorkerConfig {
   const lk = config.voice.livekit;
   if (!lk.enabled) throw new Error("voice.livekit.enabled is false — voice worker refusing to start");
   const wc: WorkerConfig = {
+    instanceHome: hiveHome,
+    instanceId: config.instance.id,
+    healthPort: config.voice.workerPort,
     livekitUrl: lk.url,
     livekitApiKey: config.voice.livekitApiKey,
     livekitApiSecret: config.voice.livekitApiSecret,

@@ -1,6 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+import { parseBootIdentity } from "../deployment/health.js";
+import { readRelease, type BootIdentity, type Release } from "../deployment/release.js";
+import { buildServiceEnvironment, servicePortKeys } from "../deployment/services.js";
+import { REGISTRY_RESULT_FILE } from "../deployment/pilot.js";
 import {
   BUILTIN_ROUTABLE_PREFIXES,
   auditInstalledProviderDecls,
@@ -352,6 +356,183 @@ export interface VoiceWorkerStatsRow {
   cellDefaults: { defaultStt?: string; defaultTts?: string } | null;
   /** Seconds since the worker last wrote this doc; null if no doc yet. */
   staleSeconds: number | null;
+  supervisorIdentity?: BootIdentity | null;
+  supervisorStaleSeconds?: number | null;
+}
+
+export interface DoctorRuntimeIdentities {
+  installed: Release | null;
+  engine: BootIdentity | null;
+  worker: BootIdentity | null;
+}
+
+export interface DoctorVoiceRuntimeProbe {
+  health: "healthy" | "unhealthy" | "unavailable";
+  registration: "registered" | "unregistered" | "unavailable";
+  maintenanceClassification: string;
+  /** The supervisor whose ledger reported the unresolved entries below. */
+  supervisor: { pid: number; bootId: string } | null;
+  unresolved: Array<{
+    jobId: string;
+    acceptedAt: number;
+    phase: string;
+    childPid?: number;
+  }>;
+}
+
+function readBootIdentity(path: string): BootIdentity | null {
+  try {
+    return parseBootIdentity(JSON.parse(readFileSync(path, "utf8")) as unknown);
+  } catch {
+    return null;
+  }
+}
+
+export function runtimeIdentitiesForDoctor(engineRoot: string, stateRoot: string): DoctorRuntimeIdentities {
+  let installed: Release | null = null;
+  try {
+    installed = readRelease(engineRoot);
+  } catch {
+    // Older/source installations have no valid packaged manifest.
+  }
+  return {
+    installed,
+    engine: readBootIdentity(resolve(stateRoot, "runtime", "engine.json")),
+    worker: readBootIdentity(resolve(stateRoot, "runtime", "voice-worker.json")),
+  };
+}
+
+export function localVoiceRuntimeForDoctor(input: {
+  engineRoot: string;
+  hiveHome: string;
+  configPath: string;
+  home: string;
+  pathEnv: string;
+  environment?: NodeJS.ProcessEnv;
+}): DoctorVoiceRuntimeProbe {
+  const entrypoint = resolve(input.engineRoot, "pkg", "runtime-probe.min.js");
+  if (!existsSync(entrypoint)) {
+    return {
+      health: "unavailable",
+      registration: "unavailable",
+      maintenanceClassification: "legacy/unavailable",
+      supervisor: null,
+      unresolved: [],
+    };
+  }
+  const source = input.environment ?? process.env;
+  const overrides = Object.fromEntries(
+    servicePortKeys.flatMap((key) => (source[key] === undefined ? [] : [[key, source[key]!]])),
+  );
+  const env = buildServiceEnvironment({
+    hiveHome: input.hiveHome,
+    configPath: input.configPath,
+    home: input.home,
+    pathEnv: input.pathEnv,
+    overrides,
+  });
+  try {
+    const output = execFileSync(process.execPath, [entrypoint, "worker"], {
+      cwd: input.hiveHome,
+      env,
+      encoding: "utf8",
+      timeout: 5_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const result = JSON.parse(output) as {
+      ok?: unknown;
+      classification?: unknown;
+      maintenanceClassification?: unknown;
+      socketOwned?: unknown;
+      sdk?: { rootStatus?: unknown; agentName?: unknown };
+      status?: { snapshot?: { unresolved?: unknown; supervisor?: { pid?: unknown; bootId?: unknown } } };
+    };
+    const unresolved = Array.isArray(result.status?.snapshot?.unresolved)
+      ? (result.status!.snapshot!.unresolved as DoctorVoiceRuntimeProbe["unresolved"])
+      : [];
+    const reported = result.status?.snapshot?.supervisor;
+    const supervisor =
+      typeof reported?.pid === "number" && typeof reported.bootId === "string"
+        ? { pid: reported.pid, bootId: reported.bootId }
+        : null;
+    return {
+      health:
+        result.sdk?.rootStatus === 200 && result.socketOwned === true && result.classification === "worker-registered"
+          ? "healthy"
+          : "unhealthy",
+      registration:
+        result.sdk?.rootStatus === 200 &&
+        result.sdk?.agentName === "hive-voice" &&
+        result.socketOwned === true &&
+        result.classification === "worker-registered"
+          ? "registered"
+          : "unregistered",
+      maintenanceClassification:
+        typeof result.maintenanceClassification === "string"
+          ? result.maintenanceClassification
+          : "probe-response-invalid",
+      supervisor,
+      unresolved,
+    };
+  } catch (error) {
+    const stdout =
+      error && typeof error === "object" && "stdout" in error
+        ? String((error as { stdout?: string | Buffer }).stdout ?? "")
+        : "";
+    let classification = "local-probe-failed";
+    try {
+      const parsed = JSON.parse(stdout) as { classification?: unknown };
+      if (typeof parsed.classification === "string") classification = parsed.classification;
+    } catch {
+      // Keep the bounded local failure classification.
+    }
+    return {
+      health: "unhealthy",
+      registration: "unavailable",
+      maintenanceClassification: classification,
+      supervisor: null,
+      unresolved: [],
+    };
+  }
+}
+
+export interface DoctorRegistryOutcome {
+  operationId: string;
+  recordedAt: string;
+  result: unknown;
+}
+
+/**
+ * The most recently recorded pilot registry-command outcome, read from the
+ * operation directories the frozen helper writes. Informational: it reports
+ * what a command recorded, never a live held state.
+ */
+export function latestRegistryOutcomeForDoctor(hiveHome: string): DoctorRegistryOutcome | null {
+  const operations = resolve(hiveHome, ".hive-state", "deployment", "operations");
+  let entries: string[];
+  try {
+    entries = readdirSync(operations);
+  } catch {
+    return null;
+  }
+  let newest: DoctorRegistryOutcome | null = null;
+  let newestAt = -1;
+  for (const entry of entries) {
+    const path = resolve(operations, entry, REGISTRY_RESULT_FILE);
+    try {
+      const info = statSync(path);
+      if (!info.isFile() || info.mtimeMs <= newestAt) continue;
+      newestAt = info.mtimeMs;
+      newest = {
+        operationId: entry,
+        recordedAt: new Date(info.mtimeMs).toISOString(),
+        result: JSON.parse(readFileSync(path, "utf8")) as unknown,
+      };
+    } catch {
+      // A missing, unreadable or malformed result is simply not the newest.
+    }
+  }
+  return newest;
 }
 
 export async function voiceWorkerStatsForDoctor(uri: string, dbName: string): Promise<VoiceWorkerStatsRow | null> {
@@ -366,9 +547,18 @@ export async function voiceWorkerStatsForDoctor(uri: string, dbName: string): Pr
       lastError?: string | null;
       cellDefaults?: { defaultStt?: string; defaultTts?: string };
       updatedAt?: Date;
+      supervisorIdentity?: unknown;
+      supervisorUpdatedAt?: Date;
     }>({ kind: "voice_worker_stats" });
     if (!doc) return null;
     const updatedAt = doc.updatedAt instanceof Date ? doc.updatedAt : null;
+    const supervisorUpdatedAt = doc.supervisorUpdatedAt instanceof Date ? doc.supervisorUpdatedAt : null;
+    let supervisorIdentity: BootIdentity | null = null;
+    try {
+      if (doc.supervisorIdentity !== undefined) supervisorIdentity = parseBootIdentity(doc.supervisorIdentity);
+    } catch {
+      // Malformed or legacy telemetry must remain explicitly unavailable.
+    }
     return {
       activeCalls: doc.activeCalls ?? 0,
       callsStarted: doc.callsStarted ?? 0,
@@ -376,6 +566,14 @@ export async function voiceWorkerStatsForDoctor(uri: string, dbName: string): Pr
       lastError: doc.lastError ?? null,
       cellDefaults: doc.cellDefaults ?? null,
       staleSeconds: updatedAt ? Math.round((Date.now() - updatedAt.getTime()) / 1000) : null,
+      ...(doc.supervisorIdentity !== undefined || doc.supervisorUpdatedAt !== undefined
+        ? {
+            supervisorIdentity,
+            supervisorStaleSeconds: supervisorUpdatedAt
+              ? Math.round((Date.now() - supervisorUpdatedAt.getTime()) / 1000)
+              : null,
+          }
+        : {}),
     };
   } catch {
     return null;

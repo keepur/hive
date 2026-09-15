@@ -7,8 +7,6 @@ export type SingleInstanceEnv = Record<string, string>;
 type HiveYamlShape = {
   instance?: {
     id?: string;
-    portBase?: number;
-    ports?: Record<string, number>;
   };
 };
 
@@ -28,7 +26,6 @@ type HiveYamlShape = {
  */
 export function deriveSingleInstanceEnv(hiveHome: string, tag?: string): SingleInstanceEnv {
   const configPath = resolveConfigFile(hiveHome);
-  const configFile = process.env.HIVE_CONFIG || "hive.yaml";
 
   let yaml: HiveYamlShape = {};
   if (existsSync(configPath)) {
@@ -36,25 +33,12 @@ export function deriveSingleInstanceEnv(hiveHome: string, tag?: string): SingleI
   }
 
   const id = yaml.instance?.id ?? "hive";
-  const portBase = yaml.instance?.portBase ?? 3100;
-  const portOverrides = Object.values(yaml.instance?.ports ?? {});
-
-  // Base port range covers every server config.ts derives from portBase
-  // (background..voice = +0..+6). Explicit overrides extend the kill-set so
-  // remapped ports also get cleared. Dedup to keep the arg compact.
-  const derived = Array.from({ length: 7 }, (_, i) => portBase + i);
-  const allPorts = Array.from(new Set([...derived, ...portOverrides])).sort((a, b) => a - b);
-
-  // Logs dir is always "logs" — daemon.ts hardcodes that for npm installs and
-  // wizard.ts mkdirs only "logs". The historical "logs-<suffix>" convention
-  // was a multi-instance dev-only artifact handled via the workspace-level
-  // instances.conf, not via single-instance mode.
+  // This handoff carries identity/selectors only. Ports are corroborated by
+  // the service/process adapters and are never treated as a kill set.
   const env: SingleInstanceEnv = {
     HIVE_SINGLE_INSTANCE: "1",
     HIVE_SINGLE_ID: id,
-    HIVE_SINGLE_CONFIG: configFile,
-    HIVE_SINGLE_LOGS: "logs",
-    HIVE_SINGLE_PORTS: allPorts.join(" "),
+    HIVE_SINGLE_CONFIG: configPath,
     HIVE_SINGLE_ROOT: hiveHome,
   };
   if (tag) env.HIVE_SINGLE_TAG = tag;

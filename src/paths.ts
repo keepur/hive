@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 
 const home = process.env.HOME ?? "/tmp";
 
@@ -37,7 +37,7 @@ export function resolveConfigFile(hiveHome: string): string {
  * hive-personal.yaml → .env-personal, hive.yaml → .env
  */
 export function resolveDotenvPath(hiveHome: string): string {
-  const configFile = process.env.HIVE_CONFIG || "hive.yaml";
+  const configFile = basename(process.env.HIVE_CONFIG || "hive.yaml");
   const suffix = configFile.match(/^hive-(.+)\.yaml$/)?.[1];
   return resolve(hiveHome, suffix ? `.env-${suffix}` : ".env");
 }

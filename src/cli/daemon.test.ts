@@ -1,8 +1,19 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildPlist, getInstanceId, getLabel, getPlistPath, getLaunchAgentLink } from "./daemon.js";
+import {
+  buildPlist,
+  getInstanceId,
+  getLabel,
+  getPlistPath,
+  getLaunchAgentLink,
+  startDaemon,
+  stopDaemon,
+} from "./daemon.js";
+
+const invokeDeploymentHelper = vi.hoisted(() => vi.fn());
+vi.mock("./deployment-helper.js", () => ({ invokeDeploymentHelper }));
 
 describe("buildPlist", () => {
   it("ProgramArguments points at the provided serverPath", () => {
@@ -81,5 +92,25 @@ describe("daemon helpers (KPR-69)", () => {
       if (prev === undefined) delete process.env.HIVE_CONFIG;
       else process.env.HIVE_CONFIG = prev;
     }
+  });
+});
+
+describe("paired daemon lifecycle routing", () => {
+  let tmp: string;
+  beforeEach(() => {
+    invokeDeploymentHelper.mockReset();
+    tmp = mkdtempSync(join(tmpdir(), "hive-daemon-route-"));
+    writeFileSync(join(tmp, "hive.yaml"), "instance:\n  id: catalyst\n");
+  });
+  afterEach(() => rmSync(tmp, { recursive: true, force: true }));
+
+  it("routes daemon start through the shared deployment helper", async () => {
+    await startDaemon(tmp);
+    expect(invokeDeploymentHelper.mock.calls[0][2]).toEqual(["--start", "--instance=catalyst"]);
+  });
+
+  it("routes stop through the shared helper so stale workers are included", async () => {
+    await stopDaemon(tmp);
+    expect(invokeDeploymentHelper.mock.calls[0][2]).toEqual(["--stop", "--instance=catalyst"]);
   });
 });

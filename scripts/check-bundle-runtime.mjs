@@ -1,161 +1,169 @@
 // scripts/check-bundle-runtime.mjs
 /**
- * Bundle runtime smoke test — verifies the bundled CLI can actually execute.
- *
- * Runs:
- *   1. node pkg/cli.min.js --version  → must print "hive v<version>"
- *   2. node pkg/cli.min.js --help     → must print usage text
- *   3. node pkg/server.min.js (exits immediately without config — just checks it loads)
- *
- * Prereq: npm run bundle (pkg/ must exist)
+ * Bundle runtime smoke test with an isolated child environment (KPR-463
+ * Task 3 Step 4). Importing this module does not launch checks.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, cpSync, rmSync, symlinkSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const PKG_DIR = "pkg";
+const MISSING_SLACK = "Missing required env var: SLACK_APP_TOKEN";
 
-if (!existsSync(PKG_DIR)) {
-  console.error(`error: ${PKG_DIR}/ not found — run 'npm run bundle' first`);
-  process.exit(1);
-}
-
-let failures = 0;
-
-// Test 1: hive --version
-try {
-  const version = execFileSync(
-    process.execPath,
-    [resolve(PKG_DIR, "cli.min.js"), "--version"],
-    { encoding: "utf-8", timeout: 10000 },
-  ).trim();
-  if (/^hive v\d+\.\d+\.\d+/.test(version)) {
-    console.log(`  ✓ --version: ${version}`);
-  } else {
-    console.error(`  ✗ --version: unexpected output: ${version}`);
-    failures++;
-  }
-} catch (err) {
-  console.error(`  ✗ --version: ${err.message}`);
-  failures++;
-}
-
-// Test 2: hive --help
-try {
-  const help = execFileSync(
-    process.execPath,
-    [resolve(PKG_DIR, "cli.min.js"), "--help"],
-    { encoding: "utf-8", timeout: 10000 },
-  ).trim();
-  if (help.includes("hive <command>") && help.includes("init")) {
-    console.log(`  ✓ --help: usage text present (${help.split("\n").length} lines)`);
-  } else {
-    console.error(`  ✗ --help: missing expected content`);
-    failures++;
-  }
-} catch (err) {
-  console.error(`  ✗ --help: ${err.message}`);
-  failures++;
-}
-
-// Test 3: server.min.js loads (will fail on missing config, but should not crash on import)
-try {
-  // Run with a timeout — the server will try to connect to MongoDB and fail,
-  // but it should at least load without syntax/import errors.
-  // We expect a non-zero exit (no config), but NOT a syntax error or missing module.
-  execFileSync(
-    process.execPath,
-    [resolve(PKG_DIR, "server.min.js")],
-    { encoding: "utf-8", timeout: 10000, env: { ...process.env, NODE_ENV: "test" } },
-  );
-  // If it exits cleanly, that's fine too
-  console.log("  ✓ server.min.js: loaded without crash");
-} catch (err) {
-  const stderr = err.stderr ?? "";
-  const stdout = err.stdout ?? "";
-  // SyntaxError or missing module/package means the bundle is broken
-  if (
-    stderr.includes("SyntaxError") ||
-    stderr.includes("Cannot find module") ||
-    stderr.includes("Cannot find package") ||
-    stderr.includes("ERR_MODULE_NOT_FOUND")
-  ) {
-    console.error(`  ✗ server.min.js: bundle broken — ${stderr.slice(0, 200)}`);
-    failures++;
-  } else {
-    // Expected: exits with error because no MongoDB/config — that's fine
-    console.log("  ✓ server.min.js: loaded (exited on missing config — expected)");
-  }
-}
-
-// Test 4: bundle runs from a relocated .hive/pkg/ path (post-Phase-4 layout)
-try {
-  const scratch = resolve(tmpdir(), `hive-bundle-check-${Date.now()}`);
-  const engine = resolve(scratch, ".hive");
+export function isEntrypoint(argv1, moduleUrl) {
+  if (argv1 === undefined) return false;
+  if (moduleUrl === pathToFileURL(argv1).href) return true;
   try {
-    mkdirSync(engine, { recursive: true });
-    // Copy the built package's pkg/ + siblings into .hive/ to match the deployed
-    // shape. PKG_DIR is the relative root the other tests also use.
-    cpSync(PKG_DIR, resolve(engine, "pkg"), { recursive: true });
-    if (existsSync("seeds")) {
-      cpSync("seeds", resolve(engine, "seeds"), { recursive: true });
-    }
-    if (existsSync("templates")) {
-      cpSync("templates", resolve(engine, "templates"), { recursive: true });
-    }
-    if (existsSync("package.json")) {
-      cpSync("package.json", resolve(engine, "package.json"));
-    }
-
-    // Symlink the repo's node_modules into .hive/node_modules so the bundle's
-    // runtime externals resolve. In the real deployed shape, populateEngine /
-    // fetch_engine runs `npm install --omit=dev` inside .hive/ to produce this;
-    // for a runtime smoke test, the dev repo's node_modules is functionally
-    // equivalent and cheap. This test's job is to catch caller-relative path
-    // regressions inside the bundle — not to re-validate the install pipeline.
-    const repoNodeModules = resolve(process.cwd(), "node_modules");
-    if (existsSync(repoNodeModules)) {
-      symlinkSync(repoNodeModules, resolve(engine, "node_modules"), "dir");
-    }
-
-    // Loading test, parallel to Test 3: run server.min.js from the relocated path.
-    // We expect a non-zero exit (no config), but NOT a syntax error or missing
-    // module/package — the goal is "the bundle still resolves its sibling paths
-    // correctly from the new CWD," not "the server runs to steady state."
-    const serverPath = resolve(engine, "pkg", "server.min.js");
-    try {
-      execFileSync(process.execPath, [serverPath], {
-        encoding: "utf-8",
-        timeout: 10000,
-        env: { ...process.env, NODE_ENV: "test", HIVE_HOME: scratch },
-      });
-      console.log("  ✓ .hive/pkg/ layout: server.min.js loaded without crash");
-    } catch (err) {
-      const stderr = err.stderr ?? "";
-      if (
-        stderr.includes("SyntaxError") ||
-        stderr.includes("Cannot find module") ||
-        stderr.includes("Cannot find package") ||
-        stderr.includes("ERR_MODULE_NOT_FOUND")
-      ) {
-        console.error(`  ✗ .hive/pkg/ layout: bundle broken — ${stderr.slice(0, 200)}`);
-        failures++;
-      } else {
-        console.log("  ✓ .hive/pkg/ layout: server.min.js loaded (exited on missing config — expected)");
-      }
-    }
-  } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    return fileURLToPath(moduleUrl) === realpathSync(argv1);
+  } catch {
+    return false;
   }
-} catch (err) {
-  console.error(`  ✗ .hive/pkg/ layout: setup failed — ${err.message}`);
-  failures++;
 }
 
-if (failures > 0) {
-  console.error(`\n${failures} runtime check(s) failed.`);
-  process.exit(1);
+export function createScratchLayout(root = mkdtempSync(resolve(tmpdir(), "hive-bundle-smoke-"))) {
+  const home = resolve(root, "home");
+  const instance = resolve(root, "instance");
+  const bin = resolve(root, "bin");
+  const tmp = resolve(root, "tmp");
+  mkdirSync(home, { recursive: true });
+  mkdirSync(instance, { recursive: true });
+  mkdirSync(bin, { recursive: true });
+  mkdirSync(tmp, { recursive: true });
+  const configPath = resolve(instance, "hive.yaml");
+  writeFileSync(configPath, "instance:\n  id: bundle-smoke\n");
+  writeFileSync(resolve(instance, ".env"), "");
+  const keychainLog = resolve(root, "security.log");
+  writeFileSync(keychainLog, "");
+  const security = resolve(bin, "security");
+  writeFileSync(
+    security,
+    `${[
+      "#!/usr/bin/env node",
+      'import { appendFileSync } from "node:fs";',
+      "const log = process.env.HIVE_SMOKE_KEYCHAIN_LOG;",
+      "if (log) appendFileSync(log, JSON.stringify(process.argv.slice(2)) + \"\\n\");",
+      "process.exit(44);",
+      "",
+    ].join("\n")}`,
+  );
+  chmodSync(security, 0o755);
+  return { root, home, instance, bin, tmp, configPath, keychainLog, security };
 }
 
-console.log("\nOK: Bundle runtime checks passed.");
+export function isolatedChildEnv(scratch) {
+  return {
+    HOME: scratch.home,
+    HIVE_HOME: scratch.instance,
+    HIVE_CONFIG: scratch.configPath,
+    PATH: [scratch.bin, dirname(process.execPath), "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":"),
+    TMPDIR: scratch.tmp,
+    NODE_ENV: "test",
+    HIVE_SMOKE_KEYCHAIN_LOG: scratch.keychainLog,
+  };
+}
+
+export function runIsolated(file, args, scratch) {
+  try {
+    const stdout = execFileSync(process.execPath, [file, ...args], {
+      encoding: "utf-8",
+      timeout: 10_000,
+      cwd: scratch.instance,
+      env: isolatedChildEnv(scratch),
+    });
+    return { status: 0, stdout, stderr: "", signal: null };
+  } catch (error) {
+    return {
+      status: typeof error.status === "number" ? error.status : 1,
+      stdout: String(error.stdout ?? ""),
+      stderr: String(error.stderr ?? ""),
+      signal: error.signal ?? null,
+      timedOut: Boolean(error.killed && error.signal === "SIGTERM") || /timed out/i.test(String(error.message ?? "")),
+    };
+  }
+}
+
+function failServer(result, label) {
+  const output = `${result.stdout}\n${result.stderr}`;
+  if (result.signal || result.timedOut || result.status === 0) {
+    throw new Error(`${label}: expected a nonzero ordinary exit, got status=${result.status} signal=${result.signal}`);
+  }
+  if (
+    output.includes("SyntaxError") ||
+    output.includes("Cannot find module") ||
+    output.includes("Cannot find package") ||
+    output.includes("ERR_MODULE_NOT_FOUND")
+  ) {
+    throw new Error(`${label}: module/native load error\n${output.slice(0, 400)}`);
+  }
+  if (!output.includes(MISSING_SLACK)) {
+    throw new Error(`${label}: missing exact Slack required-key failure\n${output.slice(0, 400)}`);
+  }
+}
+
+export function copyRelocatedPackage(engine) {
+  mkdirSync(engine, { recursive: true });
+  cpSync(PKG_DIR, resolve(engine, "pkg"), { recursive: true });
+  if (existsSync("seeds")) cpSync("seeds", resolve(engine, "seeds"), { recursive: true });
+  if (existsSync("templates")) cpSync("templates", resolve(engine, "templates"), { recursive: true });
+  cpSync("package.json", resolve(engine, "package.json"));
+  writeFileSync(resolve(engine, "npm-shrinkwrap.json"), readFileSync("package-lock.json"));
+  const repoNodeModules = resolve(process.cwd(), "node_modules");
+  if (existsSync(repoNodeModules)) {
+    symlinkSync(repoNodeModules, resolve(engine, "node_modules"), "dir");
+  }
+}
+
+export function runBundleRuntimeChecks() {
+  if (!existsSync(PKG_DIR)) {
+    throw new Error(`${PKG_DIR}/ not found — run 'npm run bundle' first`);
+  }
+  const scratch = createScratchLayout();
+  try {
+    const version = runIsolated(resolve(PKG_DIR, "cli.min.js"), ["--version"], scratch);
+    if (version.status !== 0 || !/^hive v\d+\.\d+\.\d+/.test(version.stdout.trim())) {
+      throw new Error(`--version: unexpected output: ${version.stdout || version.stderr}`);
+    }
+    console.log(`  ✓ --version: ${version.stdout.trim()}`);
+
+    const help = runIsolated(resolve(PKG_DIR, "cli.min.js"), ["--help"], scratch);
+    if (help.status !== 0 || !help.stdout.includes("hive <command>") || !help.stdout.includes("init")) {
+      throw new Error("--help: missing expected content");
+    }
+    console.log(`  ✓ --help: usage text present (${help.stdout.trim().split("\n").length} lines)`);
+
+    const server = runIsolated(resolve(PKG_DIR, "server.min.js"), [], scratch);
+    failServer(server, "server.min.js");
+    console.log("  ✓ server.min.js: exact missing Slack key");
+
+    const engine = resolve(scratch.instance, ".hive");
+    copyRelocatedPackage(engine);
+    const relocated = runIsolated(resolve(engine, "pkg", "server.min.js"), [], scratch);
+    failServer(relocated, ".hive/pkg layout");
+    console.log("  ✓ .hive/pkg/ layout: exact missing Slack key");
+  } finally {
+    rmSync(scratch.root, { recursive: true, force: true });
+  }
+  console.log("\nOK: Bundle runtime checks passed.");
+}
+
+if (isEntrypoint(process.argv[1], import.meta.url)) {
+  try {
+    runBundleRuntimeChecks();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
+}

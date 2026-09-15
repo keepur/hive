@@ -13,10 +13,14 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-const packOutput = execFileSync("npm", ["pack", "--dry-run", "--json"], {
-  encoding: "utf-8",
-  stdio: ["pipe", "pipe", "pipe"],
-});
+const packOutput = execFileSync(
+  process.execPath,
+  ["scripts/generate-shrinkwrap.mjs", "--pack", "--dry-run", "--json"],
+  {
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+  },
+);
 
 const parsed = JSON.parse(packOutput);
 // npm pack --json returned a one-element array on older npm; newer npm
@@ -29,6 +33,12 @@ const required = [
   "package.json",
   "pkg/cli.min.js",
   "pkg/server.min.js",
+  "pkg/voice-worker.min.js",
+  "pkg/voice-worker-diagnostic.min.js",
+  "pkg/runtime-probe.min.js",
+  "pkg/deploy.min.js",
+  "pkg/release.json",
+  "npm-shrinkwrap.json",
   "seeds/chief-of-staff/agent.yaml",
   "templates/constitution-bootstrap.md.tpl",
   "scripts/honeypot",

@@ -90,7 +90,12 @@ describe("pinned SDK artifact", () => {
     const rtc = JSON.parse(readFileSync("node_modules/@livekit/rtc-node/package.json", "utf8"));
     const entry = lock.packages["node_modules/@livekit/agents"];
 
-    expect(process.version).toBe("v24.16.0");
+    // Capability evidence was collected on v24.16.0 (docs/epics/kpr-462/kpr-464-sdk-capability.md;
+    // kpr-464-plan.md Task 0 Step 1: "Executed prerequisite, not a future product test").
+    // That host pin stays in the capability record and probes; this product test asserts
+    // engines-compatible Node (>=22.19.0) plus lockfile/tarball identity, not the collection patch.
+    const [major, minor] = process.versions.node.split(".").map((n) => parseInt(n, 10));
+    expect(major > 22 || (major === 22 && minor >= 19)).toBe(true);
     expect(installed.version).toBe("1.6.4");
     expect(rtc.version).toBe("0.13.33");
     expect(entry).toMatchObject({

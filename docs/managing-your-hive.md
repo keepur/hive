@@ -91,19 +91,25 @@ For specific failure modes and remediation, see [troubleshooting.md](troubleshoo
 
 ## Updates
 
+`hive update` and `hive rollback` replace the engine **and** the enabled LiveKit voice worker as one packaged release (`<instance>/.hive/pkg/server.min.js` and, when voice is enabled, `pkg/voice-worker.min.js`). Staging happens while the current pair stays up. Full command list, host prerequisites, and recovery boundaries: [KPR-463 operations](epics/kpr-462/kpr-463-operations.md).
+
 ```
 hive update
+hive update --tag=vX.Y.Z
+hive update --artifact=/absolute/path/to/keepur-hive-x.y.z.tgz
+hive update --dry-run
 ```
 
-Stops the service, fetches the new `@keepur/hive` engine tarball into `<instance>/.hive.next/`, atomically swaps it with `<instance>/.hive/`, and restarts. Auto-rolls-back from `<instance>/.hive.prev/` if the health check fails. Run when the CLI prompts you, or weekly as routine maintenance.
+Fetches (or uses) a `@keepur/hive` tarball, installs locked production dependencies as a confined job, promotes a verified clone into `<instance>/.hive.next/`, then quiesces admission, stops worker then engine, rotates `.hive`, and starts engine then worker. An active call defers the operation instead of terminating it. Auto-restores the captured prior pair from `.hive.prev/` if health fails after stop. `hive update` does not sync operator skills — use `hive skill sync` for that.
 
-To roll back the engine to the previously-installed version (without a full migration):
+To roll back the previous packaged pair (without a full 0.1.x migration):
 
 ```
 hive rollback
+hive rollback --dry-run
 ```
 
-This restores `<instance>/.hive.prev/` over `<instance>/.hive/` and restarts. Available until the next `hive update` cycles the `.prev/` snapshot out.
+This restores `<instance>/.hive.prev/` over `<instance>/.hive/` with the same stop/start order and health checks. Ordinary rollback does not need `/usr/bin/sandbox-exec`. Available until the next successful `hive update` cycles the `.prev/` snapshot out.
 
 ### Migrating from 0.1.x
 
@@ -111,13 +117,15 @@ If you're still on 0.1.x, `hive update` is **not** the right command — the 0.1
 
 ## Service control
 
-- `hive start --daemon` — load the launchd job and run hive in the background.
-- `hive stop` — unload the launchd job and stop the process.
-- `hive status` — report whether the job is loaded, the process is running, and the Slack socket is connected.
+- `hive start --daemon` — load and start the engine LaunchAgent and, when `voice.livekit.enabled`, the voice-worker LaunchAgent.
+- `hive stop` — stop both of this instance's labels (including a stale worker after voice is disabled).
+- `hive status` — report whether the engine job is loaded, the process is running, and the Slack socket is connected.
+- Packaged pair restart (no `hive restart` verb): `node <instance>/.hive/pkg/deploy.min.js --restart`, or `hive stop` then `hive start --daemon`.
+- Foreground worker only: `node <instance>/.hive/pkg/voice-worker.min.js start`.
 
 ## Configuration files
 
-Two files at your instance root (`~/services/hive/<your-instance>/`). The CLI manages most of this; the fields below are the ones you may edit. Both files survive `hive update` and `hive rollback` — only the engine in `<instance>/.hive/` gets swapped.
+Two files at your instance root (`~/services/hive/<your-instance>/`). The CLI manages most of this; the fields below are the ones you may edit. Both files survive `hive update` and `hive rollback` — only the replaceable package in `<instance>/.hive/` (engine + worker + production dependencies) gets swapped.
 
 ### `<instance>/hive.yaml`
 
