@@ -138,6 +138,7 @@ describe("service definitions", () => {
     expect(plist).toContain(`<string>${hiveHome.replace("&", "&amp;")}</string>`);
     expect(plist).toContain(`<key>HIVE_CONFIG</key><string>${configPath.replace("&", "&amp;")}</string>`);
     expect(plist).toContain("<key>VOICE_PORT</key><string>4107</string>");
+    expect(plist).toContain("<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>");
     expect(plist).not.toMatch(/TOKEN|PASSWORD|SECRET/);
   });
 
@@ -310,6 +311,130 @@ describe("service adapters", () => {
     const inspection = await controller(io).bootstrap(worker);
     expect(inspection.livePID).toBe(123);
     expect(exec.mock.calls.some(([, args]) => args[0] === "bootstrap")).toBe(false);
+  });
+
+  it("enables a previously-disabled service before bootstrap and never signals another instance", async () => {
+    const worker = definitions().worker;
+    const plist = JSON.stringify({
+      Label: worker.label,
+      ProgramArguments: [worker.nodePath, worker.entrypoint, ...worker.args],
+      WorkingDirectory: worker.hiveHome,
+      EnvironmentVariables: buildServiceEnvironment(worker),
+    });
+    const row = `  123   1 Mon Sep  8 12:34:56 2026 ${worker.nodePath} ${worker.entrypoint} start\n`;
+    let enabled = false;
+    let loaded = false;
+    const exec = vi.fn(async (command: string, args: readonly string[]) => {
+      if (command === "launchctl" && args[0] === "print") {
+        if (!loaded) throw unloaded();
+        return { stdout: "state = running\npid = 123\n", stderr: "" };
+      }
+      if (command === "launchctl" && args[0] === "print-disabled") {
+        return {
+          stdout: `{ disabled services = {\n\t"${worker.label}" => ${enabled ? "false" : "true"}\n} }\n`,
+          stderr: "",
+        };
+      }
+      if (command === "launchctl" && args[0] === "enable") {
+        expect(args[1]).toBe(`gui/501/${worker.label}`);
+        enabled = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (command === "launchctl" && args[0] === "bootstrap") {
+        expect(enabled).toBe(true);
+        loaded = true;
+        return { stdout: "", stderr: "" };
+      }
+      if (command === "plutil") return { stdout: plist, stderr: "" };
+      if (command === "ps" && args.includes("comm=")) return { stdout: `${nodePath}\n`, stderr: "" };
+      if (command === "ps") return { stdout: row, stderr: "" };
+      if (command === "lsof" && args.includes("cwd")) return { stdout: `p123\nfcwd\nn${hiveHome}\n`, stderr: "" };
+      if (command === "lsof") return { stdout: `p123\nftxt\nn${nodePath}\n`, stderr: "" };
+      throw new Error(`unexpected command ${command} ${args.join(" ")}`);
+    });
+    const io = makeIO({
+      execFile: exec,
+      lstat: vi.fn(async (path) => {
+        if (path.includes("Library/LaunchAgents")) throw enoent();
+        return stat();
+      }),
+    });
+
+    const inspection = await controller(io).bootstrap(worker);
+    expect(inspection.livePID).toBe(123);
+    expect(exec.mock.calls.filter(([, args]) => args[0] === "enable")).toHaveLength(1);
+    expect(exec.mock.calls.filter(([, args]) => args[0] === "bootstrap")).toHaveLength(1);
+    expect(exec.mock.calls.some(([, args]) => String(args[1] ?? "").includes("keepur"))).toBe(false);
+  });
+
+  it("removeWorkerLink disables and unlinks only the target worker registration", async () => {
+    const pair = definitions();
+    const workerLink = `${userHome}/Library/LaunchAgents/${pair.worker.label}.plist`;
+    const engineLink = `${userHome}/Library/LaunchAgents/${pair.engine.label}.plist`;
+    const unlinked: string[] = [];
+    const plist = JSON.stringify({
+      Label: pair.worker.label,
+      ProgramArguments: [pair.worker.nodePath, pair.worker.entrypoint, ...pair.worker.args],
+      WorkingDirectory: pair.worker.hiveHome,
+      EnvironmentVariables: buildServiceEnvironment(pair.worker),
+    });
+    const exec = vi.fn(async (command: string, args: readonly string[]) => {
+      if (command === "launchctl" && args[0] === "print") throw unloaded();
+      if (command === "launchctl" && args[0] === "print-disabled") {
+        return { stdout: `{ disabled services = {\n\t"${pair.worker.label}" => false\n} }\n`, stderr: "" };
+      }
+      if (command === "launchctl" && args[0] === "disable") {
+        expect(args[1]).toBe(`gui/501/${pair.worker.label}`);
+        return { stdout: "", stderr: "" };
+      }
+      if (command === "plutil") return { stdout: plist, stderr: "" };
+      throw new Error(`unexpected command ${command} ${args.join(" ")}`);
+    });
+    const io = makeIO({
+      execFile: exec,
+      lstat: vi.fn(async (path) => {
+        if (path === workerLink) return stat("symlink");
+        if (path === engineLink) return stat("symlink");
+        return stat();
+      }),
+      readlink: vi.fn(async () => `${hiveHome}/service/${pair.worker.label}.plist`),
+      unlink: vi.fn(async (path) => {
+        unlinked.push(path);
+      }),
+    });
+
+    await expect(controller(io).removeWorkerLink(pair.engine)).rejects.toThrow("expected voice-worker definition");
+    await controller(io).removeWorkerLink(pair.worker);
+    expect(unlinked).toEqual([workerLink]);
+    expect(exec.mock.calls.filter(([, args]) => args[0] === "disable")).toHaveLength(1);
+    expect(exec.mock.calls.some(([, args]) => args[0] === "bootout" || args[0] === "kill")).toBe(false);
+
+    const live = vi.fn(async (command: string, args: readonly string[]) => {
+      if (command === "launchctl" && args[0] === "print") return { stdout: "state = running\npid = 123\n", stderr: "" };
+      if (command === "launchctl" && args[0] === "print-disabled") {
+        return { stdout: "{ disabled services = {} }", stderr: "" };
+      }
+      if (command === "plutil") return { stdout: plist, stderr: "" };
+      if (command === "ps" && args.includes("comm=")) return { stdout: `${nodePath}\n`, stderr: "" };
+      if (command === "ps") {
+        return {
+          stdout: `  123   1 Mon Sep  8 12:34:56 2026 ${pair.worker.nodePath} ${pair.worker.entrypoint} start\n`,
+          stderr: "",
+        };
+      }
+      if (command === "lsof" && args.includes("cwd")) return { stdout: `p123\nfcwd\nn${hiveHome}\n`, stderr: "" };
+      if (command === "lsof") return { stdout: `p123\nftxt\nn${nodePath}\n`, stderr: "" };
+      throw new Error(`unexpected command ${command}`);
+    });
+    await expect(
+      controller(
+        makeIO({
+          execFile: live,
+          lstat: vi.fn(async (path) => (path.includes("Library/LaunchAgents") ? stat("symlink") : stat())),
+          readlink: vi.fn(async () => `${hiveHome}/service/${pair.worker.label}.plist`),
+        }),
+      ).removeWorkerLink(pair.worker),
+    ).rejects.toThrow("cannot remove a live worker registration");
   });
 
   it("rejects another instance label before invoking launchctl", async () => {
@@ -701,6 +826,10 @@ describe("signal fence, ordered restore and observation-only adapters", () => {
       }
       if (command === "launchctl" && args[0] === "print-disabled")
         return { stdout: "{ disabled services = {} }", stderr: "" };
+      if (command === "launchctl" && (args[0] === "enable" || args[0] === "disable")) {
+        events.push(`${args[0]}:${args[1]}`);
+        return { stdout: "", stderr: "" };
+      }
       if (command === "launchctl" && args[0] === "bootstrap") {
         const label = args[2].includes("voice-worker") ? pair.worker.label : pair.engine.label;
         events.push(`bootstrap:${label.endsWith("agent") ? "engine" : "worker"}`);
@@ -782,6 +911,18 @@ describe("signal fence, ordered restore and observation-only adapters", () => {
       "engine-check:900",
       "bootstrap:worker",
     ]);
+  });
+
+  it("restores a captured disabled transition without bootstrapping or touching another instance", async () => {
+    const { ctl, snapshot, events, exec } = restoreHarness();
+    for (const service of snapshot.services) service.enabled = false;
+    await ctl.restoreFilesAndState(snapshot);
+    expect(events.filter((event) => event.startsWith("disable:"))).toEqual([
+      `disable:gui/501/${definitions().engine.label}`,
+      `disable:gui/501/${definitions().worker.label}`,
+    ]);
+    expect(exec.mock.calls.some(([, args]) => args[0] === "bootstrap")).toBe(false);
+    expect(exec.mock.calls.some(([, args]) => String(args[1] ?? "").includes("keepur"))).toBe(false);
   });
 
   it("refuses to restore over a still-loaded registration", async () => {

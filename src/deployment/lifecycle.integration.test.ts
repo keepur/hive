@@ -98,6 +98,40 @@ describe("S9 lifecycle integration (actual frozen helper)", { timeout: INTEGRATI
     expect(oldUpdaterCalled(fx)).toBe(false);
   });
 
+  it("keeps a second instance's process state, labels and .hive-state distinct", async () => {
+    const a = await fixture({ packed: C, seedHive: C, instanceId: "s9a" });
+    const b = await fixture({ packed: C, seedHive: C, instanceId: "s9b" });
+    expect(invokeHelper(a, ["--start"]).status).toBe(0);
+    expect(invokeHelper(b, ["--start"]).status).toBe(0);
+    const aEngine = join(a.hiveHome, "service", "com.hive.s9a.agent.plist");
+    const bEngine = join(b.hiveHome, "service", "com.hive.s9b.agent.plist");
+    const aWorker = join(a.hiveHome, "service", "com.hive.s9a.voice-worker.plist");
+    const bWorker = join(b.hiveHome, "service", "com.hive.s9b.voice-worker.plist");
+    expect(readFileSync(aEngine, "utf8")).toContain(`com.hive.s9a.agent`);
+    expect(readFileSync(bEngine, "utf8")).toContain(`com.hive.s9b.agent`);
+    expect(readFileSync(aEngine, "utf8")).not.toContain("com.hive.s9b.");
+    expect(readFileSync(bEngine, "utf8")).not.toContain("com.hive.s9a.");
+    expect(readFileSync(aWorker, "utf8")).toContain(join(a.hiveHome, ".hive", "pkg", "voice-worker.min.js"));
+    expect(readFileSync(bWorker, "utf8")).toContain(join(b.hiveHome, ".hive", "pkg", "voice-worker.min.js"));
+    const aIdentity = JSON.parse(readFileSync(join(a.hiveHome, ".hive-state", "runtime", "engine.json"), "utf8")) as {
+      pid: number;
+    };
+    const bIdentity = JSON.parse(readFileSync(join(b.hiveHome, ".hive-state", "runtime", "engine.json"), "utf8")) as {
+      pid: number;
+    };
+    expect(aIdentity.pid).toBeGreaterThan(1);
+    expect(bIdentity.pid).toBeGreaterThan(1);
+    expect(aIdentity.pid).not.toBe(bIdentity.pid);
+    expect(existsSync(join(a.hiveHome, ".hive-state", "runtime", "voice-worker.json"))).toBe(true);
+    expect(existsSync(join(b.hiveHome, ".hive-state", "runtime", "voice-worker.json"))).toBe(true);
+    expect(readFileSync(join(a.hiveHome, "hive.yaml.sentinel"), "utf8")).toBe("preserve-me\n");
+    expect(readFileSync(join(b.hiveHome, "hive.yaml.sentinel"), "utf8")).toBe("preserve-me\n");
+    expect(invokeHelper(a, ["--stop"]).status).toBe(0);
+    expect(invokeHelper(b, ["--stop"]).status).toBe(0);
+    expect(existsSync(join(b.hiveHome, ".hive-state"))).toBe(true);
+    expect(existsSync(join(a.hiveHome, ".hive-state"))).toBe(true);
+  });
+
   it("fails staging before signals when sandbox-exec is missing, and rolls back without it", async () => {
     const fx = await fixture({ packed: C, seedHive: C, flags: { hideSandboxExec: true } });
     const update = invokeHelper(fx, [`--artifact=${C.tgz}`]);
