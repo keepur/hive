@@ -71,6 +71,7 @@ import { RegistryUnresolvedError } from "./pilot-records.js";
 import { ServiceController } from "./services.js";
 import { DeferredMaintenance } from "./transaction.js";
 import { planBetaPluginCompatibility } from "./plugin-compat.js";
+import { resolveHostNpmCli } from "./host-npm.js";
 
 export interface DeploymentArguments extends Omit<LifecycleCommand, "mode"> {
   mode: LifecycleMode | NonLifecycleMode;
@@ -291,22 +292,11 @@ function requireRegistrySelector(path: string | undefined, selected: SelectedIns
   }
 }
 
-async function hostNpmCli(env: NodeJS.ProcessEnv): Promise<string> {
-  if (!env.PATH) throw new Error("explicit PATH is required to resolve npm");
-  const found = execFileSync("/usr/bin/which", ["npm"], { encoding: "utf8", env: { PATH: env.PATH } }).trim();
-  const npmCli = await realpath(found);
-  const info = await lstat(npmCli);
-  if (!info.isFile() || info.isSymbolicLink() || !npmCli.endsWith("/bin/npm-cli.js")) {
-    throw new Error("host npm prerequisite must resolve to its real npm-cli.js");
-  }
-  return npmCli;
-}
-
 async function bootstrapDeps(env: NodeJS.ProcessEnv): Promise<BootstrapDeps> {
   if (!env.HOME || !isAbsolute(env.HOME) || !env.PATH) throw new Error("explicit HOME and PATH are required");
   return {
     nodePath: await realpath(process.execPath),
-    npmCliPath: await hostNpmCli(env),
+    npmCliPath: await resolveHostNpmCli(env.PATH),
     pathEnv: env.PATH,
     invokingHome: env.HOME,
     isProcessLive: (owner) => processIsLive(nodeReconcileHostIO, owner),

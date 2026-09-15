@@ -257,6 +257,7 @@ const HELPER_SOURCE_ALLOWLIST = [
   "src/deployment/pilot-probe.ts",
   "src/deployment/reconcile.ts",
   "src/deployment/plugin-compat.ts",
+  "src/deployment/host-npm.ts",
   "src/deployment/host-preparation.ts",
   "src/deployment/canonical.ts",
   "src/deployment/prior.ts",

@@ -4,7 +4,7 @@
  * Requires an already-built package. Uses the production confined-job and
  * clone-promotion path with the real /usr/bin/sandbox-exec on macOS.
  */
-import { fork, spawn, spawnSync } from "node:child_process";
+import { fork, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -12,7 +12,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -33,6 +32,12 @@ import {
 import { selectPromotionMethod } from "../dist/deployment/clone-promotion.js";
 import { stageVerifiedCandidate } from "../dist/deployment/artifact.js";
 import { readRelease, sha256 } from "../dist/deployment/release.js";
+import {
+  jobDenialLines,
+  npmDebugLogPresent,
+  startDenialCollector,
+  trackJobSpawns,
+} from "./sandbox-denial-collector.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const generator = join(repoRoot, "scripts/generate-shrinkwrap.mjs");
@@ -280,74 +285,6 @@ function writeVoiceDisabledConfig(instance) {
   writeFileSync(join(instance, ".env"), "SLACK_APP_TOKEN=xapp-dummy\nSLACK_BOT_TOKEN=xoxb-dummy\n");
 }
 
-function startDenialCollector() {
-  const startedAt = new Date();
-  const child = spawn(
-    "/usr/bin/log",
-    ["stream", "--style", "compact", "--predicate", 'eventMessage CONTAINS "Sandbox:" AND eventMessage CONTAINS "deny"'],
-    { stdio: ["ignore", "pipe", "pipe"] },
-  );
-  const chunks = [];
-  child.stdout?.on("data", (chunk) => chunks.push(chunk));
-  child.stderr?.on("data", (chunk) => chunks.push(chunk));
-  let exitCode = null;
-  child.on("exit", (code) => {
-    exitCode = code;
-  });
-  return {
-    startedAt,
-    pids: new Set(),
-    async stop() {
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 2_000));
-      if (exitCode === null) child.kill("SIGTERM");
-      const streamed = Buffer.concat(chunks).toString("utf8");
-      const start = startedAt.toISOString().replace("T", " ").replace("Z", "");
-      const shown = spawnSync(
-        "/usr/bin/log",
-        [
-          "show",
-          "--style",
-          "compact",
-          "--predicate",
-          'eventMessage CONTAINS "Sandbox:" AND eventMessage CONTAINS "deny"',
-          "--start",
-          start,
-        ],
-        { encoding: "utf8", timeout: 30_000 },
-      );
-      const evidence = `${streamed}\n${shown.stdout ?? ""}\n${shown.stderr ?? ""}`;
-      if (exitCode && exitCode !== 0 && shown.status !== 0 && evidence.trim().length === 0) {
-        throw new Error("sandbox denial evidence unavailable");
-      }
-      return evidence;
-    },
-  };
-}
-
-/** Daemons that log sandbox denials against the job tree without being job descendants. */
-const NON_JOB_SANDBOX_SUBJECTS = new Set(["logd_helper", "logd", "contactsd", "syslogd", "UserEventAgent"]);
-
-function sandboxSubject(line) {
-  const match = line.match(/Sandbox:\s+(\S+?)\((\d+)\)/);
-  return match ? { name: match[1], pid: Number(match[2]) } : null;
-}
-
-function isJobDenial(line, pids, token) {
-  if (!line.includes("Sandbox:") || !/\bdeny\b/i.test(line)) return false;
-  // Production self-test must deny this sibling write; it is not an install leak.
-  if (line.includes(".outside")) return false;
-  const subject = sandboxSubject(line);
-  if (subject && NON_JOB_SANDBOX_SUBJECTS.has(subject.name)) return false;
-  if (subject && pids.has(subject.pid)) return true;
-  // Short-lived descendants (make, node-gyp) may exit before PID sampling; count
-  // them only when the kernel record names this scratch tree.
-  return Boolean(subject && line.includes(token));
-}
-
-function jobDenialLines(evidence, pids, token) {
-  return evidence.split("\n").filter((line) => isJobDenial(line, pids, token));
-}
-
 function printRecord(stdout, prefix) {
   const line = stdout
     .split("\n")
@@ -356,21 +293,6 @@ function printRecord(stdout, prefix) {
   if (!line) throw new Error(`${prefix} record missing`);
   process.stdout.write(`${line}\n`);
   return JSON.parse(line.slice(prefix.length + 1));
-}
-
-function npmDebugLogPresent(jobPath) {
-  const directory = join(jobPath, JOB_WRITE_LOCATIONS.npmLogs);
-  if (!existsSync(directory)) return false;
-  const files = [];
-  const visit = (current) => {
-    for (const entry of readdirSync(current, { withFileTypes: true })) {
-      const path = join(current, entry.name);
-      if (entry.isDirectory()) visit(path);
-      else files.push(path);
-    }
-  };
-  visit(directory);
-  return files.some((file) => /debug/i.test(file) || file.endsWith(".log"));
 }
 
 async function exerciseInstalled(hive, instance, scratchBin, scratchTmp, logPath, expected) {
@@ -484,18 +406,7 @@ async function main() {
       nodePath,
     });
     const collector = startDenialCollector();
-    const trackedIO = {
-      ...nodeConfinedJobIO,
-      spawn(command, args, options) {
-        return nodeConfinedJobIO.spawn(command, args, {
-          ...options,
-          onSpawn(pid) {
-            collector.pids.add(pid);
-            options.onSpawn?.(pid);
-          },
-        });
-      },
-    };
+    const trackedIO = trackJobSpawns(nodeConfinedJobIO, collector);
     const jobsParent = join(canonicalHome, ".hive-state", "jobs", operationId);
     mkdirSync(jobsParent, { recursive: true, mode: 0o700 });
     const promotion = await selectPromotionMethod({
@@ -531,7 +442,7 @@ async function main() {
         `sandbox denials during confined install: ${denials}\n${denialLines.slice(0, 20).join("\n")}`,
       );
     }
-    if (!npmDebugLogPresent(stagedCandidate.installed.job.job.path)) {
+    if (!npmDebugLogPresent(stagedCandidate.installed.job.job.path, JOB_WRITE_LOCATIONS.npmLogs)) {
       throw new Error("npm debug log missing from the install job directory");
     }
     const hive = join(canonicalHome, ".hive");

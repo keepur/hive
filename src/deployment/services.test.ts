@@ -1,9 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   ServiceController,
   buildServiceDefinitions,
   buildServiceEnvironment,
   buildServicePlist,
+  captureProgramArguments,
   getServiceLabel,
   getServiceLaunchAgentLink,
   getServicePlistPath,
@@ -823,17 +827,19 @@ describe("read-only first-capture discovery", () => {
       processChanges?: boolean;
       foreignWritable?: boolean;
       instancePlistExists?: boolean;
+      programArguments?: (label: string) => string[];
     } = {},
   ) {
     const mutations: string[] = [];
     let psCalls = 0;
-    const plistFor = (label: string) =>
-      JSON.stringify({
+    const argsFor = (label: string) => {
+      const entry = label.endsWith("agent") ? "pkg/server.min.js" : "dist/voice-worker/main.js";
+      return options.programArguments?.(label) ?? [nodePath, `${pilotRoot}/${entry}`];
+    };
+    const plistFor = (label: string) => {
+      return JSON.stringify({
         Label: label,
-        ProgramArguments: [
-          nodePath,
-          `${pilotRoot}/${label.endsWith("agent") ? "pkg/server.min.js" : "dist/voice-worker/main.js"}`,
-        ],
+        ProgramArguments: argsFor(label),
         WorkingDirectory: hiveHome,
         StandardOutPath: `${hiveHome}/logs/${label}.log`,
         StandardErrorPath: `${hiveHome}/logs/${label}.err`,
@@ -844,6 +850,7 @@ describe("read-only first-capture discovery", () => {
           PATH: "/usr/bin",
         },
       });
+    };
     const exec = vi.fn(async (command: string, args: readonly string[]) => {
       if (command === "launchctl" && args[0] === "print") {
         return { stdout: `state = running\npid = ${args[1].endsWith("agent") ? 700 : 701}\n`, stderr: "" };
@@ -867,9 +874,10 @@ describe("read-only first-capture discovery", () => {
       if (command === "ps") {
         psCalls += 1;
         const pid = Number(args[args.indexOf("-p") + 1]);
-        const entry = pid === 700 ? "pkg/server.min.js" : "dist/voice-worker/main.js";
+        const label =
+          pid === 700 ? getServiceLabel("personal_1", "engine") : getServiceLabel("personal_1", "voice-worker");
         const start = options.processChanges && psCalls > 2 ? "Mon Sep  8 13:00:00 2026" : "Mon Sep  8 12:34:56 2026";
-        return { stdout: `  ${pid}   1 ${start} ${nodePath} ${pilotRoot}/${entry}\n`, stderr: "" };
+        return { stdout: `  ${pid}   1 ${start} ${argsFor(label).join(" ")}\n`, stderr: "" };
       }
       if (command === "lsof" && args.includes("cwd")) return { stdout: `p1\nfcwd\nn${hiveHome}\n`, stderr: "" };
       if (command === "lsof") return { stdout: `p1\nftxt\nn${nodePath}\n`, stderr: "" };
@@ -965,5 +973,57 @@ describe("read-only first-capture discovery", () => {
     const { io, mutations } = discoveryHarness(options);
     await expect(discoveryController(io, validator).discoverForCapture({})).rejects.toThrow(message);
     expect(mutations).toEqual([]);
+  });
+
+  it("captures packaged worker argv with a non-path start token", async () => {
+    const { io, mutations } = discoveryHarness({
+      programArguments: (label) =>
+        label.endsWith("voice-worker")
+          ? [nodePath, `${pilotRoot}/pkg/voice-worker.min.js`, "start"]
+          : [nodePath, `${pilotRoot}/pkg/server.min.js`],
+    });
+    const found = await discoveryController(io, async () => lease).discoverForCapture({});
+    expect(found[1].effectivePlist.path).toBe(`${pilotRoot}/com.hive.personal_1.voice-worker.plist`);
+    expect(mutations).toEqual([]);
+  });
+});
+
+describe("captureProgramArguments", () => {
+  it("accepts packaged [abs-node, abs-voice-worker.min.js, start]", () => {
+    expect(
+      captureProgramArguments(
+        [nodePath, "/Users/example/services/hive/.hive/pkg/voice-worker.min.js", "start"],
+        hiveHome,
+      ),
+    ).toEqual([nodePath, "/Users/example/services/hive/.hive/pkg/voice-worker.min.js", "start"]);
+  });
+
+  it("accepts pilot [abs-node, relative dist/voice-worker/main.js, start] against an absolute WorkingDirectory", () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "hive-capture-argv-")));
+    try {
+      const relative = join("dist", "voice-worker", "main.js");
+      mkdirSync(join(root, "dist", "voice-worker"), { recursive: true });
+      writeFileSync(join(root, relative), "");
+      expect(captureProgramArguments([nodePath, relative, "start"], root)).toEqual([nodePath, relative, "start"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects empty argv", () => {
+    expect(() => captureProgramArguments([], hiveHome)).toThrow("ProgramArguments are empty");
+    expect(() => captureProgramArguments(undefined, hiveHome)).toThrow("ProgramArguments are empty");
+  });
+
+  it("rejects a relative entrypoint that does not exist after resolve", () => {
+    expect(() => captureProgramArguments([nodePath, "dist/voice-worker/main.js", "start"], hiveHome)).toThrow(
+      "ProgramArguments entrypoint does not exist under WorkingDirectory",
+    );
+  });
+
+  it("rejects a non-absolute Node executable", () => {
+    expect(() =>
+      captureProgramArguments(["node", "/Users/example/pkg/voice-worker.min.js", "start"], hiveHome),
+    ).toThrow("ProgramArguments node executable must be an absolute path");
   });
 });

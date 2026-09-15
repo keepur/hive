@@ -11,9 +11,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const commands: { command: string; args: readonly string[] }[] = [];
+const hostNpmRoot = mkdtempSync(join(tmpdir(), "hive-host-npm-cli-"));
+const hostNpmCliFixture = join(hostNpmRoot, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+mkdirSync(dirname(hostNpmCliFixture), { recursive: true });
+writeFileSync(hostNpmCliFixture, "#!/usr/bin/env node\n");
 vi.mock("node:child_process", async (original) => {
   const actual = await original<typeof import("node:child_process")>();
   return {
@@ -25,7 +29,9 @@ vi.mock("node:child_process", async (original) => {
       callback: (...values: unknown[]) => void,
     ) => {
       commands.push({ command, args });
-      if (command === "which") return callback(null, { stdout: `${process.execPath}\n`, stderr: "" });
+      if (command === "which" || command === "/usr/bin/which") {
+        return callback(null, { stdout: `${hostNpmCliFixture}\n`, stderr: "" });
+      }
       return callback(Object.assign(new Error(`unexpected host command in unit test: ${command}`), { code: 1 }));
     },
   };
@@ -600,7 +606,7 @@ describe("lifecycle wiring of the pilot routes", () => {
         { HOME: root, PATH: "/usr/bin:/bin", HIVE_CONFIG: "hive.yaml" },
       ),
     ).rejects.toBeInstanceOf(MigrationPendingError);
-    expect(commands.map((entry) => entry.command)).toEqual(["which"]);
+    expect(commands.map((entry) => entry.command)).toEqual(["/usr/bin/which"]);
     expect(existsSync(operation.paths.priorSnapshot)).toBe(false);
     expect(existsSync(resolve(operation.record.canonicalHome, ".hive.next"))).toBe(false);
     const record = JSON.parse(readFileSync(operation.paths.currentRecord, "utf8"));
@@ -627,7 +633,7 @@ describe("lifecycle wiring of the pilot routes", () => {
         { HOME: root, PATH: "/usr/bin:/bin", HIVE_CONFIG: "hive.yaml" },
       ),
     ).rejects.toBeInstanceOf(MigrationPendingError);
-    expect(commands.map((entry) => entry.command)).toEqual(["which"]);
+    expect(commands.map((entry) => entry.command)).toEqual(["/usr/bin/which"]);
     expect(JSON.parse(readFileSync(operation.paths.currentRecord, "utf8"))).toMatchObject({
       resolution: "deferred",
       signalsBegun: false,
@@ -752,7 +758,7 @@ describe("native first migration through runNodeLifecycle", () => {
     const prior = JSON.parse(readFileSync(b.operation.paths.priorSnapshot, "utf8"));
     expect(prior.pilot).toMatchObject({ snapshotPath: b.pilot.selector, snapshotSha256: b.pilot.sha256 });
     // Only host `which` ran; no launchd, sandbox-exec, npm or vendor call.
-    expect(commands.map((entry) => entry.command)).toEqual(["which"]);
+    expect(commands.map((entry) => entry.command)).toEqual(["/usr/bin/which"]);
     await finishOperationLock(b.operation);
   });
 

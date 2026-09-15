@@ -19,8 +19,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  jobDenialLines,
+  npmDebugLogPresent,
+  startDenialCollector,
+  trackJobSpawns,
+} from "./sandbox-denial-collector.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -99,14 +105,20 @@ if (process.platform !== "darwin" || process.arch !== "arm64" || major !== 24) {
 const {
   ConfinedJobRunner,
   JOB_WRITE_LOCATIONS,
+  nodeConfinedJobIO,
   requireJobSuccess,
   runConfinementSelfTest,
 } = await import("../dist/deployment/confined-job.js");
-const { selectPromotionMethod } = await import("../dist/deployment/clone-promotion.js");
-const { stageVerifiedCandidate } = await import("../dist/deployment/artifact.js");
+const { CANDIDATE_RUNTIME_LOADING_PROBES, promoteAndVerify, releaseIdentity, selectPromotionMethod } = await import(
+  "../dist/deployment/clone-promotion.js"
+);
+const { extractAndValidateArtifact, installStagedArtifact, resolveArtifact } = await import(
+  "../dist/deployment/artifact.js"
+);
 
 const { artifact: selected } = parseArgs(process.argv);
 const scratch = mkdtempSync(join(tmpdir(), "hive-t10-"));
+const token = scratch.split(sep).at(-1) ?? "hive-t10";
 try {
   const artifact = selected ?? packRepository(join(scratch, "pack"));
   if (!existsSync(artifact) || !artifact.endsWith(".tgz")) throw new Error(`T10 artifact missing: ${artifact}`);
@@ -134,22 +146,63 @@ try {
     sourceParent: jobsParent,
     destinationParent: canonicalHome,
   });
-  const runner = new ConfinedJobRunner({ canonicalInstanceHome: canonicalHome, operationId, selfTest });
+  let activeCollector = null;
+  const runner = new ConfinedJobRunner({
+    canonicalInstanceHome: canonicalHome,
+    operationId,
+    selfTest,
+    io: trackJobSpawns(nodeConfinedJobIO, () => activeCollector),
+  });
+  const staging = {
+    runner,
+    nodePath,
+    npmCliPath,
+    invokingHome: home,
+    pathEnv: process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin",
+    archiveDirectory: join(canonicalHome, ".hive-state", "archives", operationId),
+    promotionMethod: promotion.method,
+  };
   const nextDir = join(canonicalHome, ".hive.next");
-  const staged = await stageVerifiedCandidate({
-    selector: { artifact },
-    context: {
+  const resolved = await resolveArtifact({ artifact }, staging);
+
+  const collectorB = startDenialCollector();
+  activeCollector = collectorB;
+  const extracted = await extractAndValidateArtifact(resolved, staging, false);
+  const installed = await installStagedArtifact(extracted, staging);
+  const evidenceB = await collectorB.stop();
+  const denialsB = jobDenialLines(evidenceB, collectorB.pids, token).length;
+  if (denialsB !== 0) {
+    throw new Error(`T10(b) sandbox denials during confined install: ${denialsB}`);
+  }
+  if (!npmDebugLogPresent(installed.job.job.path, JOB_WRITE_LOCATIONS.npmLogs)) {
+    throw new Error("T10(b) npm debug log missing from the install job directory");
+  }
+
+  const collectorD = startDenialCollector();
+  activeCollector = collectorD;
+  const { verification } = await promoteAndVerify({
+    source: installed.root,
+    destination: nextDir,
+    method: staging.promotionMethod,
+    verification: {
+      archiveSha256: resolved.archiveSha256,
+      expectedRelease: releaseIdentity(extracted.release),
+      requireClean: false,
+      archiveMembers: extracted.archiveMembers,
       runner,
       nodePath,
       npmCliPath,
-      invokingHome: home,
-      pathEnv: process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin",
-      archiveDirectory: join(canonicalHome, ".hive-state", "archives", operationId),
-      promotionMethod: promotion.method,
+      pathEnv: staging.pathEnv,
+      dependencyTree: true,
+      runtimeLoading: CANDIDATE_RUNTIME_LOADING_PROBES,
     },
-    destination: nextDir,
-    requireClean: false,
   });
+  const evidenceD = await collectorD.stop();
+  activeCollector = null;
+  const denialsD = jobDenialLines(evidenceD, collectorD.pids, token).length;
+  if (denialsD !== 0) {
+    throw new Error(`T10(d) sandbox denials during runtime-loading: ${denialsD}`);
+  }
   const hive = join(canonicalHome, ".hive");
   renameSync(nextDir, hive);
 
@@ -174,7 +227,9 @@ try {
       "  if (parent === dir) throw new Error('agents-root');",
       "  dir = parent;",
       "}",
-      "const sdkChild = join(dir, 'dist', 'ipc', 'job_proc_lazy_main.js');",
+      "const jobHelper = join(dir, 'dist', 'ipc', 'job_proc_lazy_main.js');",
+      "const inferenceHelper = join(dir, 'dist', 'ipc', 'inference_proc_lazy_main.js');",
+      "if (!existsSync(jobHelper) || !existsSync(inferenceHelper)) throw new Error('sdk helper missing');",
       "const inference = requireFrom.resolve('@livekit/local-inference');",
       "const rtc = await import('@livekit/rtc-node');",
       "const silero = await import('@livekit/agents-plugin-silero');",
@@ -182,26 +237,29 @@ try {
       "await silero.VAD.load({ forceCPU: true });",
       "await room.disconnect();",
       "await rtc.dispose();",
-      "await new Promise((resolve, reject) => {",
-      "  const child = fork(sdkChild, [worker], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });",
-      "  const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('sdk timeout')); }, 15000);",
-      "  let initialized = false;",
-      "  child.on('message', (message) => {",
-      "    if (message?.case === 'initializeResponse') {",
-      "      initialized = true;",
-      "      child.send({ case: 'shutdownRequest', value: {} });",
-      "    }",
+      "async function waitInitialized(child) {",
+      "  await new Promise((resolve, reject) => {",
+      "    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('sdk timeout')); }, 15000);",
+      "    let initialized = false;",
+      "    child.on('message', (message) => {",
+      "      if (message?.case === 'initializeResponse') {",
+      "        initialized = true;",
+      "        child.send({ case: 'shutdownRequest', value: {} });",
+      "      }",
+      "    });",
+      "    child.send({ case: 'initializeRequest', value: { loggerOptions: { level: 'error', pretty: false } } });",
+      "    child.on('exit', (code, signal) => {",
+      "      clearTimeout(timer);",
+      "      if (!initialized) reject(new Error('sdk exit without initializeResponse'));",
+      "      else if (code) reject(new Error('sdk exit ' + code));",
+      "      else if (signal) reject(new Error('sdk signal ' + signal));",
+      "      else resolve();",
+      "    });",
       "  });",
-      "  child.send({ case: 'initializeRequest', value: { loggerOptions: { level: 'error', pretty: false } } });",
-      "  child.on('exit', (code, signal) => {",
-      "    clearTimeout(timer);",
-      "    if (!initialized) reject(new Error('sdk exit without initializeResponse'));",
-      "    else if (code) reject(new Error('sdk exit ' + code));",
-      "    else if (signal) reject(new Error('sdk signal ' + signal));",
-      "    else resolve();",
-      "  });",
-      "});",
-      "process.stdout.write(JSON.stringify({ sdkChild, inference, ok: true }) + '\\n');",
+      "}",
+      "await waitInitialized(fork(jobHelper, [worker], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }));",
+      "await waitInitialized(fork(inferenceHelper, [JSON.stringify({})], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }));",
+      "process.stdout.write(JSON.stringify({ sdkChild: jobHelper, jobHelper, inferenceHelper, inference, ok: true }) + '\\n');",
       "",
     ].join("\n")}`,
   );
@@ -218,20 +276,27 @@ try {
   );
 
   const macos = spawnSync("/usr/bin/sw_vers", ["-productVersion"], { encoding: "utf8" });
-  const runtimeJobs = staged.verification.jobs.filter((job) => job.record.kind === "runtime-loading");
+  const runtimeJobs = verification.jobs.filter((job) => job.record.kind === "runtime-loading");
+  const sdk = JSON.parse(sdkJob.stdout.toString("utf8") || "{}");
   process.stdout.write(
     `T10_CLOSURE ${JSON.stringify({
       a: { selfTest: selfTest.outcome, macosVersion: selfTest.macosVersion },
       b: {
-        installExit: staged.installed.job.exitCode,
-        npmLogs: existsSync(join(staged.installed.job.job.path, JOB_WRITE_LOCATIONS.npmLogs)),
+        installExit: installed.job.exitCode,
+        npmLogs: npmDebugLogPresent(installed.job.job.path, JOB_WRITE_LOCATIONS.npmLogs),
+        denials: denialsB,
       },
-      c: { sdk: JSON.parse(sdkJob.stdout.toString("utf8") || "{}") },
+      c: {
+        sdk,
+        jobHelper: sdk.jobHelper,
+        inferenceHelper: sdk.inferenceHelper,
+      },
       d: {
         jobs: runtimeJobs.map((job) => ({
           exitCode: job.exitCode,
           stdout: job.stdout.toString("utf8").slice(0, 4_096),
         })),
+        denials: denialsD,
       },
       e: {
         macosVersion: macos.stdout.trim(),

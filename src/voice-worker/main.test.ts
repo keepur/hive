@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { bootIdentityForModule } from "../deployment/release.js";
 import { createMaintenanceSupervisor } from "./maintenance-ipc.js";
 
 const mocks = vi.hoisted(() => ({
@@ -34,7 +35,7 @@ vi.mock("mongodb", () => ({
   }),
 }));
 
-import voiceAgent, { isEntrypoint } from "./main.js";
+import voiceAgent, { isEntrypoint, persistVoiceWorkerBootIdentity } from "./main.js";
 
 const WORKER_CONFIG = {
   instanceHome: "/fixture/hive",
@@ -152,6 +153,35 @@ describe("isEntrypoint (KPR-428)", () => {
     writeFileSync(real, "");
     const missing = join(tmp, "does-not-exist.ts");
     expect(isEntrypoint(missing, moduleUrlFor(real))).toBe(false);
+  });
+});
+
+describe("persistVoiceWorkerBootIdentity (KPR-463)", () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = realpathSync(mkdtempSync(join(tmpdir(), "voice-worker-boot-identity-")));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("writes the production runtime record without the S9 stand-in", () => {
+    const modulePath = join(home, "src", "voice-worker", "main.js");
+    mkdirSync(join(home, "src", "voice-worker"), { recursive: true });
+    writeFileSync(modulePath, "");
+    const identity = bootIdentityForModule(pathToFileURL(modulePath).href, "voice-worker");
+
+    const record = persistVoiceWorkerBootIdentity(home, identity);
+
+    expect(record).toBe(join(home, ".hive-state", "runtime", "voice-worker.json"));
+    expect(JSON.parse(readFileSync(record, "utf8"))).toEqual(identity);
+  });
+
+  it("rejects a non-absolute instance home", () => {
+    const identity = bootIdentityForModule(import.meta.url, "voice-worker");
+    expect(() => persistVoiceWorkerBootIdentity("relative-home", identity)).toThrow("instance home must be absolute");
   });
 });
 

@@ -1,9 +1,15 @@
 import { defineAgent, cli, WorkerOptions, type JobContext } from "@livekit/agents";
 import { MongoClient } from "mongodb";
 import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { bootIdentityForModule, bootIdentityLogFields, packageRootForModule } from "../deployment/release.js";
+import {
+  bootIdentityForModule,
+  bootIdentityLogFields,
+  packageRootForModule,
+  writeBootIdentityRecord,
+  type BootIdentity,
+} from "../deployment/release.js";
 import { createLogger } from "../logging/logger.js";
 import { resolveCell } from "./cells.js";
 import { parseDispatchMetadata } from "./dispatch-meta.js";
@@ -76,12 +82,24 @@ export function isEntrypoint(argv1: string | undefined, moduleUrl: string): bool
   }
 }
 
+/**
+ * Persist the supervisor boot identity consumed by runtime health checks.
+ * Production launchd runs this process; the S9 stand-in is not a writer.
+ */
+export function persistVoiceWorkerBootIdentity(instanceHome: string, identity: BootIdentity): string {
+  if (!isAbsolute(instanceHome)) throw new Error("instance home must be absolute");
+  const path = resolve(instanceHome, ".hive-state", "runtime", "voice-worker.json");
+  writeBootIdentityRecord(path, identity);
+  return path;
+}
+
 if (isEntrypoint(process.argv[1], import.meta.url)) {
   void (async () => {
     const [{ livekitServerAuth, loadWorkerConfig }, { VoiceWorkerHeartbeat }, { ServiceController }] =
       await Promise.all([import("./worker-config.js"), import("./telemetry.js"), import("../deployment/services.js")]);
     const wc = loadWorkerConfig();
     const identity = bootIdentityForModule(import.meta.url, "voice-worker");
+    persistVoiceWorkerBootIdentity(wc.instanceHome, identity);
     const supervisorRef = { pid: identity.pid, bootId: identity.bootId };
     const processInspector = new ServiceController({
       instanceId: wc.instanceId,

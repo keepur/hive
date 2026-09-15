@@ -25,6 +25,7 @@ import {
   readEngineMarkersAfter,
 } from "./health.js";
 import { contained, readRelease, type BootIdentity, type Release } from "./release.js";
+import { resolveHostNpmCli } from "./host-npm.js";
 import {
   directoryIdentity,
   disposeOwnedDirectory,
@@ -397,14 +398,7 @@ export async function runNodeLifecycle(
   const clock = options.clock ?? defaultClock;
   let context = await resolveLifecycleContext(operation, environment);
   const home = context.home;
-  const npmLookup = await execFile("which", ["npm"], {
-    env: { PATH: context.pathEnv },
-    encoding: "utf8",
-    maxBuffer: 64 * 1024,
-  });
-  const npmPath = await realpath(npmLookup.stdout.trim());
-  const npmInfo = await lstat(npmPath);
-  if (!npmInfo.isFile() || npmInfo.isSymbolicLink()) throw new Error("host npm prerequisite is not a regular file");
+  const npmPath = await resolveHostNpmCli(context.pathEnv);
   operation.record.hostNodePath = await realpath(process.execPath);
   operation.record.hostNpmPath = npmPath;
   await persistOperation(operation);

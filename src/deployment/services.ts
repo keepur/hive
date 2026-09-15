@@ -1,4 +1,5 @@
 import { execFile as nodeExecFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import {
   access,
   chmod,
@@ -171,6 +172,42 @@ export function buildServiceDefinitions(input: ServiceDefinitionInput): {
   };
   reconcileServiceOverrides([engine, worker]);
   return { engine, worker };
+}
+
+/**
+ * Documented launchd argv: absolute Node, an entrypoint that is absolute or
+ * exists after resolve against WorkingDirectory, then optional non-path
+ * tokens such as `start`. Empty argv is never accepted.
+ */
+export function captureProgramArguments(
+  args: unknown,
+  workingDirectory: string,
+  exists: (path: string) => boolean = existsSync,
+): string[] {
+  if (!Array.isArray(args) || args.length === 0) {
+    throw new Error("ProgramArguments are empty");
+  }
+  if (!args.every((item) => typeof item === "string" && item.length > 0)) {
+    throw new Error("ProgramArguments are not documented executable argv");
+  }
+  if (args.length < 2) {
+    throw new Error("ProgramArguments must include node and an entrypoint");
+  }
+  if (typeof workingDirectory !== "string" || !isAbsolute(workingDirectory)) {
+    throw new Error("WorkingDirectory is invalid");
+  }
+  const argv = args as string[];
+  if (!isAbsolute(argv[0]!)) {
+    throw new Error("ProgramArguments node executable must be an absolute path");
+  }
+  const entrypoint = argv[1]!;
+  if (!isAbsolute(entrypoint)) {
+    const resolved = resolve(workingDirectory, entrypoint);
+    if (!exists(resolved)) {
+      throw new Error("ProgramArguments entrypoint does not exist under WorkingDirectory");
+    }
+  }
+  return argv;
 }
 
 export function reconcileServiceOverrides(definitions: readonly ServiceDefinition[]): void {
@@ -1015,15 +1052,15 @@ export class ServiceController {
     lease: CaptureTicketLease,
   ): { args: string[]; cwd: string; environment: Record<string, string>; stdout: string; stderr: string } {
     if (!fields || fields.Label !== label) throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} plist label mismatch`);
-    if (
-      !Array.isArray(fields.ProgramArguments) ||
-      fields.ProgramArguments.length < 2 ||
-      !fields.ProgramArguments.every((item) => typeof item === "string" && isAbsolute(item))
-    ) {
-      throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} ProgramArguments are not absolute executable paths`);
-    }
     if (typeof fields.WorkingDirectory !== "string" || !isAbsolute(fields.WorkingDirectory)) {
       throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} WorkingDirectory is invalid`);
+    }
+    let args: string[];
+    try {
+      args = captureProgramArguments(fields.ProgramArguments, fields.WorkingDirectory);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`PILOT_CAPTURE_BLOCKED: ${label} ${message}`, { cause: error });
     }
     const env = fields.EnvironmentVariables;
     if (!env || typeof env !== "object" || Array.isArray(env)) {
@@ -1052,7 +1089,7 @@ export class ServiceController {
       return value;
     };
     return {
-      args: fields.ProgramArguments as string[],
+      args,
       cwd: fields.WorkingDirectory,
       environment,
       stdout: logPath(fields.StandardOutPath),
