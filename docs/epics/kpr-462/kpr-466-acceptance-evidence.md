@@ -1,11 +1,11 @@
 # KPR-466 acceptance evidence
 
-**Status:** 463 T9 not yet passed as of 2026-09-15; preflight not attempted
+**Status:** 463 T9 not yet passed as of 2026-09-15; Task 2 stopped — T9 evidence file absent (P1–P7 not attempted)
 **Ticket-complete?** No — none of the four spec §3.3 terminal states is reachable until T9 passes and P1–P7 are recorded on the live identity.
 **Build/pins:** pending
 **Running identities (read back at session start):** pending
 
-Authored 2026-09-15 (offline only). No instance, database, log, or call was touched to write this record. Later tasks fill cells in the sections below; they do not rename sections, invent a fifth ticket-terminal state, or copy live numbers from sibling evidence files.
+Authored 2026-09-15 (offline only). Task 1 wrote the skeleton. Task 2 (same date) reconfirmed `docs/epics/kpr-462/kpr-463-deployment-evidence.md` is absent in this worktree and in git (`git ls-files` no match), then **stopped**. No instance, database, log, launchd, hive doctor, or call was touched. Later tasks fill cells in the sections below; they do not rename sections, invent a fifth ticket-terminal state, or copy live numbers from sibling evidence files.
 
 Authority: [kpr-466-spec.md](./kpr-466-spec.md) at `ff9ff7b0` (sha256 `f6de0e83b79d04c1592797705d55b1f47fea90048cf69610bfea9a3cddd8adef`). Sibling evidence, referenced not duplicated: [kpr-465-latency-evidence.md](./kpr-465-latency-evidence.md), [kpr-464-startup-evidence.md](./kpr-464-startup-evidence.md). Required T9 input [kpr-463-deployment-evidence.md](./kpr-463-deployment-evidence.md) does not exist (Task 2). Merge SHA `6b993455` is not T9 (canon R17).
 
@@ -13,9 +13,9 @@ Standing Invariant 2: this git-committed record must not contain transcript text
 
 ## 1. Status line
 
-**Status:** `463 T9 not yet passed as of 2026-09-15; preflight not attempted`
+**Status:** `463 T9 not yet passed as of 2026-09-15; Task 2 stopped — T9 evidence file absent (P1–P7 not attempted)`
 
-This is a pre-terminal blocker (plan Task 1: name the actual blocker until a §3.3 state is reachable). It is not a fifth ticket-terminal state name. A reviewer does not need the spec to see that none of the four states below is claimed.
+This is a pre-terminal blocker (plan Task 2: name the actual blocker until a §3.3 state is reachable). It is not a fifth ticket-terminal state name. A reviewer does not need the spec to see that none of the four states below is claimed. Task 1's "preflight not attempted" phrasing is superseded by this Task 2 stop.
 
 | Spec §3.3 terminal state | Ticket complete? | Claimed in this record? |
 | --- | --- | --- |
@@ -24,7 +24,7 @@ This is a pre-terminal blocker (plan Task 1: name the actual blocker until a §3
 | `live end-to-end acceptance failed` | No | no |
 | `live end-to-end acceptance incomplete` | No | no |
 
-Reason the first §3.3 state is not claimed: `docs/epics/kpr-462/kpr-463-deployment-evidence.md` is absent; [kpr-463-operations.md](./kpr-463-operations.md) status remains `implementation verified; migration pending`; merge SHA `6b993455` is not T9 (R17). Preflight (P1–P7) has not been attempted. Task 7 must carry this blocker forward verbatim rather than relabel it as preflight-verified.
+Reason the first §3.3 state is not claimed: `docs/epics/kpr-462/kpr-463-deployment-evidence.md` is absent (Task 2 reconfirmed 2026-09-15). [kpr-463-operations.md](./kpr-463-operations.md) status remains `implementation verified; migration pending`. Merge SHA `6b993455` is not T9 (R17). Task 2 **stopped** without attempting P1–P7 (rows stay `pending`, not `fail`) and without any live probe. Task 7 must carry this blocker forward verbatim rather than relabel it as preflight-verified.
 
 ## 2. Build/pins and running identities
 
@@ -70,6 +70,8 @@ A `dist/` or git-checkout ProgramArguments remains ineligible. Pilot recovery is
 
 No-call checks (spec §5). A failed required row stops the session (no dialing). `hive doctor` green is not P1–P7 (R18). Keepur remains untouched. Do not run `scripts/livekit-setup.ts`.
 
+Task 2 (2026-09-15) did **not** run these checks: T9 evidence is absent, so P1–P7 remain `pending` (not `fail`). No launchd, log, Mongo, hive doctor, or live-instance probe was issued.
+
 | ID | Check | Result | Evidence |
 | --- | --- | --- | --- |
 | P1 | Artifact and process identity | pending | pending |
@@ -86,7 +88,7 @@ No-call checks (spec §5). A failed required row stops the session (no dialing).
 | --- | --- |
 | Evidence file | [kpr-463-deployment-evidence.md](./kpr-463-deployment-evidence.md) — **does not exist** |
 | Digest | pending (file absent) |
-| Restart/rollback (spec §6.1 row R) | pending — cannot be `consumed` until T9 is recorded as passed in that file |
+| Restart/rollback (spec §6.1 row R) | not `consumed` — Task 2 stopped on absent T9 evidence; cannot consume until T9 is recorded as passed in that file |
 | T9 consumption | blocked |
 | Not T9 (R17) | merge SHA `6b993455`; operations.md `implementation verified; migration pending` |
 
@@ -94,7 +96,7 @@ No-call checks (spec §5). A failed required row stops the session (no dialing).
 
 ## 6. Session log
 
-pending: no session has been authorized or run.
+Task 2 (2026-09-15): **stopped**. T9 evidence file absent. P1–P7 not attempted. No live session authorized. No launchd, log, Mongo, hive doctor, or instance probe.
 
 Each session gets one subsection recording:
 
