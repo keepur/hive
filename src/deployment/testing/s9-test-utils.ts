@@ -38,19 +38,36 @@ export function invokeBootstrap(fixture: S9Fixture, packed: PackedRelease): Help
   return invokeHelper(fixture, bootstrapArgs(packed));
 }
 
-export function events(fixture: S9Fixture): string[] {
+export function eventRecords(fixture: S9Fixture): Array<Record<string, unknown>> {
   const path = join(fixture.control, "events.jsonl");
   if (!existsSync(path)) return [];
   return readFileSync(path, "utf8")
     .split("\n")
     .filter(Boolean)
-    .map((line) => {
+    .flatMap((line) => {
       try {
-        return String((JSON.parse(line) as { type?: string }).type ?? line);
+        const parsed: unknown = JSON.parse(line);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return [parsed as Record<string, unknown>];
       } catch {
-        return line;
+        // keep scanning
       }
+      return [];
     });
+}
+
+export function events(fixture: S9Fixture): string[] {
+  return eventRecords(fixture).map((event) => String(event.type ?? ""));
+}
+
+export function launchdServices(
+  fixture: S9Fixture,
+): Record<string, { pid?: number | null; loaded?: boolean; enabled?: boolean }> {
+  const path = join(fixture.control, "launchd.json");
+  if (!existsSync(path)) return {};
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as {
+    services?: Record<string, { pid?: number | null; loaded?: boolean; enabled?: boolean }>;
+  };
+  return parsed.services ?? {};
 }
 
 export function oldUpdaterCalled(fixture: S9Fixture): boolean {

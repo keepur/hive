@@ -176,28 +176,53 @@ function parsePlistArgs(plistPath) {
   }
 }
 
+function instanceSlice(hiveHome) {
+  const cfg = config();
+  const instances = cfg.instances && typeof cfg.instances === "object" ? cfg.instances : {};
+  const keys = [];
+  if (hiveHome) keys.push(hiveHome);
+  try {
+    if (hiveHome) keys.push(fs.realpathSync(hiveHome));
+  } catch {
+    // selector may not exist yet
+  }
+  const slice = keys.map((key) => (Object.prototype.hasOwnProperty.call(instances, key) ? instances[key] : null)).find(Boolean) ?? null;
+  return {
+    mongoUri: slice?.mongoUri ?? cfg.mongoUri ?? "",
+    mongoDb: slice?.mongoDb ?? cfg.mongoDb ?? "",
+    workerPort: slice?.workerPort ?? cfg.workerPort,
+    voicePort: slice?.voicePort ?? cfg.voicePort,
+    bridgeToken: cfg.bridgeToken ?? "",
+    flags: cfg.flags ?? {},
+    standinPath: cfg.standinPath,
+    repoRoot: cfg.repoRoot,
+  };
+}
+
 function spawnStandin(label, plistPath) {
   const parsed = parsePlistArgs(plistPath);
   if (!parsed || parsed.args.length < 2) throw new Error(`S9 stand-in missing plist arguments for ${label}`);
-  const cfg = config();
-  const standin = cfg.standinPath;
+  const hiveHome = parsed.env?.HIVE_HOME;
+  const slice = instanceSlice(hiveHome);
+  const standin = slice.standinPath;
   if (!standin || !existsSync(standin)) throw new Error("S9 stand-in path missing");
   const role = label.endsWith(".voice-worker") ? "worker" : "engine";
+  const listenPort = role === "worker" ? Number(slice.workerPort) : Number(slice.voicePort);
   const env = {
     ...parsed.env,
     HIVE_S9_CONTROL: CONTROL,
     HIVE_S9_ROLE: role,
     HIVE_S9_LABEL: label,
-    HIVE_S9_REPO: cfg.repoRoot,
-    HIVE_S9_MONGO_URI: cfg.mongoUri ?? "",
-    HIVE_S9_MONGO_DB: cfg.mongoDb ?? "",
-    HIVE_S9_WORKER_PORT: String(cfg.workerPort ?? ""),
-    HIVE_S9_VOICE_PORT: String(cfg.voicePort ?? ""),
-    HIVE_S9_BRIDGE_TOKEN: cfg.bridgeToken ?? "",
-    HIVE_S9_ADMISSION: cfg.flags?.admission ?? "open",
-    HIVE_S9_DELAY_CLOSE: cfg.flags?.delayClose ? "1" : "",
+    HIVE_S9_REPO: slice.repoRoot,
+    HIVE_S9_MONGO_URI: slice.mongoUri ?? "",
+    HIVE_S9_MONGO_DB: slice.mongoDb ?? "",
+    HIVE_S9_WORKER_PORT: String(slice.workerPort ?? ""),
+    HIVE_S9_VOICE_PORT: String(slice.voicePort ?? ""),
+    HIVE_S9_BRIDGE_TOKEN: slice.bridgeToken ?? "",
+    HIVE_S9_ADMISSION: slice.flags?.admission ?? "open",
+    HIVE_S9_DELAY_CLOSE: slice.flags?.delayClose ? "1" : "",
     PATH: parsed.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
-    NODE_PATH: join(cfg.repoRoot, "node_modules"),
+    NODE_PATH: join(slice.repoRoot, "node_modules"),
   };
   const child = childProcess.spawn(parsed.args[0], [standin, `--role=${role}`, `--plist=${plistPath}`], {
     cwd: parsed.cwd,
@@ -219,10 +244,11 @@ function spawnStandin(label, plistPath) {
     loaded: true,
     enabled: true,
     plistPath,
+    hiveHome,
+    listenPort,
   };
   saveLaunchd(state);
   appendEvent({ type: "standin-spawn", label, pid: child.pid });
-  const hiveHome = parsed.env.HIVE_HOME;
   const identityName = role === "worker" ? "voice-worker.json" : "engine.json";
   if (hiveHome) {
     const identityPath = join(hiveHome, ".hive-state", "runtime", identityName);
@@ -277,6 +303,7 @@ function handleLaunchctl(args) {
     const label = target.startsWith(`${domain}/`) ? target.slice(domain.length + 1) : target;
     state.services[label] = { ...(state.services[label] ?? {}), enabled: cmd === "enable", loaded: state.services[label]?.loaded ?? false };
     saveLaunchd(state);
+    appendEvent({ type: cmd, label });
     return { stdout: "", stderr: "", status: 0 };
   }
   if (cmd === "bootstrap") {
@@ -285,6 +312,7 @@ function handleLaunchctl(args) {
     const parsed = parsePlistArgs(plistPath);
     const label = parsed ? basename(plistPath, ".plist") : "";
     spawnStandin(label, plistPath);
+    appendEvent({ type: "bootstrap", label });
     return { stdout: "", stderr: "", status: 0 };
   }
   if (cmd === "bootout") {
@@ -369,20 +397,22 @@ function handleLsof(args) {
     const port = Number(String(tcp).slice("-iTCP:".length));
     const cfg = config();
     const services = Object.values(launchdState().services);
-    const workerPort = Number(cfg.workerPort);
-    const voicePort = Number(cfg.voicePort);
-    let service = null;
-    if (Number.isFinite(port) && port === workerPort) {
-      service = services.find(
-        (candidate) => candidate?.pid && String(candidate.plistPath ?? candidate.command ?? "").includes("voice-worker"),
-      );
-    } else if (Number.isFinite(port) && port === voicePort) {
-      service = services.find(
-        (candidate) =>
-          candidate?.pid &&
-          (String(candidate.plistPath ?? "").includes(".agent.plist") ||
-            String(candidate.command ?? "").includes("server.min.js")),
-      );
+    let service = services.find((candidate) => candidate?.pid && Number(candidate.listenPort) === port);
+    if (!service?.pid) {
+      const workerPort = Number(cfg.workerPort);
+      const voicePort = Number(cfg.voicePort);
+      if (Number.isFinite(port) && port === workerPort) {
+        service = services.find(
+          (candidate) => candidate?.pid && String(candidate.plistPath ?? candidate.command ?? "").includes("voice-worker"),
+        );
+      } else if (Number.isFinite(port) && port === voicePort) {
+        service = services.find(
+          (candidate) =>
+            candidate?.pid &&
+            (String(candidate.plistPath ?? "").includes(".agent.plist") ||
+              String(candidate.command ?? "").includes("server.min.js")),
+        );
+      }
     }
     if (!service?.pid) {
       const error = new Error("lsof: no matching listeners");

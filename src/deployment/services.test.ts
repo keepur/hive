@@ -915,14 +915,21 @@ describe("signal fence, ordered restore and observation-only adapters", () => {
 
   it("restores a captured disabled transition without bootstrapping or touching another instance", async () => {
     const { ctl, snapshot, events, exec } = restoreHarness();
-    for (const service of snapshot.services) service.enabled = false;
-    await ctl.restoreFilesAndState(snapshot);
+    for (const service of snapshot.services) {
+      service.enabled = false;
+      service.loaded = false;
+      service.inspection.loaded = false;
+    }
+    await ctl.restore(snapshot);
+    expect(events.filter((event) => event.startsWith("bootstrap"))).toEqual([]);
+    expect(events.filter((event) => event.startsWith("enable"))).toEqual([]);
     expect(events.filter((event) => event.startsWith("disable:"))).toEqual([
       `disable:gui/501/${definitions().engine.label}`,
       `disable:gui/501/${definitions().worker.label}`,
     ]);
     expect(exec.mock.calls.some(([, args]) => args[0] === "bootstrap")).toBe(false);
-    expect(exec.mock.calls.some(([, args]) => String(args[1] ?? "").includes("keepur"))).toBe(false);
+    expect(exec.mock.calls.some(([, args]) => args[0] === "enable")).toBe(false);
+    expect(exec.mock.calls.some(([, args]) => args.join(" ").includes("keepur"))).toBe(false);
   });
 
   it("refuses to restore over a still-loaded registration", async () => {

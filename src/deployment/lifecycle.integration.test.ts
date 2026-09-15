@@ -1,6 +1,15 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  readFileSync,
+  realpathSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -15,14 +24,22 @@ import {
 import { ensureCandidatePack, ensureHistoricalPack, type PackedRelease } from "./testing/s9-packages.js";
 import {
   bootstrapArgs,
+  eventRecords,
   events,
   helperResult,
   INTEGRATION_TIMEOUT_MS,
+  launchdServices,
   oldUpdaterCalled,
   operationRecords,
   secretsLeak,
   waitLatchWaiting,
 } from "./testing/s9-test-utils.js";
+import {
+  buildServiceDefinitions,
+  buildServicePlist,
+  getServiceLaunchAgentLink,
+  getServicePlistPath,
+} from "./services.js";
 
 describe("S9 lifecycle integration (actual frozen helper)", { timeout: INTEGRATION_TIMEOUT_MS }, () => {
   let C: PackedRelease;
@@ -35,13 +52,65 @@ describe("S9 lifecycle integration (actual frozen helper)", { timeout: INTEGRATI
   }, INTEGRATION_TIMEOUT_MS);
 
   afterAll(async () => {
-    for (const fixture of fixtures.splice(0)) await destroyFixture(fixture);
+    const pending = fixtures.splice(0).sort((left, right) => Number(left.ownsRoot) - Number(right.ownsRoot));
+    for (const fixture of pending) await destroyFixture(fixture);
   }, INTEGRATION_TIMEOUT_MS);
 
   async function fixture(options: Parameters<typeof createFixture>[0]): Promise<S9Fixture> {
     const created = await createFixture(options);
     fixtures.push(created);
     return created;
+  }
+
+  function pidAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function plantLeftoverWorker(fx: S9Fixture): { label: string; link: string } {
+    const hiveHome = realpathSync(fx.hiveHome);
+    const userHome = realpathSync(fx.userHome);
+    const pair = buildServiceDefinitions({
+      instanceId: fx.instanceId,
+      nodePath: process.execPath,
+      hiveHome,
+      configPath: realpathSync(fx.configPath),
+      home: userHome,
+      pathEnv: "/usr/bin:/bin:/usr/sbin:/sbin",
+    });
+    const plistPath = getServicePlistPath(hiveHome, fx.instanceId, "voice-worker");
+    const linkPath = getServiceLaunchAgentLink(userHome, fx.instanceId, "voice-worker");
+    writeFileSync(plistPath, buildServicePlist(pair.worker), { mode: 0o600 });
+    if (!existsSync(linkPath)) symlinkSync(plistPath, linkPath);
+    const launchdPath = join(fx.control, "launchd.json");
+    const prior = existsSync(launchdPath)
+      ? (JSON.parse(readFileSync(launchdPath, "utf8")) as { services?: Record<string, unknown> })
+      : { services: {} };
+    writeFileSync(
+      launchdPath,
+      `${JSON.stringify(
+        {
+          ...prior,
+          services: {
+            ...(prior.services ?? {}),
+            [pair.worker.label]: {
+              loaded: true,
+              enabled: true,
+              pid: null,
+              plistPath,
+              hiveHome,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return { label: pair.worker.label, link: linkPath };
   }
 
   it("starts, stops and restarts the packaged pair through the frozen helper", async () => {
@@ -98,38 +167,93 @@ describe("S9 lifecycle integration (actual frozen helper)", { timeout: INTEGRATI
     expect(oldUpdaterCalled(fx)).toBe(false);
   });
 
-  it("keeps a second instance's process state, labels and .hive-state distinct", async () => {
+  it("keeps a sibling instance running under one launchd mock when the first is stopped", async () => {
     const a = await fixture({ packed: C, seedHive: C, instanceId: "s9a" });
-    const b = await fixture({ packed: C, seedHive: C, instanceId: "s9b" });
-    expect(invokeHelper(a, ["--start"]).status).toBe(0);
-    expect(invokeHelper(b, ["--start"]).status).toBe(0);
-    const aEngine = join(a.hiveHome, "service", "com.hive.s9a.agent.plist");
-    const bEngine = join(b.hiveHome, "service", "com.hive.s9b.agent.plist");
-    const aWorker = join(a.hiveHome, "service", "com.hive.s9a.voice-worker.plist");
-    const bWorker = join(b.hiveHome, "service", "com.hive.s9b.voice-worker.plist");
-    expect(readFileSync(aEngine, "utf8")).toContain(`com.hive.s9a.agent`);
-    expect(readFileSync(bEngine, "utf8")).toContain(`com.hive.s9b.agent`);
-    expect(readFileSync(aEngine, "utf8")).not.toContain("com.hive.s9b.");
-    expect(readFileSync(bEngine, "utf8")).not.toContain("com.hive.s9a.");
-    expect(readFileSync(aWorker, "utf8")).toContain(join(a.hiveHome, ".hive", "pkg", "voice-worker.min.js"));
-    expect(readFileSync(bWorker, "utf8")).toContain(join(b.hiveHome, ".hive", "pkg", "voice-worker.min.js"));
-    const aIdentity = JSON.parse(readFileSync(join(a.hiveHome, ".hive-state", "runtime", "engine.json"), "utf8")) as {
-      pid: number;
-    };
-    const bIdentity = JSON.parse(readFileSync(join(b.hiveHome, ".hive-state", "runtime", "engine.json"), "utf8")) as {
-      pid: number;
-    };
-    expect(aIdentity.pid).toBeGreaterThan(1);
-    expect(bIdentity.pid).toBeGreaterThan(1);
-    expect(aIdentity.pid).not.toBe(bIdentity.pid);
-    expect(existsSync(join(a.hiveHome, ".hive-state", "runtime", "voice-worker.json"))).toBe(true);
-    expect(existsSync(join(b.hiveHome, ".hive-state", "runtime", "voice-worker.json"))).toBe(true);
-    expect(readFileSync(join(a.hiveHome, "hive.yaml.sentinel"), "utf8")).toBe("preserve-me\n");
+    const b = await fixture({ packed: C, seedHive: C, instanceId: "s9b", share: a });
+    expect(a.control).toBe(b.control);
+    expect(a.userHome).toBe(b.userHome);
+    expect(a.hiveHome).not.toBe(b.hiveHome);
+    const startA = invokeHelper(a, ["--start"]);
+    expect(startA.status, startA.stderr + startA.stdout).toBe(0);
+    const startB = invokeHelper(b, ["--start"]);
+    expect(startB.status, startB.stderr + startB.stdout).toBe(0);
+    const aEngineLabel = `com.hive.s9a.agent`;
+    const aWorkerLabel = `com.hive.s9a.voice-worker`;
+    const bEngineLabel = `com.hive.s9b.agent`;
+    const bWorkerLabel = `com.hive.s9b.voice-worker`;
+    const bEnginePlist = join(b.hiveHome, "service", `${bEngineLabel}.plist`);
+    const bWorkerPlist = join(b.hiveHome, "service", `${bWorkerLabel}.plist`);
+    const bEngineIdentityPath = join(b.hiveHome, ".hive-state", "runtime", "engine.json");
+    const bWorkerIdentityPath = join(b.hiveHome, ".hive-state", "runtime", "voice-worker.json");
+    const bEngineIdentityBefore = readFileSync(bEngineIdentityPath, "utf8");
+    const bWorkerIdentityBefore = readFileSync(bWorkerIdentityPath, "utf8");
+    const loadedBefore = launchdServices(b);
+    const bEnginePid = loadedBefore[bEngineLabel]?.pid;
+    const bWorkerPid = loadedBefore[bWorkerLabel]?.pid;
+    expect(typeof bEnginePid).toBe("number");
+    expect(typeof bWorkerPid).toBe("number");
+    expect(bEnginePid).toBeGreaterThan(1);
+    expect(bWorkerPid).toBeGreaterThan(1);
+    expect(bEnginePid).not.toBe(bWorkerPid);
+    expect(pidAlive(bEnginePid!)).toBe(true);
+    expect(pidAlive(bWorkerPid!)).toBe(true);
+    expect(readFileSync(bEnginePlist, "utf8")).toContain(bEngineLabel);
+    expect(readFileSync(bWorkerPlist, "utf8")).toContain(bWorkerLabel);
     expect(readFileSync(join(b.hiveHome, "hive.yaml.sentinel"), "utf8")).toBe("preserve-me\n");
-    expect(invokeHelper(a, ["--stop"]).status).toBe(0);
-    expect(invokeHelper(b, ["--stop"]).status).toBe(0);
-    expect(existsSync(join(b.hiveHome, ".hive-state"))).toBe(true);
-    expect(existsSync(join(a.hiveHome, ".hive-state"))).toBe(true);
+    expect(readFileSync(join(b.hiveHome, "agents", "keep.txt"), "utf8")).toBe("agent-sentinel\n");
+    try {
+      const stopA = invokeHelper(a, ["--stop"]);
+      expect(stopA.status, stopA.stderr + stopA.stdout).toBe(0);
+      const loadedAfter = launchdServices(b);
+      expect(loadedAfter[aEngineLabel]?.loaded).toBe(false);
+      expect(loadedAfter[aWorkerLabel]?.loaded).toBe(false);
+      expect(loadedAfter[bEngineLabel]?.loaded).toBe(true);
+      expect(loadedAfter[bWorkerLabel]?.loaded).toBe(true);
+      expect(loadedAfter[bEngineLabel]?.pid).toBe(bEnginePid);
+      expect(loadedAfter[bWorkerLabel]?.pid).toBe(bWorkerPid);
+      expect(pidAlive(bEnginePid!)).toBe(true);
+      expect(pidAlive(bWorkerPid!)).toBe(true);
+      expect(existsSync(join(b.userHome, "Library", "LaunchAgents", `${bEngineLabel}.plist`))).toBe(true);
+      expect(existsSync(join(b.userHome, "Library", "LaunchAgents", `${bWorkerLabel}.plist`))).toBe(true);
+      expect(readFileSync(bEnginePlist, "utf8")).toContain(bEngineLabel);
+      expect(readFileSync(bWorkerPlist, "utf8")).toContain(join(b.hiveHome, ".hive", "pkg", "voice-worker.min.js"));
+      expect(readFileSync(bEngineIdentityPath, "utf8")).toBe(bEngineIdentityBefore);
+      expect(readFileSync(bWorkerIdentityPath, "utf8")).toBe(bWorkerIdentityBefore);
+      expect(existsSync(join(b.hiveHome, ".hive-state"))).toBe(true);
+      expect(readFileSync(join(b.hiveHome, "hive.yaml.sentinel"), "utf8")).toBe("preserve-me\n");
+      expect(readFileSync(join(b.hiveHome, "agents", "keep.txt"), "utf8")).toBe("agent-sentinel\n");
+    } finally {
+      expect(invokeHelper(b, ["--stop"]).status).toBe(0);
+    }
+  });
+
+  it("starts engine-only with voice disabled and unlinks a leftover worker LaunchAgent", async () => {
+    const fx = await fixture({ packed: C, seedHive: C, voiceEnabled: false });
+    expect(readFileSync(fx.configPath, "utf8")).toContain("enabled: false");
+    expect(readFileSync(join(fx.hiveHome, ".env"), "utf8")).not.toMatch(
+      /LIVEKIT_|CARTESIA_|DEEPGRAM_|ELEVENLABS_|HIVE_VOICE_BRIDGE_TOKEN/,
+    );
+    const leftover = plantLeftoverWorker(fx);
+    expect(existsSync(leftover.link)).toBe(true);
+    expect(launchdServices(fx)[leftover.label]?.loaded).toBe(true);
+    const start = invokeHelper(fx, ["--start"]);
+    expect(start.status, start.stderr + start.stdout).toBe(0);
+    const bootstraps = eventRecords(fx)
+      .filter((event) => event.type === "bootstrap")
+      .map((event) => String(event.label ?? ""));
+    expect(bootstraps).toEqual([`com.hive.${fx.instanceId}.agent`]);
+    expect(bootstraps.some((label) => label.endsWith(".voice-worker"))).toBe(false);
+    expect(
+      eventRecords(fx).some((event) => event.type === "standin-spawn" && String(event.label).endsWith(".voice-worker")),
+    ).toBe(false);
+    expect(eventRecords(fx).some((event) => event.type === "disable" && event.label === leftover.label)).toBe(true);
+    expect(existsSync(leftover.link)).toBe(false);
+    expect(launchdServices(fx)[leftover.label]?.loaded).not.toBe(true);
+    expect(existsSync(join(fx.hiveHome, ".hive-state", "runtime", "engine.json"))).toBe(true);
+    expect(existsSync(join(fx.hiveHome, ".hive-state", "runtime", "voice-worker.json"))).toBe(false);
+    expect(existsSync(join(fx.hiveHome, "hive.yaml.sentinel"))).toBe(true);
+    expect(secretsLeak(`${start.stdout}${start.stderr}`, fx)).toEqual([]);
+    expect(invokeHelper(fx, ["--stop"]).status).toBe(0);
   });
 
   it("fails staging before signals when sandbox-exec is missing, and rolls back without it", async () => {

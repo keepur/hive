@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
   symlinkSync,
@@ -61,6 +62,7 @@ export interface S9Fixture {
   livekit: LivekitMock;
   helper: string;
   cli: string;
+  ownsRoot: boolean;
 }
 
 export async function freePort(): Promise<number> {
@@ -80,29 +82,99 @@ export async function freePort(): Promise<number> {
   });
 }
 
-function writeEnv(path: string, extra: Record<string, string> = {}): void {
-  const lines = Object.entries({ ...DUMMY_ENV, ...extra }).map(([key, value]) => `${key}=${value}`);
+const VOICE_SECRET_KEYS = [
+  "LIVEKIT_API_KEY",
+  "LIVEKIT_API_SECRET",
+  "HIVE_VOICE_BRIDGE_TOKEN",
+  "DEEPGRAM_API_KEY",
+  "CARTESIA_API_KEY",
+  "ELEVENLABS_API_KEY",
+] as const;
+
+function writeEnv(path: string, extra: Record<string, string> = {}, voiceEnabled = true): void {
+  const values: Record<string, string> = { ...DUMMY_ENV, ...extra };
+  if (!voiceEnabled) {
+    for (const key of VOICE_SECRET_KEYS) delete values[key];
+  }
+  const lines = Object.entries(values).map(([key, value]) => `${key}=${value}`);
   writeFileSync(path, `${lines.join("\n")}\n`, { mode: 0o600 });
 }
 
+function inertLivekit(): LivekitMock {
+  return { url: "http://127.0.0.1:1", port: 0, requests: [], stop: async () => {} };
+}
+
+function readJsonObject(path: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+  } catch {
+    // missing or malformed control file
+  }
+  return {};
+}
+
 export function writeControl(
-  fixture: Pick<S9Fixture, "control" | "home" | "userHome" | "root" | "ports">,
+  fixture: Pick<S9Fixture, "control" | "home" | "userHome" | "root" | "ports" | "hiveHome">,
   flags: S9Flags = {},
   extras: Record<string, unknown> = {},
 ): void {
+  const path = join(fixture.control, "config.json");
+  const existing = readJsonObject(path);
+  const existingRoots = Array.isArray(existing.allowRoots)
+    ? existing.allowRoots.filter((value): value is string => typeof value === "string")
+    : [];
+  const allowRoots = [
+    ...new Set([
+      ...existingRoots,
+      fixture.root,
+      fixture.home,
+      fixture.hiveHome,
+      fixture.userHome,
+      tmpdir(),
+      "/tmp",
+      "/private/tmp",
+    ]),
+  ];
+  const existingFlags =
+    existing.flags && typeof existing.flags === "object" && !Array.isArray(existing.flags)
+      ? (existing.flags as Record<string, unknown>)
+      : {};
+  const mongoUri = extras.mongoUri ?? `mongodb://127.0.0.1:${fixture.ports.mongo}`;
+  const mongoDb = extras.mongoDb ?? `hive_${extras.instanceId ?? "s9a"}`;
+  const existingInstances =
+    existing.instances && typeof existing.instances === "object" && !Array.isArray(existing.instances)
+      ? (existing.instances as Record<string, unknown>)
+      : {};
+  const instanceRecord = {
+    mongoUri,
+    mongoDb,
+    workerPort: fixture.ports.worker,
+    voicePort: fixture.ports.voice,
+  };
+  const instanceKeys = new Set([fixture.hiveHome, fixture.home]);
+  try {
+    instanceKeys.add(realpathSync(fixture.hiveHome));
+  } catch {
+    // hive home may not exist yet during a partial write
+  }
+  const instances = { ...existingInstances };
+  for (const key of instanceKeys) instances[key] = instanceRecord;
   writeFileSync(
-    join(fixture.control, "config.json"),
+    path,
     JSON.stringify(
       {
-        allowRoots: [fixture.root, fixture.home, fixture.userHome, tmpdir(), "/tmp", "/private/tmp"],
+        ...existing,
+        allowRoots,
         repoRoot: REPO,
         standinPath: STANDIN,
-        mongoUri: extras.mongoUri ?? `mongodb://127.0.0.1:${fixture.ports.mongo}`,
-        mongoDb: extras.mongoDb ?? `hive_${extras.instanceId ?? "s9a"}`,
+        mongoUri,
+        mongoDb,
         workerPort: fixture.ports.worker,
         voicePort: fixture.ports.voice,
         bridgeToken: DUMMY_ENV.HIVE_VOICE_BRIDGE_TOKEN,
-        flags,
+        flags: { ...existingFlags, ...flags },
+        instances,
       },
       null,
       2,
@@ -117,44 +189,56 @@ export async function createFixture(options: {
   flags?: S9Flags;
   personal?: boolean;
   mongoDb?: string;
+  voiceEnabled?: boolean;
+  share?: Pick<S9Fixture, "userHome" | "control" | "root">;
 }): Promise<S9Fixture> {
+  const voiceEnabled = options.voiceEnabled !== false;
+  const shared = options.share;
+  if (shared && !options.instanceId) throw new Error("shared fixture requires a distinct instanceId");
   const instanceId = options.instanceId ?? "s9a";
-  const root = mkdtempSync(join(tmpdir(), "hive-s9-fix-"));
-  const userHome = join(root, "home");
-  const hiveHome = join(userHome, "hive");
+  const root = shared?.root ?? mkdtempSync(join(tmpdir(), "hive-s9-fix-"));
+  const userHome = shared?.userHome ?? join(root, "home");
+  const hiveHome = shared ? join(userHome, `hive-${instanceId}`) : join(userHome, "hive");
+  const control = shared?.control ?? join(root, "control");
   mkdirSync(join(userHome, "Library", "LaunchAgents"), { recursive: true, mode: 0o755 });
   mkdirSync(join(hiveHome, "logs"), { recursive: true, mode: 0o755 });
   mkdirSync(join(hiveHome, "service"), { recursive: true, mode: 0o755 });
   mkdirSync(join(hiveHome, ".hive-state"), { recursive: true, mode: 0o700 });
-  const [base, mongoPort, livekitPort] = await Promise.all([freePort(), freePort(), freePort()]);
+  const [base, mongoPort, livekitPort] = await Promise.all([
+    freePort(),
+    freePort(),
+    voiceEnabled ? freePort() : Promise.resolve(0),
+  ]);
   const voice = base + 5;
   const worker = base + 7;
   const mongo = await startDisposableMongo(mongoPort);
-  const livekit = await startLivekitMock(livekitPort);
+  const livekit = voiceEnabled ? await startLivekitMock(livekitPort) : inertLivekit();
   const configName = options.personal ? "hive-personal.yaml" : "hive.yaml";
   const configPath = join(hiveHome, configName);
-  writeFileSync(
-    configPath,
-    [
-      "instance:",
-      `  id: ${instanceId}`,
-      `  portBase: ${base}`,
-      "voice:",
-      "  livekit:",
-      "    enabled: true",
-      `    url: ${livekit.url}`,
-      "    sipTrunkId: ST_s9",
-      "",
-    ].join("\n"),
-    { mode: 0o644 },
-  );
-  writeEnv(join(hiveHome, ".env"), { MONGODB_URI: mongo.uri });
+  const yaml = [
+    "instance:",
+    `  id: ${instanceId}`,
+    `  portBase: ${base}`,
+    "voice:",
+    "  livekit:",
+    `    enabled: ${voiceEnabled ? "true" : "false"}`,
+  ];
+  if (voiceEnabled) {
+    yaml.push(`    url: ${livekit.url}`, "    sipTrunkId: ST_s9");
+  }
+  yaml.push("");
+  writeFileSync(configPath, yaml.join("\n"), { mode: 0o644 });
+  writeEnv(join(hiveHome, ".env"), { MONGODB_URI: mongo.uri }, voiceEnabled);
   if (options.personal) {
-    writeEnv(join(hiveHome, ".env-personal"), {
-      MONGODB_URI: mongo.uri,
-      HIVE_VOICE_BRIDGE_TOKEN: "s9-personal-bridge",
-      VOICE_PORT: String(voice + 10),
-    });
+    writeEnv(
+      join(hiveHome, ".env-personal"),
+      {
+        MONGODB_URI: mongo.uri,
+        HIVE_VOICE_BRIDGE_TOKEN: "s9-personal-bridge",
+        VOICE_PORT: String(voice + 10),
+      },
+      voiceEnabled,
+    );
   }
   if (options.seedHive) {
     cpSync(join(options.seedHive.extract, "package"), join(hiveHome, ".hive"), { recursive: true });
@@ -167,7 +251,6 @@ export async function createFixture(options: {
   writeFileSync(join(hiveHome, "hive.yaml.sentinel"), "preserve-me\n", { mode: 0o644 });
   mkdirSync(join(hiveHome, "agents"), { recursive: true });
   writeFileSync(join(hiveHome, "agents", "keep.txt"), "agent-sentinel\n", { mode: 0o644 });
-  const control = join(root, "control");
   mkdirSync(join(control, "latches"), { recursive: true });
   const fixture: S9Fixture = {
     root,
@@ -182,20 +265,27 @@ export async function createFixture(options: {
     livekit,
     helper: join(options.packed.extract, "package", "pkg", "deploy.min.js"),
     cli: join(options.packed.extract, "package", "pkg", "cli.min.js"),
+    ownsRoot: shared === undefined,
   };
   writeControl(fixture, options.flags ?? {}, {
     mongoUri: mongo.uri,
     mongoDb: options.mongoDb ?? `hive_${instanceId}`,
     instanceId,
   });
-  writeFileSync(join(userHome, ".s9-control"), `${control}\n`, { mode: 0o600 });
+  const marker = join(userHome, ".s9-control");
+  if (existsSync(marker)) {
+    const current = readFileSync(marker, "utf8").trim();
+    if (current !== control) throw new Error("refusing to overwrite .s9-control with a different control path");
+  } else {
+    writeFileSync(marker, `${control}\n`, { mode: 0o600 });
+  }
   return fixture;
 }
 
 export async function destroyFixture(fixture: S9Fixture): Promise<void> {
   await fixture.mongo.stop().catch(() => {});
   await fixture.livekit.stop().catch(() => {});
-  rmSync(fixture.root, { recursive: true, force: true });
+  if (fixture.ownsRoot !== false) rmSync(fixture.root, { recursive: true, force: true });
 }
 
 export interface HelperResult {
