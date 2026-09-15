@@ -99,6 +99,8 @@ describe("Seatbelt profile and job paths", () => {
     const env = confinedJobEnvironment(job, { home: "job", pathEnv: "/usr/bin:/bin" });
     for (const key of [
       "TMPDIR",
+      "TMP",
+      "TEMP",
       "npm_config_cache",
       "npm_config_logs_dir",
       "npm_config_devdir",

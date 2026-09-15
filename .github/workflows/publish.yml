@@ -39,12 +39,29 @@ jobs:
         run: npm run check
 
       - name: Build
-        run: npm run build
+        run: npm run bundle
 
-      - name: Audit pack contents (dry run)
-        run: npm pack --dry-run
+      - name: Pack release
+        id: pack
+        run: |
+          mkdir -p "$RUNNER_TEMP/hive-release"
+          node scripts/generate-shrinkwrap.mjs --pack --json --pack-destination "$RUNNER_TEMP/hive-release" | tee "$RUNNER_TEMP/hive-pack.json"
+          node -e '
+            const fs = require("fs");
+            const crypto = require("crypto");
+            const path = require("path");
+            const parsed = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/hive-pack.json", "utf8"));
+            const info = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0];
+            if (!info?.filename) throw new Error("pack json missing filename");
+            const archive = path.join(process.env.RUNNER_TEMP, "hive-release", info.filename);
+            if (!fs.existsSync(archive)) throw new Error("packed archive missing: " + archive);
+            const digest = crypto.createHash("sha256").update(fs.readFileSync(archive)).digest("hex");
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, "archive=" + archive + "\n");
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, "digest=" + digest + "\n");
+            console.log("Packed " + archive + " sha256=" + digest);
+          '
 
       - name: Publish to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: npm publish "${{ steps.pack.outputs.archive }}" --access public

@@ -99,6 +99,11 @@ describe("readRelease", () => {
     expect(() => readRelease(root)).toThrow();
   });
 
+  it("rejects a missing shrinkwrap", () => {
+    unlinkSync(join(root, "npm-shrinkwrap.json"));
+    expect(() => readRelease(root)).toThrow();
+  });
+
   it("rejects a missing required artifact", () => {
     unlinkSync(join(root, "pkg", "runtime-probe.min.js"));
     expect(() => readRelease(root)).toThrow();

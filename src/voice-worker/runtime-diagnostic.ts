@@ -64,8 +64,13 @@ function findSingleFile(root: string, basename: string, releaseRoot: string): st
     }
   };
   visit(root);
-  if (found.length !== 1) throw new Error(`asset-count:${basename}`);
-  return found[0]!;
+  if (found.length === 0) throw new Error(`asset-count:${basename}`);
+  if (found.length === 1) return found[0]!;
+  // @livekit/agents-plugin-silero ships identical copies under src/ and dist/.
+  const digest = sha256(found[0]!);
+  if (found.some((path) => sha256(path) !== digest)) throw new Error(`asset-count:${basename}`);
+  const runtimeCopy = found.find((path) => path.endsWith(`${sep}dist${sep}${basename}`));
+  return runtimeCopy ?? found[0]!;
 }
 
 function relativeEvidence(releaseRoot: string, path: string) {
@@ -73,9 +78,19 @@ function relativeEvidence(releaseRoot: string, path: string) {
   return { path: relative(releaseRoot, actual), sha256: sha256(actual) };
 }
 
+/** Dyld shared-cache entries in `process.report` name paths that are not real files. */
+function existingRealpath(path: string): string | undefined {
+  try {
+    return realpathSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
 function loadedNativeEvidence(releaseRoot: string, before: Set<string>, after: readonly string[]) {
   const loaded = after
-    .map((path) => realpathSync(path))
+    .map((path) => existingRealpath(path))
+    .filter((path): path is string => path !== undefined)
     .filter((path) => !before.has(path) && inside(releaseRoot, path) && /\.(?:node|dylib|so(?:\.\d+)*)$/i.test(path));
   const rtc = loaded.filter((path) => /rtc|livekit/i.test(path));
   const onnx = loaded.filter((path) => /onnxruntime/i.test(path));
@@ -125,7 +140,11 @@ export async function offline(moduleUrl = import.meta.url): Promise<Record<strin
   ) as Record<keyof typeof PINNED_PACKAGES, { root: string; entry: string; version: string }>;
 
   const initialReport = process.report.getReport() as { sharedObjects: string[] };
-  const before = new Set(initialReport.sharedObjects.map((path) => realpathSync(path)));
+  const before = new Set(
+    initialReport.sharedObjects
+      .map((path) => existingRealpath(path))
+      .filter((path): path is string => path !== undefined),
+  );
   let room: { disconnect(): Promise<void> } | null = null;
   let rtcModule: { dispose(): Promise<void> } | null = null;
   try {

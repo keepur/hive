@@ -320,6 +320,8 @@ export function confinedJobEnvironment(
     HOME: home,
     PATH: options.pathEnv,
     TMPDIR: resolve(jobDirectory, JOB_WRITE_LOCATIONS.tmp),
+    TMP: resolve(jobDirectory, JOB_WRITE_LOCATIONS.tmp),
+    TEMP: resolve(jobDirectory, JOB_WRITE_LOCATIONS.tmp),
     XDG_CACHE_HOME: resolve(jobDirectory, JOB_WRITE_LOCATIONS.cache),
     npm_config_cache: resolve(jobDirectory, JOB_WRITE_LOCATIONS.npmCache),
     npm_config_logs_dir: resolve(jobDirectory, JOB_WRITE_LOCATIONS.npmLogs),

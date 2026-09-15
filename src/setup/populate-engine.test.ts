@@ -9,8 +9,9 @@ import {
   realpathSync,
   statSync,
 } from "node:fs";
-import { resolve, join } from "node:path";
+import { resolve, join, dirname } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { sha256 } from "../deployment/release.js";
 import {
   ConfinedJobRunner,
@@ -440,6 +441,15 @@ describe("populateEngine (confined staging)", () => {
     await expect(populateEngine(pkgRoot, instanceDir, { skipInstall: true })).rejects.toThrow(
       /Engine already populated/,
     );
+  });
+
+  it("skipInstall is not reachable from shipped CLI flags", () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const cli = readFileSync(resolve(here, "../cli.ts"), "utf8");
+    const wizard = readFileSync(resolve(here, "wizard.ts"), "utf8");
+    expect(cli).not.toMatch(/skipInstall|skip-install/);
+    expect(wizard).toContain("populateEngine(pkgRoot, targetDir)");
+    expect(wizard).not.toMatch(/skipInstall/);
   });
 });
 

@@ -5,11 +5,20 @@
  * Prereq: npm run build (tsc → dist/)
  * Output: pkg/ (publish-ready minified bundles)
  */
-import { build, type Plugin } from "esbuild";
+import { build, type Metafile, type Plugin } from "esbuild";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { rmSync, mkdirSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, relative, resolve, sep } from "node:path";
+import { createRequire, isBuiltin } from "node:module";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 const PKG_DIR = "pkg";
+const REPO_ROOT = resolve(".");
+
+execFileSync(process.execPath, [resolve(REPO_ROOT, "scripts/generate-shrinkwrap.mjs"), "--check-source"], {
+  cwd: REPO_ROOT,
+  stdio: "inherit",
+});
 
 // Clean and recreate
 rmSync(PKG_DIR, { recursive: true, force: true });
@@ -28,6 +37,13 @@ const external = [
   "@slack/socket-mode",
   "@slack/web-api",
   "@linear/sdk",
+  // LiveKit worker runtime — resolved from the installed production tree
+  "@livekit/agents",
+  "@livekit/agents-plugin-cartesia",
+  "@livekit/agents-plugin-deepgram",
+  "@livekit/agents-plugin-elevenlabs",
+  "@livekit/agents-plugin-silero",
+  "@livekit/rtc-node",
   // File-processing libs with complex internal asset loading
   "pdf-parse",
   "mammoth",
@@ -82,6 +98,16 @@ await build({
   ...shared,
   entryPoints: {
     server: "dist/index.js",
+  },
+});
+
+// Voice worker, packaged diagnostics, and runtime probe (KPR-463 Task 2 Step 3)
+await build({
+  ...shared,
+  entryPoints: {
+    "voice-worker": "dist/voice-worker/main.js",
+    "voice-worker-diagnostic": "dist/voice-worker/runtime-diagnostic.js",
+    "runtime-probe": "dist/deployment/runtime-probe.js",
   },
 });
 
@@ -204,5 +230,149 @@ for (const m of configSrc.matchAll(/\brequired\(\s*"([A-Z0-9_]+)"\s*\)/g)) {
 const requiredEnvList = [...requiredEnv].sort();
 writeFileSync(resolve(PKG_DIR, "required-env.json"), JSON.stringify({ requiredEnv: requiredEnvList }, null, 2) + "\n");
 console.log(`  pkg/required-env.json (${requiredEnvList.length} keys: ${requiredEnvList.join(", ")})`);
+
+// Frozen orchestration helper: no third-party externals except the bundled
+// YAML parser. Builtins are canonicalized to `node:` and the complete graph
+// is checked against the Task 2 Step 3 allowlist (plan brace list plus the
+// remaining S7 helper modules main.ts already imports).
+const HELPER_SOURCE_ALLOWLIST = [
+  "src/deployment/main.ts",
+  "src/deployment/operation.ts",
+  "src/deployment/transaction.ts",
+  "src/deployment/artifact.ts",
+  "src/deployment/services.ts",
+  "src/deployment/health.ts",
+  "src/deployment/release.ts",
+  "src/deployment/ports.ts",
+  "src/deployment/confined-job.ts",
+  "src/deployment/clone-promotion.ts",
+  // Remaining S7 helper source that the frozen entry already imports.
+  "src/deployment/bootstrap.ts",
+  "src/deployment/lifecycle.ts",
+  "src/deployment/pilot.ts",
+  "src/deployment/pilot-records.ts",
+  "src/deployment/pilot-capture.ts",
+  "src/deployment/pilot-lifecycle.ts",
+  "src/deployment/pilot-observer.ts",
+  "src/deployment/pilot-probe.ts",
+  "src/deployment/reconcile.ts",
+  "src/deployment/plugin-compat.ts",
+  "src/deployment/host-preparation.ts",
+  "src/deployment/canonical.ts",
+  "src/deployment/prior.ts",
+  "src/deployment/stop-proof.ts",
+  "src/deployment/worker-maintenance.ts",
+  "src/voice-worker/maintenance-ipc.ts",
+  "src/voice-worker/admission.ts",
+  "src/paths.ts",
+  "src/logging/logger.ts",
+] as const;
+
+function compiledFromSource(source: string): string {
+  if (!source.startsWith("src/") || !source.endsWith(".ts")) {
+    throw new Error(`helper allowlist entry must be a src/ TypeScript path: ${source}`);
+  }
+  return resolve(REPO_ROOT, `dist/${source.slice("src/".length, -".ts".length)}.js`);
+}
+
+const helperAllowedFiles = new Set(HELPER_SOURCE_ALLOWLIST.map(compiledFromSource));
+
+function yamlPackageRoot(): string {
+  const require = createRequire(import.meta.url);
+  let directory = dirname(require.resolve("yaml"));
+  while (true) {
+    const manifestPath = resolve(directory, "package.json");
+    if (existsSync(manifestPath)) {
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { name?: unknown };
+      if (manifest.name === "yaml") return directory;
+    }
+    const parent = dirname(directory);
+    if (parent === directory) throw new Error("could not resolve the yaml package root");
+    directory = parent;
+  }
+}
+
+function insideRoot(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+function assertHelperGraph(metafile: Metafile, yamlRoot: string): void {
+  const rejectExternal = (specifier: string, from: string): void => {
+    if (!specifier.startsWith("node:")) {
+      throw new Error(`helper external is not a node: builtin (${specifier} from ${from})`);
+    }
+  };
+  for (const [file, input] of Object.entries(metafile.inputs)) {
+    const actual = resolve(REPO_ROOT, file);
+    const allowedFile = helperAllowedFiles.has(actual) || insideRoot(yamlRoot, actual);
+    if (!allowedFile) {
+      throw new Error(`helper graph includes a file outside the allowlist: ${relative(REPO_ROOT, actual)}`);
+    }
+    for (const imported of input.imports) {
+      if (imported.external) rejectExternal(imported.path, file);
+    }
+  }
+  for (const [file, output] of Object.entries(metafile.outputs)) {
+    for (const imported of output.imports) {
+      if (imported.external) rejectExternal(imported.path, file);
+    }
+  }
+}
+
+const canonicalizeBuiltins: Plugin = {
+  name: "canonicalize-builtins",
+  setup(build) {
+    build.onResolve({ filter: /.*/ }, (args) => {
+      if (!isBuiltin(args.path)) return undefined;
+      return {
+        path: args.path.startsWith("node:") ? args.path : `node:${args.path}`,
+        external: true,
+      };
+    });
+  },
+};
+
+const yamlRoot = yamlPackageRoot();
+const helper = await build({
+  absWorkingDir: REPO_ROOT,
+  outdir: PKG_DIR,
+  outExtension: { ".js": ".min.js" },
+  bundle: true,
+  minify: true,
+  platform: "node",
+  target: "node22",
+  format: "esm",
+  splitting: false,
+  external: [],
+  metafile: true,
+  logLevel: "info",
+  entryPoints: { deploy: "dist/deployment/main.js" },
+  plugins: [canonicalizeBuiltins],
+  banner: {
+    js: "import { createRequire as __hiveCreateRequire } from 'node:module'; const require = __hiveCreateRequire(import.meta.url);",
+  },
+});
+if (!helper.metafile) throw new Error("helper build did not produce a metafile");
+assertHelperGraph(helper.metafile, yamlRoot);
+console.log("  pkg/deploy.min.js (frozen helper, node: externals only)");
+
+const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+const sourceRevision = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+const sourceDirty =
+  execFileSync("git", ["status", "--porcelain", "--untracked-files=normal"], {
+    encoding: "utf8",
+  }).trim().length > 0;
+if (!/^[a-f0-9]{40}$/.test(sourceRevision)) throw new Error("full source revision required");
+const release = {
+  schemaVersion: 1,
+  packageVersion: pkg.version,
+  sourceRevision,
+  sourceDirty,
+  dependencyLockSha256: createHash("sha256").update(readFileSync("package-lock.json")).digest("hex"),
+  voiceWorker: { path: "pkg/voice-worker.min.js", admissionProtocol: 1 },
+};
+writeFileSync(resolve(PKG_DIR, "release.json"), JSON.stringify(release, null, 2) + "\n");
+console.log(`  pkg/release.json (${release.packageVersion}, dirty=${String(release.sourceDirty)})`);
 
 console.log("\n✓ Bundle complete → pkg/");
