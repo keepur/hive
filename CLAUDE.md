@@ -29,7 +29,7 @@ Design specs and implementation plans live in the **private** companion repo `ke
 
 - All changes go through PRs into `main`. `main` is `enforce_admins: true` + `required_linear_history: true` — no direct pushes, no merge commits (squash or rebase only).
 - `npm run check` must pass before submitting.
-- **CI**: GitHub Actions runs `npm run check` on every PR and push to `main` (self-hosted ARM64 runner on Mac Mini).
+- **CI**: GitHub Actions on the self-hosted macOS ARM64 runner runs Node 22 and Node 24 jobs (`actions/setup-node`): `npm run build`, `npm run check`, `npm run check:bundle` (includes `check:artifact`); Node 24 also runs the T10 engineering harness (Node 22 records `T10_SKIP`).
 
 ### Releases
 

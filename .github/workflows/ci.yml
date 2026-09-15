@@ -10,19 +10,49 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Two self-hosted macOS ARM64 packed-artifact jobs (KPR-463 Task 11):
+# Node 22 retains engine support (T2/T7 unskipped; T10 is a named skip, never closure).
+# Node 24 is the packed-artifact / T10 engineering job (T2/T7/T10 unskipped).
+# Neither job closes T10 acceptance. Do not rely on the runner's ambient Node.
 jobs:
   check:
-    name: Typecheck + Lint + Format + Test
+    name: macOS ARM64 Node ${{ matrix.node }}
     runs-on: [self-hosted, macOS, ARM64]
-    timeout-minutes: 10
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
 
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: arm64
+
+      - name: Verify selected Node major
+        env:
+          EXPECTED_NODE_MAJOR: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          major="$(node -p 'process.versions.node.split(".")[0]')"
+          echo "node=$(node -v) npm=$(npm --version) os=$(uname -srm)"
+          /usr/bin/sw_vers
+          if [ "$major" != "$EXPECTED_NODE_MAJOR" ]; then
+            echo "actions/setup-node did not select Node $EXPECTED_NODE_MAJOR (got $(node -v)); ambient runner Node is not acceptable" >&2
+            exit 1
+          fi
+
       - name: Install dependencies
         run: npm ci
+
+      - name: Build
+        run: npm run build
 
       - name: Typecheck
         run: npm run typecheck
@@ -39,5 +69,26 @@ jobs:
           SLACK_APP_TOKEN: xapp-test-placeholder
           SLACK_BOT_TOKEN: xoxb-test-placeholder
 
-      - name: Bundle decontamination check
+      - name: Bundle and packed-artifact checks
         run: npm run check:bundle
+
+      - name: T10 confinement harness
+        env:
+          EXPECTED_NODE_MAJOR: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          node scripts/check-confinement-closure.mjs | tee "$RUNNER_TEMP/t10.txt"
+          if [ "$EXPECTED_NODE_MAJOR" = "24" ]; then
+            grep -F 'T10_CLOSURE' "$RUNNER_TEMP/t10.txt"
+            if grep -F 'T10_SKIP' "$RUNNER_TEMP/t10.txt"; then
+              echo "Node 24 job must run T10 unskipped; a skip is not T10 closure" >&2
+              exit 1
+            fi
+          else
+            grep -F 'T10_SKIP' "$RUNNER_TEMP/t10.txt"
+            grep -F "Node major ${EXPECTED_NODE_MAJOR}" "$RUNNER_TEMP/t10.txt"
+            if grep -F 'T10_CLOSURE' "$RUNNER_TEMP/t10.txt"; then
+              echo "Node 22 named skip must never be treated as T10_CLOSURE" >&2
+              exit 1
+            fi
+          fi

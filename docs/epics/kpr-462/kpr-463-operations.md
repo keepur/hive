@@ -41,7 +41,7 @@ The engine loopback voice endpoint still authenticates the LiveKit bridge with `
 
 T2 on this host used the real `/usr/bin/sandbox-exec`, the confinement self-test passed, `promotionMethod=clone`, and `ARTIFACT_INSTALL_OK` reported **denials=0**. That is a repeatable engineering check. It is **not** T10 closure.
 
-T10 is a **named skip** on Node major 26 (`T10_SKIP` … `observed darwin/arm64 Node major 26`). T10 remains pending until a macOS ARM64 host whose invoking Node major version is 24 runs `node scripts/check-confinement-closure.mjs` against the selected archive. T9 remains pending until actual dodi migration evidence exists. Do not treat CI, this Node 26 run, or packaged tests as closing T9 or T10.
+T10 is a **named skip** on Node major 26 (`T10_SKIP` … `observed darwin/arm64 Node major 26`). T10 remains pending until a macOS ARM64 host whose invoking Node major version is 24 runs `node scripts/check-confinement-closure.mjs` against the selected archive. T9 remains pending until actual dodi migration evidence exists. Do not treat CI, this Node 26 run, or packaged tests as closing T9 or T10. CI (`.github/workflows/ci.yml`) runs two self-hosted macOS ARM64 packed-artifact jobs via `actions/setup-node`: Node 22 (`build` + `check` + `check:bundle`/`check:artifact`, T2/T7 unskipped, T10 named skip) and Node 24 (same path plus an unskipped T10 engineering run); neither job closes T10 acceptance.
 
 ### Node, npm, native install
 
