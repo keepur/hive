@@ -744,6 +744,9 @@ export class ServiceController {
         pids.add(currentPID);
       } else if (line.startsWith("n") && currentPID !== null) {
         continue;
+      } else if (/^[a-zA-Z]/.test(line) && !line.startsWith("n")) {
+        // Darwin lsof -Fpn still emits fd records (`f5`) and other field letters.
+        continue;
       } else {
         throw new Error("could not parse listener ownership");
       }

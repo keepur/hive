@@ -29,6 +29,7 @@ describe("paths", () => {
     ["/srv/selected/hive-personal.yaml", ".env-personal"],
     ["/srv/hive-parent/config/hive-personal.yaml", ".env-personal"],
     ["/outside/another-instance/hive-personal.yaml", ".env-personal"],
+    ["/selected/symlink-home/hive-personal.yaml", ".env-personal"],
   ])("keeps dotenv under the selected home for selector %s", (selector, dotenv) => {
     if (selector === undefined) delete process.env.HIVE_CONFIG;
     else process.env.HIVE_CONFIG = selector;

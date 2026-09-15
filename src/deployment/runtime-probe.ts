@@ -126,9 +126,26 @@ export async function probeBridge(
   }
 }
 
+const CONFINED_PROBE_OVERLAY_KEYS = new Set([
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "XDG_CACHE_HOME",
+  "npm_config_cache",
+  "npm_config_logs_dir",
+  "npm_config_devdir",
+  "npm_config_update_notifier",
+  "npm_config_fund",
+  "npm_config_audit",
+]);
+
 function selectedEnvironment(environment: NodeJS.ProcessEnv): Record<string, string> {
   const selected: Record<string, string> = {};
   for (const [key, value] of Object.entries(environment)) {
+    // Darwin injects this on every exec, including sanitized probe spawns.
+    if (key === "__CF_USER_TEXT_ENCODING") continue;
+    // Confined config-probe jobs overlay installer write locations inside the job.
+    if (CONFINED_PROBE_OVERLAY_KEYS.has(key)) continue;
     if (value !== undefined) selected[key] = value;
   }
   return selected;

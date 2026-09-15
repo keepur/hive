@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { appendFileSync, mkdtempSync, rmSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { AdmissionSnapshot } from "../voice-worker/admission.js";
 import type { MaintenanceReply } from "../voice-worker/maintenance-ipc.js";
 import type { BootIdentity, Release } from "./release.js";
@@ -450,5 +451,161 @@ describe("boundedHealthWindows", () => {
     expect(result).toBeNull();
     expect(deadlines).toEqual([30_100, 40_100, 50_100]);
     expect(sleep).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("S9 packaged selector/loader fixture", () => {
+  it("personal dotenv wins for engine config, worker loader and packaged probe without printing secrets", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { chmodSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join, resolve } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const repo = resolve(fileURLToPath(new URL("../../package.json", import.meta.url)), "..");
+    const root = mkdtempSync(join(tmpdir(), "hive-s9-loader-"));
+    try {
+      const home = join(root, "home");
+      const hiveHome = join(home, "hive");
+      mkdirSync(join(hiveHome), { recursive: true });
+      writeFileSync(
+        join(hiveHome, "hive-personal.yaml"),
+        [
+          "instance:",
+          "  id: personal_1",
+          "  portBase: 4100",
+          "voice:",
+          "  livekit:",
+          "    enabled: true",
+          "    url: http://127.0.0.1:9",
+          "    sipTrunkId: ST_s9",
+          "",
+        ].join("\n"),
+      );
+      writeFileSync(
+        join(hiveHome, ".env"),
+        [
+          "SLACK_APP_TOKEN=xapp-default",
+          "SLACK_BOT_TOKEN=xoxb-default",
+          "LIVEKIT_API_KEY=default-key",
+          "LIVEKIT_API_SECRET=default-secret-default-secret",
+          "HIVE_VOICE_BRIDGE_TOKEN=default-bridge",
+          "DEEPGRAM_API_KEY=default-deepgram",
+          "CARTESIA_API_KEY=default-cartesia",
+          "ELEVENLABS_API_KEY=default-eleven",
+          "VOICE_PORT=3105",
+          "",
+        ].join("\n"),
+      );
+      writeFileSync(
+        join(hiveHome, ".env-personal"),
+        [
+          "SLACK_APP_TOKEN=xapp-personal",
+          "SLACK_BOT_TOKEN=xoxb-personal",
+          "LIVEKIT_API_KEY=personal-key",
+          "LIVEKIT_API_SECRET=personal-secret-personal-secret",
+          "HIVE_VOICE_BRIDGE_TOKEN=personal-bridge-token",
+          "DEEPGRAM_API_KEY=personal-deepgram",
+          "CARTESIA_API_KEY=personal-cartesia",
+          "ELEVENLABS_API_KEY=personal-eleven",
+          "VOICE_PORT=4115",
+          "",
+        ].join("\n"),
+      );
+      const bin = join(root, "bin");
+      mkdirSync(bin);
+      writeFileSync(join(bin, "security"), "#!/bin/sh\nexit 44\n", { mode: 0o755 });
+      chmodSync(join(bin, "security"), 0o755);
+      const configPath = join(hiveHome, "hive-personal.yaml");
+      const env = {
+        HOME: home,
+        HIVE_HOME: hiveHome,
+        HIVE_CONFIG: configPath,
+        PATH: `${bin}:/usr/bin:/bin`,
+        VOICE_PORT: "4225",
+      };
+      const engine = execFileSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { config } from ${JSON.stringify(pathToFileURL(join(repo, "dist/config.js")).href)};
+           process.stdout.write(JSON.stringify({
+             id: config.instance.id,
+             voicePort: config.voice.port,
+             tokenClass: config.voice.bridgeToken === "personal-bridge-token" ? "personal" : "other",
+             dotenv: "selected"
+           }));`,
+        ],
+        { encoding: "utf8", env },
+      );
+      const worker = execFileSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { loadWorkerConfig } from ${JSON.stringify(pathToFileURL(join(repo, "dist/voice-worker/worker-config.js")).href)};
+           const wc = loadWorkerConfig();
+           process.stdout.write(JSON.stringify({
+             id: wc.instanceId,
+             voicePort: Number(new URL(wc.bridgeUrl).port),
+             tokenClass: wc.bridgeToken === "personal-bridge-token" ? "personal" : "other"
+           }));`,
+        ],
+        { encoding: "utf8", env },
+      );
+      const probePath = join(repo, "dist", "deployment", "runtime-probe.js");
+      // Probe requires the exact service environment (no inherited secrets).
+      let probe = "";
+      try {
+        probe = execFileSync(process.execPath, [probePath, "config"], {
+          encoding: "utf8",
+          env: {
+            HIVE_HOME: hiveHome,
+            HIVE_CONFIG: configPath,
+            HOME: home,
+            PATH: env.PATH,
+            VOICE_PORT: "4225",
+          },
+        });
+      } catch (error) {
+        const failure = error as { stdout?: string; stderr?: string };
+        probe = String(failure.stdout ?? "");
+        if (!probe) throw error;
+      }
+      const parseJson = (text: string): Record<string, unknown> => {
+        const lines = text.trim().split("\n");
+        for (const line of [...lines].reverse()) {
+          const start = line.indexOf("{");
+          if (start < 0) continue;
+          try {
+            return JSON.parse(line.slice(start)) as Record<string, unknown>;
+          } catch {
+            // keep scanning
+          }
+        }
+        throw new Error(`no JSON in:\n${text.slice(-1_000)}`);
+      };
+      const engineJson = parseJson(engine) as { id: string; voicePort: number; tokenClass: string };
+      const workerJson = parseJson(worker) as { id: string; voicePort: number; tokenClass: string };
+      const probeJson = parseJson(probe) as {
+        instanceId?: string;
+        listeners?: { voice?: number };
+        ok?: boolean;
+        classification?: string;
+      };
+      expect(engineJson.id).toBe("personal_1");
+      expect(workerJson.id).toBe("personal_1");
+      expect(engineJson.tokenClass).toBe("personal");
+      expect(workerJson.tokenClass).toBe("personal");
+      expect(engineJson.voicePort).toBe(4225);
+      expect(workerJson.voicePort).toBe(4225);
+      expect(probeJson.instanceId).toBe("personal_1");
+      expect(probeJson.listeners?.voice).toBe(4225);
+      expect(`${engine}${worker}${probe}`).not.toContain("personal-bridge-token");
+      expect(`${engine}${worker}${probe}`).not.toContain("personal-secret");
+      expect(`${engine}${worker}${probe}`).not.toContain("default-bridge");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

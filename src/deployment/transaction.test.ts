@@ -825,3 +825,25 @@ describe("helper argument and pure dry-run boundary", () => {
     expect(() => realpathSync(join(root, ".hive-state"))).toThrow();
   });
 });
+
+describe("S9 closed-gate propagation into failed activation / checked recovery", () => {
+  it.each([
+    "persistence-faulted closed gate",
+    "maintenance-owned closed gate",
+    "missing admission evidence",
+    "stale admission evidence",
+    "mismatched snapshot supervisor PID/boot",
+  ])("%s fails activation, runs checked recovery, and never records healthy", async (name) => {
+    const { io, calls } = fakeTransaction();
+    io.verifyCandidatePair = async () => {
+      calls.push("health");
+      throw new Error(name);
+    };
+    await expect(activate(io)).rejects.toThrow("activation failed; prior pair restored and verified");
+    expect(calls).toContain("phase:recovering");
+    expect(calls).toContain("recover");
+    expect(calls).toContain("resolved");
+    expect(calls).not.toContain("finalize");
+    expect(calls).not.toContain("phase:healthy");
+  });
+});

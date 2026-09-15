@@ -208,6 +208,9 @@ describe("service adapters", () => {
 
     exec.mockResolvedValueOnce({ stdout: "n*:4107\n", stderr: "" });
     await expect(controller(io).listener(4107, 10)).rejects.toThrow("could not parse listener ownership");
+
+    exec.mockResolvedValueOnce({ stdout: "p10\nf5\nn127.0.0.1:4107\n", stderr: "" });
+    await expect(controller(io).listener(4107, 10)).resolves.toEqual({ port: 4107, pid: 10 });
   });
 
   it("fails missing and escaping entrypoints before any filesystem mutation", async () => {

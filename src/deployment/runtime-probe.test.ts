@@ -99,6 +99,17 @@ describe("service environment fence", () => {
         /differs from service environment/,
       );
     }
+    expect(assertRuntimeProbeEnvironment({ ...environment, __CF_USER_TEXT_ENCODING: "0x1F5:0x0:0x0" })).toEqual(
+      environment,
+    );
+    expect(
+      assertRuntimeProbeEnvironment({
+        ...environment,
+        TMPDIR: "/tmp/job/tmp",
+        npm_config_cache: "/tmp/job/npm-cache",
+        npm_config_update_notifier: "false",
+      }),
+    ).toEqual(environment);
   });
 
   it("accepts a valid port override and refuses a malformed one", () => {
