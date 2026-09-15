@@ -230,6 +230,10 @@ try {
       "const jobHelper = join(dir, 'dist', 'ipc', 'job_proc_lazy_main.js');",
       "const inferenceHelper = join(dir, 'dist', 'ipc', 'inference_proc_lazy_main.js');",
       "if (!existsSync(jobHelper) || !existsSync(inferenceHelper)) throw new Error('sdk helper missing');",
+      "const eotRunner = join(dir, 'dist', 'inference', 'eot', 'runner.js');",
+      "if (!existsSync(eotRunner)) throw new Error('eot runner missing');",
+      "const runners = { lk_eot_audio: pathToFileURL(eotRunner).href };",
+      "if (!runners.lk_eot_audio || Object.keys(runners).length === 0) throw new Error('empty inference runners');",
       "const inference = requireFrom.resolve('@livekit/local-inference');",
       "const rtc = await import('@livekit/rtc-node');",
       "const silero = await import('@livekit/agents-plugin-silero');",
@@ -237,9 +241,9 @@ try {
       "await silero.VAD.load({ forceCPU: true });",
       "await room.disconnect();",
       "await rtc.dispose();",
-      "async function waitInitialized(child) {",
+      "async function waitInitialized(child, timeoutMs) {",
       "  await new Promise((resolve, reject) => {",
-      "    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('sdk timeout')); }, 15000);",
+      "    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('sdk timeout')); }, timeoutMs);",
       "    let initialized = false;",
       "    child.on('message', (message) => {",
       "      if (message?.case === 'initializeResponse') {",
@@ -257,9 +261,10 @@ try {
       "    });",
       "  });",
       "}",
-      "await waitInitialized(fork(jobHelper, [worker], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }));",
-      "await waitInitialized(fork(inferenceHelper, [JSON.stringify({})], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }));",
-      "process.stdout.write(JSON.stringify({ sdkChild: jobHelper, jobHelper, inferenceHelper, inference, ok: true }) + '\\n');",
+      "await waitInitialized(fork(jobHelper, [worker], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }), 15000);",
+      "// Inference child: EotRunner.initialize()/initEot() pages ~138 MB. SDK initializeTimeout is 5 min; 120s is a bounded Seatbelt budget.",
+      "await waitInitialized(fork(inferenceHelper, [JSON.stringify(runners)], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }), 120000);",
+      "process.stdout.write(JSON.stringify({ sdkChild: jobHelper, jobHelper, inferenceHelper, inference, inferenceRunners: Object.keys(runners), ok: true }) + '\\n');",
       "",
     ].join("\n")}`,
   );
@@ -271,13 +276,17 @@ try {
       home: "job",
       pathEnv: process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin",
       extraEnv: { HIVE_HOME: dummyHome, HIVE_CONFIG: join(dummyHome, "hive.yaml") },
-      timeoutMs: 120_000,
+      // Parent RTC/Silero + 15s job helper + 120s inference EOT init (see driver).
+      timeoutMs: 240_000,
     }),
   );
 
   const macos = spawnSync("/usr/bin/sw_vers", ["-productVersion"], { encoding: "utf8" });
   const runtimeJobs = verification.jobs.filter((job) => job.record.kind === "runtime-loading");
   const sdk = JSON.parse(sdkJob.stdout.toString("utf8") || "{}");
+  if (!Array.isArray(sdk.inferenceRunners) || !sdk.inferenceRunners.includes("lk_eot_audio")) {
+    throw new Error("T10(c) inference argv did not carry registered runners");
+  }
   process.stdout.write(
     `T10_CLOSURE ${JSON.stringify({
       a: { selfTest: selfTest.outcome, macosVersion: selfTest.macosVersion },
@@ -290,6 +299,7 @@ try {
         sdk,
         jobHelper: sdk.jobHelper,
         inferenceHelper: sdk.inferenceHelper,
+        inferenceRunners: sdk.inferenceRunners,
       },
       d: {
         jobs: runtimeJobs.map((job) => ({

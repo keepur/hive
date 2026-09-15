@@ -64,7 +64,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm run test",
-    "check:bundle": "npm run bundle && node scripts/check-bundle-strings.mjs && node --test scripts/generate-shrinkwrap.test.mjs && node scripts/check-bundle-pack.mjs && node --test scripts/check-bundle-runtime.test.mjs && node scripts/check-bundle-runtime.mjs && node scripts/check-bundle-qdrant-stub.mjs && npm run check:artifact",
+    "check:bundle": "npm run bundle && node scripts/check-bundle-strings.mjs && node --test scripts/generate-shrinkwrap.test.mjs && node --test scripts/check-confinement-closure.test.mjs && node scripts/check-bundle-pack.mjs && node --test scripts/check-bundle-runtime.test.mjs && node scripts/check-bundle-runtime.mjs && node scripts/check-bundle-qdrant-stub.mjs && npm run check:artifact",
     "check:artifact": "node scripts/check-artifact-install.mjs",
     "bundle": "npm run build && npx tsx build/bundle.ts",
     "pack:release": "node scripts/generate-shrinkwrap.mjs --pack",
