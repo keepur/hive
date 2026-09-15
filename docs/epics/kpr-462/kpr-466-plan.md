@@ -22,7 +22,7 @@
 - **R18** — No-call packaged profile (identity, engine markers, missing-agent 400, SDK registration, containment) vs informational doctor (installed ≠ observed; no default vendor API); pilot recovery is a separate profile.
 - **R19** — Conversation, warm default, tool-ack, vendors, and Mokie routing unchanged.
 
-**Readiness:** DRAFT — **R13–R19 revision** of the previously clean round-6 plan at `169445c5` (plan-review round 6 approved; `ready-to-implement` withheld as blocked-dependency on then-In-Progress KPR-463). Epic head is now `6b993455ac34691bc79bfe4247cf780d708562b8`. This is not a "round 6 draft." Nothing in this plan assumes KPR-463 T9 has passed, that a KPR-465 configuration decision exists, or that May's go has been given. Task 1 is the only task this plan authorizes to run before T9 + May's go.
+**Readiness:** DRAFT — **R13–R19 revision** of the previously clean round-6 plan at `169445c5` (plan-review round 6 approved; `ready-to-implement` then withheld as blocked-dependency on In-Progress KPR-463). Epic head for this revision is `61568435`; KPR-463 merge is `6b993455ac34691bc79bfe4247cf780d708562b8`. This is not a "round 6 draft." KPR-463 and KPR-465 are **delivered**, so the maturity dependency check is satisfied. T9, P1–P7, 465 config/keep-cold-by-absence, and May's go remain **execution** gates in Dependency order — not `ready-to-implement` predicates. Nothing in this plan assumes those execution gates have already passed. After clean plan review, Task 1 may start immediately; Task 2 still requires T9 evidence (not May's go); Task 7 may still close honestly if May's go never arrives; Tasks 3–6 still require May's go.
 
 **Assumptions (spec not edited):**
 
@@ -426,4 +426,4 @@ No report from May at all (call ended before she gave one) reads as "none report
 
 ## Execution Handoff
 
-Plan saved to `docs/epics/kpr-462/kpr-466-plan.md`. Ready for independent plan review of this R13–R19 revision. Task 1 may start immediately; Tasks 2–7 remain gated exactly as stated in "Dependency order" above. `ready-to-implement` stays withheld until actual T9 + May's go exist; this revision does not assume either.
+Plan saved to `docs/epics/kpr-462/kpr-466-plan.md`. Ready to execute after independent plan review and the child-delivery dependency check — Task 1 may start immediately; Tasks 2–7 remain gated exactly as stated in "Dependency order" above. `ready-to-implement` is the maturity label for that review + delivered-children check, not a T9 or May-go predicate.
