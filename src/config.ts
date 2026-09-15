@@ -256,7 +256,7 @@ export function resolveVoiceLivekitConfig(raw: unknown): VoiceLivekitConfig {
     inboundAgents,
     agentVoices,
     defaultStt: str(src.defaultStt, "deepgram/flux-general-en"),
-    defaultTts: str(src.defaultTts, "cartesia/sonic-3"),
+    defaultTts: str(src.defaultTts, "cartesia/sonic-2"),
   };
 }
 
@@ -469,7 +469,7 @@ export const config = {
   },
   mongo: {
     uri: optional("MONGODB_URI", "mongodb://localhost:27017"),
-    dbName: optional("MONGODB_DB", `hive_${instanceId}`),
+    dbName: optional("MONGODB_DB", `hive_h_${instanceId}`),
   },
   defaultAgent: optional("DEFAULT_AGENT", "chief-of-staff"),
   google: {
