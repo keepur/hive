@@ -1200,7 +1200,9 @@ describe("standalone restart, takeover, and obsolete operations", () => {
       });
       const old = scanner(new ModelCatalogStore(delayed, { now: () => new Date(now) }), oldDiscover, () => now, {
         uuid: () => oldId,
-        leaseMs: 900,
+        // The detached write is fenced on this lease; at 900 ms a hosted-runner stall let it lapse before the
+        // fault hook saw the mutation (`detached` stayed undefined). Keep it under waitForActualExpiry's 8 s cap.
+        leaseMs: 3_000,
       });
       let oldTick: Promise<void> | undefined;
       let successor: ModelCatalogScanner | undefined;
