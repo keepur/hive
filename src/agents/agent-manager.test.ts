@@ -570,6 +570,23 @@ describe("AgentManager", () => {
     );
   });
 
+  afterEach(() => {
+    // Cancel the reflection timers this test's manager armed. Three ok,
+    // non-system turns on one memory-eligible thread (the KPR-313 flip round
+    // trip, the KPR-211 rotation case, the warm voice leases) arm the
+    // production 30 s debounce, unref'd, and nothing else stops it: the next
+    // beforeEach builds a NEW manager and store, but the old manager's timer
+    // still fires runReflectionTurn against the OLD store through the shared
+    // module-level runner mock. Locally the file finishes in ~5 s and the
+    // timers never fire; on a loaded runner the file outlives 30 s and a
+    // stale reflection lands inside whichever test is running, consuming a
+    // mockResolvedValueOnce and shifting mock.calls (CI run 35146251937:
+    // `expected 's-3' to be 's-A'` in the KPR-434 adopt case — 's-3' is the
+    // flip test's last session id). stopReflections() is the service-shutdown
+    // cancel; it is the per-test teardown the shared manager was missing.
+    manager.stopReflections();
+  });
+
   // KPR-220 Phase 10: `sendMessage` + `processThreadQueue` + `concurrency
   // limiting (maxConcurrent)` + `end-of-conversation reflection` describe
   // blocks deleted. Coverage is now in the `spawnTurn (KPR-216)` describe
@@ -6843,6 +6860,10 @@ describe("AgentManager", () => {
         manager.runWorkItemTurn("agent-a", smsItem(threadId, "turn A")),
         manager.runWorkItemTurn("agent-a", smsItem(threadId, "turn B")),
       ]);
+      // Exactly the two turns above — a stray call here (a leaked reflection
+      // from an earlier test's manager, see the top-level afterEach) would
+      // otherwise surface only as an opaque id mismatch at index 1.
+      expect(mockRunnerSend).toHaveBeenCalledTimes(2);
       expect(mockRunnerSend.mock.calls[0]![1]).toBeUndefined(); // A: handoff, fresh
       expect(seenArg(0)).toBeUndefined();
       expect(mockRunnerSend.mock.calls[1]![1]).toBe("s-A"); // B adopted A's switched session…
