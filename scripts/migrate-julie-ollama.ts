@@ -33,16 +33,21 @@ const SERVER = "ollama";
 const GUARDRAIL_MARKER = "## Personnel Data — Privacy Boundary";
 
 /**
- * Shape: two named paths, an explicit trigger list, and a closing clause
- * forbidding the quiet easy path.
+ * Mirrors the shape of Ross's "Document Handling — Privacy Boundary": two named
+ * paths, an explicit sensitive-trigger list, and a closing clause forbidding the
+ * quiet easy path. Ross's lives in agent_definitions.systemPrompt, not .soul
+ * (verified 2026-09-16 by reading both fields for all eight ollama agents).
  *
- * NOTE (verified 2026-09-16 against hive_catalyst.agent_definitions): this is
- * currently the ONLY written local-vs-frontier routing rule of any of the eight
- * ollama agents. Bill, Diana, Lily, Nora, Ross, Stefan and Warren all carry the
- * tool with zero routing language in their souls. An earlier version of this
- * comment claimed to mirror an existing guardrail of Ross's; no such text
- * exists. Treat this block as the prototype for a shared default, not as one
- * instance of an established pattern. Parity is tracked separately.
+ * Scope difference worth knowing: Ross's rule routes DOCUMENTS (on-device
+ * rag_ingest vs Google Workspace fetch into cloud context). This one routes
+ * INFERENCE (which model answers). Same privacy logic, different mechanism —
+ * so it is a shape precedent, not a drop-in template.
+ *
+ * Parity, verified same audit: of the eight, only Ross has any written privacy
+ * routing rule at all, and his says nothing about model choice. Bill, Diana,
+ * Lily, Nora, Stefan and Warren have none in either field. Julie's is therefore
+ * the first inference-routing rule on the team. Parity for the rest is an open
+ * item, tracked separately — not silently fixed here.
  *
  * Deliberately a PRIVACY boundary, not a cost escape hatch — routing HR work
  * to a weaker model by guess is silent quality degradation where it does the
