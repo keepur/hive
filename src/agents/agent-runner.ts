@@ -75,6 +75,7 @@ import { createScheduleMcpServer } from "../schedule/schedule-mcp-server.js";
 import { createTeamMcpServer } from "../team/team-mcp-server.js";
 import { createAdminMcpServer } from "../admin/admin-mcp-server.js";
 import { createCodeSearchMcpServer } from "../code-index/code-search-mcp-server.js";
+import { createOllamaMcpServer } from "../ollama/ollama-mcp-server.js";
 import { createWorkflowMcpServer } from "../workflow/workflow-mcp-server.js";
 import { createWorkerPoolMcpServer } from "../workers/worker-pool-mcp-server.js";
 import { createVoiceFixtureMcpServer } from "../voice/voice-fixture-mcp-server.js";
@@ -438,6 +439,9 @@ export class AgentRunner {
   private adminMcpServer?: ReturnType<typeof createAdminMcpServer>;
   private memoryLifecycle?: MemoryLifecycle;
   private codeSearchMcpServer?: ReturnType<typeof createCodeSearchMcpServer>;
+  private ollamaMcpServer?: ReturnType<typeof createOllamaMcpServer>;
+  /** Core-server drift is logged once per runner, not once per turn. */
+  private loggedCoreServerDrift = false;
   private workflowMcpServer?: ReturnType<typeof createWorkflowMcpServer>;
   // KPR-213: optional shared prefix cache. Production wires this in via
   // index.ts; tests that don't pass one fall through to a direct buildPrefix
@@ -1187,6 +1191,36 @@ export class AgentRunner {
       }
     }
 
+    // ── Core-server drift guard ────────────────────────────────────────────
+    // This loop only ever DELETES. A name in `coreServers` that has no entry
+    // in `allConfigs` is not an error here — it simply never appears, with no
+    // log line anywhere. That silence is how seven agents ran for weeks
+    // configured for `ollama` with no ollama: a deploy overwrote the untracked
+    // `.hive/pkg/mcp/ollama.min.js` bundle and nothing said a word. The
+    // existing "Delegate server not found, skipping" warning cannot catch this
+    // — by definition it only fires for DELEGATE servers.
+    //
+    // So: name every configured core server that resolved to nothing. Names
+    // wired in-process by send() (no stdio placeholder — the KPR-327 memory
+    // pattern) and engine-auto-injected names are legitimately absent here and
+    // are excluded. Anything left is real drift: a removed server, a typo, or a
+    // bundle that vanished. Logged once per runner so a hot-reload loop cannot
+    // turn a config mistake into log spam.
+    if (!this.loggedCoreServerDrift) {
+      const autoInjected = this.autoInjectedServerNames();
+      const unresolved = [...coreSet].filter(
+        (name) => !allConfigs[name] && !IN_PROCESS_PORTED_SERVERS.has(name) && !autoInjected.has(name),
+      );
+      if (unresolved.length > 0) {
+        this.loggedCoreServerDrift = true;
+        log.error("Core servers configured but not available — agent will silently lack these tools", {
+          agent: this.agentConfig.id,
+          servers: unresolved,
+          hint: "Name removed from the engine, a typo in coreServers, or a plugin that failed to load. Fix the agent definition or restore the server.",
+        });
+      }
+    }
+
     // Autonomy gates — strip servers based on per-agent resolved flags
     if (!this.agentConfig.autonomy.externalComms) {
       for (const key of ["resend", "quo"]) {
@@ -1403,6 +1437,25 @@ export class AgentRunner {
       });
     }
 
+    // Ollama is in-process-only with no stdio placeholder (KPR-327 memory
+    // pattern) — surface its descriptor explicitly so the Lane B partition
+    // bridges its tools instead of silently dropping them. Gate mirrors the
+    // runtime wiring in send(): no db requirement.
+    // (Standing obligation, CLAUDE.md "Adding an in-process MCP server".)
+    if (this.shouldEnableInProcessServer("ollama") && !mcpServers["ollama"]) {
+      inventory.push({
+        ...classifyToolTransport({
+          name: "ollama",
+          transport: "sdk-in-process",
+          source: "core",
+          requiresTurnContext: TURN_CONTEXT_DEPENDENT_SERVERS.has("ollama"),
+          requiresHiveRuntime: true,
+          inProcess: true,
+        }),
+        schemas: { kind: "connect-time" },
+      });
+    }
+
     // KPR-324 C7 + KPR-327 pattern: voice-fixture is in-process-only with no
     // stdio placeholder — surface its descriptor explicitly so the Lane B
     // partition sees it honestly (bridged, not silently absent). Gate
@@ -1598,6 +1651,18 @@ export class AgentRunner {
         this.codeSearchMcpServer = createCodeSearchMcpServer({ db: this.db });
       }
       servers["code-search"] = this.codeSearchMcpServer;
+    }
+
+    // Ollama MCP — in-process, local-model inference for privacy-sensitive
+    // work. No db dependency (it only talks to the local daemon on
+    // OLLAMA_URL), so unlike code-search it is NOT gated on `this.db`.
+    // Restores the capability the seven ollama-configured agents lost when a
+    // deploy erased the untracked `.hive/pkg/mcp/ollama.min.js` bundle.
+    if (this.shouldEnableInProcessServer("ollama")) {
+      if (!this.ollamaMcpServer) {
+        this.ollamaMcpServer = createOllamaMcpServer({});
+      }
+      servers["ollama"] = this.ollamaMcpServer;
     }
 
     // KPR-122: workflow MCP — in-process. Gated by config.workflow.enabled

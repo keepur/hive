@@ -4977,3 +4977,111 @@ describe("KPR-434: memory rides the turn input under the digest gate; system pro
     expect(mockLog.info).toHaveBeenCalledWith("Sending prompt to agent", expect.objectContaining({ promptLength: 5 }));
   });
 });
+
+// ── Ollama in-process server + core-server drift guard ──────────────────
+// Restores the local-inference capability that seven agents lost when a
+// deploy erased the untracked `.hive/pkg/mcp/ollama.min.js` bundle, and pins
+// the guard that makes that class of loss loud instead of silent.
+describe("AgentRunner — ollama", () => {
+  function makeOllamaRunner(coreServers: string[], db?: any): AgentRunner {
+    return new AgentRunner(
+      makeAgentConfig({ coreServers }),
+      makeMockMemoryManager() as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      db,
+    );
+  }
+
+  it("builds the in-process ollama server when the agent lists it", () => {
+    const servers = makeOllamaRunner(["ollama"], makeFakeInProcessDb()).buildInProcessServers();
+    expect(Object.keys(servers)).toContain("ollama");
+  });
+
+  it("does NOT build ollama for an agent that does not list it", () => {
+    const servers = makeOllamaRunner(["memory"], makeFakeInProcessDb()).buildInProcessServers();
+    expect(Object.keys(servers)).not.toContain("ollama");
+  });
+
+  it("builds ollama with NO db — it talks to a local daemon, unlike code-search", () => {
+    // The distinguishing gate. If someone later copies the code-search block
+    // and adds a `this.db &&` guard, this fails.
+    const servers = makeOllamaRunner(["ollama"]).buildInProcessServers();
+    expect(Object.keys(servers)).toContain("ollama");
+  });
+
+  it("surfaces ollama in the tool-transport inventory so Lane B providers bridge it", () => {
+    // KPR-327 compensation: in-process-only servers have no stdio placeholder,
+    // so without an explicit descriptor ollama works on Claude and is silently
+    // invisible to openai/codex/gemini/grok.
+    const entry = makeOllamaRunner(["ollama"], makeFakeInProcessDb())
+      .buildToolTransportInventory()
+      .find((e: any) => e.name === "ollama");
+    expect(entry).toBeDefined();
+    expect(entry).toMatchObject({ inProcess: true, transport: "sdk-in-process", source: "core" });
+  });
+
+  it("is reusable across turns rather than rebuilt", () => {
+    const runner = makeOllamaRunner(["ollama"]);
+    expect(runner.buildInProcessServers().ollama).toBe(runner.buildInProcessServers().ollama);
+  });
+});
+
+describe("AgentRunner — core-server drift guard", () => {
+  // These assert on the ABSENCE of a log line, so a call leaked from a prior
+  // test would make them fail for the wrong reason.
+  beforeEach(() => mockLog.error.mockClear());
+
+  function driftRunner(coreServers: string[]): AgentRunner {
+    return new AgentRunner(
+      makeAgentConfig({ coreServers }),
+      makeMockMemoryManager() as any,
+      [],
+      new Map(),
+      "{}",
+      undefined,
+      undefined,
+      makeFakeInProcessDb(),
+    );
+  }
+
+  function driftCall(): any[] | undefined {
+    return mockLog.error.mock.calls.find(
+      (c: any[]) => c[0] === "Core servers configured but not available — agent will silently lack these tools",
+    );
+  }
+
+  it("logs an error naming a core server that resolves to nothing", () => {
+    // This is the exact failure that went unnoticed for weeks: the config said
+    // `ollama`, the binary was gone, and nothing was logged.
+    driftRunner(["memory", "totally-not-a-server"]).buildToolTransportInventory();
+    const call = driftCall();
+    expect(call).toBeDefined();
+    expect(call![1].servers).toEqual(["totally-not-a-server"]);
+  });
+
+  it("stays quiet for in-process servers, which legitimately have no stdio entry", () => {
+    driftRunner(["memory", "structured-memory", "contacts", "code-search", "ollama"]).buildToolTransportInventory();
+    expect(driftCall()).toBeUndefined();
+  });
+
+  it("stays quiet for engine-auto-injected servers", () => {
+    driftRunner(["schedule", "team", "team-roster", "skill-author"]).buildToolTransportInventory();
+    expect(driftCall()).toBeUndefined();
+  });
+
+  it("logs once per runner, not once per turn — a hot-reload loop must not spam", () => {
+    const runner = driftRunner(["totally-not-a-server"]);
+    runner.buildToolTransportInventory();
+    runner.buildToolTransportInventory();
+    runner.buildToolTransportInventory();
+    expect(
+      mockLog.error.mock.calls.filter(
+        (c: any[]) => c[0] === "Core servers configured but not available — agent will silently lack these tools",
+      ),
+    ).toHaveLength(1);
+  });
+});

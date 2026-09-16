@@ -35,6 +35,9 @@ export const IN_PROCESS_PORTED_SERVERS = new Set<string>([
   "admin",
   "code-search",
   "workflow",
+  // Local-model inference. In-process only — it was previously a hand-edited
+  // `.hive/pkg/mcp/ollama.min.js` bundle, which a deploy erased silently.
+  "ollama",
   // KPR-390: meeting worker pool — in-process only (no per-server bundle).
   "worker-pool",
   // KPR-324 C7: voice-pilot test fixture — in-process only, never delegable.

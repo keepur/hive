@@ -54,6 +54,7 @@
     "setup:plist": "npx tsx setup/generate-plist.ts",
     "update": "git pull && npm install && npm run build",
     "reindex": "npx tsx scripts/code-index.ts",
+    "check:core-servers": "npx tsx scripts/check-core-servers.ts",
     "lint": "eslint src/ setup/",
     "lint:fix": "eslint --fix src/ setup/",
     "format": "prettier --write \"src/**/*.ts\" \"setup/**/*.ts\"",

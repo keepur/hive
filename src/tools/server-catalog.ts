@@ -93,6 +93,13 @@ export const SERVER_CATALOG: Record<string, ServerCatalogEntry> = {
     usage: "Finding code by what it does, not just by filename",
     notFor: "Broad web search — use brave-search instead",
   },
+  ollama: {
+    description: "Local-model inference — run a prompt on this machine, nothing leaves the device",
+    usage:
+      "Privacy-sensitive work: personnel, medical, financial, or client-identifiable material that must not go to a cloud model",
+    notFor: "General reasoning where quality matters — a local 14B is materially weaker than your primary model",
+    toolkitBlurb: "Local Ollama inference — privacy-preserving, stays on this machine",
+  },
   memory: {
     description: "Read and write your personal agent memory",
     usage: "Storing and retrieving facts across conversations. Auto-managed — don't over-save",

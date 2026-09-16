@@ -75,6 +75,9 @@ const INFRASTRUCTURE_SERVERS = new Set([
   "keychain",
   "admin",
   "skill-author",
+  // Local daemon on OLLAMA_URL — no credential to check, so it belongs here
+  // rather than carrying a SERVER_CREDENTIAL_CHECKS entry.
+  "ollama",
 ]);
 
 /**
