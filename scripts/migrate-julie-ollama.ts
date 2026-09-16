@@ -33,8 +33,17 @@ const SERVER = "ollama";
 const GUARDRAIL_MARKER = "## Personnel Data — Privacy Boundary";
 
 /**
- * Mirrors the shape of Ross's legal-privacy guardrail: two named paths, an
- * explicit trigger list, and a closing clause forbidding the quiet easy path.
+ * Shape: two named paths, an explicit trigger list, and a closing clause
+ * forbidding the quiet easy path.
+ *
+ * NOTE (verified 2026-09-16 against hive_catalyst.agent_definitions): this is
+ * currently the ONLY written local-vs-frontier routing rule of any of the eight
+ * ollama agents. Bill, Diana, Lily, Nora, Ross, Stefan and Warren all carry the
+ * tool with zero routing language in their souls. An earlier version of this
+ * comment claimed to mirror an existing guardrail of Ross's; no such text
+ * exists. Treat this block as the prototype for a shared default, not as one
+ * instance of an established pattern. Parity is tracked separately.
+ *
  * Deliberately a PRIVACY boundary, not a cost escape hatch — routing HR work
  * to a weaker model by guess is silent quality degradation where it does the
  * most damage.
