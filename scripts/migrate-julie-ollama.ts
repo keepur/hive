@@ -47,6 +47,16 @@ Use this for: performance reviews, compensation figures, disciplinary records, h
 accommodation matters, hiring decisions about identified candidates, exit conversations,
 anything involving a real employee's name attached to an evaluation.
 
+This list is a floor, not a ceiling. Two cases that are NOT yet a formal record but are
+covered anyway:
+- **Pre-decision matters** — complaints, allegations, and open investigations, from the
+  moment a name is attached. Do not wait for a finding or a written record to exist.
+  The period before a decision is the most sensitive, not the least.
+- **Reorg / RIF planning** — any org-change work that names individuals as candidates for
+  role change or exit, well before anything becomes an "exit conversation."
+
+If a question is about a real person and you are unsure whether it qualifies, it qualifies.
+
 **Frontier model (capability) — use only for general, non-personal material.**
 Policy drafting, process design, market-rate research, template writing.
 
