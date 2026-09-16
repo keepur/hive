@@ -12,6 +12,11 @@ import type { CatalogChangeDoc } from "./model-catalog-types.js";
 import { deferred, faultDb } from "./testing/catalog-db.test-support.js";
 import { startStandaloneMongo } from "./testing/standalone-mongo.js";
 
+// Every case here drives a real owned mongod (beforeAll) through journaled writes and lease waits. On the
+// shared CI runner a few seconds of wall-clock stall is normal, so budget this file like its hooks (30 s)
+// instead of the unit suite's 10 s.
+vi.setConfig({ testTimeout: 30_000 });
+
 const CHANGES = "agent_model_catalog_changes";
 const ROUTE: NoticeRoute = {
   agentId: "chief-of-staff",
@@ -657,8 +662,12 @@ describe("ModelCatalogNotifier with owned standalone Mongo", () => {
     const firstDispatch = dispatcherFixture();
     const first = new ModelCatalogNotifier(crashOutbox, firstDispatch as any, {
       uuid: uuidSequence("crashed"),
-      leaseMs: 80,
-      renewMs: 1_000,
+      // Every step from the claim to the faulted ack is gated on this lease (client clock and the server's
+      // $$NOW). Once it lapses the row is released before any ack, ackEntered never resolves, and the test
+      // hangs to its timeout: a single 100 ms stall on the send-intent write reproduced the CI failure at
+      // 80 ms. Keep renewMs above leaseMs so nothing moves the stranded lease before the recovery below.
+      leaseMs: 1_000,
+      renewMs: 5_000,
       pollMs: 1_000,
       drainMs: 250,
     });
@@ -680,10 +689,7 @@ describe("ModelCatalogNotifier with owned standalone Mongo", () => {
     expect(firstDispatch.prepareCatalogNotification).toHaveBeenCalledTimes(1);
     expect(firstDispatch.sendPreparedCatalogNotification).toHaveBeenCalledTimes(1);
 
-    const remaining = stranded.delivery.claim!.leaseExpiresAt.getTime() - Date.now();
-    if (remaining >= 0) await new Promise((resolve) => setTimeout(resolve, remaining + 25));
-    const serverTime = (await mongo.db.admin().command({ hello: 1 })).localTime as Date;
-    expect(serverTime.getTime()).toBeGreaterThan(stranded.delivery.claim!.leaseExpiresAt.getTime());
+    await waitForServerAfter(stranded.delivery.claim!.leaseExpiresAt);
 
     const recoveredDispatch = dispatcherFixture();
     const recovered = new ModelCatalogNotifier(new ModelCatalogOutbox(mongo.db), recoveredDispatch as any, {
