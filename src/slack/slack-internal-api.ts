@@ -40,11 +40,30 @@ export class SlackInternalApi {
     this.registry = opts.registry;
   }
 
+  /**
+   * Actual port the server is listening on (mirrors WsAdapter.listeningPort,
+   * KPR-218). When constructed with `port: 0` (OS-assigned ephemeral) this
+   * returns the resolved port post-`start()`; otherwise the constructor value.
+   * A failed bind drops the handle, so it also reads back as the constructor
+   * value — 0 for a caller that asked for an ephemeral port. Tests use the
+   * ephemeral path so parallel workers can never collide on a port.
+   */
+  get listeningPort(): number {
+    const addr = this.server?.address();
+    if (addr && typeof addr === "object" && "port" in addr) return addr.port;
+    return this.port;
+  }
+
   async start(): Promise<void> {
     this.server = createServer((req, res) => {
       this.handleRequest(req, res).catch((err) => {
         log.error("HTTP handler error", { error: String(err) });
-        res.writeHead(500, { "Content-Type": "application/json" });
+        // Every handler writes head and body back to back, so a throw after the
+        // headers went out is theoretical — but writeHead on a sent response
+        // throws ERR_HTTP_HEADERS_SENT out of this catch, and the client would
+        // then hang on a never-ended response. Always end with a JSON body.
+        if (res.writableEnded) return;
+        if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "Internal server error" }));
       });
     });
@@ -87,7 +106,7 @@ export class SlackInternalApi {
     });
     if (!bound) return;
 
-    log.info("Slack internal API started", { port: this.port });
+    log.info("Slack internal API started", { port: this.listeningPort });
   }
 
   async stop(): Promise<void> {

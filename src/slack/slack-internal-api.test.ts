@@ -61,18 +61,28 @@ async function startApi(
   agentManager: Record<string, unknown>,
   registry: Record<string, unknown> = makeRegistry(),
 ): Promise<{ api: SlackInternalApi; port: number; token: string; stop: () => Promise<void> }> {
-  // Use a random high port for testing — pick one in the ephemeral range.
-  const port = 50000 + Math.floor(Math.random() * 10000);
+  // Port 0: the OS hands out a port nothing else holds. The previous
+  // `50000 + random(10000)` sat inside macOS's ephemeral range (49152-65535),
+  // so a parallel vitest worker's port-0 mock server could already own the
+  // pick. start() logs and returns on EADDRINUSE by design (silently here — the
+  // logger is mocked), and the request then reached the OTHER worker's server:
+  // beekeeper-client.test.ts answers unknown routes with a body-less 404, which
+  // is exactly the "Unexpected end of JSON input" CI showed once (keepur/keepur
+  // run 35145880473, 2026-09-16).
   const token = "test-token-abc";
 
   const api = new SlackInternalApi({
-    port,
+    port: 0,
     authToken: token,
     gateway: gateway as never,
     agentManager: agentManager as never,
     registry: registry as never,
   });
   await api.start();
+  // A failed bind reads back as the configured 0. Fail by name instead of
+  // letting the request wander off to whoever holds a port.
+  const port = api.listeningPort;
+  if (port === 0) throw new Error("SlackInternalApi did not bind (see mockLog.error)");
 
   return { api, port, token, stop: () => api.stop() };
 }
@@ -90,8 +100,25 @@ async function post(
     headers,
     body: JSON.stringify(body),
   });
-  const json = (await res.json()) as Record<string, unknown>;
-  return { status: res.status, body: json };
+  return { status: res.status, body: await readJson(res) };
+}
+
+/**
+ * Parse a JSON response, naming the status and raw body when it is not JSON —
+ * `res.json()` alone throws a bare "Unexpected end of JSON input", which says
+ * nothing about who answered or with what.
+ */
+async function readJson(res: Response): Promise<Record<string, unknown>> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch (err) {
+    const contentType = res.headers.get("content-type") ?? "(none)";
+    throw new Error(
+      `non-JSON response: HTTP ${res.status}, content-type ${contentType}, body ${JSON.stringify(text.slice(0, 200))} (${String(err)})`,
+      { cause: err },
+    );
+  }
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -129,7 +156,7 @@ describe("SlackInternalApi — auth", () => {
       method: "GET",
       headers: { Authorization: `Bearer ${token}` },
     });
-    const json = (await res.json()) as Record<string, unknown>;
+    const json = await readJson(res);
     expect(res.status).toBe(405);
     expect(json).toMatchObject({ ok: false });
   });

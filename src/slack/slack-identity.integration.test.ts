@@ -60,9 +60,10 @@ describe("KPR-492 integration — agent_id becomes username on chat.postMessage"
   beforeEach(async () => {
     vi.clearAllMocks();
     const gateway = new SlackGateway("xapp-test", "xoxb-test");
-    port = 50000 + Math.floor(Math.random() * 10000);
     api = new SlackInternalApi({
-      port,
+      // OS-assigned: a random 50000-59999 pick could collide with a parallel
+      // worker's port-0 server — see startApi() in slack-internal-api.test.ts.
+      port: 0,
       authToken: token,
       gateway,
       agentManager: { getActiveWorkItems: () => [] } as never,
@@ -71,6 +72,8 @@ describe("KPR-492 integration — agent_id becomes username on chat.postMessage"
       } as never,
     });
     await api.start();
+    port = api.listeningPort;
+    if (port === 0) throw new Error("SlackInternalApi did not bind");
   });
 
   afterEach(async () => {
@@ -83,7 +86,15 @@ describe("KPR-492 integration — agent_id becomes username on chat.postMessage"
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       body: JSON.stringify(body),
     });
-    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+    const text = await res.text();
+    try {
+      return { status: res.status, body: JSON.parse(text) as Record<string, unknown> };
+    } catch (err) {
+      throw new Error(
+        `non-JSON response: HTTP ${res.status}, body ${JSON.stringify(text.slice(0, 200))} (${String(err)})`,
+        { cause: err },
+      );
+    }
   }
 
   it("carries the agent's name and icon all the way to chat.postMessage", async () => {
