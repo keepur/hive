@@ -11,8 +11,8 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: [self-hosted, macOS, ARM64]
-    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
 
@@ -28,6 +28,16 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+
+      # `npm run check` includes the model-catalog integration tests, which
+      # spawn their own standalone mongod; the hosted image ships without one.
+      - name: Install mongod
+        run: |
+          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+          echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu $(lsb_release -cs)/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mongodb-org-server
+          mongod --version | head -1
 
       - name: Install dependencies
         run: npm ci
