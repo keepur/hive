@@ -13,13 +13,27 @@ concurrency:
 jobs:
   check:
     name: Typecheck + Lint + Format + Test
-    runs-on: [self-hosted, macOS, ARM64]
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      # The model-catalog integration tests spawn their own standalone mongod
+      # (MONGOD_BINARY or `mongod` on PATH); the hosted image ships without one.
+      - name: Install mongod
+        run: |
+          curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+          echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu $(lsb_release -cs)/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mongodb-org-server
+          mongod --version | head -1
 
       - name: Install dependencies
         run: npm ci
