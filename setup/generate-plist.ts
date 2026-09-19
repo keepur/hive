@@ -4,7 +4,8 @@
  *
  * Generates (filenames include instance ID from hive.yaml):
  *   service/com.hive.<id>.agent.plist        — main Hive service
- *   service/com.hive.<id>.rotate-logs.plist  — daily log rotation
+ *   service/com.hive.<id>.rotate-logs.plist  — log rotation (daily at 04:00; set
+ *                                             HIVE_ROTATE_LOGS_WEEKDAY=0-7 for weekly)
  *   service/com.hive.<id>.deploy-check.plist — periodic deploy checker
  *   service/com.hive.<id>.voice-worker.plist — LiveKit voice worker (only when
  *                                             voice.livekit.enabled is true)
@@ -17,6 +18,7 @@ import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { buildRotateLogsPlist, parseRotateWeekday } from "./rotate-logs-plist.ts";
 
 const ROOT = resolve(import.meta.dirname, "..");
 
@@ -47,6 +49,9 @@ const LOGS_DIR = join(DEPLOY_DIR, "logs");
 const LABEL = `com.hive.${instanceId}.agent`;
 const LABEL_LOGS = `com.hive.${instanceId}.rotate-logs`;
 const LABEL_DEPLOY = `com.hive.${instanceId}.deploy-check`;
+
+// Validated up front so a bad value fails before any plist is written.
+const rotateWeekday = parseRotateWeekday(process.env.HIVE_ROTATE_LOGS_WEEKDAY);
 
 // Detect paths
 const nodePath = execSync("which node", { encoding: "utf-8" }).trim();
@@ -114,46 +119,20 @@ console.log(`  Logs: ${LOGS_DIR}/`);
 
 // ── Log rotation plist ─────────────────────────────────────────────
 
-const rotatePlist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${LABEL_LOGS}</string>
-
-  <key>ProgramArguments</key>
-  <array>
-    <string>${DEPLOY_DIR}/.hive/service/rotate-logs.sh</string>
-  </array>
-
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>${pathEnv}</string>
-    <key>HOME</key>
-    <string>${home}</string>
-  </dict>
-
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>4</integer>
-    <key>Minute</key>
-    <integer>0</integer>
-  </dict>
-
-  <key>StandardOutPath</key>
-  <string>${LOGS_DIR}/rotate-logs.log</string>
-  <key>StandardErrorPath</key>
-  <string>${LOGS_DIR}/rotate-logs.log</string>
-</dict>
-</plist>
-`;
+const rotatePlist = buildRotateLogsPlist({
+  label: LABEL_LOGS,
+  deployDir: DEPLOY_DIR,
+  logsDir: LOGS_DIR,
+  home,
+  pathEnv,
+  weekday: rotateWeekday,
+});
 
 const rotatePlistPath = join(SERVICE_DIR, `${LABEL_LOGS}.plist`);
 writeFileSync(rotatePlistPath, rotatePlist);
 console.log(`Generated: ${rotatePlistPath}`);
 console.log(`  Label: ${LABEL_LOGS}`);
+console.log(`  Schedule: ${rotateWeekday === undefined ? "daily" : `weekly (weekday ${rotateWeekday})`} at 04:00`);
 
 // ── Deploy checker plist ──────────────────────────────────────────
 

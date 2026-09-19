@@ -5,6 +5,8 @@ set -euo pipefail
 # Generates plists, symlinks them into ~/Library/LaunchAgents, and bootstraps.
 #
 # Set HIVE_DEPLOY_DIR to override the working directory (default: ~/services/<instance-id>)
+# Set HIVE_ROTATE_LOGS_WEEKDAY=0-7 (0 and 7 = Sunday) to rotate logs weekly at 04:00
+# on that day instead of daily. Re-run this script to change the schedule.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HIVE_ROOT="$(dirname "$SCRIPT_DIR")"
