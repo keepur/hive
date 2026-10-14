@@ -78,7 +78,7 @@
     "@anthropic-ai/sdk": "^0.123.0",
     "@google/genai": "^2.21.0",
     "@linear/sdk": "^95.0.0",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "@openai/agents": "^0.11.4",
     "@qdrant/js-client-rest": "~1.18.0",
     "@slack/socket-mode": "^2.0.7",
