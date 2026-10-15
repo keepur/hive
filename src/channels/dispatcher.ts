@@ -55,12 +55,28 @@ import {
 const log = createLogger("dispatcher");
 
 /** Max length for status queries — anything longer is real content, not a status check */
-const STATUS_MAX_LENGTH = 80;
+export const STATUS_MAX_LENGTH = 80;
 
-const STATUS_PATTERNS = [
-  /^status\??$/i,
+/**
+ * Patterns that route a message to the fleet health report instead of to an agent.
+ *
+ * These MUST stay unambiguously fleet-level. A bare "status" and "health" used to
+ * live here, which meant asking an agent for the status of something it owed you
+ * got intercepted by the dispatcher and answered with a fleet-wide report — the
+ * agent never saw the message. Fleet queries are now "hive"-prefixed so the bare
+ * words reach the agent.
+ *
+ * Do not add a pattern that matches a single common word on its own (including a
+ * bare "hive", which is ambiguous in a product literally named Hive) — that
+ * re-creates the same collision.
+ *
+ * Exported so dispatcher.test.ts asserts against the real array rather than a
+ * duplicated local copy, which previously let source and test drift silently.
+ */
+export const STATUS_PATTERNS = [
+  /^hive\s+status\??$/i,
+  /^hive\s+health\??$/i,
   /^how.{0,20}(everyone|agents?|doing|running)/i,
-  /^health\??$/i,
   /^system status/i,
 ];
 

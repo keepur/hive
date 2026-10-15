@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { Dispatcher } from "./dispatcher.js";
+import { Dispatcher, STATUS_PATTERNS, STATUS_MAX_LENGTH } from "./dispatcher.js";
 import type { WorkItem } from "../types/work-item.js";
 import { ProviderCircuitOpenError } from "../agents/provider-circuit-breaker.js";
 import {
@@ -248,29 +248,39 @@ function makeMockAdapter() {
 // ---------------------------------------------------------------------------
 
 describe("status patterns", () => {
-  const STATUS_PATTERNS = [
-    /^status\??$/i,
-    /^how.{0,20}(everyone|agents?|doing|running)/i,
-    /^health\??$/i,
-    /^system status/i,
-  ];
-
+  // STATUS_PATTERNS / STATUS_MAX_LENGTH are imported from dispatcher.ts, NOT
+  // redeclared here. They used to be duplicated as local literals, which meant
+  // this suite went green against its own copy and could not detect that the
+  // real patterns had changed (or failed to change). Keep them imported.
   function isStatusQuery(text: string): boolean {
     const trimmed = text.trim();
-    return trimmed.length <= 80 && STATUS_PATTERNS.some((p) => p.test(trimmed));
+    return trimmed.length <= STATUS_MAX_LENGTH && STATUS_PATTERNS.some((p) => p.test(trimmed));
   }
 
-  it("matches 'status'", () => expect(isStatusQuery("status")).toBe(true));
-  it("matches 'status?'", () => expect(isStatusQuery("status?")).toBe(true));
-  it("matches 'Status'", () => expect(isStatusQuery("Status")).toBe(true));
-  it("matches 'health'", () => expect(isStatusQuery("health")).toBe(true));
-  it("matches 'health?'", () => expect(isStatusQuery("health?")).toBe(true));
+  // Fleet-level queries are "hive"-prefixed and DO hit the health report.
+  it("matches 'hive status'", () => expect(isStatusQuery("hive status")).toBe(true));
+  it("matches 'hive status?'", () => expect(isStatusQuery("hive status?")).toBe(true));
+  it("matches 'Hive Status'", () => expect(isStatusQuery("Hive Status")).toBe(true));
+  it("matches 'hive health'", () => expect(isStatusQuery("hive health")).toBe(true));
+  it("matches 'hive health?'", () => expect(isStatusQuery("hive health?")).toBe(true));
+  it("matches 'hive  status' (extra whitespace)", () => expect(isStatusQuery("hive  status")).toBe(true));
   it("matches 'how is everyone'", () => expect(isStatusQuery("how is everyone")).toBe(true));
   it("matches 'how are the agents doing'", () => expect(isStatusQuery("how are the agents doing")).toBe(true));
   it("matches 'how is everyone running'", () => expect(isStatusQuery("how is everyone running")).toBe(true));
   it("matches 'system status'", () => expect(isStatusQuery("system status")).toBe(true));
+
+  // The regression this change exists to fix: a bare "status"/"health" asked of
+  // an agent must NOT be swallowed by the fleet report — it has to reach the agent.
+  it("does NOT match bare 'status'", () => expect(isStatusQuery("status")).toBe(false));
+  it("does NOT match bare 'status?'", () => expect(isStatusQuery("status?")).toBe(false));
+  it("does NOT match bare 'Status'", () => expect(isStatusQuery("Status")).toBe(false));
+  it("does NOT match bare 'health'", () => expect(isStatusQuery("health")).toBe(false));
+  it("does NOT match bare 'health?'", () => expect(isStatusQuery("health?")).toBe(false));
+  // A bare "hive" is ambiguous in a product named Hive — must not intercept.
+  it("does NOT match bare 'hive'", () => expect(isStatusQuery("hive")).toBe(false));
+
   it("does NOT match long messages", () => {
-    expect(isStatusQuery("status " + "x".repeat(100))).toBe(false);
+    expect(isStatusQuery("hive status " + "x".repeat(100))).toBe(false);
   });
   it("does NOT match regular messages containing 'status'", () => {
     expect(isStatusQuery("what is the status of the Johnson project")).toBe(false);
@@ -419,11 +429,42 @@ describe("Dispatcher routing", () => {
     expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("river", item2);
   });
 
-  it("intercepts status queries and does not call agent", async () => {
-    const item = makeWorkItem({ text: "status" });
+  it("intercepts fleet status queries and does not call agent", async () => {
+    const item = makeWorkItem({ text: "hive status" });
     await dispatcher.dispatch(item);
     expect(agentManager.runWorkItemTurn).not.toHaveBeenCalled();
     expect(adapter.deliver).toHaveBeenCalledTimes(1);
+  });
+
+  // The point of the "hive"-prefix gate, asserted end-to-end through dispatch()
+  // rather than against the regex array: a bare "status" typed in an agent's own
+  // channel is a question FOR that agent ("status of the thing you owe me") and
+  // must reach it, not be swallowed by the fleet health report. This is the exact
+  // scenario that motivated the change. Note these items are addressed to a
+  // channel that routes (agent-jasper) — an unaddressed item is dropped for
+  // routing reasons and would pass this assertion vacuously.
+  it("routes a bare 'status' in an agent channel to that agent, not the health report", async () => {
+    const item = makeWorkItem({
+      source: { kind: "slack", id: "C456", label: "agent-jasper" },
+      text: "status",
+    });
+    await dispatcher.dispatch(item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("jasper", item);
+    // deliver() carries both agent replies and the fleet report, so assert on
+    // WHICH path produced it: the health report delivers as agentId "system".
+    expect(adapter.deliver).not.toHaveBeenCalledWith(expect.objectContaining({ agentId: "system" }));
+  });
+
+  it("routes a bare 'health' in an agent channel to that agent, not the health report", async () => {
+    const item = makeWorkItem({
+      source: { kind: "slack", id: "C456", label: "agent-jasper" },
+      text: "health",
+    });
+    await dispatcher.dispatch(item);
+    expect(agentManager.runWorkItemTurn).toHaveBeenCalledWith("jasper", item);
+    // deliver() carries both agent replies and the fleet report, so assert on
+    // WHICH path produced it: the health report delivers as agentId "system".
+    expect(adapter.deliver).not.toHaveBeenCalledWith(expect.objectContaining({ agentId: "system" }));
   });
 
   it("suppresses non-response agent output", async () => {
