@@ -276,3 +276,95 @@ describe("MemoryManager.getHotTierPrompt recall-trailer variants (KPR-349 §D5)"
     }
   });
 });
+
+describe("MemoryManager.getHotTierPrompt budget-dropped hot records in the trailer", () => {
+  let manager: MemoryManager;
+  let mockStore: ReturnType<typeof makeMockMemoryStore>;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    manager = new MemoryManager(mockDb as any);
+    await manager.init();
+    mockStore = makeMockMemoryStore();
+    manager.memoryStore = mockStore as any;
+  });
+
+  // Each line is `- [2026-03-15] ` + 80 chars + ` (importance)` ≈ 106 chars ≈ 27 tokens.
+  // A budget of 30 fits exactly one.
+  const bigRecords = (n: number, overrides: Partial<MemoryRecord> = {}) =>
+    Array.from({ length: n }, (_, i) => makeRecord({ content: String.fromCharCode(65 + i).repeat(80), ...overrides }));
+
+  it("counts budget-dropped hot records in the trailer total and names them", async () => {
+    mockStore.getHotTier.mockResolvedValueOnce(bigRecords(4));
+    mockStore.countNonHot.mockResolvedValueOnce(7);
+
+    const result = await manager.getHotTierPrompt("agent-1", 30);
+
+    // 1 rendered, 3 dropped, 7 warm/cold ⇒ 10 unreachable-but-recallable.
+    expect(result).toContain(
+      "---\nYou have 10 additional memories available via `memory_recall` — 3 of them are hot records dropped from the section above to fit the memory budget, so compact your hot tier. Use it to search for context before starting tasks.",
+    );
+  });
+
+  it("emits a trailer when records were dropped even with zero warm/cold records", async () => {
+    // Previously: countNonHot() === 0 suppressed the trailer entirely, so an
+    // agent whose whole hot tier fell off the budget was told nothing at all.
+    mockStore.getHotTier.mockResolvedValueOnce(bigRecords(3));
+    mockStore.countNonHot.mockResolvedValueOnce(0);
+
+    const result = await manager.getHotTierPrompt("agent-1", 30);
+
+    expect(result).toContain("You have 2 additional memories");
+    expect(result).toContain("2 of them are hot records dropped from the section above");
+  });
+
+  it("uses singular grammar for exactly one dropped record", async () => {
+    mockStore.getHotTier.mockResolvedValueOnce(bigRecords(2));
+    mockStore.countNonHot.mockResolvedValueOnce(0);
+
+    const result = await manager.getHotTierPrompt("agent-1", 30);
+
+    expect(result).toContain("1 of them is a hot record dropped from the section above");
+  });
+
+  it("keeps the trailer byte-identical when nothing was dropped", async () => {
+    mockStore.getHotTier.mockResolvedValueOnce(bigRecords(2));
+    mockStore.countNonHot.mockResolvedValueOnce(7);
+
+    const result = await manager.getHotTierPrompt("agent-1", 10000);
+
+    expect(result).toContain(
+      "---\nYou have 7 additional memories available via `memory_recall`. Use it to search for context before starting tasks.",
+    );
+    expect(result).not.toContain("dropped from the section above");
+  });
+
+  it("does not count pinned records as dropped — they are exempt from the gate", async () => {
+    // Pinned records bypass the break but still spend budget, so they render
+    // and must not be reported as dropped.
+    mockStore.getHotTier.mockResolvedValueOnce(bigRecords(3, { pinned: true, importance: "critical" }));
+    mockStore.countNonHot.mockResolvedValueOnce(7);
+
+    const result = await manager.getHotTierPrompt("agent-1", 30);
+
+    expect(result).toContain("A".repeat(80));
+    expect(result).toContain("C".repeat(80));
+    expect(result).toContain(
+      "---\nYou have 7 additional memories available via `memory_recall`. Use it to search for context before starting tasks.",
+    );
+    expect(result).not.toContain("dropped from the section above");
+  });
+
+  it("reports the drop in the §D5 gated variant without making a tool claim", async () => {
+    mockStore.getHotTier.mockResolvedValueOnce(bigRecords(4));
+    mockStore.countNonHot.mockResolvedValueOnce(7);
+
+    const result = await manager.getHotTierPrompt("agent-1", 30, { recallToolName: null });
+
+    expect(result).toContain(
+      "---\nYou have 10 additional memories — 3 of them are hot records dropped from the section above to fit the memory budget, so compact your hot tier.",
+    );
+    expect(result).not.toContain("memory_recall");
+    expect(result).not.toContain("Use it to search");
+  });
+});

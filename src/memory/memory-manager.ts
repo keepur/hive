@@ -99,6 +99,7 @@ export class MemoryManager {
     const sections: Record<string, string[]> = {};
     const pinnedEntries: string[] = [];
     let tokenCount = 0;
+    let renderedCount = 0;
 
     for (const r of hotRecords) {
       const date = r.updatedAt.toISOString().split("T")[0];
@@ -107,6 +108,7 @@ export class MemoryManager {
 
       if (tokenCount + lineTokens > budgetTokens && !r.pinned) break;
       tokenCount += lineTokens;
+      renderedCount++;
 
       if (r.pinned) {
         pinnedEntries.push(`- ${r.content} (${r.importance}, pinned)`);
@@ -128,15 +130,40 @@ export class MemoryManager {
     }
 
     const warmColdCount = await this._memoryStore.countNonHot(agentId);
-    if (warmColdCount > 0) {
+
+    // Hot records the budget gate dropped. The `break` above is terminal, so
+    // everything from the break point on is silently absent from the digest —
+    // and countNonHot() only counts `tier != "hot"`, so these were previously
+    // neither rendered NOR counted. An agent over budget was told a number
+    // that understated its own unreachable context by exactly this many
+    // records, with no signal inside the prompt that anything was missing.
+    //
+    // Reported separately from warmColdCount on purpose: the two call for
+    // different responses. Warm/cold records are in their intended tier and
+    // just need recalling; dropped hot records mean this agent's hot tier no
+    // longer fits its budget (usually pinned records, which are exempt from
+    // the gate but still spend budget) and needs compacting.
+    const droppedHotCount = hotRecords.length - renderedCount;
+
+    if (warmColdCount > 0 || droppedHotCount > 0) {
       const recallToolName = opts?.recallToolName === undefined ? "memory_recall" : opts.recallToolName;
+      // Both kinds of unrendered record are reachable by the recall tool, so
+      // the headline number is the total. The breakdown clause is emitted only
+      // when something was actually dropped: that keeps the common case
+      // byte-identical to pre-existing output, so no agent's cached prompt
+      // prefix churns for a clause that would always read "0".
+      const unrenderedTotal = warmColdCount + droppedHotCount;
+      const dropClause =
+        droppedHotCount > 0
+          ? ` — ${droppedHotCount} of ${droppedHotCount === 1 ? "them is a hot record" : "them are hot records"} dropped from the section above to fit the memory budget, so compact your hot tier`
+          : "";
       parts.push(
         recallToolName === null
           ? // §D5 gated variant (KPR-349 final-gate ruling): reworded, count
             // stays, imperative tool sentence gone — NOT a naive line-drop
             // of the fused sentence.
-            `---\nYou have ${warmColdCount} additional memories.`
-          : `---\nYou have ${warmColdCount} additional memories available via \`${recallToolName}\`. Use it to search for context before starting tasks.`,
+            `---\nYou have ${unrenderedTotal} additional memories${dropClause}.`
+          : `---\nYou have ${unrenderedTotal} additional memories available via \`${recallToolName}\`${dropClause}. Use it to search for context before starting tasks.`,
       );
     }
 
